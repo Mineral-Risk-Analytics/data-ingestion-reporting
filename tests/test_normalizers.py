@@ -13,10 +13,10 @@ def test_geography_resolver_maps_census_code() -> None:
 
 
 def test_supplier_resolver_finds_alias() -> None:
-    supplier = MagicMock()
-    supplier.canonical_name = "Tesla Inc."
+    company = MagicMock()
+    company.canonical_name = "Tesla Inc."
     alias_row = MagicMock()
-    alias_row.supplier = supplier
+    alias_row.company = company
 
     mock_db = MagicMock()
 
@@ -28,4 +28,4 @@ def test_supplier_resolver_finds_alias() -> None:
     mock_db.execute.side_effect = exec_side_effect
 
     r = SupplierResolver(mock_db)
-    assert r.resolve_name("Tesla Motors Inc") is supplier
+    assert r.resolve_name("Tesla Motors Inc") is company

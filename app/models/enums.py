@@ -14,6 +14,9 @@ class SourceType(str, Enum):
     NREL_CHARGING = "nrel_charging"
     USITC = "usitc"
     CANADA_POLICY = "canada_policy"
+    COMTRADE = "comtrade"
+    LME = "lme"
+    USGS = "usgs"
 
 
 class ImplementationPhase(str, Enum):
@@ -40,19 +43,56 @@ class DocumentType(str, Enum):
     UNKNOWN = "unknown"
 
 
-class SupplierType(str, Enum):
-    OEM = "oem"
-    TIER1 = "tier1"
+class SupplyChainStage(str, Enum):
+    """Position in the battery supply chain — replaces SupplierType."""
     MINER = "miner"
     REFINER = "refiner"
+    PRECURSOR = "precursor"        # precursor cathode active material
     CELL_MAKER = "cell_maker"
+    PACK_MAKER = "pack_maker"
+    OEM = "oem"
+    RECYCLER = "recycler"
+    TRADER = "trader"
     OTHER = "other"
 
 
+class FacilityType(str, Enum):
+    MINE = "mine"
+    REFINERY = "refinery"
+    CELL_FACTORY = "cell_factory"
+    PACK_PLANT = "pack_plant"
+    RECYCLING = "recycling"
+    R_AND_D = "r_and_d"
+    HQ = "hq"
+
+
+class FacilityStatus(str, Enum):
+    OPERATING = "operating"
+    PLANNED = "planned"
+    UNDER_CONSTRUCTION = "under_construction"
+    MOTHBALLED = "mothballed"
+    CLOSED = "closed"
+
+
+class ComplianceStatus(str, Enum):
+    COMPLIANT = "compliant"
+    NON_COMPLIANT = "non_compliant"
+    PARTIAL = "partial"
+    UNKNOWN = "unknown"
+
+
 class ReportType(str, Enum):
-    OEM = "oem"
-    SUPPLIER = "supplier"
-    INVESTOR = "investor"
+    MARKET_INTELLIGENCE = "market_intelligence"
+    SUPPLIER_RISK = "supplier_risk"
+    REGULATORY_IMPACT = "regulatory_impact"
+    GEOGRAPHY_RISK = "geography_risk"
+
+
+class ReportFocusType(str, Enum):
+    MATERIAL = "material"
+    COMPANY = "company"
+    REGULATION = "regulation"
+    GEOGRAPHY = "geography"
 
 
 class ReportAudience(str, Enum):
@@ -67,3 +107,16 @@ class ReportRunStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class TenantPlan(str, Enum):
+    STARTER = "starter"
+    PRO = "pro"
+    ENTERPRISE = "enterprise"
+
+
+class UserRole(str, Enum):
+    OWNER = "owner"
+    ADMIN = "admin"
+    ANALYST = "analyst"
+    MEMBER = "member"

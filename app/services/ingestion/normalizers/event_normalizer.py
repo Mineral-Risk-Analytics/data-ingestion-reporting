@@ -2,6 +2,8 @@
 Build preliminary `risk_events` rows from parsed domain objects.
 
 Scores are heuristic and explainable — replaced by richer models in later phases.
+All severity_score and confidence_score values are on the 0-1.0 scale required by
+the scoring formula (event_impact = severity × effective_confidence × recency × relevance).
 """
 
 from __future__ import annotations
@@ -28,14 +30,15 @@ class RiskEventDraft:
 
 
 def build_regulatory_risk_event(parsed: ParsedRegulation) -> RiskEventDraft:
-    severity = 35.0
+    severity = 0.35
     text = (parsed.abstract_text or parsed.title or "").lower()
     keywords = ("battery", "critical mineral", "tariff", "section 232", "import")
     hits = sum(1 for k in keywords if k in text)
-    severity = min(95.0, severity + hits * 10)
-    cats = [RiskCategory.REGULATORY_POLICY.value]
+    severity = min(0.95, severity + hits * 0.10)
+    cats = [RiskCategory.REGULATORY_COMPLIANCE.value]
     if "tariff" in text or "trade" in text:
-        cats.append(RiskCategory.MATERIAL_SUPPLY.value)
+        # Trade-related regulatory notices also carry a geopolitical dimension
+        cats.append(RiskCategory.GEOPOLITICAL_TRADE.value)
 
     geo = {"scope": "federal", "topics": parsed.topics[:10]}
 
@@ -49,7 +52,7 @@ def build_regulatory_risk_event(parsed: ParsedRegulation) -> RiskEventDraft:
             else None
         ),
         severity_score=severity,
-        confidence_score=70.0,
+        confidence_score=0.70,
         risk_categories=cats,
         geography=geo,
         metadata={"agencies": parsed.agencies, "doc_type": parsed.doc_type},
@@ -64,25 +67,25 @@ def build_sec_filing_event(
     filed_at: datetime | None,
     narrative: str | None,
 ) -> RiskEventDraft:
-    severity = 25.0
+    severity = 0.25
     if form.upper() in {"8-K", "6-K"}:
-        severity += 15.0
+        severity += 0.15
     if form.upper() == "10-K":
-        severity += 5.0
+        severity += 0.05
     text = (narrative or "").lower()
     if any(x in text for x in ("supply chain", "lithium", "battery", "sec 1502")):
-        severity += 10.0
+        severity += 0.10
 
     return RiskEventDraft(
         event_type="sec_filing_signal",
         title=f"{form} — {company or 'issuer'}",
         summary=narrative[:4000] if narrative else None,
         event_date=filed_at,
-        severity_score=min(90.0, severity),
-        confidence_score=55.0,
+        severity_score=min(0.90, severity),
+        confidence_score=0.55,
         risk_categories=[
-            RiskCategory.SUPPLIER_OPERATIONAL.value,
-            RiskCategory.MARKET_DEMAND.value,
+            # SEC filings map to financial_pressure; operational signals covered by other events
+            RiskCategory.FINANCIAL_PRESSURE.value,
         ],
         geography={"issuer": company, "accession": accession},
         metadata={"form": form},
@@ -90,18 +93,18 @@ def build_sec_filing_event(
 
 
 def build_news_event(article: ParsedArticle) -> RiskEventDraft:
-    severity = 30.0 + min(40.0, len(article.event_labels) * 5.0)
-    cats = [RiskCategory.MARKET_DEMAND.value]
+    severity = 0.30 + min(0.40, len(article.event_labels) * 0.05)
+    cats = [RiskCategory.OPERATIONAL.value]  # default pillar for unclassified news
     if any("regulation" in e.lower() or "policy" in e.lower() for e in article.event_labels):
-        cats.append(RiskCategory.REGULATORY_POLICY.value)
+        cats.append(RiskCategory.REGULATORY_COMPLIANCE.value)
 
     return RiskEventDraft(
         event_type="news_article",
         title=article.title,
         summary=(article.body_text or "")[:4000] or None,
         event_date=article.published_at,
-        severity_score=min(95.0, severity),
-        confidence_score=45.0,
+        severity_score=min(0.95, severity),
+        confidence_score=0.45,
         risk_categories=cats,
         geography={"source": article.source_name},
         metadata={"entities": article.entities[:20], "labels": article.event_labels},
@@ -115,21 +118,21 @@ def build_trade_risk_event(
     trade_value_usd: float | None,
     import_export: str,
 ) -> RiskEventDraft:
-    severity = 20.0
+    severity = 0.20
     if trade_value_usd and trade_value_usd > 1e9:
-        severity += 25.0
+        severity += 0.25
     desc = (hs_description or "").lower()
     if "lithium" in desc or "battery" in desc:
-        severity += 20.0
+        severity += 0.20
 
     return RiskEventDraft(
         event_type="trade_flow_signal",
         title=f"Trade observation ({import_export}) — {partner or 'partner'}",
         summary=hs_description,
         event_date=datetime.now(timezone.utc),
-        severity_score=min(90.0, severity),
-        confidence_score=50.0,
-        risk_categories=[RiskCategory.MATERIAL_SUPPLY.value],
+        severity_score=min(0.90, severity),
+        confidence_score=0.50,
+        risk_categories=[RiskCategory.GEOPOLITICAL_TRADE.value],
         geography={"partner": partner},
         metadata={"trade_value_usd": trade_value_usd},
     )

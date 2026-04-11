@@ -1,31 +1,55 @@
-"""Combine sub-scores into an overall supplier view."""
+"""Aggregate the five component scores into an overall supplier risk score (v2)."""
 
 from __future__ import annotations
 
-from app.services.scoring.types import ScoreResult
+SCORING_VERSION = "2.0"
+
+PILLAR_WEIGHTS = {
+    "material":      0.30,
+    "geopolitical":  0.20,
+    "regulatory":    0.20,
+    "operational":   0.15,
+    "financial":     0.15,
+}
 
 
 def aggregate_supplier_risk(
-    *,
     material_score: float,
+    geopolitical_score: float,
     regulatory_score: float,
-    financial_pressure_score: float,
     operational_score: float,
-) -> ScoreResult:
+    financial_score: float,
+) -> dict:
     """
-    Default weights favor materials + regulatory for battery supply-chain use cases.
+    Combine five pillar scores into an overall score dict.
+
+    Weights: material 30%, geopolitical 20%, regulatory 20%, operational 15%,
+    financial 15%.  Raw floats are stored unrounded; round only in the
+    presentation/API layer to preserve precision for score-delta comparisons.
+
+    Args:
+        material_score:     Material Concentration Risk on [0, 100].
+        geopolitical_score: Geopolitical / Trade Risk on [0, 100].
+        regulatory_score:   Regulatory & Compliance Risk on [0, 100].
+        operational_score:  Operational Risk on [0, 100].
+        financial_score:    Financial Pressure on [0, 100].
+
+    Returns:
+        Dict with all component scores, weighted overall score, and scoring_version.
     """
-    w_mat, w_reg, w_fin, w_ops = 0.35, 0.35, 0.15, 0.15
     overall = (
-        material_score * w_mat
-        + regulatory_score * w_reg
-        + financial_pressure_score * w_fin
-        + operational_score * w_ops
+        PILLAR_WEIGHTS["material"]     * material_score
+        + PILLAR_WEIGHTS["geopolitical"] * geopolitical_score
+        + PILLAR_WEIGHTS["regulatory"]   * regulatory_score
+        + PILLAR_WEIGHTS["operational"]  * operational_score
+        + PILLAR_WEIGHTS["financial"]    * financial_score
     )
-    rationale = [
-        f"Weighted blend (mat/reg/fin/ops): "
-        f"{w_mat:.2f}/{w_reg:.2f}/{w_fin:.2f}/{w_ops:.2f}",
-        f"Inputs — material={material_score:.1f}, regulatory={regulatory_score:.1f}, "
-        f"financial={financial_pressure_score:.1f}, operational={operational_score:.1f}",
-    ]
-    return ScoreResult(score=overall, rationale=rationale)
+    return {
+        "material_concentration_risk_score": material_score,
+        "geopolitical_trade_risk_score":     geopolitical_score,
+        "regulatory_compliance_risk_score":  regulatory_score,
+        "operational_risk_score":            operational_score,
+        "financial_pressure_score":          financial_score,
+        "overall_risk_score":                overall,
+        "scoring_version":                   SCORING_VERSION,
+    }

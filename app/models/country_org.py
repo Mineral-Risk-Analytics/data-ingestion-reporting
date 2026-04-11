@@ -1,40 +1,15 @@
-"""Supporting entities: countries and organizations (all phases)."""
-
-from __future__ import annotations
-
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, Optional
-
-from sqlalchemy import DateTime, ForeignKey, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.db.base import Base
-
-if TYPE_CHECKING:
-    pass
-
-
-class Country(Base):
-    __tablename__ = "countries"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    iso2: Mapped[str] = mapped_column(String(2), unique=True, nullable=False, index=True)
-    iso3: Mapped[Optional[str]] = mapped_column(String(3))
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    region: Mapped[Optional[str]] = mapped_column(String(128))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-
-class Organization(Base):
-    __tablename__ = "organizations"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
-    org_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    country_id: Mapped[Optional[int]] = mapped_column(ForeignKey("countries.id", ondelete="SET NULL"))
-    metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
+# REMOVED: Country and Organization models have been dropped from the schema.
+#
+# Country was a reference table that only served as a FK target for
+# the Organization model. Neither table appears in ads_database_schema_v1.
+# Geography is handled throughout the codebase via ISO2 string codes
+# (headquarters_country, source_geography, geography_code, etc.) with no FK
+# enforcement — consistent with the schema doc's design.
+#
+# Organization was an undocumented leftover from an earlier architecture
+# sketch. The companies table (with parent_company_id self-reference) covers
+# its intended use case.
+#
+# This file is kept as a tombstone to prevent stale imports from breaking
+# silently. Remove the file entirely once you confirm no external code
+# references Country or Organization.

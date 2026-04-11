@@ -5,8 +5,9 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Country, Material, Source, Supplier, SupplierAlias
-from app.models.enums import ImplementationPhase, SourceType
+from app.models import Country, Material, Source
+from app.models.company import Company, CompanyAlias
+from app.models.enums import ImplementationPhase, SourceType, SupplyChainStage
 
 
 def seed_if_empty(session: Session) -> dict[str, int]:
@@ -48,19 +49,18 @@ def seed_if_empty(session: Session) -> dict[str, int]:
         )
         stats["materials"] = 3
 
-    if session.scalar(select(Supplier).limit(1)) is None:
-        tesla = Supplier(
+    if session.scalar(select(Company).limit(1)) is None:
+        tesla = Company(
             canonical_name="Tesla Inc.",
-            supplier_type="oem",
+            supply_chain_stage=SupplyChainStage.OEM.value,
             headquarters_country="US",
-            headquarters_region="north_america",
             public_ticker="TSLA",
             is_public=True,
             notes="Seed OEM for SEC demo CIK",
         )
-        alb = Supplier(
+        alb = Company(
             canonical_name="Albemarle Corporation",
-            supplier_type="miner",
+            supply_chain_stage=SupplyChainStage.MINER.value,
             headquarters_country="US",
             public_ticker="ALB",
             is_public=True,
@@ -70,12 +70,12 @@ def seed_if_empty(session: Session) -> dict[str, int]:
         session.flush()
         session.add_all(
             [
-                SupplierAlias(supplier_id=tesla.id, alias="Tesla Motors Inc", alias_type="aka"),
-                SupplierAlias(supplier_id=alb.id, alias="Albemarle Corp.", alias_type="legal"),
+                CompanyAlias(company_id=tesla.id, alias="Tesla Motors Inc", alias_type="aka"),
+                CompanyAlias(company_id=alb.id, alias="Albemarle Corp.", alias_type="legal"),
             ]
         )
-        stats["suppliers"] = 2
-        stats["supplier_aliases"] = 2
+        stats["companies"] = 2
+        stats["company_aliases"] = 2
 
     if session.scalar(select(Source).limit(1)) is None:
         session.add_all(

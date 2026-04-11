@@ -1,38 +1,86 @@
-"""ORM models — import side effects register metadata with Base."""
+"""ORM models — import side effects register all metadata with Base."""
 
-from app.models.country_org import Country, Organization
-from app.models.documents import DocumentChunk, EntityLink, SourceDocument
+from app.models.company import (
+    Company,
+    CompanyAlias,
+    CompanyMaterialExposure,
+    CompanyScore,
+    CompanySupplyRelationship,
+)
+from app.models.documents import DocumentChunk, SourceDocument
+from app.models.facility import Facility
 from app.models.ingestion import IngestionRun, RawApiPayload
-from app.models.regulatory import Regulation, RiskEvent
-from app.models.reporting import AnalystNote, ReportInsight, ReportRun
+from app.models.platform import Tenant, UsageEvent, User
+from app.models.regulatory import (
+    CompanyRegulationExposure,
+    Regulation,
+    RegulationGeographyScope,
+    RegulationMaterialScope,
+    RiskEvent,
+    RiskEventCompany,
+    RiskEventGeography,
+    RiskEventMaterial,
+    RiskEventRegulation,
+)
+from app.models.reporting import (
+    AnalystNote,
+    ReportInsight,
+    ReportRun,
+    ReportTemplate,
+    ReportTemplateFocusEntity,
+)
+from app.models.scoring import GeographyScore, MaterialScore
 from app.models.source import Source
 from app.models.supply import (
+    CommodityPrice,
+    HsCodeMaterialMapping,
     Material,
-    Supplier,
-    SupplierAlias,
-    SupplierMaterialExposure,
-    SupplierScore,
     TradeFlow,
 )
 
 __all__ = [
-    "AnalystNote",
-    "Country",
+    # Company layer
+    "Company",
+    "CompanyAlias",
+    "CompanyMaterialExposure",
+    "CompanyScore",
+    "CompanySupplyRelationship",
+    # Documents
     "DocumentChunk",
-    "EntityLink",
+    "SourceDocument",
+    # Facility
+    "Facility",
+    # Ingestion
     "IngestionRun",
-    "Material",
-    "Organization",
     "RawApiPayload",
+    # Platform
+    "Tenant",
+    "User",
+    "UsageEvent",
+    # Regulatory + events
+    "CompanyRegulationExposure",
     "Regulation",
+    "RegulationGeographyScope",
+    "RegulationMaterialScope",
+    "RiskEvent",
+    "RiskEventCompany",
+    "RiskEventGeography",
+    "RiskEventMaterial",
+    "RiskEventRegulation",
+    # Reporting
+    "AnalystNote",
     "ReportInsight",
     "ReportRun",
-    "RiskEvent",
+    "ReportTemplate",
+    "ReportTemplateFocusEntity",
+    # Scoring
+    "GeographyScore",
+    "MaterialScore",
+    # Source
     "Source",
-    "SourceDocument",
-    "Supplier",
-    "SupplierAlias",
-    "SupplierMaterialExposure",
-    "SupplierScore",
+    # Supply
+    "CommodityPrice",
+    "HsCodeMaterialMapping",
+    "Material",
     "TradeFlow",
 ]

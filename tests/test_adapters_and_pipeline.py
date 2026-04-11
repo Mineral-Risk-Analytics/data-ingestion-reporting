@@ -53,4 +53,7 @@ def test_regulation_to_risk_event_integration() -> None:
     )
     draft = build_regulatory_risk_event(parsed)
     assert draft.event_type == "federal_register_notice"
-    assert draft.severity_score > 30
+    # severity_score is on the 0-1.0 scale (scoring v2); "battery tariff supply chain"
+    # contributes multiple keyword hits pushing well above the 0.35 base.
+    assert 0.0 < draft.severity_score <= 1.0
+    assert draft.severity_score > 0.30

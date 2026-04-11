@@ -37,7 +37,7 @@ class StubNewsProvider:
                 "body": "Analysts noted tightening environmental review timelines for "
                 "gigafactory expansions and downstream lithium refining projects.",
                 "entities": [{"type": "material", "name": "lithium"}],
-                "event_classification": ["regulatory_policy", "infrastructure_ecosystem"],
+                "event_classification": ["regulatory_compliance", "geopolitical_trade"],
             }
         ]
 

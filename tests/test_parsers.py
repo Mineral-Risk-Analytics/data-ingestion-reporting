@@ -46,11 +46,11 @@ def test_parse_article() -> None:
             "source": "demo",
             "published_at": "2024-01-15T10:00:00+00:00",
             "body": "Utilities flagged winter peak loads.",
-            "event_classification": ["infrastructure_ecosystem"],
+            "event_classification": ["geopolitical_trade"],
         }
     )
     assert art.external_id == "n1"
-    assert "infrastructure_ecosystem" in art.event_labels
+    assert "geopolitical_trade" in art.event_labels
 
 
 def test_parse_sec_filing_recent() -> None:
