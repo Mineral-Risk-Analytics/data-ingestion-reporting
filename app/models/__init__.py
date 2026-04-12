@@ -1,5 +1,7 @@
 """ORM models — import side effects register all metadata with Base."""
 
+from app.models.battery_chemistry import BatteryChemistry, BatteryChemistryMaterial, ChemistryRiskScore
+from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.company import (
     Company,
     CompanyAlias,
@@ -40,6 +42,11 @@ from app.models.supply import (
 )
 
 __all__ = [
+    # Battery chemistry
+    "BatteryChemistry",
+    "BatteryChemistryMaterial",
+    "ChemistryRiskScore",
+    "MaterialCriticalitySignal",
     # Company layer
     "Company",
     "CompanyAlias",

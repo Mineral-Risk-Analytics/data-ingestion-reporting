@@ -18,6 +18,7 @@ dependencies = [
     "python-multipart>=0.0.17",
     "typer>=0.15.0",
     "openai>=1.54.0",
+    "openpyxl>=3.1.0",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +31,22 @@ dev = [
 
 [project.scripts]
 bdi-ingest = "app.cli:main"
+
+[tool.hatch.envs.default.scripts]
+ingest-usgs = "bdi-ingest ingest-usgs ./data/mineral_commodities/MCS2025_World_Data.csv"
+ingest-usgs-force = "bdi-ingest ingest-usgs ./data/mineral_commodities/MCS2025_World_Data.csv --force"
+ingest-worldbank = "bdi-ingest ingest-worldbank"
+ingest-worldbank-full = "bdi-ingest ingest-worldbank --since-year 1960"
+ingest-opensanctions = "bdi-ingest ingest-opensanctions"
+ingest-comtrade = "bdi-ingest ingest-comtrade"
+ingest-comtrade-recent = "bdi-ingest ingest-comtrade --years 2021,2022,2023"
+ingest-comtrade-cn-only = "bdi-ingest ingest-comtrade --reporters CN --years 2021,2022,2023"
+seed-materials = "bdi-ingest seed-materials"
+seed-hs-mappings = "bdi-ingest seed-hs-mappings"
+seed-hs-mappings-force = "bdi-ingest seed-hs-mappings --force"
+rescore-chemistry = "bdi-ingest rescore-chemistry"
+rescore-chemistry-lfp = "bdi-ingest rescore-chemistry --slug lfp"
+rescore-chemistry-nmc = "bdi-ingest rescore-chemistry --slug nmc"
 
 [build-system]
 requires = ["hatchling"]

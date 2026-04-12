@@ -87,6 +87,16 @@ def embed_and_store_chunks(
     # --- Embed all chunks in one batched call --------------------------------
     vectors = embed_texts(chunks)  # may raise EmbeddingError — caller handles
 
+    # When OPENAI_API_KEY is not set, embed_texts returns empty lists as a
+    # no-op. Skip vector persistence entirely so the run still succeeds.
+    if vectors and not vectors[0]:
+        log.info(
+            "document_embedder.skipped_vectors",
+            source_document_id=source_document_id,
+            reason="embed_texts returned empty vectors (API key not configured)",
+        )
+        return 0
+
     if len(vectors) != len(chunks):
         raise RuntimeError(
             f"embed_texts returned {len(vectors)} vectors for {len(chunks)} chunks "

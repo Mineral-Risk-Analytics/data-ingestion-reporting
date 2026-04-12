@@ -12,7 +12,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 if TYPE_CHECKING:
+    from app.models.battery_chemistry import BatteryChemistryMaterial
     from app.models.company import CompanyMaterialExposure
+    from app.models.criticality_signal import MaterialCriticalitySignal
     from app.models.documents import SourceDocument
 
 
@@ -44,6 +46,17 @@ class Material(Base):
     is_eu_crma_critical: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+    # Added by migration 002_battery_chemistry
+    patent_occurrence_trend: Mapped[Optional[str]] = mapped_column(
+        String(16), nullable=True,
+        comment="rising | declining | stable. DENORMALIZED CACHE — authoritative source "
+                "is material_criticality_signals. Refreshed by _sync_patent_trend().",
+    )
+    data_availability: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True,
+        comment="commercial | limited | no_benchmark. Used by chemistry_risk.py "
+                "to compute score_confidence.",
+    )
     notes: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -61,6 +74,12 @@ class Material(Base):
     )
     commodity_prices: Mapped[list["CommodityPrice"]] = relationship(
         back_populates="material", cascade="all, delete-orphan"
+    )
+    criticality_signals: Mapped[list["MaterialCriticalitySignal"]] = relationship(
+        back_populates="material", cascade="all, delete-orphan"
+    )
+    chemistry_uses: Mapped[list["BatteryChemistryMaterial"]] = relationship(
+        back_populates="material"
     )
 
 

@@ -17,7 +17,10 @@ target_metadata = Base.metadata
 
 
 def get_url() -> str:
-    return get_settings().database_url
+    settings = get_settings()
+    # Prefer the direct (unpooled) connection for migrations — DDL does not
+    # work reliably through PgBouncer in transaction mode.
+    return settings.database_url_direct or settings.database_url
 
 
 def run_migrations_offline() -> None:

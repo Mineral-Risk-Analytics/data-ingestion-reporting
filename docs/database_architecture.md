@@ -1,7 +1,7 @@
 # Database Architecture
 
 ## Non-Technical Summary
-> **Last updated: April 2026**
+> **Last updated: April 2026 — reflects migrations 001 (baseline), 002 (battery chemistry risk layer), and 003 (HS code mappings)**
 > This section is for anyone who wants to understand what the platform stores and why, without needing to know SQL or software engineering.
 
 The battery supply chain intelligence platform is built around a single question: **how risky is it to rely on a particular company for a critical component of an EV battery?**
@@ -52,7 +52,12 @@ The schema is organised into eleven dependency layers. Tables in later layers re
 6. Document storage    source_documents, document_chunks
 7. Risk & regulatory   regulations, risk_events
 8. Relationship layer  (10 junction / bridge tables)
+                       +  hs_code_material_mappings   [migration 003]
 9. Scoring             company_scores, material_scores, geography_scores
+                       +  material_criticality_signals [migration 002]
+                       +  battery_chemistries          [migration 002]
+                       +  battery_chemistry_materials  [migration 002]
+                       +  chemistry_risk_scores        [migration 002]
 10. Reports            report_templates, report_template_focus_entities,
                        report_runs, report_insights, analyst_notes
 11. Platform users     users, usage_events
@@ -120,21 +125,25 @@ Externalises constants that govern how scoring and entity resolution behave for 
 
 ### `materials`
 
-The critical minerals and compounds tracked by the platform.
+The critical minerals and compounds tracked by the platform. As of migration 002, covers 39 materials (34 from USGS MCS + 5 seeded manually: Neodymium, Praseodymium, Dysprosium, Terbium, Sodium).
 
 | Column | Type | Notes |
 |--------|------|-------|
 | `id` | SERIAL PK | — |
-| `canonical_name` | VARCHAR(255) UNIQUE NOT NULL | e.g. `Lithium`, `Cobalt`, `Battery-grade Graphite` |
-| `category` | VARCHAR(128) | e.g. `critical_mineral`, `cathode_material` |
+| `canonical_name` | VARCHAR(255) UNIQUE NOT NULL | e.g. `Lithium`, `Cobalt`, `Natural Graphite` |
+| `category` | VARCHAR(128) | e.g. `cathode_active`, `anode`, `structural`, `component` |
 | `symbol_or_code` | VARCHAR(64) | Chemical symbol or commodity code |
-| `hs_codes` | JSONB | List of relevant HS code strings |
-| `criticality_score` | FLOAT | 0–1 intrinsic criticality rating |
-| `primary_producing_countries` | JSONB | ISO2 country codes of major producers |
-| `price_unit` | VARCHAR(20) | Unit for commodity prices, e.g. `USD/t` |
-| `is_ira_critical_mineral` | BOOLEAN DEFAULT false | Flagged under US IRA |
-| `is_eu_crma_critical` | BOOLEAN DEFAULT false | Flagged under EU Critical Raw Materials Act |
-| `notes` | TEXT | — |
+| `hs_codes` | JSONB | 4-digit HS code prefix strings for trade flow matching |
+| `criticality_score` | FLOAT | 0–1 normalised HHI from USGS mine production data. Denormalised convenience column — authoritative source is `material_criticality_signals`. |
+| `primary_producing_countries` | JSONB | ISO2 country codes ranked by production volume |
+| `price_unit` | VARCHAR(20) | e.g. `per_mt`, `per_kg` |
+| `is_ira_critical_mineral` | BOOLEAN DEFAULT false | Flagged under US Inflation Reduction Act |
+| `is_eu_crma_critical` | BOOLEAN DEFAULT false | Flagged under EU Critical Raw Materials Act 2023 |
+| `patent_occurrence_trend` | VARCHAR(16) | `rising` \| `declining` \| `stable` \| NULL. **Denormalized cache** — authoritative source is `material_criticality_signals`. Refreshed by `_sync_patent_trend()` after any signal write. *Added in migration 002.* |
+| `data_availability` | VARCHAR(32) | `commercial` \| `limited` \| `no_benchmark`. Used by `score_chemistry()` to compute `score_confidence`. *Added in migration 002.* |
+| `notes` | TEXT | Source methodology and production notes |
+
+**Relationships:** one `material` → many `material_criticality_signals`, many `battery_chemistry_materials` (via junction), many `hs_code_material_mappings`, many `trade_flows`, many `commodity_prices`, many `company_material_exposures`.
 
 ### `companies`
 
@@ -672,10 +681,122 @@ sources ──→ ingestion_runs ──→ raw_api_payloads
 
 materials ──→ hs_code_material_mappings ← trade_flows
 materials ──→ commodity_prices
+materials ──→ material_criticality_signals  (source=usgs_mcs|eu_crma|iea_report|patstat|manual)
+
+battery_chemistries ──→ battery_chemistry_materials ─────► materials
+                                                            (valid_from/valid_to versioning)
+battery_chemistries ──→ chemistry_risk_scores (append-only)
 
 companies ──→ company_aliases
 companies ──→ facilities
 ```
+
+---
+
+## Battery Chemistry Risk Layer (migration 002)
+
+Added April 2026. Introduces four new tables for chemistry-level supply chain risk scoring.
+
+### `battery_chemistries`
+
+One row per battery cell chemistry. NMC variants (111/622/811) are collapsed into a single `nmc` slug for v1.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `slug` | VARCHAR(64) UNIQUE | `nmc`, `lfp`, `nca`, `lfmp`, `sodium_ion`, `solid_state` |
+| `name` | VARCHAR(255) | Human-readable name |
+| `description` | TEXT | — |
+| `status` | VARCHAR(32) | `commercial` \| `emerging` \| `research` |
+| `current_market_share_pct` | FLOAT | Approximate global share 0.0–1.0 |
+| `market_share_as_of_date` | DATE | **Required when share is set** — LFP went from ~6% to 40%+ in 3 years; without this date the figure is uninterpretable |
+| `is_active` | BOOLEAN | — |
+
+**Seeded:** 6 rows at migration time (NMC 0.38, LFP 0.40, NCA 0.08, LFMP 0.04, sodium_ion 0.03, solid_state 0.01 — 2024-12-31 vintage).
+
+### `battery_chemistry_materials`
+
+Versioned junction linking each chemistry to its constituent materials with intensity weights. Temporal versioning enables score auditability as compositions evolve.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `battery_chemistry_id` | FK → `battery_chemistries` | — |
+| `material_id` | FK → `materials` | — |
+| `role` | VARCHAR(64) | `cathode_active` \| `anode` \| `electrolyte` \| `current_collector` \| `other` |
+| `intensity` | FLOAT | 0–1: relative material intensity in this chemistry |
+| `is_substitutable` | BOOLEAN | Whether another material can substitute |
+| `valid_from` | DATE NOT NULL | When this intensity value became applicable |
+| `valid_to` | DATE | NULL = currently active. Point-in-time: `valid_from ≤ as_of ≤ COALESCE(valid_to, 'infinity')` |
+
+**Unique constraint:** `(battery_chemistry_id, material_id, role, valid_from)`
+
+**Seeded:** ~48 rows via `seed-materials` CLI covering all 6 chemistries.
+
+### `material_criticality_signals`
+
+Authoritative timeseries of per-material criticality from multiple sources. Replaces the single static `materials.criticality_score` float for multi-source, multi-year tracking.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `material_id` | FK → `materials` | — |
+| `source` | VARCHAR(32) | `usgs_mcs` \| `eu_crma` \| `iea_report` \| `patstat` \| `manual` |
+| `reference_year` | INTEGER | Publication year of the assessment |
+| `criticality_score` | FLOAT | 0.0–1.0 normalised criticality |
+| `trend_direction` | VARCHAR(16) | `rising` \| `declining` \| `stable` |
+| `hhi_score` | FLOAT | Raw HHI Σ(share_i²), 0–1 scale |
+| `metadata_json` | JSONB | Source methodology notes |
+
+**Unique constraint:** `(material_id, source, reference_year)`
+
+**Source priority** in `score_chemistry()`: `eu_crma` > `iea_report` > `usgs_mcs` > `manual` > `patstat` > `materials.criticality_score` (fallback)
+
+### `chemistry_risk_scores`
+
+Pre-computed, append-only chemistry-level risk scores. One row per scoring run.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `battery_chemistry_id` | FK → `battery_chemistries` | — |
+| `computed_at` | TIMESTAMPTZ | When scored |
+| `as_of_date` | DATE | Point-in-time for active composition lookup |
+| `methodology_version` | VARCHAR(16) | `"1.0"` |
+| `material_concentration_score` | FLOAT | 0–100 |
+| `geopolitical_score` | FLOAT | 0–100 |
+| `composite_risk_score` | FLOAT | 0–100 |
+| `score_confidence` | FLOAT | 0–1. Penalised by `data_availability`. Floored at 0.3. |
+| `metadata_json` | JSONB | `signal_sources`, `geo_coverage`, `materials_missing_hs`, `patent_modifiers_applied`, `trade_flows_vintage`, `no_benchmark_materials` |
+
+**CLI:** `bdi-ingest rescore-chemistry [--slug nmc] [--as-of 2024-01-01]`
+
+---
+
+## HS Code Mappings (migration 003)
+
+### `hs_code_material_mappings`
+
+Maps 4-digit HS code prefixes to `materials.id`. Bridges trade flow data (stored at 4-digit level by Comtrade ingestion) to specific materials for concentration scoring.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `hs_code_prefix` | VARCHAR(10) NOT NULL | 4-digit string e.g. `"2604"` |
+| `material_id` | FK → `materials` | — |
+| `description` | TEXT | What this HS chapter covers |
+| `confidence` | FLOAT | 0.0–1.0 specificity tier (not data quality) |
+
+**Unique constraint:** `(hs_code_prefix, material_id)`
+
+**Confidence tiers:**
+- `1.0` — unambiguous: prefix maps to exactly one material (e.g. `2504` = Natural Graphite)
+- `0.7–0.9` — primary material, prefix covers 2–3 commodities
+- `0.5–0.6` — partial attribution: prefix covers many materials (e.g. `2615` = Vanadium + Niobium + Tantalum + Zirconium)
+
+**Chapter 81 note:** HS 8112 covers Gallium, Germanium, Indium, Niobium, and Chromium at the 4-digit level. Individual 6-digit codes are specific (8112.21 = Chromium, 8112.31 = Germanium, etc.) but Comtrade ingestion queries at 4-digit. These mappings are intentionally low-confidence (0.6–0.7) until ingestion is updated.
+
+**Seeded:** 71 rows via `seed-hs-mappings` CLI. Source: USGS MCS 2025, UN Comtrade HS 2022, EU CRM Act 2023 Annex II.
 
 ---
 

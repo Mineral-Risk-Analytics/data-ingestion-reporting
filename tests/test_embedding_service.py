@@ -49,7 +49,14 @@ class TestEmbedTextsOutputLength:
         mock_client.embeddings.create.return_value = _make_openai_response(texts)
 
         _get_client.cache_clear()
-        with patch("app.services.ai.embeddings._get_client", return_value=mock_client):
+        with (
+            patch("app.services.ai.embeddings._get_client", return_value=mock_client),
+            patch("app.services.ai.embeddings.get_settings") as mock_settings,
+        ):
+            mock_settings.return_value.openai_api_key = "sk-test"
+            mock_settings.return_value.embedding_model = "text-embedding-3-small"
+            mock_settings.return_value.embedding_dimensions = 1536
+            mock_settings.return_value.embedding_batch_size = 64
             result = embed_texts(texts)
 
         assert len(result) == 1
@@ -61,7 +68,14 @@ class TestEmbedTextsOutputLength:
         mock_client.embeddings.create.return_value = _make_openai_response(texts)
 
         _get_client.cache_clear()
-        with patch("app.services.ai.embeddings._get_client", return_value=mock_client):
+        with (
+            patch("app.services.ai.embeddings._get_client", return_value=mock_client),
+            patch("app.services.ai.embeddings.get_settings") as mock_settings,
+        ):
+            mock_settings.return_value.openai_api_key = "sk-test"
+            mock_settings.return_value.embedding_model = "text-embedding-3-small"
+            mock_settings.return_value.embedding_dimensions = 1536
+            mock_settings.return_value.embedding_batch_size = 64
             result = embed_texts(texts)
 
         assert len(result) == 5

@@ -2,7 +2,12 @@
 
 > **Last updated: April 2026**
 
-The ingestion subsystem follows a consistent pattern: **configure → fetch → persist raw → parse → normalize → write domain rows → emit risk signals → entity resolution → score**. The class responsible for tying this together is **`IngestionPipeline`** in `app/services/ingestion/pipeline.py`.
+The platform has two ingestion paths:
+
+1. **Pipeline-based** (`IngestionPipeline`) — for event-driven sources that emit risk signals (Federal Register, Census trade, SEC EDGAR, news). Follows the pattern: **configure → fetch → persist raw → parse → normalize → write domain rows → emit risk signals → entity resolution → score**.
+2. **CLI-based** — for reference data and commodity sources that don't emit risk events (USGS, World Bank, OpenSanctions, Comtrade). Each is a standalone command invoked via `uv run bdi-ingest <command>`.
+
+This document covers the pipeline path. See [Data sources](data-sources.md) for CLI-based sources.
 
 ## Entry points
 
@@ -126,6 +131,8 @@ HTTP client:
 
 ## Extending the pipeline
 
+**To add a new pipeline source (event-emitting):**
+
 1. Add `SourceType` value and migration if needed.
 2. Implement adapter `fetch` returning appropriate `FetchBundle`(s).
 3. Register class in `ADAPTER_BY_TYPE`.
@@ -133,4 +140,12 @@ HTTP client:
 5. Seed a `sources` row with `config_json` defaults.
 6. Call `_add_risk_event` for each new event so entity resolution and scoring are wired automatically.
 
-See also: [Parsing & normalization](parsing-and-normalization.md), [Scoring](scoring.md), [Data model & internal API](data-model-and-api.md).
+**To add a new CLI-based source (reference data):**
+
+1. Create `app/services/ingestion/<source_name>.py` with a standalone function (e.g. `ingest_<source>(session, ...)`).
+2. Add idempotency: use `ON CONFLICT DO NOTHING` or check-before-insert patterns.
+3. Register a Typer command in `app/cli.py`.
+4. Add a `hatch` script shortcut in `pyproject.toml` if useful.
+5. Write tests with mocked SQLAlchemy sessions.
+
+See also: [Data sources](data-sources.md), [Parsing & normalization](parsing-and-normalization.md), [Scoring](scoring.md).

@@ -82,6 +82,15 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         return []
 
     settings = get_settings()
+
+    if not settings.openai_api_key:
+        log.info(
+            "embeddings.skipped",
+            reason="OPENAI_API_KEY not set — returning empty vectors",
+            text_count=len(texts),
+        )
+        return [[] for _ in texts]
+
     model = settings.embedding_model
     dimensions = settings.embedding_dimensions
     batch_size = settings.embedding_batch_size

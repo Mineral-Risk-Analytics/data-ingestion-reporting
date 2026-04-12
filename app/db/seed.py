@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Country, Material, Source
+from app.models import Material, Source
 from app.models.company import Company, CompanyAlias
 from app.models.enums import ImplementationPhase, SourceType, SupplyChainStage
 
@@ -14,40 +14,8 @@ def seed_if_empty(session: Session) -> dict[str, int]:
     """Idempotent seed: only inserts when tables are empty."""
     stats: dict[str, int] = {}
 
-    if session.scalar(select(Country).limit(1)) is None:
-        session.add_all(
-            [
-                Country(iso2="US", iso3="USA", name="United States", region="north_america"),
-                Country(iso2="CA", iso3="CAN", name="Canada", region="north_america"),
-                Country(iso2="CN", iso3="CHN", name="China", region="asia_pacific"),
-                Country(iso2="KR", iso3="KOR", name="South Korea", region="asia_pacific"),
-            ]
-        )
-        stats["countries"] = 4
-
-    if session.scalar(select(Material).limit(1)) is None:
-        session.add_all(
-            [
-                Material(
-                    canonical_name="Lithium chemicals",
-                    category="critical_mineral",
-                    symbol_or_code="Li",
-                    notes="Upstream lithium salts / hydroxide",
-                ),
-                Material(
-                    canonical_name="Lithium-ion battery cells",
-                    category="component",
-                    symbol_or_code="LIB",
-                    notes="HS-like grouping for cells/packs",
-                ),
-                Material(
-                    canonical_name="Rare earth compounds",
-                    category="critical_mineral",
-                    notes="Separators / magnets exposure",
-                ),
-            ]
-        )
-        stats["materials"] = 3
+    # Materials are seeded via: uv run bdi-ingest ingest-usgs <path/to/MCS2025_World_Data.csv>
+    # Do not seed materials here — data must come from the official USGS CSV.
 
     if session.scalar(select(Company).limit(1)) is None:
         tesla = Company(

@@ -2,7 +2,12 @@
 
 > **Last updated: April 2026**
 
-The scoring engine is **stateless, pure-function, and transparent**: every component function returns a raw `float` (0-100) with no database reads. Persistence happens after computation, never inside the scoring layer. The aggregate result dict includes a `scoring_version` field so downstream displays can flag score deltas caused by a methodology change rather than a real-world signal change.
+The platform has two independent scoring systems:
+
+1. **Company risk scoring** (five-pillar) — rates a specific supply chain company's risk across material concentration, geopolitical, regulatory, operational, and financial dimensions. Output: `company_scores`.
+2. **Chemistry risk scoring** — rates a battery cell chemistry's supply risk based on its material composition, criticality signals, and geographic concentration of its constituent minerals. Output: `chemistry_risk_scores`.
+
+Both systems are **stateless, pure-function, and transparent**: component functions return raw `float` values with no database reads. Persistence happens after computation, never inside the scoring layer.
 
 ---
 
@@ -227,9 +232,87 @@ See `tests/test_orchestrator.py` for:
 
 ---
 
+---
+
+## Chemistry Risk Scoring
+
+### Overview
+
+`app/services/scoring/chemistry_risk.py` scores a battery chemistry's supply risk based on its current material composition and criticality data. Unlike company scoring, this scorer reads directly from the database (it is not purely stateless) and is CLI-triggered rather than pipeline-triggered.
+
+**CLI:** `bdi-ingest rescore-chemistry [--slug nmc] [--as-of 2024-01-01]`
+
+### Inputs
+
+| Data | Source table | Notes |
+|------|-------------|-------|
+| Material composition | `battery_chemistry_materials` | Filtered by `valid_from ≤ as_of ≤ COALESCE(valid_to, 'infinity')` |
+| Criticality signals | `material_criticality_signals` | Resolved by source priority (see below) |
+| Fallback criticality | `materials.criticality_score` | Used when no signal rows exist |
+| Patent trend | `materials.patent_occurrence_trend` | `rising`/`declining`/`stable` |
+| Data availability | `materials.data_availability` | `commercial`/`limited`/`no_benchmark` |
+| Geographic concentration | `trade_flows` + `hs_code_material_mappings` | Filtered to high-concentration geos |
+
+### Signal source priority
+
+`_resolve_criticality_signal()` picks the best available signal for each material in this order:
+
+1. `eu_crma` — EU regulatory authority (not yet ingested, planned)
+2. `iea_report` — Demand-driven, forward-looking (not yet ingested, planned)
+3. `usgs_mcs` — Production-based HHI (current baseline)
+4. `manual` — Hand-entered
+5. `patstat` — Patent-derived (planned)
+6. `materials.criticality_score` — Fallback if no signal rows exist
+
+### Score formula
+
+```
+# Per material:
+adjusted_criticality = criticality_score × PATENT_TREND_MODIFIERS[patent_occurrence_trend]
+material_risk = score_material_exposure(adjusted_criticality, concentration, trade_volatility)
+
+# Aggregated across materials (intensity-weighted):
+material_concentration_score = Σ(intensity_i × material_risk_i) / Σ(intensity_i)
+geopolitical_score = Σ(intensity_i × geo_concentration_i) / Σ(intensity_i)
+composite_risk_score = 0.50 × material_concentration_score + 0.50 × geopolitical_score
+
+# Confidence:
+score_confidence = max(0.30, Π DATA_AVAILABILITY_CONFIDENCE[data_availability_i])
+```
+
+### Patent trend modifiers (named constants)
+
+These are empirical estimates, not derived from the underlying EPO PATSTAT data directly. They will be replaced with data-driven values once PATSTAT ingestion is live.
+
+| Trend | Modifier |
+|-------|---------|
+| `rising` | × 1.15 |
+| `stable` | × 1.00 |
+| `declining` | × 0.85 |
+| `None` | × 1.00 (treated as stable) |
+
+### Data availability confidence multipliers
+
+| Tier | Multiplier |
+|------|-----------|
+| `commercial` | 1.00 — LME/exchange-traded price benchmark exists |
+| `limited` | 0.85 — Sporadic or opaque pricing |
+| `no_benchmark` | 0.65 — Bilateral contracts only; no public price |
+
+`score_confidence = max(0.30, product of all multipliers)`. A chemistry scoring entirely from `no_benchmark` materials floors at 0.3.
+
+### Output
+
+Appended as a new row in `chemistry_risk_scores`. Never overwrites existing rows.
+
+`metadata_json` records: signal sources used per material, geo coverage gaps, materials missing HS codes, patent modifiers applied, trade flows vintage, no-benchmark material list, final score confidence.
+
+---
+
 ## Related reading
 
 - [Overview](overview.md)
+- [Data sources](data-sources.md) — what feeds the scoring inputs
 - [Parsing & normalization](parsing-and-normalization.md) — event drafts and RiskCategory tags
 - [Ingestion pipeline](ingestion-pipeline.md) — how post-ingestion rescoring is triggered
 - [Reports & AI](reports-and-ai.md) — where scored narratives surface

@@ -104,5 +104,6 @@ Idempotency: re-running ingest **updates** existing documents by external id; `r
 ## Related reading
 
 - [Ingestion pipeline](ingestion-pipeline.md)
+- [Data sources](data-sources.md) — all sources, tables, and score contributions
 - [Scoring](scoring.md) — RiskCategory tags drive evidence selection
 - [Overview](overview.md)
