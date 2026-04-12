@@ -31,6 +31,7 @@ from app.models.reporting import (
 )
 from app.models.scoring import GeographyScore, MaterialScore
 from app.models.source import Source
+from app.models.supply_chain_context import SupplyChainContext
 from app.models.supply import (
     CommodityPrice,
     HsCodeMaterialMapping,
@@ -78,6 +79,8 @@ __all__ = [
     "MaterialScore",
     # Source
     "Source",
+    # Domain config
+    "SupplyChainContext",
     # Supply
     "CommodityPrice",
     "HsCodeMaterialMapping",

@@ -1,0 +1,694 @@
+# Database Architecture
+
+## Non-Technical Summary
+> **Last updated: April 2026**
+> This section is for anyone who wants to understand what the platform stores and why, without needing to know SQL or software engineering.
+
+The battery supply chain intelligence platform is built around a single question: **how risky is it to rely on a particular company for a critical component of an EV battery?**
+
+To answer that, the database stores and connects five types of information:
+
+**1. Who the companies are.**
+The platform tracks companies across the EV battery supply chain — miners, refiners, cell makers, pack assemblers, and OEMs. For each company it stores where they are headquartered, what stage of the supply chain they operate in, whether they are publicly traded, and any alternative names they go by. Companies can also own other companies (parent-subsidiary relationships).
+
+**2. What materials they use.**
+Critical minerals like lithium, cobalt, nickel, and graphite power EV batteries. The database tracks which materials each company depends on, how much they depend on them, and where those materials come from. Materials flagged as critical under the US Inflation Reduction Act or the EU Critical Raw Materials Act are specifically tagged.
+
+**3. What risks are happening.**
+Every day the system ingests news, government filings, trade data, and regulatory updates. These get turned into structured "risk events" — records that say something like "on this date, in this country, something happened that poses a material supply risk, with this severity." Events are automatically linked to the companies and materials they affect.
+
+**4. What the rules are.**
+The platform tracks major regulations — UFLPA, the EU Battery Regulation, IRA domestic content requirements — and maps which companies are exposed to each one and whether they appear to be compliant.
+
+**5. What the risk scores are.**
+All of the above feeds a scoring engine that produces a single risk score for each company, broken into five pillars: material concentration risk, geopolitical/trade risk, regulatory compliance risk, operational risk, and financial pressure. Scores are never overwritten — each run appends a new row so you can track how a company's risk profile has changed over time.
+
+The platform is multi-tenant, meaning different organisations each see their own data and reports. Users belong to a tenant (an organisation account), and usage is tracked so the platform knows who is doing what.
+
+---
+
+## Technical Overview
+
+The database runs on **PostgreSQL 16** with two extensions:
+- **`pgvector`** — enables vector similarity search on document embeddings (1536-dimensional, OpenAI `text-embedding-3-small` compatible)
+- **`pgcrypto`** — provides `gen_random_uuid()` for server-side UUID generation
+
+Primary keys are `SERIAL INTEGER` for high-volume append tables (risk events, scores, trade flows) and `UUID` for entity tables where stable global IDs are needed across systems (companies, tenants, users).
+
+All timestamps are stored with timezone (`TIMESTAMPTZ`). Dates without time components use `DATE`. JSONB columns are used for semi-structured payloads (pillar weights, geography lists, scoring rationale) to avoid premature schema rigidity.
+
+---
+
+## Schema Layers
+
+The schema is organised into eleven dependency layers. Tables in later layers reference tables in earlier ones.
+
+```
+1. Extensions          pgvector, pgcrypto
+2. Platform            tenants
+3. Domain config       supply_chain_contexts
+4. Entity tables       materials, companies, company_aliases, facilities
+5. Ingestion pipeline  sources, ingestion_runs, raw_api_payloads
+6. Document storage    source_documents, document_chunks
+7. Risk & regulatory   regulations, risk_events
+8. Relationship layer  (10 junction / bridge tables)
+9. Scoring             company_scores, material_scores, geography_scores
+10. Reports            report_templates, report_template_focus_entities,
+                       report_runs, report_insights, analyst_notes
+11. Platform users     users, usage_events
+```
+
+---
+
+## Layer 2 — Platform
+
+### `tenants`
+
+One row per customer organisation. All multi-tenant data traces back here.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | UUID PK | Server-generated via `gen_random_uuid()` |
+| `clerk_org_id` | VARCHAR(128) UNIQUE NOT NULL | External ID from Clerk auth provider |
+| `name` | VARCHAR(512) NOT NULL | Display name of the organisation |
+| `plan` | VARCHAR(64) DEFAULT `'starter'` | Billing plan tier |
+| `metadata_json` | JSONB | Arbitrary tenant metadata |
+| `created_at` | TIMESTAMPTZ | — |
+| `updated_at` | TIMESTAMPTZ | — |
+
+---
+
+## Layer 3 — Domain Configuration
+
+### `supply_chain_contexts`
+
+Externalises constants that govern how scoring and entity resolution behave for a specific supply chain domain. The initial seed row is the EV battery domain. Adding a new row here would allow the platform to support a different domain (e.g. rare earth magnets, solar panels) without code changes.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `slug` | VARCHAR(64) UNIQUE NOT NULL | Machine-readable identifier, e.g. `ev_battery` |
+| `name` | VARCHAR(255) NOT NULL | Human-readable name |
+| `description` | TEXT | — |
+| `default_pillar_weights` | JSONB NOT NULL | Scoring weights by pillar, e.g. `{"material_concentration": 0.30, "geopolitical_trade": 0.20, ...}` |
+| `high_concentration_geos` | JSONB NOT NULL | ISO2 country codes treated as high-concentration geographies, e.g. `["CN", "CD", "RU"]` |
+| `relevant_hs_code_prefixes` | JSONB NOT NULL | HS code prefixes relevant to this domain, e.g. `["8507", "2825"]` |
+| `supply_chain_stages` | JSONB NOT NULL | Valid stage values for `companies.supply_chain_stage`, e.g. `["miner", "refiner", ...]` |
+| `is_active` | BOOLEAN DEFAULT true | — |
+
+**Seeded at migration time:**
+
+```json
+{
+  "slug": "ev_battery",
+  "default_pillar_weights": {
+    "material_concentration": 0.30,
+    "geopolitical_trade": 0.20,
+    "regulatory": 0.20,
+    "operational": 0.15,
+    "financial": 0.15
+  },
+  "high_concentration_geos": ["CN", "CD", "RU"],
+  "relevant_hs_code_prefixes": ["8507", "2825", "2836", "2604", "2602", "2501"],
+  "supply_chain_stages": ["miner", "refiner", "cell_maker", "pack_maker", "oem", "trader"]
+}
+```
+
+---
+
+## Layer 4 — Entity Tables
+
+### `materials`
+
+The critical minerals and compounds tracked by the platform.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `canonical_name` | VARCHAR(255) UNIQUE NOT NULL | e.g. `Lithium`, `Cobalt`, `Battery-grade Graphite` |
+| `category` | VARCHAR(128) | e.g. `critical_mineral`, `cathode_material` |
+| `symbol_or_code` | VARCHAR(64) | Chemical symbol or commodity code |
+| `hs_codes` | JSONB | List of relevant HS code strings |
+| `criticality_score` | FLOAT | 0–1 intrinsic criticality rating |
+| `primary_producing_countries` | JSONB | ISO2 country codes of major producers |
+| `price_unit` | VARCHAR(20) | Unit for commodity prices, e.g. `USD/t` |
+| `is_ira_critical_mineral` | BOOLEAN DEFAULT false | Flagged under US IRA |
+| `is_eu_crma_critical` | BOOLEAN DEFAULT false | Flagged under EU Critical Raw Materials Act |
+| `notes` | TEXT | — |
+
+### `companies`
+
+Every entity in the supply chain — miners, refiners, cell makers, pack assemblers, OEMs, traders. Self-references for parent/subsidiary hierarchy.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | UUID PK | — |
+| `canonical_name` | VARCHAR(512) UNIQUE NOT NULL | Normalised company name for deduplication |
+| `legal_name` | VARCHAR(512) | Full registered legal name |
+| `supply_chain_stage` | VARCHAR(64) | One of the stages defined in `supply_chain_contexts` |
+| `headquarters_country` | CHAR(2) | ISO2 country code |
+| `headquarters_region` | VARCHAR(128) | Sub-national region |
+| `public_ticker` | VARCHAR(32) | Stock ticker if publicly traded |
+| `is_public` | BOOLEAN DEFAULT false | — |
+| `duns_number` | VARCHAR(32) | Dun & Bradstreet identifier |
+| `lei` | VARCHAR(20) | Legal Entity Identifier (ISO 17442) |
+| `parent_company_id` | UUID FK → `companies.id` ON DELETE SET NULL | Self-reference for subsidiary tracking |
+| `data_confidence` | FLOAT | 0–1 confidence in entity resolution accuracy |
+| `data_source` | VARCHAR(128) | Where this company record originated |
+| `notes` | TEXT | — |
+
+### `company_aliases`
+
+Alternative names, ticker symbols, and legacy names for companies. Used by entity resolution to match incoming raw text to a canonical company.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `company_id` | UUID FK → `companies.id` ON DELETE CASCADE | — |
+| `alias` | VARCHAR(512) NOT NULL | The alternative name |
+| `alias_type` | VARCHAR(64) DEFAULT `'aka'` | e.g. `aka`, `ticker`, `former_name`, `subsidiary` |
+
+**Unique constraint:** `(company_id, alias)`
+
+### `facilities`
+
+Physical locations associated with a company (mines, refineries, gigafactories). Geographic coordinates enable map-based views.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | UUID PK | — |
+| `company_id` | UUID FK → `companies.id` ON DELETE CASCADE | — |
+| `facility_type` | VARCHAR(64) NOT NULL | e.g. `mine`, `refinery`, `cell_factory`, `pack_assembly` |
+| `country` | CHAR(2) NOT NULL | ISO2 country code |
+| `region` | VARCHAR(128) | — |
+| `city` | VARCHAR(128) | — |
+| `status` | VARCHAR(64) DEFAULT `'operating'` | `operating`, `under_construction`, `suspended`, `closed` |
+| `capacity_notes` | TEXT | Production capacity in human-readable form |
+| `latitude` / `longitude` | FLOAT | Optional precise coordinates |
+| `metadata_json` | JSONB | Additional facility attributes |
+
+---
+
+## Layer 5 — Ingestion Pipeline
+
+### `sources`
+
+Registry of every external data source the platform can ingest from.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `name` | VARCHAR(255) UNIQUE NOT NULL | e.g. `Federal Register`, `SEC EDGAR`, `Census Trade` |
+| `source_type` | VARCHAR(64) NOT NULL | `federal_register`, `census_trade`, `sec_edgar`, `news` |
+| `phase` | VARCHAR(8) NOT NULL | Implementation phase, e.g. `p1` |
+| `is_active` | BOOLEAN DEFAULT true | Inactive sources are skipped by the scheduler |
+| `config_json` | JSONB | Adapter-specific configuration (API keys, URL templates, etc.) |
+
+### `ingestion_runs`
+
+Execution log for every ingestion job. Tracks status, duration, statistics, and any error messages. One row per source per run attempt.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `source_id` | INTEGER FK → `sources.id` ON DELETE CASCADE | — |
+| `org_id` | UUID FK → `tenants.id` ON DELETE SET NULL | Optional tenant scoping |
+| `status` | VARCHAR(32) NOT NULL | `running`, `success`, `failed` |
+| `started_at` | TIMESTAMPTZ | — |
+| `completed_at` | TIMESTAMPTZ | NULL while running |
+| `parameters_json` | JSONB | Runtime parameters passed to the adapter |
+| `error_message` | TEXT | Populated on failure |
+| `stats_json` | JSONB | Counters: items fetched, written, skipped, etc. |
+
+### `raw_api_payloads`
+
+Immutable record of every raw HTTP response received during ingestion. Enables reprocessing without re-fetching and provides an audit trail. Large response bodies are stored on object storage (R2); the path is stored here.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `ingestion_run_id` | INTEGER FK → `ingestion_runs.id` ON DELETE CASCADE | — |
+| `source_id` | INTEGER FK → `sources.id` ON DELETE CASCADE | — |
+| `endpoint` | VARCHAR(1024) NOT NULL | Full URL that was called |
+| `http_status` | INTEGER | HTTP response code |
+| `request_params_json` | JSONB | Query params / request body sent |
+| `response_body_path` | VARCHAR(1024) | Path to the raw body in object storage |
+| `response_body_text` | TEXT | Inline copy for small payloads |
+| `checksum` | VARCHAR(64) | SHA-256 of the response body for deduplication |
+
+---
+
+## Layer 6 — Document Storage
+
+### `source_documents`
+
+One row per unique document ingested — a Federal Register notice, an SEC filing, a news article. Deduplication is enforced by `(source_id, external_id)`.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `source_id` | INTEGER FK → `sources.id` ON DELETE CASCADE | — |
+| `external_id` | VARCHAR(512) NOT NULL | The document's ID within the source (e.g. Federal Register document number) |
+| `title` | VARCHAR(1024) | — |
+| `url` | TEXT | Canonical URL |
+| `published_at` | TIMESTAMPTZ | Publication/filing date |
+| `document_type` | VARCHAR(64) DEFAULT `'unknown'` | `regulation`, `sec_filing`, `news_article`, `trade_record` |
+| `raw_storage_path` | VARCHAR(1024) | Path to raw file in object storage |
+| `raw_text` | TEXT | Extracted plain text |
+| `checksum` | VARCHAR(64) | SHA-256 for deduplication |
+| `metadata_json` | JSONB | Source-specific metadata |
+
+**Unique constraint:** `(source_id, external_id)`
+
+### `document_chunks`
+
+Documents are split into overlapping text chunks for vector search. Each chunk stores a 1536-dimensional embedding generated by OpenAI `text-embedding-3-small`. An IVFFlat index (`lists=100`) enables fast approximate nearest-neighbour search.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `source_document_id` | INTEGER FK → `source_documents.id` ON DELETE CASCADE | — |
+| `chunk_index` | INTEGER NOT NULL | Sequential position within the document |
+| `text` | TEXT NOT NULL | The text content of this chunk |
+| `embedding` | VECTOR(1536) | pgvector embedding; indexed with IVFFlat (cosine distance) |
+| `embedding_id` | VARCHAR(128) | Optional external embedding ID from an embedding provider |
+| `metadata_json` | JSONB | Chunk-level metadata (page number, section, etc.) |
+
+---
+
+## Layer 7 — Regulatory & Risk Events
+
+### `regulations`
+
+Master registry of laws, executive orders, and standards that affect the supply chain. Examples: UFLPA, EU Battery Regulation 2023/1542, IRA Section 45X.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `source_document_id` | INTEGER FK → `source_documents.id` ON DELETE SET NULL | The Federal Register or EUR-Lex document this came from |
+| `regulation_key` | VARCHAR(256) UNIQUE NOT NULL | Stable machine-readable key, e.g. `UFLPA`, `EU_BATTERY_REG_2023` |
+| `title` | VARCHAR(1024) | Full title |
+| `issuing_body` | VARCHAR(512) | e.g. `US CBP`, `European Commission` |
+| `geography` | VARCHAR(256) | Primary jurisdiction |
+| `policy_theme` | VARCHAR(256) | e.g. `forced_labour`, `domestic_content`, `battery_passport` |
+| `status` | VARCHAR(128) | `active`, `proposed`, `superseded` |
+| `publication_date` | DATE | — |
+| `effective_date` | DATE | When obligations take effect |
+| `summary` | TEXT | Human-readable description |
+| `metadata_json` | JSONB | — |
+
+### `risk_events`
+
+The core signal table. Each row represents a discrete event that could affect supply chain risk — an export restriction announcement, a mine closure, an SEC going-concern warning, a tariff escalation. Created by the normaliser/classifier during ingestion.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `source_document_id` | INTEGER FK → `source_documents.id` ON DELETE SET NULL | Originating document (nullable — events can be manually created) |
+| `event_type` | VARCHAR(128) NOT NULL | Broad category, e.g. `supply_disruption`, `policy_change`, `financial_stress` |
+| `event_date` | TIMESTAMPTZ | When the event occurred (may differ from fetch date) |
+| `title` | VARCHAR(1024) NOT NULL | — |
+| `summary` | TEXT | — |
+| `severity_score` | FLOAT | 0–1 signal of how severe this event is |
+| `confidence_score` | FLOAT | 0–1 confidence that the classification is correct |
+| `risk_categories_json` | JSONB | List of pillar category tags, e.g. `["geopolitical_trade", "material_concentration"]` |
+| `geography_json` | JSONB | ISO2 country codes affected |
+| `content_hash` | VARCHAR(64) | Deduplication hash of title + summary |
+| `metadata_json` | JSONB | Subtype flags, effective dates, HS codes, etc. |
+
+---
+
+## Layer 8 — Relationship Layer
+
+This layer contains ten junction tables that connect the entity and event tables. Rather than embedding foreign keys everywhere, all many-to-many relationships are expressed here with explicit confidence/relevance scores.
+
+### `company_material_exposures`
+
+Which materials does each company depend on, at which stage, and from which country?
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `company_id` | UUID FK → `companies.id` ON DELETE CASCADE | — |
+| `material_id` | INTEGER FK → `materials.id` ON DELETE CASCADE | — |
+| `supply_chain_stage` | VARCHAR(64) NOT NULL | The stage at which this company uses the material |
+| `exposure_score` | FLOAT NOT NULL | 0–100 dependency intensity |
+| `source_geography` | CHAR(2) | ISO2 country where the material is sourced |
+| `data_confidence` | FLOAT | 0–1 confidence in this exposure record |
+| `as_of_date` | DATE | When this exposure was assessed |
+
+**Unique constraint:** `(company_id, material_id, supply_chain_stage)`
+
+### `company_supply_relationships`
+
+Direct supply relationships between companies — who buys from whom, for which material.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `buyer_id` | UUID FK → `companies.id` ON DELETE CASCADE | — |
+| `supplier_id` | UUID FK → `companies.id` ON DELETE CASCADE | — |
+| `material_id` | INTEGER FK → `materials.id` ON DELETE SET NULL | Optional: which material this relationship is for |
+| `relationship_type` | VARCHAR(64) DEFAULT `'direct'` | `direct`, `indirect`, `inferred` |
+| `data_confidence` | FLOAT | 0–1 confidence |
+| `valid_from` / `valid_to` | DATE | Known validity period of the relationship |
+
+**Unique constraint:** `(buyer_id, supplier_id, material_id)`
+
+### `regulation_material_scope`
+
+Which regulations apply to which materials?
+
+| Columns | Notes |
+|---------|-------|
+| `regulation_id → regulations.id` | — |
+| `material_id → materials.id` | — |
+| `scope_type` | `covered`, `exempt`, `proposed` |
+
+### `regulation_geography_scope`
+
+Which countries does each regulation apply to or originate from?
+
+| Columns | Notes |
+|---------|-------|
+| `regulation_id → regulations.id` | — |
+| `country_code` | ISO2 |
+| `scope_type` | `jurisdiction`, `targeted`, `origin` |
+
+### `company_regulation_exposure`
+
+Is a given company exposed to a given regulation, and what is its compliance status?
+
+| Columns | Notes |
+|---------|-------|
+| `company_id → companies.id` | — |
+| `regulation_id → regulations.id` | — |
+| `compliance_status` | `compliant`, `non_compliant`, `at_risk`, `unknown` |
+| `exposure_reason` | Free text explanation |
+| `assessed_at` | DATE |
+
+### `hs_code_material_mappings`
+
+Lookup table mapping HS code prefixes to materials. Used during trade flow ingestion to automatically identify which material a shipment relates to.
+
+| Columns | Notes |
+|---------|-------|
+| `hs_code_prefix → materials.id` | e.g. `8507` → Lithium-ion batteries |
+| `confidence` | 0–1, defaults to 1.0 for exact matches |
+
+### `risk_event_companies`
+
+Which companies is a given risk event relevant to, and how relevant?
+
+| Columns | Notes |
+|---------|-------|
+| `risk_event_id → risk_events.id` ON DELETE CASCADE | — |
+| `company_id → companies.id` ON DELETE CASCADE | — |
+| `relevance_score` | FLOAT — fed into `relevance_multiplier` in the scoring formula |
+| `match_reason` | `named`, `geography`, `material`, `category_broad` |
+
+**Unique constraint:** `(risk_event_id, company_id)`
+
+### `risk_event_materials`
+
+Which materials is a given risk event relevant to?
+
+| Columns | Notes |
+|---------|-------|
+| `risk_event_id → risk_events.id` | — |
+| `material_id → materials.id` | — |
+| `relevance_score` | FLOAT |
+| `match_reason` | VARCHAR(64) |
+
+### `risk_event_regulations`
+
+Links risk events that discuss a specific regulation to that regulation's master record.
+
+| Columns | Notes |
+|---------|-------|
+| `risk_event_id → risk_events.id` | — |
+| `regulation_id → regulations.id` | — |
+| `relevance_score` | FLOAT |
+
+### `risk_event_geographies`
+
+Which countries is a risk event relevant to, beyond the broad `geography_json` JSONB field? Enables country-level risk aggregation.
+
+| Columns | Notes |
+|---------|-------|
+| `risk_event_id → risk_events.id` | — |
+| `country_code` | CHAR(2) |
+| `geography_context` | `primary`, `secondary`, `supply_origin` |
+
+### `trade_flows`
+
+Raw international trade statistics ingested from sources like US Census trade data. One row per `(period, reporter, partner, hs_code, import/export)` observation.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `source_document_id` | INTEGER FK → `source_documents.id` | — |
+| `period` | VARCHAR(16) | e.g. `2024-Q3`, `2024-11` |
+| `reporter_country` | VARCHAR(8) | Reporting country (ISO2/ISO3) |
+| `partner_country` | VARCHAR(8) | Trade partner (ISO2/ISO3) |
+| `hs_code` | VARCHAR(32) | Harmonised System code |
+| `material_id` | INTEGER FK → `materials.id` ON DELETE SET NULL | Set by HS code lookup |
+| `import_export_flag` | VARCHAR(16) | `import` or `export` |
+| `trade_value_usd` | FLOAT | USD value |
+
+### `commodity_prices`
+
+Historical spot prices for tracked materials. One row per `(material, date, source)`.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `material_id` | INTEGER FK → `materials.id` ON DELETE CASCADE | — |
+| `price_date` | DATE NOT NULL | — |
+| `price_usd` | FLOAT NOT NULL | — |
+| `price_unit` | VARCHAR(20) NOT NULL | e.g. `USD/t`, `USD/lb` |
+| `source` | VARCHAR(128) NOT NULL | Data provider name |
+
+**Unique constraint:** `(material_id, price_date, source)`
+
+---
+
+## Layer 9 — Scoring
+
+Scores are always appended — never updated in place. This preserves a full time-series of how risk profiles evolve. Scores exist at three levels of granularity.
+
+### `company_scores`
+
+Risk score for a single company at a single point in time. Generated by the scoring orchestrator after each ingestion run.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `company_id` | UUID FK → `companies.id` ON DELETE CASCADE | — |
+| `as_of_date` | DATE NOT NULL | The date this score reflects |
+| `material_concentration_risk_score` | FLOAT | 0–100, weight 30% |
+| `geopolitical_trade_risk_score` | FLOAT | 0–100, weight 20% |
+| `regulatory_risk_score` | FLOAT | 0–100, weight 20% |
+| `operational_risk_score` | FLOAT | 0–100, weight 15% |
+| `financial_pressure_score` | FLOAT | 0–100, weight 15% |
+| `overall_risk_score` | FLOAT | Weighted aggregate |
+| `rationale_json` | JSONB | Full `SupplierScoreRationale` — inputs, component scores, top evidence event IDs, decay parameters, notes |
+| `scoring_version` | VARCHAR(32) DEFAULT `'2.0'` | Formula version for reproducibility |
+
+### `material_scores`
+
+Aggregate risk score for a critical material across all companies that handle it. Used for portfolio-level views.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `material_id` | INTEGER FK → `materials.id` ON DELETE CASCADE | — |
+| `as_of_date` | DATE NOT NULL | — |
+| `material_concentration_score` | FLOAT | — |
+| `geopolitical_trade_score` | FLOAT | — |
+| `regulatory_compliance_score` | FLOAT | — |
+| `operational_score` | FLOAT | — |
+| `financial_pressure_score` | FLOAT | — |
+| `overall_risk_score` | FLOAT | — |
+| `company_count` | INTEGER | Number of companies contributing to this score |
+| `event_count` | INTEGER | Number of risk events factored in |
+
+### `geography_scores`
+
+Country-level risk roll-up. Supports heat-map views and geopolitical exposure summaries.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `geography_code` | CHAR(2) NOT NULL | ISO2 country code |
+| `as_of_date` | DATE NOT NULL | — |
+| `geopolitical_trade_score` | FLOAT | — |
+| `regulatory_compliance_score` | FLOAT | — |
+| `operational_score` | FLOAT | — |
+| `overall_risk_score` | FLOAT | — |
+| `company_count` | INTEGER | — |
+| `event_count` | INTEGER | — |
+
+---
+
+## Layer 10 — Reports
+
+### `report_templates`
+
+Configures how a report should be structured. Can be a platform-level template (shared) or an org-specific override.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | UUID PK | — |
+| `org_id` | UUID FK → `tenants.id` ON DELETE CASCADE | NULL for platform templates |
+| `name` | VARCHAR(255) NOT NULL | — |
+| `focus_type` | VARCHAR(64) NOT NULL | `company`, `material`, `geography`, `portfolio` |
+| `audience_type` | VARCHAR(64) NOT NULL | `executive`, `analyst`, `procurement` |
+| `is_platform_template` | BOOLEAN | Shared across all tenants if true |
+| `weight_overrides` | JSONB | Optional pillar weight overrides for this template |
+| `sections_config` | JSONB | Ordered list of sections to include |
+
+### `report_template_focus_entities`
+
+Which specific entities (companies, materials, geographies) a report template is focused on.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `template_id` | UUID FK → `report_templates.id` ON DELETE CASCADE | — |
+| `entity_type` | VARCHAR(64) | `company`, `material`, `geography` |
+| `entity_id` | VARCHAR(128) | The UUID or integer ID of the entity |
+
+### `report_runs`
+
+Each time a report is generated, a row is inserted here. Tracks status and links back to the template.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `org_id` | UUID FK → `tenants.id` ON DELETE SET NULL | Which tenant triggered this |
+| `template_id` | UUID FK → `report_templates.id` ON DELETE SET NULL | — |
+| `report_type` | VARCHAR(64) | Mirrors `focus_type` from the template |
+| `audience_type` | VARCHAR(64) | — |
+| `as_of_date` | DATE | The date the report reflects |
+| `status` | VARCHAR(32) DEFAULT `'queued'` | `queued`, `running`, `complete`, `failed` |
+
+### `report_insights`
+
+Individual findings written into the report. Each insight optionally links to a company, material, regulation, or geography.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `report_run_id` | INTEGER FK → `report_runs.id` ON DELETE CASCADE | — |
+| `insight_type` | VARCHAR(64) | e.g. `risk_alert`, `trend`, `recommendation` |
+| `title` | VARCHAR(512) | — |
+| `body` | TEXT | The written insight content |
+| `related_company_id` | UUID FK → `companies.id` ON DELETE SET NULL | — |
+| `related_material_id` | INTEGER FK → `materials.id` ON DELETE SET NULL | — |
+| `related_regulation_id` | INTEGER FK → `regulations.id` ON DELETE SET NULL | — |
+| `related_geography_code` | CHAR(2) | — |
+| `sort_order` | INTEGER DEFAULT 0 | Display order within the report |
+
+### `analyst_notes`
+
+Free-text annotations that analysts can attach to any entity (company, material, regulation, geography) using a generic `(entity_type, entity_id)` composite reference rather than hard foreign keys.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `entity_type` | VARCHAR(64) | e.g. `company`, `material` |
+| `entity_id` | VARCHAR(128) | The ID of the target entity (string to accommodate both UUIDs and integers) |
+| `note_type` | VARCHAR(64) | e.g. `flag`, `context`, `override` |
+| `note_text` | TEXT | — |
+
+---
+
+## Layer 11 — Platform Users
+
+### `users`
+
+Platform users authenticated via Clerk. Each user belongs to exactly one tenant.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | UUID PK | — |
+| `tenant_id` | UUID FK → `tenants.id` ON DELETE CASCADE | — |
+| `clerk_user_id` | VARCHAR(128) UNIQUE NOT NULL | External Clerk user ID |
+| `email` | VARCHAR(512) | — |
+| `role` | VARCHAR(64) DEFAULT `'member'` | `owner`, `admin`, `member`, `viewer` |
+
+### `usage_events`
+
+Append-only event log of user actions within the platform. Used for billing, analytics, and audit.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `tenant_id` | UUID FK → `tenants.id` ON DELETE CASCADE | — |
+| `user_id` | UUID FK → `users.id` ON DELETE SET NULL | NULL for system-initiated events |
+| `event_type` | VARCHAR(128) | e.g. `report_generated`, `score_requested`, `export_downloaded` |
+| `metadata_json` | JSONB | Event-specific context |
+
+---
+
+## Entity Relationship Summary
+
+The diagram below shows the primary relationships between logical groups. Arrows represent foreign key direction (child → parent).
+
+```
+tenants ──────────────────────────────────────────────┐
+  │                                                    │
+  ├── users ──→ usage_events                           │
+  │                                                    │
+  └── report_templates ──→ report_template_focus_entities
+           │
+           └── report_runs ──→ report_insights
+                                    │
+                          ┌─────────┼──────────┐
+                          ▼         ▼          ▼
+                      companies  materials  regulations
+
+supply_chain_contexts (domain config — referenced by scoring logic)
+
+materials ◄──── company_material_exposures ────► companies
+                       │
+                   source_geography (ISO2)
+
+companies ◄──── company_supply_relationships ────► companies
+                       │
+                    materials (optional)
+
+regulations ◄── regulation_material_scope ──► materials
+regulations ◄── regulation_geography_scope ── (country_code)
+companies   ◄── company_regulation_exposure ──► regulations
+
+sources ──→ ingestion_runs ──→ raw_api_payloads
+               │
+               └──→ source_documents ──→ document_chunks (+ embedding vector)
+                           │
+                    ┌──────┴────────┐
+                    ▼               ▼
+               risk_events      regulations
+                    │
+         ┌──────────┼───────────────┐────────────┐
+         ▼          ▼               ▼            ▼
+  risk_event_    risk_event_    risk_event_  risk_event_
+  companies      materials      regulations  geographies
+         │
+         ▼
+    companies ──→ company_scores (append-only)
+    materials  ──→ material_scores (append-only)
+    (country)  ──→ geography_scores (append-only)
+
+materials ──→ hs_code_material_mappings ← trade_flows
+materials ──→ commodity_prices
+
+companies ──→ company_aliases
+companies ──→ facilities
+```
+
+---
+
+## Key Design Decisions
+
+**Append-only scores.** `company_scores`, `material_scores`, and `geography_scores` never have rows updated in place. Each scoring run inserts a new row. This gives a full historical time series for trend analysis and score-delta tracking, at the cost of more storage.
+
+**UUID vs integer PKs.** Entity tables (`companies`, `tenants`, `users`, `facilities`, `report_templates`) use UUID primary keys because they need to be stable identifiers that can be created client-side or referenced across external systems. High-volume write tables (`risk_events`, `source_documents`, `ingestion_runs`, scores) use auto-increment integers for index efficiency.
+
+**JSONB for semi-structured fields.** `risk_categories_json`, `geography_json`, `rationale_json`, pillar weights, and HS code lists all use JSONB to avoid premature normalisation. JSONB supports indexed containment queries (`@>`) which power the evidence query layer's category and geography filtering.
+
+**pgvector for semantic search.** `document_chunks.embedding` stores 1536-dimensional vectors with an IVFFlat index (100 lists, cosine distance). This enables "find documents semantically similar to this query" without an external vector database.
+
+**Multi-tenancy via `tenant_id`.** Reports and ingestion runs carry `org_id` (a UUID FK to `tenants`). Entity data (companies, materials, events, scores) is intentionally shared across tenants — the intelligence layer is a shared resource. Only reports, templates, and usage events are tenant-scoped.
+
+**Cascade vs SET NULL.** `ON DELETE CASCADE` is used when child rows have no meaning without their parent (e.g. a `document_chunk` without its `source_document`). `ON DELETE SET NULL` is used when the child row retains independent value even if the referenced parent is deleted (e.g. a `risk_event` that outlives the deletion of its originating document).

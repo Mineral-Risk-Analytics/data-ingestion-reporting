@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     news_provider: str = "stub"
     news_api_key: str = ""
 
+    # OpenAI / embedding
+    openai_api_key: str = ""
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dimensions: int = 1536
+    embedding_batch_size: int = 64  # max texts per API call
+
 
 @lru_cache
 def get_settings() -> Settings:

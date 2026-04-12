@@ -6,7 +6,8 @@ Do NOT apply this to a database that already has tables.
 Table creation order respects FK dependencies:
   1. Extensions
   2. Platform (tenants)
-  3. Entity tables (materials, companies, facilities)
+  3. Domain config (supply_chain_contexts)
+  4. Entity tables (materials, companies, facilities)
   5. Source & ingestion pipeline
   6. Document storage
   7. Regulatory & risk events
@@ -55,6 +56,54 @@ def upgrade() -> None:
         sa.UniqueConstraint("clerk_org_id"),
     )
     op.create_index("ix_tenants_clerk_org_id", "tenants", ["clerk_org_id"], unique=True)
+
+    # -------------------------------------------------------------------------
+    # 3. Domain config — supply_chain_contexts
+    # Externalises constants that were previously hardcoded in Python scoring:
+    # pillar weights, high-concentration geographies, HS code prefixes, and
+    # valid supply chain stages. One row per domain. Seed: EV battery.
+    # -------------------------------------------------------------------------
+    op.create_table(
+        "supply_chain_contexts",
+        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("slug", sa.String(64), nullable=False),
+        sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("default_pillar_weights", postgresql.JSONB(), nullable=False),
+        sa.Column("high_concentration_geos", postgresql.JSONB(), nullable=False),
+        sa.Column("relevant_hs_code_prefixes", postgresql.JSONB(), nullable=False),
+        sa.Column("supply_chain_stages", postgresql.JSONB(), nullable=False),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()")),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("slug"),
+    )
+    op.create_index("ix_supply_chain_contexts_slug", "supply_chain_contexts", ["slug"], unique=True)
+
+    # Seed: EV battery domain — values mirror current hardcoded scoring constants.
+    op.execute(
+        sa.text(
+            """
+            INSERT INTO supply_chain_contexts
+                (slug, name, description, default_pillar_weights,
+                 high_concentration_geos, relevant_hs_code_prefixes,
+                 supply_chain_stages, is_active)
+            VALUES (
+                'ev_battery',
+                'EV Battery Supply Chain',
+                'Lithium-ion battery supply chain covering critical minerals '
+                '(lithium, cobalt, graphite, nickel, manganese), cell '
+                'manufacturing, and pack assembly for electric vehicles.',
+                '{"material_concentration": 0.30, "geopolitical_trade": 0.20, "regulatory": 0.20, "operational": 0.15, "financial": 0.15}'::jsonb,
+                '["CN", "CD", "RU"]'::jsonb,
+                '["8507", "2825", "2836", "2604", "2602", "2501"]'::jsonb,
+                '["miner", "refiner", "cell_maker", "pack_maker", "oem", "trader"]'::jsonb,
+                true
+            )
+            """
+        )
+    )
 
     # -------------------------------------------------------------------------
     # 4. Entity tables
@@ -730,5 +779,6 @@ def downgrade() -> None:
     op.drop_table("company_aliases")
     op.drop_table("companies")
     op.drop_table("materials")
+    op.drop_table("supply_chain_contexts")
     op.drop_table("tenants")
     # Leave pgvector and pgcrypto extensions in place
