@@ -133,17 +133,29 @@ def get_company_material_exposure(
 def get_active_compliance_obligations(
     db: Session,
     company_id: uuid.UUID,
-) -> list[str]:
+) -> list[tuple[str, float]]:
     """
-    Return active compliance obligation keys for this company.
+    Return active compliance obligations as (regulation_key, weight_multiplier) tuples.
+
+    The weight_multiplier reflects compliance severity:
+      non_compliant → 1.00  (confirmed violation; full uplift)
+      unknown       → 0.50  (unassessed; conservative mid-weight)
+      partial       → 0.40  (in transition; partial uplift)
 
     Primary source: company_regulation_exposure joined to regulations.
-    Fallback: text-scan of recent regulatory events (early data state).
-    Returns keys like: ["UFLPA", "EU_BATTERY_REG", "IRA_DOMESTIC"]
+    Fallback: text-scan of recent regulatory events (worst-case weight assumed).
+
+    Returns e.g. [("IRA_DOMESTIC", 1.0), ("UFLPA", 0.40)]
     """
+    _STATUS_WEIGHT: dict[str, float] = {
+        "non_compliant": 1.00,
+        "unknown":       0.50,
+        "partial":       0.40,
+    }
+
     # Primary: structured compliance table
     stmt = (
-        select(Regulation.regulation_key)
+        select(Regulation.regulation_key, CompanyRegulationExposure.compliance_status)
         .join(
             CompanyRegulationExposure,
             CompanyRegulationExposure.regulation_id == Regulation.id,
@@ -155,12 +167,19 @@ def get_active_compliance_obligations(
             ),
         )
     )
-    keys = list(db.scalars(stmt).all())
-    if keys:
-        return sorted(keys)
+    rows = db.execute(stmt).all()
+    if rows:
+        return sorted(
+            [
+                (key, _STATUS_WEIGHT.get(status, 0.40))
+                for key, status in rows
+            ],
+            key=lambda t: t[0],
+        )
 
     # Fallback: text-derive from recent regulatory events
-    # TODO: remove once company_regulation_exposure is populated
+    # Assume worst-case weight (1.0) since status is unknown from events alone.
+    # TODO: remove once company_regulation_exposure is populated everywhere.
     known_obligations: dict[str, str] = {
         "uflpa":          "UFLPA",
         "eu battery":     "EU_BATTERY_REG",
@@ -187,7 +206,7 @@ def get_active_compliance_obligations(
         for keyword, obligation_key in known_obligations.items():
             if keyword in text:
                 found.add(obligation_key)
-    return sorted(found)
+    return [(k, 1.0) for k in sorted(found)]
 
 
 def get_filing_signals(

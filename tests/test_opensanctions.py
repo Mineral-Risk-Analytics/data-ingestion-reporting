@@ -16,8 +16,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.services.ingestion.opensanctions import (
+    _build_lei_index,
     _build_name_index,
     _content_hash,
+    _extract_leis,
     _normalise,
     match_companies,
     parse_sanctions_csv,
@@ -34,7 +36,10 @@ def _make_csv_bytes(rows: list[dict]) -> io.BytesIO:
     Uses detach() so the TextIOWrapper does not close the underlying BytesIO
     when it goes out of scope (Python 3.12+ GC behaviour).
     """
-    fieldnames = ["id", "schema", "name", "aliases", "birth_date", "countries", "datasets", "first_seen", "last_seen"]
+    fieldnames = [
+        "id", "schema", "name", "aliases", "birth_date",
+        "countries", "identifiers", "datasets", "first_seen", "last_seen",
+    ]
     import csv as _csv
     buf = io.BytesIO()
     wrapper = io.TextIOWrapper(buf, encoding="utf-8", newline="")
@@ -44,8 +49,6 @@ def _make_csv_bytes(rows: list[dict]) -> io.BytesIO:
         full_row = {f: row.get(f, "") for f in fieldnames}
         writer.writerow(full_row)
     wrapper.flush()
-    # Detach before wrapper leaves scope — prevents it from closing buf.
-    # Capture the bytes first so the returned BytesIO is always at position 0.
     data = buf.getvalue()
     wrapper.detach()
     return io.BytesIO(data)
@@ -58,6 +61,7 @@ _SAMPLE_ROWS = [
         "name": "John Doe",
         "aliases": "",
         "countries": "RU",
+        "identifiers": "",
         "datasets": "us_ofac_sdn",
         "first_seen": "2020-01-01",
         "last_seen": "2024-01-01",
@@ -68,6 +72,7 @@ _SAMPLE_ROWS = [
         "name": "Rosneft Oil Company",
         "aliases": "Rosneft|PJSC Rosneft",
         "countries": "RU",
+        "identifiers": "",
         "datasets": "us_ofac_sdn|eu_fsf",
         "first_seen": "2014-03-20",
         "last_seen": "2024-06-01",
@@ -78,6 +83,7 @@ _SAMPLE_ROWS = [
         "name": "Glencore International AG",
         "aliases": "Glencore PLC|GLEN",
         "countries": "CH|CD",
+        "identifiers": "lei-2138008O0QXTNYGBCT15|isin-CH0002647786",
         "datasets": "ch_seco_sanctions",
         "first_seen": "2021-04-01",
         "last_seen": "2024-05-01",
@@ -88,6 +94,7 @@ _SAMPLE_ROWS = [
         "name": "Shell Trading (US) Company",
         "aliases": "",
         "countries": "US",
+        "identifiers": "",
         "datasets": "us_ofac_sdn",
         "first_seen": "2022-01-01",
         "last_seen": "2024-01-01",
@@ -98,11 +105,96 @@ _SAMPLE_ROWS = [
         "name": "MV Sanctioned Ship",
         "aliases": "",
         "countries": "KP",
+        "identifiers": "",
         "datasets": "us_ofac_sdn",
         "first_seen": "2023-01-01",
         "last_seen": "2024-01-01",
     },
 ]
+
+
+# ---------------------------------------------------------------------------
+# _normalise
+# ---------------------------------------------------------------------------
+
+class TestNormalise:
+    def test_lowercases(self):
+        assert _normalise("ROSNEFT") == "rosneft"
+
+    def test_collapses_whitespace(self):
+        assert _normalise("Extra  Spaces  Here") == "extra spaces here"
+
+    def test_strips_inc(self):
+        assert _normalise("Tesla Inc.") == "tesla"
+
+    def test_strips_ltd(self):
+        assert _normalise("Albemarle Ltd.") == "albemarle"
+
+    def test_strips_plc(self):
+        assert _normalise("Glencore plc") == "glencore"
+
+    def test_strips_ag(self):
+        assert _normalise("Volkswagen AG") == "volkswagen"
+
+    def test_strips_pjsc(self):
+        assert _normalise("Nornickel PJSC") == "nornickel"
+
+    def test_strips_jsc(self):
+        assert _normalise("Nornickel JSC") == "nornickel"
+
+    def test_strips_oao(self):
+        assert _normalise("Lukoil OAO") == "lukoil"
+
+    def test_strips_pao(self):
+        assert _normalise("Gazprom PAO") == "gazprom"
+
+    def test_strips_company(self):
+        assert _normalise("Rosneft Oil Company") == "rosneft oil"
+
+    def test_strips_corporation(self):
+        assert _normalise("Albemarle Corporation") == "albemarle"
+
+    def test_strips_punctuation(self):
+        assert _normalise("Tesla, Inc.") == "tesla"
+
+    def test_pjsc_prefix_stripped(self):
+        assert _normalise("PJSC Norilsk Nickel") == "norilsk nickel"
+
+    def test_identical_after_suffix_removal(self):
+        """PJSC prefix and nothing both reduce to the same core."""
+        assert _normalise("PJSC Norilsk Nickel") == _normalise("Norilsk Nickel")
+
+
+# ---------------------------------------------------------------------------
+# _extract_leis
+# ---------------------------------------------------------------------------
+
+class TestExtractLeis:
+    def test_extracts_single_lei(self):
+        leis = _extract_leis("lei-2138008O0QXTNYGBCT15")
+        assert leis == ["2138008O0QXTNYGBCT15"]
+
+    def test_extracts_lei_from_mixed_identifiers(self):
+        leis = _extract_leis("lei-2138008O0QXTNYGBCT15|isin-CH0002647786|bic-GLCNCHGG")
+        assert leis == ["2138008O0QXTNYGBCT15"]
+
+    def test_extracts_multiple_leis(self):
+        leis = _extract_leis("lei-AAAA|lei-BBBB")
+        assert set(leis) == {"AAAA", "BBBB"}
+
+    def test_empty_string_returns_empty(self):
+        assert _extract_leis("") == []
+
+    def test_no_lei_prefix_returns_empty(self):
+        assert _extract_leis("isin-US0378331005|bic-CITIUS33") == []
+
+    def test_lei_uppercased(self):
+        leis = _extract_leis("lei-aaaa1111bbbb2222")
+        assert leis == ["AAAA1111BBBB2222"]
+
+    def test_case_insensitive_prefix(self):
+        leis = _extract_leis("LEI-AAAA")
+        assert leis == ["AAAA"]
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +262,7 @@ class TestParseSanctionsCsv:
         }
         buf = _make_csv_bytes([row])
         results = parse_sanctions_csv(buf)
-        assert len(results[0]["aliases"]) == 1  # all three normalise to "acme"
+        assert len(results[0]["aliases"]) == 1  # all three lowercase to "acme"
 
     def test_countries_split_on_pipe(self):
         buf = _make_csv_bytes(_SAMPLE_ROWS)
@@ -215,6 +307,23 @@ class TestParseSanctionsCsv:
         empty_buf = _make_csv_bytes([])
         assert parse_sanctions_csv(empty_buf) == []
 
+    def test_leis_extracted_from_identifiers(self):
+        buf = _make_csv_bytes(_SAMPLE_ROWS)
+        results = parse_sanctions_csv(buf)
+        glencore = next(r for r in results if r["name"] == "Glencore International AG")
+        assert "2138008O0QXTNYGBCT15" in glencore["leis"]
+
+    def test_leis_empty_when_no_identifiers(self):
+        buf = _make_csv_bytes(_SAMPLE_ROWS)
+        results = parse_sanctions_csv(buf)
+        rosneft = next(r for r in results if r["name"] == "Rosneft Oil Company")
+        assert rosneft["leis"] == []
+
+    def test_leis_field_present_on_all_results(self):
+        buf = _make_csv_bytes(_SAMPLE_ROWS)
+        results = parse_sanctions_csv(buf)
+        assert all("leis" in r for r in results)
+
 
 # ---------------------------------------------------------------------------
 # _build_name_index
@@ -227,6 +336,7 @@ class TestBuildNameIndex:
                 "opensanctions_id": "os-1",
                 "name": "Rosneft Oil Company",
                 "aliases": ["rosneft", "pjsc rosneft"],
+                "leis": [],
                 "countries": ["RU"],
                 "datasets": ["us_ofac_sdn"],
                 "first_seen": None,
@@ -236,6 +346,7 @@ class TestBuildNameIndex:
                 "opensanctions_id": "os-2",
                 "name": "Glencore International AG",
                 "aliases": ["glencore plc", "glen"],
+                "leis": [],
                 "countries": ["CH", "CD"],
                 "datasets": ["ch_seco_sanctions"],
                 "first_seen": None,
@@ -243,22 +354,35 @@ class TestBuildNameIndex:
             },
         ]
 
-    def test_primary_name_is_indexed(self):
+    def test_primary_name_indexed_with_suffix_stripped(self):
         index = _build_name_index(self._entities())
-        assert "rosneft oil company" in index
+        # "Rosneft Oil Company" → strip "company" → "rosneft oil"
+        assert "rosneft oil" in index
+        # Original unsimplified form is NOT a key
+        assert "rosneft oil company" not in index
 
-    def test_aliases_are_indexed(self):
+    def test_alias_pjsc_stripped(self):
         index = _build_name_index(self._entities())
-        assert "glencore plc" in index
+        # alias "pjsc rosneft" → strip "pjsc" → "rosneft"
+        assert "rosneft" in index
+
+    def test_alias_plc_stripped(self):
+        index = _build_name_index(self._entities())
+        # alias "glencore plc" → strip "plc" → "glencore"
+        assert "glencore" in index
+
+    def test_non_suffix_alias_preserved(self):
+        index = _build_name_index(self._entities())
+        # "glen" has no suffix to strip
         assert "glen" in index
-        assert "pjsc rosneft" in index
 
     def test_normalisation_lowercases(self):
         entities = [
             {
                 "opensanctions_id": "os-upper",
-                "name": "UPPER CASE COMPANY",
+                "name": "UPPER CASE NAME",
                 "aliases": [],
+                "leis": [],
                 "countries": [],
                 "datasets": [],
                 "first_seen": None,
@@ -266,8 +390,8 @@ class TestBuildNameIndex:
             }
         ]
         index = _build_name_index(entities)
-        assert "upper case company" in index
-        assert "UPPER CASE COMPANY" not in index
+        assert "upper case name" in index
+        assert "UPPER CASE NAME" not in index
 
     def test_normalisation_collapses_whitespace(self):
         entities = [
@@ -275,6 +399,7 @@ class TestBuildNameIndex:
                 "opensanctions_id": "os-ws",
                 "name": "Extra  Spaces  Here",
                 "aliases": [],
+                "leis": [],
                 "countries": [],
                 "datasets": [],
                 "first_seen": None,
@@ -285,12 +410,13 @@ class TestBuildNameIndex:
         assert "extra spaces here" in index
 
     def test_multiple_entities_share_same_alias_key(self):
-        """Two entities with overlapping aliases should both be in the index list."""
+        """Two entities with overlapping normalised aliases → both in index list."""
         entities = [
             {
                 "opensanctions_id": "os-a",
                 "name": "Company A",
                 "aliases": ["shared name"],
+                "leis": [],
                 "countries": [],
                 "datasets": [],
                 "first_seen": None,
@@ -300,6 +426,7 @@ class TestBuildNameIndex:
                 "opensanctions_id": "os-b",
                 "name": "Company B",
                 "aliases": ["shared name"],
+                "leis": [],
                 "countries": [],
                 "datasets": [],
                 "first_seen": None,
@@ -314,20 +441,88 @@ class TestBuildNameIndex:
 
 
 # ---------------------------------------------------------------------------
+# _build_lei_index
+# ---------------------------------------------------------------------------
+
+class TestBuildLeiIndex:
+    def _entities_with_leis(self) -> list[dict]:
+        return [
+            {
+                "opensanctions_id": "os-lei-1",
+                "name": "Glencore International AG",
+                "aliases": [],
+                "leis": ["2138008O0QXTNYGBCT15"],
+                "countries": ["CH"],
+                "datasets": ["ch_seco_sanctions"],
+                "first_seen": None,
+                "last_seen": None,
+            },
+            {
+                "opensanctions_id": "os-lei-2",
+                "name": "Nornickel PJSC",
+                "aliases": [],
+                "leis": [],
+                "countries": ["RU"],
+                "datasets": ["us_ofac_sdn"],
+                "first_seen": None,
+                "last_seen": None,
+            },
+        ]
+
+    def test_entity_indexed_by_lei(self):
+        index = _build_lei_index(self._entities_with_leis())
+        assert "2138008O0QXTNYGBCT15" in index
+
+    def test_entity_without_lei_not_in_index(self):
+        index = _build_lei_index(self._entities_with_leis())
+        assert len(index) == 1  # only the Glencore entity
+
+    def test_lei_maps_to_entity_list(self):
+        index = _build_lei_index(self._entities_with_leis())
+        assert index["2138008O0QXTNYGBCT15"][0]["opensanctions_id"] == "os-lei-1"
+
+    def test_multiple_leis_per_entity(self):
+        entities = [
+            {
+                "opensanctions_id": "os-multi",
+                "name": "Some Corp",
+                "aliases": [],
+                "leis": ["AAAA", "BBBB"],
+                "countries": [],
+                "datasets": [],
+                "first_seen": None,
+                "last_seen": None,
+            }
+        ]
+        index = _build_lei_index(entities)
+        assert "AAAA" in index
+        assert "BBBB" in index
+
+    def test_empty_entities_returns_empty_index(self):
+        assert _build_lei_index([]) == {}
+
+
+# ---------------------------------------------------------------------------
 # match_companies
 # ---------------------------------------------------------------------------
 
-def _mock_company(canonical_name: str) -> MagicMock:
+def _mock_company(canonical_name: str, lei: str | None = None) -> MagicMock:
     c = MagicMock()
     c.id = uuid.uuid4()
     c.canonical_name = canonical_name
+    c.lei = lei
     return c
 
 
-def _mock_alias(company_id: uuid.UUID, alias: str) -> MagicMock:
+def _mock_alias(
+    company_id: uuid.UUID,
+    alias: str,
+    alias_type: str = "aka",
+) -> MagicMock:
     a = MagicMock()
     a.company_id = company_id
     a.alias = alias
+    a.alias_type = alias_type
     return a
 
 
@@ -338,8 +533,6 @@ def _mock_session_for_match(
     session = MagicMock()
 
     def scalars_side_effect(stmt):
-        # Distinguish Company from CompanyAlias query by inspecting the
-        # whereclause entity — use a call-count approach instead.
         result = MagicMock()
         result.all.return_value = scalars_side_effect._calls.pop(0)
         return result
@@ -349,18 +542,36 @@ def _mock_session_for_match(
     return session
 
 
+def _entity(
+    name: str,
+    aliases: list[str] | None = None,
+    leis: list[str] | None = None,
+    countries: list[str] | None = None,
+    datasets: list[str] | None = None,
+    opensanctions_id: str = "os-1",
+) -> dict:
+    return {
+        "opensanctions_id": opensanctions_id,
+        "name": name,
+        "aliases": aliases or [],
+        "leis": leis or [],
+        "countries": countries or [],
+        "datasets": datasets or [],
+        "first_seen": None,
+        "last_seen": None,
+    }
+
+
 class TestMatchCompanies:
     def _entities_glencore(self) -> list[dict]:
         return [
-            {
-                "opensanctions_id": "os-glen-1",
-                "name": "GLENCORE INTERNATIONAL AG",
-                "aliases": ["glencore plc"],
-                "countries": ["CH", "CD"],
-                "datasets": ["ch_seco_sanctions"],
-                "first_seen": None,
-                "last_seen": None,
-            }
+            _entity(
+                name="GLENCORE INTERNATIONAL AG",
+                aliases=["glencore plc"],
+                leis=[],
+                countries=["CH", "CD"],
+                datasets=["ch_seco_sanctions"],
+            )
         ]
 
     def test_match_via_alias(self):
@@ -370,8 +581,9 @@ class TestMatchCompanies:
 
         result = match_companies(session, self._entities_glencore())
 
-        # "Glencore PLC" alias normalises to "glencore plc" which matches the
-        # entity alias "glencore plc" → should find a match
+        # "Glencore PLC" → strip "plc" → "glencore"
+        # entity "GLENCORE INTERNATIONAL AG" → strip "international"/"ag" → "glencore"
+        # canonical "Glencore International" → strip "international" → "glencore"
         assert len(result) == 1
         matched_company, matched_entities = result[0]
         assert matched_company.canonical_name == "Glencore International"
@@ -383,8 +595,30 @@ class TestMatchCompanies:
 
         result = match_companies(session, self._entities_glencore())
 
-        # canonical name "Glencore International AG" normalises and matches
-        # the entity name "GLENCORE INTERNATIONAL AG" (case-insensitive)
+        assert len(result) == 1
+
+    def test_match_via_lei(self):
+        lei = "2138008O0QXTNYGBCT15"
+        company = _mock_company("Glencore", lei=lei)
+        session = _mock_session_for_match([company], [])
+        entities = [_entity(name="Glencore International AG", leis=[lei])]
+
+        result = match_companies(session, entities)
+
+        assert len(result) == 1
+        matched_company, _ = result[0]
+        assert matched_company.canonical_name == "Glencore"
+
+    def test_lei_match_takes_priority_over_name(self):
+        """Company matched via LEI should appear in results even if its name differs."""
+        lei = "UNIQUE-LEI-123"
+        company = _mock_company("Completely Different Name", lei=lei)
+        session = _mock_session_for_match([company], [])
+        # Entity has a different name but the same LEI
+        entities = [_entity(name="GLENCORE INTERNATIONAL AG", leis=[lei])]
+
+        result = match_companies(session, entities)
+
         assert len(result) == 1
 
     def test_no_match_returns_empty(self):
@@ -408,7 +642,7 @@ class TestMatchCompanies:
     def test_matched_entities_deduplicated(self):
         """Same entity matched via both canonical name and alias should appear once."""
         company = _mock_company("Glencore International AG")
-        alias = _mock_alias(company.id, "Glencore International AG")  # same as canonical
+        alias = _mock_alias(company.id, "Glencore International AG")
         session = _mock_session_for_match([company], [alias])
 
         result = match_companies(session, self._entities_glencore())
@@ -416,6 +650,46 @@ class TestMatchCompanies:
         _, matched_entities = result[0]
         ids = [e["opensanctions_id"] for e in matched_entities]
         assert len(ids) == len(set(ids))
+
+    def test_ticker_aliases_skipped(self):
+        """Aliases with alias_type='ticker' must not be used for name matching."""
+        company = _mock_company("Tesla Inc.")
+        # Create a ticker alias that happens to match the Glencore entity name
+        ticker_alias = _mock_alias(company.id, "Glencore International AG", alias_type="ticker")
+        session = _mock_session_for_match([company], [ticker_alias])
+
+        result = match_companies(session, self._entities_glencore())
+        # Ticker alias should be skipped; no match
+        assert result == []
+
+    def test_lei_aliases_skipped_from_name_matching(self):
+        """Aliases with alias_type='lei' are raw LEI strings, not human-readable names."""
+        company = _mock_company("Tesla Inc.")
+        lei_alias = _mock_alias(company.id, "GLENCORE INTERNATIONAL AG", alias_type="lei")
+        session = _mock_session_for_match([company], [lei_alias])
+
+        result = match_companies(session, self._entities_glencore())
+        assert result == []
+
+    def test_pjsc_suffix_stripped_for_match(self):
+        """'Nornickel PJSC' in OpenSanctions should match our alias 'Nornickel'."""
+        company = _mock_company("Norilsk Nickel")
+        alias = _mock_alias(company.id, "Nornickel")
+        session = _mock_session_for_match([company], [alias])
+        entities = [_entity(name="Nornickel PJSC", aliases=[])]
+
+        result = match_companies(session, entities)
+
+        assert len(result) == 1
+
+    def test_company_null_lei_skips_lei_matching(self):
+        """A company with lei=None must not be considered for LEI matching."""
+        company = _mock_company("Rosneft", lei=None)
+        session = _mock_session_for_match([company], [])
+        entities = [_entity(name="Unrelated Entity", leis=["SOME-LEI"])]
+
+        result = match_companies(session, entities)
+        assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +734,7 @@ class TestContentHash:
 def _make_entity(
     name: str = "Rosneft Oil Company",
     aliases: list[str] | None = None,
+    leis: list[str] | None = None,
     countries: list[str] | None = None,
     datasets: list[str] | None = None,
     opensanctions_id: str = "os-1",
@@ -468,6 +743,7 @@ def _make_entity(
         "opensanctions_id": opensanctions_id,
         "name": name,
         "aliases": aliases or [],
+        "leis": leis or [],
         "countries": countries or ["RU"],
         "datasets": datasets or ["us_ofac_sdn"],
         "first_seen": None,
@@ -489,7 +765,6 @@ def _make_ingest_session(existing_event=None) -> MagicMock:
     scalars_result.all.return_value = []
     session.scalars.return_value = scalars_result
 
-    # Give the mock event an id attribute so flush() → event.id works
     def add_side_effect(obj):
         if not hasattr(obj, "id") or obj.id is None:
             obj.id = 999
@@ -525,7 +800,7 @@ class TestIngestOpensanctions:
         company = _mock_company("Rosneft Oil Company")
         entities = [_make_entity()]
         matches = [(company, entities)]
-        existing_event = MagicMock()  # truthy → already exists
+        existing_event = MagicMock()
         session = _make_ingest_session(existing_event=existing_event)
 
         with (
@@ -558,7 +833,7 @@ class TestIngestOpensanctions:
         """A high-concentration geo with zero matching entities produces no event."""
         from app.services.ingestion.opensanctions import ingest_opensanctions
 
-        entities = [_make_entity(countries=["RU"])]  # No entities for CN
+        entities = [_make_entity(countries=["RU"])]
         session = _make_ingest_session(existing_event=None)
 
         with (
@@ -606,7 +881,6 @@ class TestIngestOpensanctions:
             ingest_opensanctions,
         )
 
-        # One entity per default geo
         entities = [_make_entity(countries=[geo]) for geo in _DEFAULT_HIGH_CONCENTRATION_GEOS]
         session = _make_ingest_session(existing_event=None)
 

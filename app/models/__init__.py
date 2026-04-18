@@ -31,6 +31,7 @@ from app.models.reporting import (
     ReportTemplate,
     ReportTemplateFocusEntity,
 )
+from app.models.review import SeedReviewFinding, SeedReviewRun
 from app.models.scoring import GeographyScore, MaterialScore
 from app.models.source import Source
 from app.models.supply_chain_context import SupplyChainContext
@@ -81,6 +82,9 @@ __all__ = [
     "ReportRun",
     "ReportTemplate",
     "ReportTemplateFocusEntity",
+    # Seed review
+    "SeedReviewRun",
+    "SeedReviewFinding",
     # Scoring
     "GeographyScore",
     "MaterialScore",

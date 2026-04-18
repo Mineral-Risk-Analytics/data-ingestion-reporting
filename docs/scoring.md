@@ -216,6 +216,92 @@ Schema DDL is in `alembic/versions/001_baseline.py`.
 
 ---
 
+## Data Flow
+
+flowchart TB
+    subgraph DB["Database (raw evidence)"]
+        ME[(CompanyMaterialExposure<br/>material, geography, exposure_score)]
+        RE[(RiskEvent<br/>severity, confidence, event_date,<br/>category, metadata_json)]
+        REC[(RiskEventCompany<br/>relevance_score)]
+        REM[(RiskEventMaterial)]
+        CRE[(CompanyRegulationExposure<br/>compliance_status)]
+    end
+
+    subgraph Q["1. Evidence query<br/>(evidence_query.py)"]
+        Q1[get_company_material_exposure]
+        Q2[get_events_for_company<br/>by RiskCategory]
+        Q3[get_filing_signals]
+        Q4[get_active_compliance_obligations<br/>status -> weight]
+    end
+
+    ME --> Q1
+    RE --> Q2
+    REC --> Q2
+    REM --> Q2
+    RE --> Q3
+    CRE --> Q4
+
+    subgraph IMP["2a. Per-event impact<br/>(event_impact.py)"]
+        IMPF["event_impact =<br/>severity × eff_confidence ×<br/>recency × relevance<br/>(0 - 1.56)"]
+    end
+
+    Q2 --> IMPF
+    Q3 --> IMPF
+
+    subgraph AGG["2b. Aggregate to component inputs<br/>(evidence_aggregator.py)"]
+        DM["derive_material_inputs<br/>criticality | concentration | trade_volatility"]
+        DG["derive_geopolitical_inputs<br/>country_conc | export_restr | tariff"]
+        DR["derive_regulatory_inputs<br/>top_event_impacts | obligations | proximity"]
+        DO["derive_operational_inputs<br/>structural_dep | event_impacts"]
+        DF["derive_financial_inputs<br/>base | leverage | liquidity | count"]
+    end
+
+    Q1 --> DM
+    IMPF --> DM
+    Q1 --> DG
+    IMPF --> DG
+    IMPF --> DR
+    Q4 --> DR
+    IMPF --> DO
+    IMPF --> DF
+
+    subgraph PILLAR["3. Pillar scoring (0-100 each)"]
+        P1["Material<br/>0.35·crit + 0.35·conc + 0.30·vol"]
+        P2["Geopolitical<br/>0.40·country + 0.35·export + 0.25·tariff"]
+        P3["Regulatory<br/>event(top-3)·proximity·60<br/>+ obligation_uplift (cap 40)"]
+        P4["Operational<br/>0.40·struct_dep + 0.60·avg_event"]
+        P5["Financial<br/>base + leverage + liquidity"]
+    end
+
+    DM --> P1
+    DG --> P2
+    DR --> P3
+    DO --> P4
+    DF --> P5
+
+    subgraph ROLL["4. Aggregate (supplier_risk.py)"]
+        OVR["overall_risk_score =<br/>0.30·M + 0.20·G + 0.20·R +<br/>0.15·O + 0.15·F"]
+    end
+
+    P1 -- "30%" --> OVR
+    P2 -- "20%" --> OVR
+    P3 -- "20%" --> OVR
+    P4 -- "15%" --> OVR
+    P5 -- "15%" --> OVR
+
+    subgraph PERSIST["5. Persist (orchestrator.py)"]
+        ROW[(CompanyScore row<br/>+ rationale_json)]
+    end
+
+    P1 --> ROW
+    P2 --> ROW
+    P3 --> ROW
+    P4 --> ROW
+    P5 --> ROW
+    OVR --> ROW
+
+---
+
 ## Testing
 
 See `tests/test_scoring.py` for:

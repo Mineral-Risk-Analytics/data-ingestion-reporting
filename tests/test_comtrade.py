@@ -433,7 +433,32 @@ class TestIngestComtrade:
 
         mock_sleep.assert_called_once_with(1.5)
 
-    def test_session_commit_called(self):
+    def test_session_commit_called_when_rows_inserted(self):
+        """Commit is called once per batch that has rows to insert."""
+        from app.services.ingestion.comtrade import ingest_comtrade
+
+        session = _make_ingest_session(existing_doc=False)
+
+        with (
+            patch("app.services.ingestion.comtrade.get_settings") as mock_settings,
+            patch("app.services.ingestion.comtrade.fetch_annual_exports", return_value=[_raw_row()]),
+            patch("app.services.ingestion.comtrade.time.sleep"),
+        ):
+            mock_settings.return_value.comtrade_api_key = "test-key"
+            mock_settings.return_value.comtrade_rate_limit_delay = 0
+            mock_settings.return_value.comtrade_base_url = "https://example.com"
+            ingest_comtrade(
+                session=session,
+                years=[2023],
+                reporters={"CN": 156},
+                hs_prefixes=["8507"],
+            )
+
+        # One batch with one row → exactly one commit
+        session.commit.assert_called_once()
+
+    def test_session_commit_not_called_when_empty_response(self):
+        """No commit is issued when all API responses are empty — nothing to persist."""
         from app.services.ingestion.comtrade import ingest_comtrade
 
         session = _make_ingest_session(existing_doc=False)
@@ -453,4 +478,4 @@ class TestIngestComtrade:
                 hs_prefixes=["8507"],
             )
 
-        session.commit.assert_called_once()
+        session.commit.assert_not_called()

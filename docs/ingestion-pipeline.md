@@ -149,3 +149,20 @@ HTTP client:
 5. Write tests with mocked SQLAlchemy sessions.
 
 See also: [Data sources](data-sources.md), [Parsing & normalization](parsing-and-normalization.md), [Scoring](scoring.md).
+
+
+**Order of operations for running scripts and scoring**
+# 1. Reference data (once)
+bdi-ingest seed-companies
+bdi-ingest ingest-usgs path/to/MCS2025_World_Data.csv
+bdi-ingest seed-materials
+bdi-ingest seed-hs-mappings
+
+# 2. Scoring data
+bdi-ingest seed-material-exposures   # Material + Geopolitical pillars
+bdi-ingest seed-regulations          # Regulatory pillar
+bdi-ingest ingest-sec-edgar          # partial Financial signal
+
+# 3. Score and view
+bdi-ingest rescore-all
+bdi-ingest show-scores

@@ -4,29 +4,42 @@ Downloads the free daily bulk CSV export from OpenSanctions
 (https://www.opensanctions.org) and produces two types of ``RiskEvent`` rows:
 
 1. **Company match events** (``event_type="sanctions_listing"``) — one event per
-   company in the ``companies`` table whose canonical name or alias matches a
-   sanctioned entity by normalised string comparison.
+   company in the ``companies`` table whose canonical name, alias, or LEI matches
+   a sanctioned entity. LEI matching is the primary path (exact, no false
+   positives); name matching is the fallback.
 
 2. **Geography signal events** (``event_type="geography_sanctions_exposure"``) —
    one event per high-concentration geography (default: CN, CD, RU, IR, KP)
    recording how many sanctioned company/organisation records are linked to that
    country in the OpenSanctions dataset.
 
+Matching strategy
+-----------------
+**Primary — LEI**: The ``identifiers`` column of the simple CSV contains
+pipe-delimited identifiers such as ``lei-529900HNOAA1KXQJUQ27``. We extract
+these and match against ``Company.lei``. This is exact and produces no false
+positives. Run ``bdi-ingest ingest-gleif`` before this command to backfill LEIs.
+
+**Fallback — normalised name**: Lowercases both sides, strips common legal
+entity suffixes (Inc., Ltd., PJSC, JSC, OAO, PAO, plc, AG, GmbH …) and
+collapses whitespace. Checked against ``Company.canonical_name`` and all
+``CompanyAlias.alias`` values where ``alias_type`` is not ``"lei"`` or
+``"ticker"`` (those are not human-readable names).
+
 Important caveats
 -----------------
-- **Name matching is fuzzy by normalisation only** (lowercase + whitespace
-  collapse). There will be false positives — two unrelated companies can share
-  a common name fragment. A human review step is strongly recommended before
-  acting on any sanctions match.
+- **Zero company events is the expected outcome** when none of the seeded
+  companies are directly sanctioned. Most publicly-traded mining/OEM companies
+  are not on OFAC/EU/UN sanctions lists — only their executives or subsidiaries
+  may be. This is not a bug; re-run after populating more companies or when
+  sanctions lists change.
 
-- **The ``companies`` table may be empty on first run.** In that case, company
-  matching produces zero events. This is expected — seed companies from SEC
-  EDGAR, the USGS ingest, or manual data entry first.
+- **Name matching can still produce false positives** for short or generic
+  names. A human review step is recommended before acting on any match.
 
 - **Geography events are volume signals, not quality signals.** A country with
   1,000 sanctioned shell companies is not necessarily riskier than one with 10
-  major state-owned enterprises. The severity score (``count / 500``) reflects
-  raw volume. Treat it as one input among many.
+  major state-owned enterprises.
 
 No raw sanctions entity records are stored in the database — only structured
 ``RiskEvent`` rows for confirmed matches.
@@ -63,6 +76,22 @@ _BATCH_SIZE = 100
 _COMPANY_SCHEMAS = {"Company", "Organization", "LegalEntity", "PublicBody"}
 
 _DEFAULT_HIGH_CONCENTRATION_GEOS = ["CN", "CD", "RU", "IR", "KP"]
+
+# Legal entity suffixes stripped during name normalisation.  Covers Western,
+# Russian (PJSC/JSC/OAO/PAO/ZAO), CIS, and East-Asian conventions.
+_LEGAL_SUFFIXES_RE = re.compile(
+    r"\b("
+    r"inc\.?|ltd\.?|co\.?|ag|plc|n\.?v\.?|s\.?a\.?|gmbh|llc|corp\.?|"
+    r"limited|group|holding|holdings|international|corporation|company|"
+    r"pjsc|ojsc|jsc|oao|pao|zao|ooo|ao|"  # Russian / CIS legal forms
+    r"pty|nl|spa|sas|srl|bv|nv|kk|kft|as|ab|oy|oyj"  # AU/EU/Asian forms
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Alias types that are NOT human-readable names and should be skipped during
+# name-based matching (LEIs and tickers are handled separately or not at all).
+_SKIP_ALIAS_TYPES = {"lei", "ticker"}
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +145,23 @@ def _parse_date(value: str) -> Optional[datetime]:
         return None
 
 
+def _extract_leis(identifiers_cell: str) -> list[str]:
+    """Extract LEI values from a pipe-delimited identifiers cell.
+
+    OpenSanctions uses the prefix ``lei-`` before each LEI value, e.g.:
+        ``lei-529900HNOAA1KXQJUQ27|isin-DE0007664039``
+
+    Returns a (possibly empty) list of bare LEI strings (uppercase).
+    """
+    leis: list[str] = []
+    for part in _split_pipe(identifiers_cell):
+        if part.lower().startswith("lei-"):
+            lei = part[4:].strip().upper()
+            if lei:
+                leis.append(lei)
+    return leis
+
+
 def parse_sanctions_csv(buf: io.BytesIO) -> list[dict]:
     """Parse the CSV buffer into a list of sanctioned entity dicts.
 
@@ -128,6 +174,7 @@ def parse_sanctions_csv(buf: io.BytesIO) -> list[dict]:
         opensanctions_id  (str)
         name              (str — primary name)
         aliases           (list[str] — pipe-split, stripped, lowercased, deduped)
+        leis              (list[str] — extracted from ``identifiers`` column)
         countries         (list[str] — uppercase ISO2 codes)
         datasets          (list[str])
         first_seen        (datetime | None)
@@ -155,12 +202,14 @@ def parse_sanctions_csv(buf: io.BytesIO) -> list[dict]:
 
         countries = [c.strip().upper() for c in _split_pipe(row.get("countries") or "") if c.strip()]
         datasets = _split_pipe(row.get("datasets") or "")
+        leis = _extract_leis(row.get("identifiers") or "")
 
         results.append(
             {
                 "opensanctions_id": (row.get("id") or "").strip(),
                 "name": primary_name,
                 "aliases": aliases_norm,
+                "leis": leis,
                 "countries": countries,
                 "datasets": datasets,
                 "first_seen": _parse_date(row.get("first_seen") or ""),
@@ -180,8 +229,16 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 
 def _normalise(name: str) -> str:
-    """Lowercase, strip, collapse internal whitespace."""
-    return _WHITESPACE_RE.sub(" ", name.lower().strip())
+    """Lowercase, strip legal entity suffixes, strip punctuation, collapse whitespace.
+
+    Strips common Western and Russian/CIS legal forms (PJSC, JSC, OAO, plc,
+    Ltd., Inc., AG …) so that ``"Nornickel PJSC"`` and ``"Nornickel"`` both
+    reduce to ``"nornickel"`` and compare equal.
+    """
+    name = name.lower()
+    name = _LEGAL_SUFFIXES_RE.sub("", name)
+    name = re.sub(r"[,.\-/\\]", " ", name)  # strip punctuation
+    return _WHITESPACE_RE.sub(" ", name).strip()
 
 
 def _build_name_index(entities: list[dict]) -> dict[str, list[dict]]:
@@ -198,18 +255,36 @@ def _build_name_index(entities: list[dict]) -> dict[str, list[dict]]:
     return index
 
 
+def _build_lei_index(entities: list[dict]) -> dict[str, list[dict]]:
+    """Build a lookup dict: LEI (uppercase) → list of matching sanctioned entities."""
+    index: dict[str, list[dict]] = {}
+    for entity in entities:
+        for lei in entity.get("leis", []):
+            if lei:
+                index.setdefault(lei.upper(), []).append(entity)
+    return index
+
+
 def match_companies(
     session: Session,
     entities: list[dict],
 ) -> list[tuple[Any, list[dict]]]:
     """Return ``(Company ORM row, list of matching sanctioned entities)`` pairs.
 
-    Queries all ``companies`` and ``company_aliases`` in two bulk queries (no N+1
-    lookups). Normalises names the same way as ``_build_name_index``. Returns only
-    companies with at least one match.
+    Matching is two-phase:
+    1. **LEI match** (primary): exact match on ``Company.lei`` against the
+       ``lei-*`` values extracted from the ``identifiers`` column. Zero false
+       positives.
+    2. **Name match** (fallback): normalised match on ``Company.canonical_name``
+       and readable ``CompanyAlias`` values (alias_type not in ``lei``/``ticker``).
+
+    Queries all companies and aliases in two bulk queries (no N+1 lookups).
+    Returns only companies with at least one match.
     """
     name_index = _build_name_index(entities)
-    if not name_index:
+    lei_index = _build_lei_index(entities)
+
+    if not name_index and not lei_index:
         return []
 
     all_companies: list[Company] = list(session.scalars(select(Company)).all())
@@ -220,16 +295,24 @@ def match_companies(
 
     matched: dict[Any, list[dict]] = {}  # company_id → matched entities
 
-    # Check canonical names
+    # --- Phase 1: LEI match --------------------------------------------------
+    lei_matches = 0
+    for company in all_companies:
+        if company.lei and company.lei.upper() in lei_index:
+            matched.setdefault(company.id, []).extend(lei_index[company.lei.upper()])
+            lei_matches += 1
+
+    # --- Phase 2: name match (canonical + aliases) ---------------------------
     for company in all_companies:
         key = _normalise(company.canonical_name)
-        if key in name_index:
+        if key and key in name_index:
             matched.setdefault(company.id, []).extend(name_index[key])
 
-    # Check aliases
     for alias_row in all_aliases:
+        if alias_row.alias_type in _SKIP_ALIAS_TYPES:
+            continue
         key = _normalise(alias_row.alias)
-        if key in name_index:
+        if key and key in name_index:
             company = company_by_id.get(alias_row.company_id)
             if company:
                 matched.setdefault(company.id, []).extend(name_index[key])
@@ -246,7 +329,23 @@ def match_companies(
         company = company_by_id[company_id]
         result.append((company, unique))
 
-    log.info("opensanctions.match.done", companies_matched=len(result))
+    if not result:
+        log.warning(
+            "opensanctions.match.none_found",
+            total_companies_checked=len(all_companies),
+            note=(
+                "Zero company matches is expected when none of the seeded companies "
+                "are directly sanctioned. Run `bdi-ingest ingest-gleif` first to "
+                "backfill LEIs for higher-precision matching."
+            ),
+        )
+    else:
+        log.info(
+            "opensanctions.match.done",
+            companies_matched=len(result),
+            via_lei=lei_matches,
+            via_name=len(result) - lei_matches,
+        )
     return result
 
 

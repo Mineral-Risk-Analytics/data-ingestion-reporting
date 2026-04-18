@@ -5,22 +5,31 @@ Two-part score:
   2. Obligation uplift — hard legal obligations (UFLPA, EU Battery Reg, IRA) add
      additive points capped at 40.  These are not regular policy events; they carry
      enforcement deadlines and are scored separately to avoid dilution.
+
+Obligation uplift is weighted by compliance_status severity:
+  non_compliant × 1.00  (confirmed violation — full statutory risk)
+  unknown       × 0.50  (unassessed — conservative half-weight)
+  partial       × 0.40  (in transition — meaningful but not full exposure)
+
+This prevents partially-compliant OEMs from scoring identically to confirmed FEOC
+entities with full non-compliance on the same obligations.
 """
 
 from __future__ import annotations
 
-# Uplift points per active compliance obligation.
-# Calibrated so UFLPA alone pushes a supplier to ~25/100 before any event signal.
+# Base uplift points per active compliance obligation (before status multiplier).
+# Calibrated so a fully non_compliant UFLPA entity reaches 25/100 from obligations
+# alone before any event signal.  Hard-capped at 40 to reserve headroom for events.
 COMPLIANCE_OBLIGATIONS: dict[str, int] = {
-    "UFLPA":        25,   # supplier has known Xinjiang exposure
-    "EU_BATTERY_REG": 20, # sells into EU but lacks required compliance documentation
-    "IRA_DOMESTIC": 15,   # materials do not qualify for IRA domestic content credits
+    "UFLPA":          25,   # confirmed Xinjiang / forced-labour supply exposure
+    "EU_BATTERY_REG": 20,   # sells into EU but lacks required compliance documentation
+    "IRA_DOMESTIC":   15,   # materials do not qualify for IRA domestic content credits
 }
 
 
 def score_regulatory_profile(
     top_event_impacts: list[float],
-    active_obligations: list[str],
+    active_obligations: list[tuple[str, float]],
     policy_proximity_adjustment: float = 1.0,
 ) -> float:
     """
@@ -29,8 +38,9 @@ def score_regulatory_profile(
     Args:
         top_event_impacts:          Pre-computed event_impact values (from event_impact.py).
                                     May be any length; only the top-3 are used.
-        active_obligations:         List of obligation keys present for this supplier,
-                                    e.g. ["UFLPA", "EU_BATTERY_REG"].
+        active_obligations:         List of (obligation_key, weight_multiplier) tuples,
+                                    e.g. [("UFLPA", 1.0), ("IRA_DOMESTIC", 0.40)].
+                                    Weight reflects compliance_status severity.
         policy_proximity_adjustment: Scalar applied to the event-driven portion to
                                     account for geographic or sectoral proximity.
                                     Defaults to 1.0 (no adjustment).
@@ -42,9 +52,10 @@ def score_regulatory_profile(
     top_3 = sorted(top_event_impacts, reverse=True)[:3]
     event_score = (sum(top_3) / len(top_3)) * policy_proximity_adjustment * 60 if top_3 else 0.0
 
-    # Obligation uplift: additive, hard-capped at 40 points
+    # Obligation uplift: base points × status weight, additive, hard-capped at 40
     obligation_score = min(40.0, sum(
-        COMPLIANCE_OBLIGATIONS.get(ob, 0) for ob in active_obligations
+        COMPLIANCE_OBLIGATIONS.get(ob_key, 0) * weight
+        for ob_key, weight in active_obligations
     ))
 
     return min(100.0, event_score + obligation_score)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Material, Source
+from app.models import Source
 from app.models.company import Company, CompanyAlias
 from app.models.enums import ImplementationPhase, SourceType, SupplyChainStage
 

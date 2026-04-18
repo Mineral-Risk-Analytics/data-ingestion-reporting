@@ -59,9 +59,10 @@ def _safe_confidence(ew: EventWithRelevance) -> float:
 def _normalise_exposure_score(raw: float) -> float:
     """
     Normalise CompanyMaterialExposure.exposure_score to [0, 1.0].
-    Legacy data uses a 0-100 scale; clamp and divide uniformly.
+    Scores are stored on a 0-1.0 scale (e.g. 0.85 = high exposure).
+    Clamp to guard against any out-of-range legacy values.
     """
-    return min(1.0, max(0.0, raw / 100.0))
+    return min(1.0, max(0.0, raw))
 
 
 def _impact(ew: EventWithRelevance, category: RiskCategory, as_of_date: date,
@@ -202,9 +203,9 @@ def derive_geopolitical_inputs(
 
 def derive_regulatory_inputs(
     regulatory_events: list[EventWithRelevance],
-    active_obligations: list[str],
+    active_obligations: list[tuple[str, float]],
     as_of_date: date,
-) -> tuple[list[float], list[str], float]:
+) -> tuple[list[float], list[tuple[str, float]], float]:
     """
     Returns (top_event_impacts, active_obligations, policy_proximity_adjustment).
 
@@ -212,6 +213,10 @@ def derive_regulatory_inputs(
         Computed event_impact for each regulatory event, applying effective_confidence
         floor, category-specific recency decay, and per-supplier relevance_multiplier.
         regulatory_risk.py consumes the top-3 internally.
+
+    active_obligations:
+        Passed through unchanged — list of (regulation_key, weight_multiplier) tuples
+        from get_active_compliance_obligations().
 
     policy_proximity_adjustment:
         1.15 if any event has an effective_date within 90 days of as_of_date.

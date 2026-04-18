@@ -152,7 +152,7 @@ def _comtrade_get(
                 continue
             response.raise_for_status()
             data = response.json()
-            if isinstance(data, dict) and "error" in data:
+            if isinstance(data, dict) and data.get("error"):
                 raise ValueError(f"Comtrade API error: {data['error']}")
             return data
         except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
