@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir uv
 
 # Copy dependency manifests first — changes to these invalidate the install layer,
 # but changes to app code do not, keeping rebuilds fast.
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
 
 # Copy the package source so uv sync can install the project itself.
 # We copy only the package (not the full repo) so app-code changes don't bust
