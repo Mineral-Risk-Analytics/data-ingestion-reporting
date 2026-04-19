@@ -44,6 +44,15 @@ class Settings(BaseSettings):
     comtrade_base_url: str = "https://comtradeapi.un.org/data/v1/get"
     comtrade_rate_limit_delay: float = 1.0  # seconds between API calls
 
+    # Clerk auth (JWT via JWKS)
+    # When clerk_jwks_url is empty AND app_env == "development", auth is bypassed
+    # and a stub admin user is injected. Any non-empty value enforces verification.
+    clerk_jwks_url: str = ""
+    clerk_issuer: str = ""
+    clerk_audience: str = ""
+    # Frontend origin(s) allowed by CORS. Comma-separated for multiple origins.
+    frontend_url: str = "http://localhost:3000"
+
 
 @lru_cache
 def get_settings() -> Settings:

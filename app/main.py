@@ -1,18 +1,26 @@
-"""FastAPI application entrypoint (internal API, Phase 1)."""
+"""FastAPI application entrypoint.
+
+Phase 1 adds Clerk-authenticated routes for the admin dashboard. See
+``app/api/deps.py`` for the auth flow and dev-mode bypass.
+"""
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
+from app.api.routes.companies import router as companies_router
+from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.health import router as health_router
 from app.api.routes.ingestion import router as ingestion_router
 from app.api.routes.regulations import router as regulations_router
 from app.api.routes.risk_events import router as risk_events_router
 from app.api.routes.sources import router as sources_router
-from app.api.routes.companies import router as companies_router
 from app.api.routes.trade_flows import router as trade_flows_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
@@ -28,8 +36,50 @@ app = FastAPI(
     title="Battery Data Intelligence Engine",
     version="0.1.0",
     lifespan=lifespan,
-    description="Internal ingestion and reporting API (no auth in Phase 1).",
+    description=(
+        "Intelligence API backing the admin dashboard. Protected routes verify "
+        "Clerk session JWTs via JWKS; see app/api/deps.py."
+    ),
 )
+
+
+_settings = get_settings()
+_origins = [o.strip() for o in _settings.frontend_url.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins or ["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.__class__.__name__, "detail": exc.detail},
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"error": "ValidationError", "detail": exc.errors()},
+    )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=500,
+        content={"error": exc.__class__.__name__, "detail": str(exc)},
+    )
+
 
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(sources_router, prefix="/api/v1")
@@ -37,4 +87,5 @@ app.include_router(ingestion_router, prefix="/api/v1")
 app.include_router(risk_events_router, prefix="/api/v1")
 app.include_router(regulations_router, prefix="/api/v1")
 app.include_router(companies_router, prefix="/api/v1")
+app.include_router(dashboard_router, prefix="/api/v1")
 app.include_router(trade_flows_router, prefix="/api/v1")
