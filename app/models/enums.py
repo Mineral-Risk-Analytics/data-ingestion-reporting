@@ -93,6 +93,7 @@ class ReportFocusType(str, Enum):
     COMPANY = "company"
     REGULATION = "regulation"
     GEOGRAPHY = "geography"
+    BATTERY_CHEMISTRY = "battery_chemistry"
 
 
 class ReportAudience(str, Enum):

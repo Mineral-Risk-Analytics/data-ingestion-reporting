@@ -21,6 +21,7 @@ from app.db.base import Base
 if TYPE_CHECKING:
     from app.models.company import Company
     from app.models.documents import SourceDocument
+    from app.models.facility import Facility
     from app.models.supply import Material
 
 
@@ -216,6 +217,9 @@ class RiskEvent(Base):
     geography_links: Mapped[list["RiskEventGeography"]] = relationship(
         back_populates="risk_event", cascade="all, delete-orphan"
     )
+    facility_links: Mapped[list["RiskEventFacility"]] = relationship(
+        back_populates="risk_event", cascade="all, delete-orphan"
+    )
 
 
 class RiskEventCompany(Base):
@@ -338,3 +342,46 @@ class RiskEventGeography(Base):
     )
 
     risk_event: Mapped["RiskEvent"] = relationship(back_populates="geography_links")
+
+
+class RiskEventFacility(Base):
+    """
+    Junction: a risk event's relevance to a specific facility.
+
+    Mirrors :class:`RiskEventGeography` and :class:`RiskEventCompany`. Use this
+    when an event is known to affect a specific physical site (a mine fire, a
+    refinery sanction, a permit revocation) rather than the operating company
+    or the country at large. The ``relevance_score`` follows the same convention
+    as the other junctions and is passed through as the relevance multiplier in
+    :func:`compute_event_impact`.
+    """
+
+    __tablename__ = "risk_event_facilities"
+    __table_args__ = (
+        UniqueConstraint(
+            "risk_event_id", "facility_id", name="uq_risk_event_facility"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    risk_event_id: Mapped[int] = mapped_column(
+        ForeignKey("risk_events.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("facilities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    relevance_score: Mapped[float] = mapped_column(
+        Float, nullable=False, default=1.0
+    )
+    match_reason: Mapped[Optional[str]] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    risk_event: Mapped["RiskEvent"] = relationship(back_populates="facility_links")
+    facility: Mapped["Facility"] = relationship()

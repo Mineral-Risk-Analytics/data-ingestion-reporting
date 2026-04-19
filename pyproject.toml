@@ -17,6 +17,12 @@ dependencies = [
     "structlog>=24.4.0",
     "python-multipart>=0.0.17",
     "typer>=0.15.0",
+    "openai>=1.54.0",
+    "openpyxl>=3.1.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.3.0",
+    "pyjwt[crypto]>=2.9.0",
+    "cachetools>=5.5.0",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +35,33 @@ dev = [
 
 [project.scripts]
 bdi-ingest = "app.cli:main"
+
+[tool.hatch.envs.default.scripts]
+ingest-usgs = "bdi-ingest ingest-usgs ./data/mineral_commodities/MCS2025_World_Data.csv"
+ingest-usgs-force = "bdi-ingest ingest-usgs ./data/mineral_commodities/MCS2025_World_Data.csv --force"
+ingest-worldbank = "bdi-ingest ingest-worldbank"
+ingest-worldbank-full = "bdi-ingest ingest-worldbank --since-year 1960"
+ingest-opensanctions = "bdi-ingest ingest-opensanctions"
+ingest-comtrade = "bdi-ingest ingest-comtrade"
+ingest-comtrade-recent = "bdi-ingest ingest-comtrade --years 2021,2022,2023"
+ingest-comtrade-cn-only = "bdi-ingest ingest-comtrade --reporters CN --years 2021,2022,2023"
+ingest-gleif = "bdi-ingest ingest-gleif"
+ingest-federal-register = "bdi-ingest ingest-federal-register"
+seed-companies = "bdi-ingest seed-companies"
+seed-facilities = "bdi-ingest seed-facilities"
+seed-supply-relationships = "bdi-ingest seed-supply-relationships"
+seed-regulations = "bdi-ingest seed-regulations"
+seed-hs-mappings = "bdi-ingest seed-hs-mappings"
+seed-materials = "bdi-ingest seed-materials"
+seed-hs-mappings-force = "bdi-ingest seed-hs-mappings --force"
+build-trade-signals = "bdi-ingest build-trade-signals"
+rescore-chemistry = "bdi-ingest rescore-chemistry"
+rescore-chemistry-lfp = "bdi-ingest rescore-chemistry --slug lfp"
+rescore-chemistry-nmc = "bdi-ingest rescore-chemistry --slug nmc"
+rescore-all = "bdi-ingest rescore-all"
+show-scores = "bdi-ingest show-scores"
+scrape-ev-database = "bdi-ingest scrape-ev-database"
+scrape-ev-database-dry = "bdi-ingest scrape-ev-database --limit 20 --dry-run"
 
 [build-system]
 requires = ["hatchling"]

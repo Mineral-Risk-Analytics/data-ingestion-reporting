@@ -1,5 +1,7 @@
 """ORM models — import side effects register all metadata with Base."""
 
+from app.models.battery_chemistry import BatteryChemistry, BatteryChemistryMaterial, ChemistryRiskScore
+from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.company import (
     Company,
     CompanyAlias,
@@ -18,6 +20,7 @@ from app.models.regulatory import (
     RegulationMaterialScope,
     RiskEvent,
     RiskEventCompany,
+    RiskEventFacility,
     RiskEventGeography,
     RiskEventMaterial,
     RiskEventRegulation,
@@ -29,16 +32,24 @@ from app.models.reporting import (
     ReportTemplate,
     ReportTemplateFocusEntity,
 )
+from app.models.review import SeedReviewFinding, SeedReviewRun
 from app.models.scoring import GeographyScore, MaterialScore
 from app.models.source import Source
+from app.models.supply_chain_context import SupplyChainContext
 from app.models.supply import (
     CommodityPrice,
     HsCodeMaterialMapping,
     Material,
     TradeFlow,
 )
+from app.models.vehicle import CompanyVehicleModel, VehicleModelChemistry
 
 __all__ = [
+    # Battery chemistry
+    "BatteryChemistry",
+    "BatteryChemistryMaterial",
+    "ChemistryRiskScore",
+    "MaterialCriticalitySignal",
     # Company layer
     "Company",
     "CompanyAlias",
@@ -64,6 +75,7 @@ __all__ = [
     "RegulationMaterialScope",
     "RiskEvent",
     "RiskEventCompany",
+    "RiskEventFacility",
     "RiskEventGeography",
     "RiskEventMaterial",
     "RiskEventRegulation",
@@ -73,14 +85,22 @@ __all__ = [
     "ReportRun",
     "ReportTemplate",
     "ReportTemplateFocusEntity",
+    # Seed review
+    "SeedReviewRun",
+    "SeedReviewFinding",
     # Scoring
     "GeographyScore",
     "MaterialScore",
     # Source
     "Source",
+    # Domain config
+    "SupplyChainContext",
     # Supply
     "CommodityPrice",
     "HsCodeMaterialMapping",
     "Material",
     "TradeFlow",
+    # Vehicle (chemistry mix)
+    "CompanyVehicleModel",
+    "VehicleModelChemistry",
 ]

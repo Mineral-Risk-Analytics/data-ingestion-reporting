@@ -167,6 +167,11 @@ class CompanySupplyRelationship(Base):
         String(64), nullable=False, default="direct"
     )  # direct | indirect | estimated
     data_confidence: Mapped[Optional[float]] = mapped_column(Float)  # 0.0–1.0
+    volume_share_pct: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )
+    # Fraction of buyer's demand for this material supplied by this
+    # supplier. 0.0–1.0. NULL = relationship confirmed but share unknown.
     source_document_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("source_documents.id", ondelete="SET NULL")
     )
@@ -201,6 +206,8 @@ class CompanyScore(Base):
     operational_risk_score: Mapped[Optional[float]] = mapped_column(Float)
     financial_pressure_score: Mapped[Optional[float]] = mapped_column(Float)
     overall_risk_score: Mapped[Optional[float]] = mapped_column(Float)
+    supply_chain_propagation_score: Mapped[Optional[float]] = mapped_column(Float)
+    propagation_depth_used: Mapped[Optional[int]] = mapped_column(Integer)
     rationale_json: Mapped[Optional[Any]] = mapped_column(JSONB)
     scoring_version: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default="2.0"
