@@ -9,11 +9,16 @@ RUN pip install --no-cache-dir uv
 # but changes to app code do not, keeping rebuilds fast.
 COPY pyproject.toml uv.lock ./
 
-# Install production dependencies only (no dev extras).
-# --no-editable installs the package itself from the sdist, not a live editable link.
-RUN uv pip install --system --no-dev --no-editable .
+# Copy the package source so uv sync can install the project itself.
+# We copy only the package (not the full repo) so app-code changes don't bust
+# the dependency cache layer.
+COPY app/ app/
 
-# Copy the rest of the source after dependencies are installed.
+# Install production dependencies only (skip dev group).
+# uv sync reads uv.lock and installs everything into the system Python.
+RUN uv sync --frozen --no-dev --system
+
+# Copy the rest of the source (alembic, config files, etc.) after deps are cached.
 COPY . .
 
 ENV PYTHONUNBUFFERED=1
