@@ -9,18 +9,15 @@ RUN pip install --no-cache-dir uv
 # but changes to app code do not, keeping rebuilds fast.
 COPY pyproject.toml uv.lock README.md ./
 
-# Copy the package source so uv sync can install the project itself.
-# We copy only the package (not the full repo) so app-code changes don't bust
-# the dependency cache layer.
+# Copy the package source so uv pip install can build the project.
+# Only the package dir is copied here so app-code changes don't bust the dep cache.
 COPY app/ app/
 
-# Tell uv to install into the system Python rather than creating a venv.
-# UV_SYSTEM_PYTHON is the correct way to do this for uv sync (--system is a
-# uv pip flag and does not exist on uv sync).
-ENV UV_SYSTEM_PYTHON=1
-
-# Install production dependencies only (skip dev group).
-RUN uv sync --frozen --no-dev
+# Install the project + all runtime deps into the system Python.
+# uv pip install --system puts everything in /usr/local/lib/python3.12/site-packages
+# so `python -m uvicorn` finds it without a virtualenv.
+# Dev dependencies (defined in [tool.uv.dev-dependencies]) are NOT installed by default.
+RUN uv pip install --system .
 
 # Copy the rest of the source (alembic, config files, etc.) after deps are cached.
 COPY . .
