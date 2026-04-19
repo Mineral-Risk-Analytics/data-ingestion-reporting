@@ -4,24 +4,29 @@
 
 The platform has two independent scoring systems:
 
-1. **Company risk scoring** (five-pillar) — rates a specific supply chain company's risk across material concentration, geopolitical, regulatory, operational, and financial dimensions. Output: `company_scores`.
+1. **Company risk scoring** (six-pillar, v3.0) — rates a specific supply chain company's risk across material concentration, geopolitical, regulatory, operational, financial, and supply-chain-propagation dimensions. Output: `company_scores`.
 2. **Chemistry risk scoring** — rates a battery cell chemistry's supply risk based on its material composition, criticality signals, and geographic concentration of its constituent minerals. Output: `chemistry_risk_scores`.
 
 Both systems are **stateless, pure-function, and transparent**: component functions return raw `float` values with no database reads. Persistence happens after computation, never inside the scoring layer.
 
+> **v3.0 highlights** — see "Scoring v3.0 (April 2026): six pillars, chemistry refinement, ScoringScope" below for the full change log. The seed-staleness reviewers (`docs/seed-review.md`) feed the v3.0 inputs by keeping `CompanyMaterialExposure`, `Facility`, `CompanySupplyRelationship`, `CompanyVehicleModel`, and `CompanyRegulationExposure` rows fresh.
+
 ---
 
-## Five-Pillar Architecture
+## Six-Pillar Architecture (v3.0)
 
 | Pillar | Weight | Module |
 |--------|--------|--------|
-| Material Concentration | **30%** | `material_risk.py` |
-| Geopolitical / Trade | **20%** | `geopolitical_risk.py` |
-| Regulatory & Compliance | **20%** | `regulatory_risk.py` |
-| Operational | **15%** | `orchestrator.py` (`_score_operational`) |
-| Financial Pressure | **15%** | `financial_pressure.py` |
+| Material Concentration | **25%** | `material_risk.py` (chemistry-aware via `derive_material_inputs`) |
+| Geopolitical / Trade | **20%** | `geopolitical_risk.py` (folds in facility countries) |
+| Regulatory & Compliance | **20%** | `regulatory_risk.py` (folds in `Regulation*Scope` hits) |
+| Operational | **10%** | `orchestrator.py` (`_score_operational`; folds in facility status) |
+| Financial Pressure | **10%** | `financial_pressure.py` |
+| Supply-Chain Propagation | **15%** | `propagation_risk.py` (BFS over `CompanySupplyRelationship`) |
 
-Previous v1 weights (0.35/0.35/0.15/0.15 across four pillars) are retired. `scoring_version = "2.0"` is written to every new `company_scores` row.
+When the propagation pillar can't be computed (no suppliers, or no suppliers with persisted `CompanyScore` rows), `aggregate_supplier_risk()` re-normalises the remaining five weights so the overall score remains comparable across companies. `scoring_version = "3.0"` is written to every new `company_scores` row.
+
+Previous v2 weights (0.30/0.20/0.20/0.15/0.15) and v1 weights (0.35/0.35/0.15/0.15) are retired. Pre-existing rows keep their original version string — see *scoring_version and score delta displays*.
 
 ---
 
@@ -38,7 +43,8 @@ Previous v1 weights (0.35/0.35/0.15/0.15 across four pillars) are retired. `scor
 | `geopolitical_risk.py` | Geopolitical/Trade Risk (40/35/25 sub-weights) |
 | `regulatory_risk.py` | Regulatory & Compliance Risk: event rollup + obligation uplift |
 | `financial_pressure.py` | Financial Pressure: three bounded sub-components (0-40 / 0-30 / 0-30) |
-| `supplier_risk.py` | Five-pillar aggregate → `aggregate_supplier_risk` dict; `SCORING_VERSION` constant |
+| `propagation_risk.py` | Supply-Chain Propagation: volume-weighted, depth-decayed average of supplier `overall_risk_score` (v3.0) |
+| `supplier_risk.py` | Six-pillar aggregate → `aggregate_supplier_risk` dict; `SCORING_VERSION` constant; renormalises when propagation is `None` |
 
 ### Orchestration layer (DB reads + persistence)
 
@@ -130,7 +136,85 @@ Computed in `orchestrator._score_operational` (not a standalone module):
 score = (0.40 × structural_dependency + 0.60 × avg(weighted_event_impacts)) × 100
 ```
 
-`structural_dependency` defaults to 0.30 if no `SINGLE_SOURCE` or `CAPACITY_CONSTRAINT` events are present.
+`structural_dependency` defaults to 0.30 if no `SINGLE_SOURCE` or `CAPACITY_CONSTRAINT` events are present. In v3.0, planned / under-construction `Facility` rows lift `structural_dependency` to `max(event_signal, 0.4 × non_op_share)` — a company with 4 of 5 facilities still in construction has a clear capacity-dependency signal even before any operational event lands.
+
+### Supply-Chain Propagation (`score_propagation`) — v3.0
+
+Sixth pillar. Captures *second-party* risk: the persisted `overall_risk_score` of suppliers reachable via `CompanySupplyRelationship`.
+
+```
+share_d_w = clamp01(volume_share) × depth_weight(d)        # depth_weight = (1.00, 0.40, ...)
+score    = Σ(supplier_score × share_d_w) / Σ(share_d_w)    # clamped to [0, 100]
+```
+
+- The orchestrator runs a BFS over `CompanySupplyRelationship` (`get_supplier_chain`) with cycle detection and a hard `max_visited` cap (default 50). Default `max_depth = 2` (tier-2).
+- Suppliers without a persisted `CompanyScore` are dropped; the count is surfaced in `rationale_json.signals_used.supplier_scores_used`.
+- Edges with `volume_share_pct = NULL` substitute the conservative default of 0.10.
+- When the input list is empty (no chain, no usable scores, or scoped run), the pillar score is `None` and `aggregate_supplier_risk` re-normalises the other five pillar weights.
+
+---
+
+## Scoring v3.0 (April 2026): six pillars, chemistry refinement, ScoringScope
+
+v3.0 keeps the v2 pillar functions intact and adds three orthogonal capabilities:
+
+### 1. Sixth pillar: supply-chain propagation
+
+Migration `006_supply_chain_rollup.py` adds:
+- `risk_event_facilities` junction (used by ingestion to fan events out to facility-level relevance).
+- `company_scores.supply_chain_propagation_score` and `company_scores.propagation_depth_used` columns.
+
+The pillar reads only persisted `CompanyScore` rows for suppliers — never recurses into rescore. This keeps each rescore O(direct + tier-2 supplier rows) and avoids cascade explosions when many companies share suppliers.
+
+### 2. Chemistry-aware material weighting (no new pillar)
+
+Migration `007_company_vehicle_models.py` adds `company_vehicle_models` and `vehicle_model_chemistries`, time-windowed product-level grain on chemistry exposure.
+
+`derive_material_inputs` re-weights each `CompanyMaterialExposure` by the chemistry-aware intensity of its material. A 100% LFP OEM gets material risk dominated by Li/Fe/P; cobalt exposure (if any) collapses to the `_CHEMISTRY_BASELINE_UNMATCHED = 0.10` floor rather than being averaged at full strength.
+
+Industry-average market shares are *never* substituted when a company has no vehicle models — the aggregator falls back to legacy uniform behaviour so missing data never silently injects industry signal.
+
+`CompanyVehicleModel` rows are seeded from ev-database.org via `bdi-ingest scrape-ev-database` (see [`app/services/ingestion/scrape_ev_database.py`](../app/services/ingestion/scrape_ev_database.py)). Production volume is not exposed by that source, so the company-level chemistry mix is uniformly weighted across an OEM's variants until a manual `production_volume_units` override is applied. The scraper is idempotent on `(company_id, model_name, model_year_start)` and skips brands with no matching `Company` row — no new companies are ever created here.
+
+### 3. ScoringScope hooks (UI-ready scoped views)
+
+`ScoringScope` (in `types.py`) is a frozen dataclass with optional filters:
+
+| Field | Filters |
+|-------|---------|
+| `material_ids` | Exposures + material-tagged events + chemistry intensities |
+| `country_codes` | Source geography + facility country + geo-tagged events |
+| `chemistry_ids` | Vehicle-model chemistry mix + intensity rows |
+| `regulation_keys` | Active obligations + scope-derived regulations + regulation-tagged events |
+| `facility_ids` | Facility roster |
+| `supplier_depth_max` | Caps the propagation BFS depth from above |
+
+`ScoringScope.ALL` is the default (no-op) and is regression-tested.
+
+```python
+from app.services.scoring.orchestrator import score_company_scoped
+from app.services.scoring.types import ScoringScope
+
+# "What is OEM X's profile if we only look at Chinese exposure?"
+preview = score_company_scoped(
+    db, oem_id, ScoringScope(country_codes=frozenset({"CN"}))
+)
+# preview.id is None — scoped runs NEVER persist.
+```
+
+Two non-negotiable rules:
+- **Scoped runs never persist.** `rescore_company` coerces `persist=False` whenever `scope.is_all() is False`. The `company_scores` time-series stays comparable.
+- **Scoped runs skip propagation in v1.** Rationale: a scoped propagation rollup would mix scoped-this-company with full-scope-of-supplier signals in a way that's hard to explain. `signals_used.propagation_skipped_due_to_scope == True` flags this in the rationale.
+
+### Rationale block additions
+
+`SupplierScoreRationale` now includes:
+- `components.supply_chain_propagation` — pillar score on [0, 100] or `None`.
+- `propagation_chain` — list of `(supplier_id, depth, cumulative_volume_share, supplier_overall_score)` actually used.
+- `chemistry_mix` — list of `(chemistry_slug, share, persisted_chemistry_composite_or_null)`.
+- `signals_used` — count map: facilities, scope_obligations, regulation_events, geo_events_trade, geo_events_operational, material_country_events, supplier_chain_size, supplier_scores_used, chemistries_weighted, plus `propagation_skipped_due_to_scope` for scoped runs.
+
+These power the UI's "why did this score change?" panel without requiring back-computation from raw inputs.
 
 ---
 
@@ -170,7 +254,7 @@ db.commit()
 `rescore_company` is the **single permitted entry point** for scoring. It:
 1. Queries all evidence by category.
 2. Aggregates into float inputs.
-3. Calls all five component scorers.
+3. Calls all six component scorers.
 4. Calls `aggregate_supplier_risk()`.
 5. Builds a `SupplierScoreRationale` model.
 6. Appends a **new** `company_scores` row (never overwrites existing rows).
@@ -197,7 +281,7 @@ from app.services.scoring.types import SupplierScoreRationale
 row.rationale_json = SupplierScoreRationale(...).model_dump()
 ```
 
-Never write unstructured dicts to this column. Schema captures: `inputs` (company ID, evidence window, version, run ID), `components` (all five pillar scores + overall), `top_evidence` (event IDs most influential on the score), `decay` (eval date + per-pillar windows), and `notes` (human-readable summary string).
+Never write unstructured dicts to this column. Schema captures: `inputs` (company ID, evidence window, version, run ID), `components` (all six pillar scores + overall), `top_evidence` (event IDs most influential on the score), `decay` (eval date + per-pillar windows), and `notes` (human-readable summary string).
 
 ---
 
@@ -271,6 +355,7 @@ flowchart TB
         P3["Regulatory<br/>event(top-3)·proximity·60<br/>+ obligation_uplift (cap 40)"]
         P4["Operational<br/>0.40·struct_dep + 0.60·avg_event"]
         P5["Financial<br/>base + leverage + liquidity"]
+        P6["Propagation<br/>volume-weighted depth-decayed<br/>avg of supplier overall_risk_score"]
     end
 
     DM --> P1
@@ -278,16 +363,22 @@ flowchart TB
     DR --> P3
     DO --> P4
     DF --> P5
+    P1 --> P6
+    P2 --> P6
+    P3 --> P6
+    P4 --> P6
+    P5 --> P6
 
     subgraph ROLL["4. Aggregate (supplier_risk.py)"]
-        OVR["overall_risk_score =<br/>0.30·M + 0.20·G + 0.20·R +<br/>0.15·O + 0.15·F"]
+        OVR["overall_risk_score =<br/>0.25·M + 0.20·G + 0.20·R +<br/>0.10·O + 0.10·F + 0.15·Prop<br/>(Prop=None → renormalise 5)"]
     end
 
-    P1 -- "30%" --> OVR
+    P1 -- "25%" --> OVR
     P2 -- "20%" --> OVR
     P3 -- "20%" --> OVR
-    P4 -- "15%" --> OVR
-    P5 -- "15%" --> OVR
+    P4 -- "10%" --> OVR
+    P5 -- "10%" --> OVR
+    P6 -- "15%" --> OVR
 
     subgraph PERSIST["5. Persist (orchestrator.py)"]
         ROW[(CompanyScore row<br/>+ rationale_json)]
@@ -298,6 +389,7 @@ flowchart TB
     P3 --> ROW
     P4 --> ROW
     P5 --> ROW
+    P6 --> ROW
     OVR --> ROW
 
 ---
@@ -305,16 +397,25 @@ flowchart TB
 ## Testing
 
 See `tests/test_scoring.py` for:
-- Five-pillar aggregate contract (`test_supplier_aggregate_five_pillars`, `test_supplier_aggregate_all_keys_present`)
+- Six-pillar aggregate contract with and without propagation (`test_supplier_aggregate_five_pillars_no_propagation`, `test_supplier_aggregate_six_pillars_with_propagation`, `test_supplier_aggregate_all_keys_present`)
 - Effective confidence floor
 - Financial pressure sparse-evidence cap
-- Regulatory obligation uplift
+- Regulatory obligation uplift (now keyed on `(obligation_key, weight)` tuples)
 
 See `tests/test_orchestrator.py` for:
-- Full `rescore_company` integration (fixture supplier + events → `company_scores` row)
+- Full `rescore_company` integration (fixture supplier + events → `company_scores` row, `scoring_version == "3.0"`)
 - Append-only behaviour (two calls → two rows)
 - Non-blocking on scoring failure (ingestion run not rolled back)
 - Evidence aggregator unit tests
+
+See `tests/scoring/` for the v3.0 surface area:
+- `test_evidence_query_supply_chain.py` — BFS depth/cycle/volume math, `get_facilities_for_company`, `get_latest_company_scores`, `get_regulations_scoping_company` UNION + max-weight dedup.
+- `test_aggregator_facility_geo.py` — facility countries fold into `country_concentration` and `structural_dependency`; geo-tagged events widen export/tariff pools without double-counting.
+- `test_aggregator_scope_regulations.py` — regulation UNION (max weight), regulation-tagged event dedup, `policy_proximity_adjustment` window, `derive_propagation_inputs` shaping (skip-no-score, default-volume).
+- `test_chemistry_mix.py` — volume-weighted chemistry aggregation, time-window filtering, scope-driven re-normalisation, chemistry-aware material weighting end-to-end.
+- `test_propagation_risk.py` — pure-function pillar math: depth weights, share clamping, [0, 100] clamping.
+- `test_orchestrator_propagation.py` — end-to-end propagation through `rescore_company`: tier-1, tier-2, depth caps, suppliers with no persisted score (skipped + signals_used reflect it), no-supplier baseline (renormalisation regression guard).
+- `test_scope_and_scoped_orchestrator.py` — `ScoringScope` invariants, `score_company_scoped` never persists, scoped runs skip propagation, scope kwarg is threaded into every `evidence_query` helper.
 
 ---
 
@@ -402,3 +503,4 @@ Appended as a new row in `chemistry_risk_scores`. Never overwrites existing rows
 - [Parsing & normalization](parsing-and-normalization.md) — event drafts and RiskCategory tags
 - [Ingestion pipeline](ingestion-pipeline.md) — how post-ingestion rescoring is triggered
 - [Reports & AI](reports-and-ai.md) — where scored narratives surface
+- [Seed staleness review](seed-review.md) — keeps `CompanyMaterialExposure`, `Facility`, `CompanySupplyRelationship`, and `CompanyVehicleModel` rows fresh, which directly drives the v3.0 chemistry-aware material pillar, geographic fold-in, and supply-chain-propagation pillar.

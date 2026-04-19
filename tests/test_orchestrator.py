@@ -93,12 +93,28 @@ def _mock_evidence_no_events():
     empty evidence by producing default 0.3-0.5 range inputs per the spec.
 
     Keys are bare attribute names on the orchestrator module (as imported there).
+    Each mock accepts ``**kwargs`` so the orchestrator's new ``scope=`` and
+    other v3.0 kwargs do not break the lambda signatures.
     """
     return {
-        "get_company_material_exposure":     lambda db, cid: [],
-        "get_events_for_company":            lambda db, cid, cat, aod: [],
-        "get_filing_signals":                lambda db, cid: [],
-        "get_active_compliance_obligations": lambda db, cid: [],
+        # Existing query helpers (now scope-threaded)
+        "get_company_material_exposure":     lambda db, cid, **kw: [],
+        "get_events_for_company":            lambda db, cid, cat, aod, **kw: [],
+        "get_filing_signals":                lambda db, cid, **kw: [],
+        "get_active_compliance_obligations": lambda db, cid, **kw: [],
+        # v3.0 supply-chain rollup helpers
+        "get_facilities_for_company":        lambda db, cid, **kw: [],
+        "get_events_for_geographies":        lambda db, ccs, cat, aod, **kw: [],
+        "get_events_for_materials":          lambda db, mids, cat, aod, **kw: [],
+        "get_regulations_scoping_company":   lambda db, cid, mids, ccs, **kw: [],
+        "get_events_for_regulations":        lambda db, rkeys, aod, **kw: [],
+        "get_supplier_chain":                lambda db, cid, **kw: [],
+        "get_latest_company_scores":         lambda db, cids, **kw: {},
+        # v3.0 chemistry helpers
+        "get_chemistry_mix_for_company":     lambda db, cid, aod=None, **kw: None,
+        "get_chemistry_material_intensities": lambda db, cids, aod=None, **kw: {},
+        "get_latest_chemistry_risk_scores":  lambda db, cids, **kw: {},
+        "get_chemistry_slugs":               lambda db, cids: {},
     }
 
 
@@ -120,7 +136,7 @@ def test_rescore_writes_score_row(sqlite_session: Session, fixture_company: Comp
 
     assert score_row.id is not None, "flush() should populate the PK"
     assert score_row.company_id == fixture_company.id
-    assert score_row.scoring_version == "2.0"
+    assert score_row.scoring_version == "3.0"
 
     # All five component scores must be present and on [0, 100]
     for col in (
@@ -171,17 +187,13 @@ def test_rescore_with_one_geopolitical_event(
 
     ew = EventWithRelevance(event=ev, relevance_score=0.90)
 
-    def fake_get_events(db, cid, cat, aod):
+    def fake_get_events(db, cid, cat, aod, **kw):
         if cat == RiskCategory.GEOPOLITICAL_TRADE:
             return [ew]
         return []
 
-    overrides = {
-        "get_company_material_exposure":     lambda db, cid: [],
-        "get_events_for_company":            fake_get_events,
-        "get_filing_signals":                lambda db, cid: [],
-        "get_active_compliance_obligations": lambda db, cid: [],
-    }
+    overrides = _mock_evidence_no_events()
+    overrides["get_events_for_company"] = fake_get_events
     with patch.multiple("app.services.scoring.orchestrator", **overrides):
         score_row = rescore_company(sqlite_session, fixture_company.id, run_id="test-geo")
 
@@ -235,7 +247,7 @@ def test_scoring_failure_does_not_block_ingestion(
     """
     touched_company_ids: set[uuid.UUID] = {fixture_company.id}
 
-    def failing_rescore(db, cid, run_id):
+    def failing_rescore(db, cid, run_id, **kw):
         raise RuntimeError("DB timeout — simulated failure")
 
     errors: list[str] = []
@@ -404,9 +416,11 @@ class TestDeriveRegulatoryInputs:
     def test_no_events_returns_empty_impacts(self) -> None:
         from app.services.scoring.evidence_aggregator import derive_regulatory_inputs
 
-        impacts, obligations, prox = derive_regulatory_inputs([], ["UFLPA"], date.today())
+        impacts, obligations, prox = derive_regulatory_inputs(
+            [], [("UFLPA", 1.0)], date.today()
+        )
         assert impacts == []
-        assert obligations == ["UFLPA"]
+        assert obligations == [("UFLPA", 1.0)]
         assert prox == 1.0
 
     def test_event_within_90_days_sets_proximity(self) -> None:

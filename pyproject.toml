@@ -19,6 +19,8 @@ dependencies = [
     "typer>=0.15.0",
     "openai>=1.54.0",
     "openpyxl>=3.1.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.3.0",
 ]
 
 [project.optional-dependencies]
@@ -56,6 +58,8 @@ rescore-chemistry-lfp = "bdi-ingest rescore-chemistry --slug lfp"
 rescore-chemistry-nmc = "bdi-ingest rescore-chemistry --slug nmc"
 rescore-all = "bdi-ingest rescore-all"
 show-scores = "bdi-ingest show-scores"
+scrape-ev-database = "bdi-ingest scrape-ev-database"
+scrape-ev-database-dry = "bdi-ingest scrape-ev-database --limit 20 --dry-run"
 
 [build-system]
 requires = ["hatchling"]

@@ -46,12 +46,17 @@ def test_regulatory_obligation_uplift() -> None:
     uplift = min(40.0, COMPLIANCE_OBLIGATIONS["UFLPA"] + COMPLIANCE_OBLIGATIONS["EU_BATTERY_REG"])
     assert uplift == 40.0
 
-    score = score_regulatory_profile(top_event_impacts=[], active_obligations=["UFLPA", "EU_BATTERY_REG"])
+    score = score_regulatory_profile(
+        top_event_impacts=[],
+        active_obligations=[("UFLPA", 1.0), ("EU_BATTERY_REG", 1.0)],
+    )
     assert score == 40.0
 
 
 def test_regulatory_uflpa_only_uplift() -> None:
-    score = score_regulatory_profile(top_event_impacts=[], active_obligations=["UFLPA"])
+    score = score_regulatory_profile(
+        top_event_impacts=[], active_obligations=[("UFLPA", 1.0)]
+    )
     assert score == 25.0
 
 
@@ -59,7 +64,11 @@ def test_regulatory_combined_capped_at_100() -> None:
     # Max event score 60 + max obligation 40 = 100
     score = score_regulatory_profile(
         top_event_impacts=[1.0, 1.0, 1.0],
-        active_obligations=["UFLPA", "EU_BATTERY_REG", "IRA_DOMESTIC"],
+        active_obligations=[
+            ("UFLPA", 1.0),
+            ("EU_BATTERY_REG", 1.0),
+            ("IRA_DOMESTIC", 1.0),
+        ],
     )
     assert score == 100.0
 
@@ -167,7 +176,8 @@ def test_compute_event_impact_bad_recency_raises() -> None:
 # aggregate_supplier_risk — five-pillar contract
 # ---------------------------------------------------------------------------
 
-def test_supplier_aggregate_five_pillars() -> None:
+def test_supplier_aggregate_five_pillars_no_propagation() -> None:
+    """When propagation is None the remaining five pillars are renormalised."""
     result = aggregate_supplier_risk(
         material_score=60.0,
         geopolitical_score=50.0,
@@ -175,10 +185,29 @@ def test_supplier_aggregate_five_pillars() -> None:
         operational_score=30.0,
         financial_score=20.0,
     )
-    # 0.30*60 + 0.20*50 + 0.20*40 + 0.15*30 + 0.15*20
-    # = 18 + 10 + 8 + 4.5 + 3 = 43.5
-    assert abs(result["overall_risk_score"] - 43.5) < 0.01
-    assert result["scoring_version"] == SCORING_VERSION == "2.0"
+    # v3.0 weights w/o propagation, renormalised:
+    # base = 0.25/0.20/0.20/0.10/0.10 → sum 0.85
+    # weighted_raw = 0.25*60 + 0.20*50 + 0.20*40 + 0.10*30 + 0.10*20 = 38.0
+    # overall = 38.0 / 0.85 ≈ 44.7059
+    assert abs(result["overall_risk_score"] - (38.0 / 0.85)) < 0.01
+    assert result["scoring_version"] == SCORING_VERSION == "3.0"
+    assert result["supply_chain_propagation_score"] is None
+
+
+def test_supplier_aggregate_six_pillars_with_propagation() -> None:
+    """Sixth pillar enters the weighted sum at its full 0.15 weight."""
+    result = aggregate_supplier_risk(
+        material_score=60.0,
+        geopolitical_score=50.0,
+        regulatory_score=40.0,
+        operational_score=30.0,
+        financial_score=20.0,
+        propagation_score=70.0,
+    )
+    # 0.25*60 + 0.20*50 + 0.20*40 + 0.10*30 + 0.10*20 + 0.15*70
+    # = 15 + 10 + 8 + 3 + 2 + 10.5 = 48.5
+    assert abs(result["overall_risk_score"] - 48.5) < 0.01
+    assert result["supply_chain_propagation_score"] == 70.0
 
 
 def test_supplier_aggregate_all_keys_present() -> None:
@@ -189,6 +218,7 @@ def test_supplier_aggregate_all_keys_present() -> None:
         "regulatory_compliance_risk_score",
         "operational_risk_score",
         "financial_pressure_score",
+        "supply_chain_propagation_score",
         "overall_risk_score",
         "scoring_version",
     }
@@ -196,6 +226,12 @@ def test_supplier_aggregate_all_keys_present() -> None:
 
 
 def test_supplier_aggregate_uniform_inputs() -> None:
-    result = aggregate_supplier_risk(50, 50, 50, 50, 50)
+    result = aggregate_supplier_risk(50, 50, 50, 50, 50, propagation_score=50)
     # All pillars = 50, weights sum to 1.0 → overall = 50.0
+    assert abs(result["overall_risk_score"] - 50.0) < 0.01
+
+
+def test_supplier_aggregate_uniform_inputs_no_propagation_renormalises() -> None:
+    """Five identical pillars without propagation must still average to that value."""
+    result = aggregate_supplier_risk(50, 50, 50, 50, 50)
     assert abs(result["overall_risk_score"] - 50.0) < 0.01

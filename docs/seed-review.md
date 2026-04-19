@@ -222,3 +222,25 @@ Also out of scope for v1:
 4. Extend the CLI validator comment in [app/cli.py](../app/cli.py) if needed — the CLI reads `SEED_TYPES` dynamically.
 5. Add a unit test under `tests/review/test_<type>_reviewer.py`. Follow the existing pattern: test the pure `_score_*` helper with hand-built `SimpleNamespace` objects rather than hitting a DB.
 6. Document the new reviewer in this file.
+
+## Relationship to company scoring
+
+The seed-review reviewers keep the *inputs* to the v3.0 company scoring
+pipeline fresh:
+
+| Reviewer       | Updates table                  | Feeds into v3.0 pillar |
+| -------------- | ------------------------------ | ---------------------- |
+| regulation     | `regulations` + `*_scope`      | Regulatory & Compliance (`Regulation*Scope` UNION) |
+| company        | `companies`                    | All pillars (rationale labelling, supplier-chain BFS roots) |
+| material_exposure | `company_material_exposures` | Material Concentration (chemistry-aware reweighting) + Geopolitical (source geography) |
+| supply_relationship | `company_supply_relationships` | Supply-Chain Propagation (BFS edges) |
+| facility       | `facilities`                   | Geopolitical (facility country) + Operational (planned/under-construction) |
+
+When the reviewers surface a stale row (e.g. a closed facility still flagged
+"operating", or a withdrawn `IRA_DOMESTIC` exposure), an analyst's edit to
+the seed file flows into the next ingestion run, which then triggers a
+rescore — so the company's `overall_risk_score` in `company_scores`
+updates the next time the pipeline runs.
+
+See [scoring.md](scoring.md) for the full v3.0 pipeline (six pillars,
+chemistry refinement, `ScoringScope` hooks).

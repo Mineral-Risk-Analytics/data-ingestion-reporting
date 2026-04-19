@@ -206,6 +206,8 @@ class CompanyScore(Base):
     operational_risk_score: Mapped[Optional[float]] = mapped_column(Float)
     financial_pressure_score: Mapped[Optional[float]] = mapped_column(Float)
     overall_risk_score: Mapped[Optional[float]] = mapped_column(Float)
+    supply_chain_propagation_score: Mapped[Optional[float]] = mapped_column(Float)
+    propagation_depth_used: Mapped[Optional[int]] = mapped_column(Integer)
     rationale_json: Mapped[Optional[Any]] = mapped_column(JSONB)
     scoring_version: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default="2.0"

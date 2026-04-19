@@ -458,6 +458,135 @@ def seed_supply_relationships_cmd() -> None:
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
 
 
+@app.command("scrape-ev-database")
+def scrape_ev_database_cmd(
+    limit: Optional[int] = typer.Option(
+        None,
+        "--limit",
+        help="Cap the number of variants processed (after brand filtering). Useful for smoke tests.",
+    ),
+    brands: Optional[str] = typer.Option(
+        None,
+        "--brands",
+        help=(
+            "Comma-separated brand prefixes to keep (case-insensitive). "
+            "Example: 'Tesla,BYD,Hyundai'. Default: all brands."
+        ),
+    ),
+    rate_limit_delay: float = typer.Option(
+        3.0,
+        "--rate-limit-delay",
+        help=(
+            "Seconds to sleep BEFORE every detail-page request (be polite — "
+            "ev-database aggressively rate-limits). 3s ~ 20 req/min; bump to "
+            "5-10s if you're still seeing 429s. Sleep applies after errors too."
+        ),
+    ),
+    skip_existing: bool = typer.Option(
+        True,
+        "--skip-existing/--no-skip-existing",
+        help=(
+            "Skip variants whose ev_database_id was already persisted by a "
+            "previous run. Default ON makes the scrape resumable across "
+            "sessions: rerun after a 429 abort and only missing variants are "
+            "fetched. Use --no-skip-existing to refresh every variant."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Fetch and parse, but do NOT write any rows.",
+    ),
+    user_agent: str = typer.Option(
+        "battery-data-intelligence-engine/0.1 (research; contact via repo)",
+        "--user-agent",
+        help="HTTP User-Agent header to send with every request.",
+    ),
+    max_retries: int = typer.Option(
+        4,
+        "--max-retries",
+        help="Per-URL retry attempts on HTTP 429 before giving up on that URL.",
+    ),
+    backoff_base: float = typer.Option(
+        30.0,
+        "--backoff-base",
+        help="Base seconds for exponential 429 backoff (used when no Retry-After header).",
+    ),
+    backoff_cap: float = typer.Option(
+        300.0,
+        "--backoff-cap",
+        help="Hard cap on a single 429 sleep, in seconds.",
+    ),
+    abort_after_consecutive_429: int = typer.Option(
+        3,
+        "--abort-after-consecutive-429",
+        help=(
+            "Abort the run after this many URLs in a row exhaust their 429 "
+            "retries. Set to 0 to disable the abort guard."
+        ),
+    ),
+) -> None:
+    """Scrape ev-database.org and seed company_vehicle_models + vehicle_model_chemistries.
+
+    Discovers every variant from the cheatsheet page, fetches each detail page
+    to extract battery chemistry and model-year window, and idempotently
+    upserts rows. Variants whose brand has no matching Company are skipped
+    (no new Company rows are created here).
+
+    Production volume is intentionally NULL — ev-database does not expose it.
+    Downstream scoring weights variants uniformly when volume is absent.
+
+    Rate-limit behavior: --rate-limit-delay is slept BEFORE every detail
+    fetch. On HTTP 429 the request is retried with exponential backoff
+    (honoring Retry-After when present). After --abort-after-consecutive-429
+    URLs in a row exhaust retries the run aborts cleanly so a long run does
+    not burn hours sleeping; if you see this, wait an hour or two before
+    retrying. Output JSON includes rate_limit_hits, rate_limit_aborted,
+    remaining_after_abort, and already_stored_skipped.
+
+    Resumable workflow: --skip-existing (default ON) prunes variants whose
+    ev_database_id was already persisted, so a typical scrape looks like:
+
+    \b
+      bdi-ingest scrape-ev-database          # gets some, hits 429, aborts
+      # ... wait an hour or two ...
+      bdi-ingest scrape-ev-database          # picks up where it left off
+      # ... repeat until remaining_after_abort is 0 ...
+
+    \b
+    Run order:
+      bdi-ingest seed-companies          # brands must exist first
+      bdi-ingest seed-materials          # chemistry-intensity FKs target materials
+      bdi-ingest scrape-ev-database      # this command — feeds chemistry-aware Material pillar
+      bdi-ingest rescore-all
+    """
+    from app.services.ingestion.scrape_ev_database import run as scrape_run
+
+    brand_list = [b.strip() for b in brands.split(",")] if brands else None
+
+    s = _session()
+    try:
+        result = scrape_run(
+            s,
+            limit=limit,
+            brands=brand_list,
+            rate_limit_delay=rate_limit_delay,
+            dry_run=dry_run,
+            user_agent=user_agent,
+            max_retries=max_retries,
+            backoff_base=backoff_base,
+            backoff_cap=backoff_cap,
+            abort_after_consecutive_429=abort_after_consecutive_429,
+            skip_existing=skip_existing,
+        )
+        typer.echo(json.dumps({"ok": True, "dry_run": dry_run, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("seed-regulations")
 def seed_regulations_cmd() -> None:
     """Seed regulations, material/geography scopes, and company regulation exposures.
@@ -914,14 +1043,15 @@ def rescore_all_cmd(
 ) -> None:
     """Compute and persist company_scores rows for all (or selected) companies.
 
-    Runs the full five-pillar scoring engine for each company:
+    Runs the full six-pillar scoring engine for each company:
 
     \b
-      Material Concentration  30%
-      Geopolitical / Trade    20%
-      Regulatory / Compliance 20%
-      Operational             15%
-      Financial               15%
+      Material Concentration      25%
+      Geopolitical / Trade        20%
+      Regulatory / Compliance     20%
+      Operational                 10%
+      Financial                   10%
+      Supply-Chain Propagation    15%  (inherited risk from upstream suppliers; null → weight redistributed)
 
     company_scores is append-only — each run inserts a new row per company.
     Use --skip-existing to avoid duplicate rows when re-running on the same date.
@@ -933,8 +1063,10 @@ def rescore_all_cmd(
       bdi-ingest seed-materials
       bdi-ingest seed-material-exposures   # unblocks Material + Geopolitical pillars
       bdi-ingest seed-regulations          # unblocks Regulatory pillar
+      bdi-ingest seed-supply-relationships # unblocks Supply-Chain Propagation pillar
       bdi-ingest ingest-sec-edgar          # partial Financial pillar signal
-      bdi-ingest rescore-all               # this command
+      bdi-ingest rescore-all               # first pass: scores each company individually
+      bdi-ingest rescore-all               # second pass: propagation pillar uses upstream scores
 
     Examples:
     \b
@@ -1045,7 +1177,7 @@ def show_scores_cmd(
         "--pillar",
         help=(
             "Sort by a specific pillar instead of overall score. "
-            "One of: material, geo, regulatory, operational, financial"
+            "One of: material, geo, regulatory, operational, financial, propagation"
         ),
     ),
     limit: int = typer.Option(
@@ -1061,9 +1193,9 @@ def show_scores_cmd(
 ) -> None:
     """Display the most recent company risk scores as a ranked table.
 
-    Shows overall and per-pillar scores for each company, sorted by overall
-    risk descending (or by --pillar). Useful for quickly validating that
-    scoring is differentiated after seeding data.
+    Shows overall and per-pillar scores (Mat, Geo, Reg, Op, Fin, Prop) for each
+    company, sorted by overall risk descending (or by --pillar). Prop (supply-chain
+    propagation) shows — for companies with no scored upstream suppliers.
 
     Examples:
     \b
@@ -1083,6 +1215,7 @@ def show_scores_cmd(
         "regulatory":  CompanyScore.regulatory_risk_score,
         "operational": CompanyScore.operational_risk_score,
         "financial":   CompanyScore.financial_pressure_score,
+        "propagation": CompanyScore.supply_chain_propagation_score,
     }
 
     s = _session()
@@ -1149,12 +1282,13 @@ def show_scores_cmd(
                     "regulatory":   round(sc.regulatory_risk_score, 1),
                     "operational":  round(sc.operational_risk_score, 1),
                     "financial":    round(sc.financial_pressure_score, 1),
+                    "propagation":  round(sc.supply_chain_propagation_score, 1) if sc.supply_chain_propagation_score is not None else None,
                     "version":      sc.scoring_version,
                 })
             typer.echo(json.dumps({"as_of_date": target_date.isoformat(), "scores": out}, indent=2))
         else:
             # Formatted table
-            header = f"{'Company':<45} {'Overall':>7} {'Mat':>6} {'Geo':>6} {'Reg':>6} {'Op':>6} {'Fin':>6}"
+            header = f"{'Company':<45} {'Overall':>7} {'Mat':>6} {'Geo':>6} {'Reg':>6} {'Op':>6} {'Fin':>6} {'Prop':>6}"
             typer.echo(f"\nRisk scores — {target_date}  ({len(rows)} companies)")
             typer.echo("=" * len(header))
             typer.echo(header)
@@ -1166,6 +1300,8 @@ def show_scores_cmd(
                     else "MOD " if sc.overall_risk_score >= 35
                     else "LOW "
                 )
+                prop = sc.supply_chain_propagation_score
+                prop_str = f"{prop:>5.1f}" if prop is not None else "    —"
                 typer.echo(
                     f"{name:<45} "
                     f"{sc.overall_risk_score:>6.1f} "
@@ -1174,7 +1310,8 @@ def show_scores_cmd(
                     f"{sc.geopolitical_trade_risk_score:>5.1f}  "
                     f"{sc.regulatory_risk_score:>5.1f}  "
                     f"{sc.operational_risk_score:>5.1f}  "
-                    f"{sc.financial_pressure_score:>5.1f}"
+                    f"{sc.financial_pressure_score:>5.1f}  "
+                    f"{prop_str}"
                 )
             typer.echo("=" * len(header))
 

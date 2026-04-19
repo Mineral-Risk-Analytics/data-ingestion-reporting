@@ -20,6 +20,7 @@ from app.models.regulatory import (
     RegulationMaterialScope,
     RiskEvent,
     RiskEventCompany,
+    RiskEventFacility,
     RiskEventGeography,
     RiskEventMaterial,
     RiskEventRegulation,
@@ -41,6 +42,7 @@ from app.models.supply import (
     Material,
     TradeFlow,
 )
+from app.models.vehicle import CompanyVehicleModel, VehicleModelChemistry
 
 __all__ = [
     # Battery chemistry
@@ -73,6 +75,7 @@ __all__ = [
     "RegulationMaterialScope",
     "RiskEvent",
     "RiskEventCompany",
+    "RiskEventFacility",
     "RiskEventGeography",
     "RiskEventMaterial",
     "RiskEventRegulation",
@@ -97,4 +100,7 @@ __all__ = [
     "HsCodeMaterialMapping",
     "Material",
     "TradeFlow",
+    # Vehicle (chemistry mix)
+    "CompanyVehicleModel",
+    "VehicleModelChemistry",
 ]
