@@ -14,9 +14,13 @@ COPY pyproject.toml uv.lock ./
 # the dependency cache layer.
 COPY app/ app/
 
+# Tell uv to install into the system Python rather than creating a venv.
+# UV_SYSTEM_PYTHON is the correct way to do this for uv sync (--system is a
+# uv pip flag and does not exist on uv sync).
+ENV UV_SYSTEM_PYTHON=1
+
 # Install production dependencies only (skip dev group).
-# uv sync reads uv.lock and installs everything into the system Python.
-RUN uv sync --frozen --no-dev --system
+RUN uv sync --frozen --no-dev
 
 # Copy the rest of the source (alembic, config files, etc.) after deps are cached.
 COPY . .
