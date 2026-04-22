@@ -58,6 +58,7 @@ class Material(Base):
                 "to compute score_confidence.",
     )
     notes: Mapped[Optional[str]] = mapped_column(Text)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

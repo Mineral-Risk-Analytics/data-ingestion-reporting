@@ -12,7 +12,7 @@ import uuid
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -53,6 +53,7 @@ class Regulation(Base):
     effective_date: Mapped[Optional[date]] = mapped_column(Date)
     summary: Mapped[Optional[str]] = mapped_column(Text)
     metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -148,6 +149,7 @@ class CompanyRegulationExposure(Base):
     # compliant | non_compliant | partial | unknown
     exposure_reason: Mapped[Optional[str]] = mapped_column(Text)
     assessed_at: Mapped[Optional[date]] = mapped_column(Date)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -198,6 +200,7 @@ class RiskEvent(Base):
     content_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     # SHA-256 of (title + summary + event_date) — used for deduplication
     metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

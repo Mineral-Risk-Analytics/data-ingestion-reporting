@@ -54,6 +54,7 @@ class BatteryChemistry(Base):
         comment="Required when current_market_share_pct is set.",
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

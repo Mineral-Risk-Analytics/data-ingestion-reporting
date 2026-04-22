@@ -49,6 +49,7 @@ class CompanyListItem(BaseModel):
     latest_overall_score: Optional[float] = None
     latest_risk_band: Optional[str] = None
     latest_score_as_of_date: Optional[date] = None
+    verified: bool = False
 
 
 class CompanyDetail(BaseModel):
@@ -89,6 +90,7 @@ class ExposureRead(BaseModel):
     data_confidence: Optional[float] = None
     rationale: Optional[str] = None
     as_of_date: Optional[date] = None
+    verified: bool = False
 
 
 class RelationshipCounterparty(BaseModel):
@@ -107,6 +109,7 @@ class RelationshipRead(BaseModel):
     valid_from: Optional[date] = None
     valid_to: Optional[date] = None
     counterparty: RelationshipCounterparty
+    verified: bool = False
 
 
 class RelationshipsResponse(BaseModel):
@@ -124,6 +127,7 @@ class RegulationExposureRead(BaseModel):
     compliance_status: str
     exposure_reason: Optional[str] = None
     assessed_at: Optional[date] = None
+    verified: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +164,7 @@ class FacilityRead(BaseModel):
     capacity_notes: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    verified: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -186,4 +191,5 @@ class VehicleModelRead(BaseModel):
     production_volume_year: Optional[int] = None
     is_active: bool
     data_source: Optional[str] = None
+    verified: bool = False
     chemistries: list[VehicleModelChemistryRead] = Field(default_factory=list)

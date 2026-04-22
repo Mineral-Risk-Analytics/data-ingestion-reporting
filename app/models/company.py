@@ -49,6 +49,7 @@ class Company(Base):
     data_confidence: Mapped[Optional[float]] = mapped_column(Float)  # 0.0–1.0
     data_source: Mapped[Optional[str]] = mapped_column(String(128))  # sec_edgar | manual | etc.
     notes: Mapped[Optional[str]] = mapped_column(Text)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -126,6 +127,7 @@ class CompanyMaterialExposure(Base):
     source_document_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("source_documents.id", ondelete="SET NULL")
     )
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -177,6 +179,7 @@ class CompanySupplyRelationship(Base):
     )
     valid_from: Mapped[Optional[date]] = mapped_column(Date)
     valid_to: Mapped[Optional[date]] = mapped_column(Date)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

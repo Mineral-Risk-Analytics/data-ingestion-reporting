@@ -24,3 +24,15 @@ class PaginatedResponse(BaseModel, Generic[T]):
 class ErrorResponse(BaseModel):
     error: str
     detail: str | list | dict | None = None
+
+
+class VerifiedUpdate(BaseModel):
+    """Request body for PATCH …/verified endpoints."""
+
+    verified: bool
+
+
+class VerifiedResponse(BaseModel):
+    """Minimal response returned by all PATCH …/verified endpoints."""
+
+    verified: bool

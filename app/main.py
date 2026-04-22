@@ -2,6 +2,8 @@
 
 Phase 1 adds Clerk-authenticated routes for the admin dashboard. See
 ``app/api/deps.py`` for the auth flow and dev-mode bypass.
+Phase 2 adds reference-data browsers for materials, facilities, and chemistries,
+plus generalized per-entity analyst-note (flag-issue) endpoints.
 """
 
 from __future__ import annotations
@@ -14,10 +16,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.routes.chemistries import router as chemistries_router
 from app.api.routes.companies import router as companies_router
 from app.api.routes.dashboard import router as dashboard_router
+from app.api.routes.facilities import router as facilities_router
 from app.api.routes.health import router as health_router
 from app.api.routes.ingestion import router as ingestion_router
+from app.api.routes.materials import router as materials_router
 from app.api.routes.regulations import router as regulations_router
 from app.api.routes.risk_events import router as risk_events_router
 from app.api.routes.sources import router as sources_router
@@ -81,11 +86,17 @@ async def _unhandled_exception_handler(_request: Request, exc: Exception) -> JSO
     )
 
 
+# Phase 1
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(sources_router, prefix="/api/v1")
 app.include_router(ingestion_router, prefix="/api/v1")
-app.include_router(risk_events_router, prefix="/api/v1")
-app.include_router(regulations_router, prefix="/api/v1")
 app.include_router(companies_router, prefix="/api/v1")
 app.include_router(dashboard_router, prefix="/api/v1")
 app.include_router(trade_flows_router, prefix="/api/v1")
+
+# Phase 2 — reference data browsers + generalized flag-issue notes
+app.include_router(regulations_router, prefix="/api/v1")
+app.include_router(risk_events_router, prefix="/api/v1")
+app.include_router(materials_router, prefix="/api/v1")
+app.include_router(facilities_router, prefix="/api/v1")
+app.include_router(chemistries_router, prefix="/api/v1")

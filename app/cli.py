@@ -457,127 +457,68 @@ def seed_supply_relationships_cmd() -> None:
         result = seed_supply_relationships(s)
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
 
-
-@app.command("scrape-ev-database")
-def scrape_ev_database_cmd(
-    limit: Optional[int] = typer.Option(
+@app.command("ingest-vpic")
+def ingest_vpic_cmd(
+    companies: Optional[str] = typer.Option(
         None,
-        "--limit",
-        help="Cap the number of variants processed (after brand filtering). Useful for smoke tests.",
-    ),
-    brands: Optional[str] = typer.Option(
-        None,
-        "--brands",
+        "--companies",
         help=(
-            "Comma-separated brand prefixes to keep (case-insensitive). "
-            "Example: 'Tesla,BYD,Hyundai'. Default: all brands."
+            "Comma-separated canonical company names to process. "
+            "Defaults to all OEMs in OEM_MAKE_MAP. "
+            "Example: 'Tesla,Rivian Automotive,Lucid Group'."
         ),
+    ),
+    year_start: int = typer.Option(
+        2010,
+        "--year-start",
+        help="First model year to scan (inclusive).",
+    ),
+    year_end: Optional[int] = typer.Option(
+        None,
+        "--year-end",
+        help="Last model year to scan (inclusive). Defaults to the current year.",
     ),
     rate_limit_delay: float = typer.Option(
-        3.0,
+        0.5,
         "--rate-limit-delay",
-        help=(
-            "Seconds to sleep BEFORE every detail-page request (be polite — "
-            "ev-database aggressively rate-limits). 3s ~ 20 req/min; bump to "
-            "5-10s if you're still seeing 429s. Sleep applies after errors too."
-        ),
-    ),
-    skip_existing: bool = typer.Option(
-        True,
-        "--skip-existing/--no-skip-existing",
-        help=(
-            "Skip variants whose ev_database_id was already persisted by a "
-            "previous run. Default ON makes the scrape resumable across "
-            "sessions: rerun after a 429 abort and only missing variants are "
-            "fetched. Use --no-skip-existing to refresh every variant."
-        ),
+        help="Seconds to sleep between every vPIC API call. Increase if you see 429s.",
     ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
         help="Fetch and parse, but do NOT write any rows.",
     ),
-    user_agent: str = typer.Option(
-        "battery-data-intelligence-engine/0.1 (research; contact via repo)",
-        "--user-agent",
-        help="HTTP User-Agent header to send with every request.",
-    ),
-    max_retries: int = typer.Option(
-        4,
-        "--max-retries",
-        help="Per-URL retry attempts on HTTP 429 before giving up on that URL.",
-    ),
-    backoff_base: float = typer.Option(
-        30.0,
-        "--backoff-base",
-        help="Base seconds for exponential 429 backoff (used when no Retry-After header).",
-    ),
-    backoff_cap: float = typer.Option(
-        300.0,
-        "--backoff-cap",
-        help="Hard cap on a single 429 sleep, in seconds.",
-    ),
-    abort_after_consecutive_429: int = typer.Option(
-        3,
-        "--abort-after-consecutive-429",
-        help=(
-            "Abort the run after this many URLs in a row exhaust their 429 "
-            "retries. Set to 0 to disable the abort guard."
-        ),
-    ),
 ) -> None:
-    """Scrape ev-database.org and seed company_vehicle_models + vehicle_model_chemistries.
+    """Populate company_vehicle_models from the NHTSA vPIC API.
 
-    Discovers every variant from the cheatsheet page, fetches each detail page
-    to extract battery chemistry and model-year window, and idempotently
-    upserts rows. Variants whose brand has no matching Company are skipped
-    (no new Company rows are created here).
+    Fetches officially registered make/model names per model year and upserts
+    rows keyed on (company_id, model_name, model_year_start). Battery chemistry
+    data is NOT available in vPIC; vehicle_model_chemistries rows are not
+    written by this command.
 
-    Production volume is intentionally NULL — ev-database does not expose it.
-    Downstream scoring weights variants uniformly when volume is absent.
-
-    Rate-limit behavior: --rate-limit-delay is slept BEFORE every detail
-    fetch. On HTTP 429 the request is retried with exponential backoff
-    (honoring Retry-After when present). After --abort-after-consecutive-429
-    URLs in a row exhaust retries the run aborts cleanly so a long run does
-    not burn hours sleeping; if you see this, wait an hour or two before
-    retrying. Output JSON includes rate_limit_hits, rate_limit_aborted,
-    remaining_after_abort, and already_stored_skipped.
-
-    Resumable workflow: --skip-existing (default ON) prunes variants whose
-    ev_database_id was already persisted, so a typical scrape looks like:
-
-    \b
-      bdi-ingest scrape-ev-database          # gets some, hits 429, aborts
-      # ... wait an hour or two ...
-      bdi-ingest scrape-ev-database          # picks up where it left off
-      # ... repeat until remaining_after_abort is 0 ...
+    OEM companies are mapped to their registered vPIC make names
+    (e.g. "Volkswagen Group" covers VOLKSWAGEN, AUDI, and PORSCHE). Geely
+    Auto Group and Zeekr are not registered in vPIC and are skipped.
 
     \b
     Run order:
-      bdi-ingest seed-companies          # brands must exist first
-      bdi-ingest seed-materials          # chemistry-intensity FKs target materials
-      bdi-ingest scrape-ev-database      # this command — feeds chemistry-aware Material pillar
-      bdi-ingest rescore-all
+      bdi-ingest seed-companies    # companies must exist first
+      bdi-ingest ingest-vpic       # this command
+      bdi-ingest rescore-all       # picks up new vehicle model data
     """
-    from app.services.ingestion.scrape_ev_database import run as scrape_run
+    from app.services.ingestion.ingest_vpic import run as vpic_run
 
-    brand_list = [b.strip() for b in brands.split(",")] if brands else None
+    company_list = [c.strip() for c in companies.split(",")] if companies else None
 
     s = _session()
     try:
-        result = scrape_run(
+        result = vpic_run(
             s,
-            limit=limit,
-            brands=brand_list,
-            rate_limit_delay=rate_limit_delay,
+            companies=company_list,
+            year_start=year_start,
+            year_end=year_end,
             dry_run=dry_run,
-            user_agent=user_agent,
-            max_retries=max_retries,
-            backoff_base=backoff_base,
-            backoff_cap=backoff_cap,
-            abort_after_consecutive_429=abort_after_consecutive_429,
-            skip_existing=skip_existing,
+            rate_limit_delay=rate_limit_delay,
         )
         typer.echo(json.dumps({"ok": True, "dry_run": dry_run, **result}, indent=2))
     except Exception as exc:
