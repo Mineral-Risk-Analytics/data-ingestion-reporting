@@ -136,6 +136,9 @@ class RegulationExposureRead(BaseModel):
 
 
 class CompanyEventRead(BaseModel):
+    """Flattened view of RiskEvent + RiskEventCompany junction row."""
+
+    # risk_events fields
     id: int
     event_type: str
     event_date: Optional[datetime] = None
@@ -143,8 +146,25 @@ class CompanyEventRead(BaseModel):
     summary: Optional[str] = None
     severity_score: Optional[float] = None
     confidence_score: Optional[float] = None
+    # risk_event_companies junction fields
+    event_link_id: str  # UUID of the risk_event_companies row — needed for PATCH /review
     relevance_score: Optional[float] = None
     match_reason: Optional[str] = None
+    review_status: str = "pending"   # pending | confirmed | excluded
+    review_note: Optional[str] = None
+
+
+class EventReviewUpdate(BaseModel):
+    """Body for PATCH /companies/{id}/events/{link_id}/review."""
+
+    review_status: str  # pending | confirmed | excluded
+    review_note: Optional[str] = None
+
+
+class EventReviewResponse(BaseModel):
+    event_link_id: str
+    review_status: str
+    review_note: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +172,13 @@ class CompanyEventRead(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class FacilityRead(BaseModel):
+class FacilityGlobalRead(BaseModel):
+    """Facility shape for the global /facilities list endpoint.
+
+    Does not include company-scoped junction fields (ownership, verified link).
+    Used by the reference-data facilities browser where there is no single-company context.
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -164,7 +190,37 @@ class FacilityRead(BaseModel):
     capacity_notes: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    verified: bool = False
+    data_source: Optional[str] = None
+    verified: bool = False  # global facility verified flag
+
+
+class FacilityRead(BaseModel):
+    """Flattened view of Facility + CompanyFacility junction row.
+
+    ``company_facility_id`` is the UUID of the junction row — used by the
+    PATCH /companies/{id}/facilities/{company_facility_id}/verified endpoint.
+    ``verified`` reflects the junction-row flag (is this company's link confirmed?)
+    rather than the global facility flag (does the facility exist?).
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    # Facility fields
+    id: uuid.UUID
+    facility_type: str
+    country: str
+    region: Optional[str] = None
+    city: Optional[str] = None
+    status: str
+    capacity_notes: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    data_source: Optional[str] = None
+    # Junction fields
+    company_facility_id: uuid.UUID
+    ownership_type: str
+    ownership_pct: Optional[float] = None
+    verified: bool = False  # from company_facilities.verified
 
 
 # ---------------------------------------------------------------------------

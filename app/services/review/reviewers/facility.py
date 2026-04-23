@@ -39,7 +39,7 @@ from sqlalchemy.orm import Session
 from app.models.company import Company
 from app.models.documents import SourceDocument
 from app.models.enums import FacilityStatus, SourceType
-from app.models.facility import Facility
+from app.models.facility import CompanyFacility, Facility
 from app.models.source import Source
 from app.services.review.scoring import as_utc_datetime, score_to_relevance
 from app.services.review.types import Finding
@@ -110,7 +110,8 @@ def review(
     """Run the facility reviewer and return a list of findings."""
     stmt = (
         select(Facility, Company)
-        .join(Company, Facility.company_id == Company.id)
+        .join(CompanyFacility, CompanyFacility.facility_id == Facility.id)
+        .join(Company, Company.id == CompanyFacility.company_id)
         .where(Facility.status.in_(_REVIEWABLE_STATUSES))
         .where(Facility.city.isnot(None))
     )

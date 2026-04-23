@@ -20,7 +20,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from app.models.company import Company
-from app.models.facility import Facility
+from app.models.facility import CompanyFacility, Facility
 
 log = structlog.get_logger(__name__)
 
@@ -236,9 +236,15 @@ _ALLOWED_STATUSES = {
 def seed_facilities(session: Session) -> dict[str, int]:
     """Upsert all curated facilities. Idempotent.
 
-    Deduplicates on (company_id, facility_type, country, city). City comparison
-    is NULL-safe: two entries with city=None at the same company/type/country are
-    treated as duplicates.
+    Two-phase dedup:
+      1. Find or create a ``Facility`` row by (facility_type, country, city).
+         City comparison is NULL-safe.
+      2. Find or create a ``CompanyFacility`` junction row by (company_id,
+         facility_id). If the link already exists, skip it; if the facility
+         record changed, update its mutable fields.
+
+    This supports the many-to-many design: a JV facility is one ``Facility``
+    row linked to multiple companies via separate ``CompanyFacility`` rows.
 
     Returns {"inserted": int, "updated": int, "skipped": int, "companies_not_found": int}
     """
@@ -253,7 +259,7 @@ def seed_facilities(session: Session) -> dict[str, int]:
     for entry in _FACILITIES:
         canonical_name: str = entry["company_canonical_name"]
 
-        # Resolve company_id — cached after first lookup.
+        # Resolve company — cached after first lookup.
         if canonical_name not in company_cache:
             company_cache[canonical_name] = session.scalar(
                 select(Company).where(Company.canonical_name == canonical_name)
@@ -271,16 +277,17 @@ def seed_facilities(session: Session) -> dict[str, int]:
         facility_type: str = entry["facility_type"]
         country: str = entry["country"]
         city = entry.get("city")
+        ownership_type: str = entry.get("ownership_type", "operator")
 
-        # NULL-safe city comparison: treat two NULL cities as equal.
+        # ── Phase 1: find or create the Facility record ───────────────────────
+        # NULL-safe city comparison: treat two NULL cities as the same facility.
         city_cond = (
             Facility.city.is_(None) if city is None else Facility.city == city
         )
 
-        existing = session.scalar(
+        existing_facility = session.scalar(
             select(Facility).where(
                 and_(
-                    Facility.company_id == company.id,
                     Facility.facility_type == facility_type,
                     Facility.country == country,
                     city_cond,
@@ -288,60 +295,82 @@ def seed_facilities(session: Session) -> dict[str, int]:
             )
         )
 
-        if existing is not None:
-            changed_fields: list[str] = []
-            seed_values = {
-                "status": entry.get("status", "operating"),
-                "capacity_notes": entry.get("capacity_notes"),
-                "latitude": entry.get("latitude"),
-                "longitude": entry.get("longitude"),
-                "data_source": entry.get("data_source", "manual"),
-            }
-            for field, seed_value in seed_values.items():
-                if getattr(existing, field) != seed_value:
-                    setattr(existing, field, seed_value)
-                    changed_fields.append(field)
+        seed_values = {
+            "status": entry.get("status", "operating"),
+            "capacity_notes": entry.get("capacity_notes"),
+            "latitude": entry.get("latitude"),
+            "longitude": entry.get("longitude"),
+            "data_source": entry.get("data_source", "manual"),
+        }
 
-            if changed_fields:
+        if existing_facility is None:
+            existing_facility = Facility(
+                facility_type=facility_type,
+                country=country,
+                region=entry.get("region"),
+                city=city,
+                **seed_values,
+            )
+            session.add(existing_facility)
+            session.flush()  # assign id before creating junction row
+            log.info(
+                "seed_facilities.facility_inserted",
+                facility_type=facility_type,
+                country=country,
+                city=city,
+            )
+        else:
+            # Update mutable fields if the seed data changed.
+            changed = [
+                f for f, v in seed_values.items()
+                if getattr(existing_facility, f) != v
+            ]
+            for f in changed:
+                setattr(existing_facility, f, seed_values[f])
+            if changed:
                 log.info(
-                    "seed_facilities.updated",
-                    canonical_name=canonical_name,
+                    "seed_facilities.facility_updated",
                     facility_type=facility_type,
                     country=country,
                     city=city,
-                    changed_fields=changed_fields,
+                    changed_fields=changed,
                 )
-                updated += 1
-            else:
-                log.debug(
-                    "seed_facilities.skip_existing",
-                    canonical_name=canonical_name,
-                    facility_type=facility_type,
-                    country=country,
-                    city=city,
+
+        # ── Phase 2: find or create the CompanyFacility junction row ──────────
+        existing_link = session.scalar(
+            select(CompanyFacility).where(
+                and_(
+                    CompanyFacility.company_id == company.id,
+                    CompanyFacility.facility_id == existing_facility.id,
                 )
-                skipped += 1
+            )
+        )
+
+        if existing_link is not None:
+            log.debug(
+                "seed_facilities.link_exists",
+                canonical_name=canonical_name,
+                facility_type=facility_type,
+                country=country,
+                city=city,
+            )
+            skipped += 1
             continue
 
-        facility = Facility(
+        link = CompanyFacility(
             company_id=company.id,
-            facility_type=facility_type,
-            country=country,
-            region=entry.get("region"),
-            city=city,
-            status=entry.get("status", "operating"),
-            capacity_notes=entry.get("capacity_notes"),
-            latitude=entry.get("latitude"),
-            longitude=entry.get("longitude"),
-            data_source=entry.get("data_source", "manual"),
+            facility_id=existing_facility.id,
+            ownership_type=ownership_type,
+            ownership_pct=entry.get("ownership_pct"),
         )
-        session.add(facility)
+        session.add(link)
         log.info(
-            "seed_facilities.inserted",
+            "seed_facilities.link_inserted",
             canonical_name=canonical_name,
             facility_type=facility_type,
             country=country,
             city=city,
+            ownership_type=ownership_type,
         )
         inserted += 1
 

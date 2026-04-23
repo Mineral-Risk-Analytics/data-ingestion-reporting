@@ -14,7 +14,7 @@ from app.db.base import Base
 
 if TYPE_CHECKING:
     from app.models.documents import SourceDocument
-    from app.models.facility import Facility
+    from app.models.facility import CompanyFacility
     from app.models.supply import Material
 
 
@@ -66,7 +66,7 @@ class Company(Base):
     scores: Mapped[list["CompanyScore"]] = relationship(
         back_populates="company", cascade="all, delete-orphan"
     )
-    facilities: Mapped[list["Facility"]] = relationship(
+    facility_links: Mapped[list["CompanyFacility"]] = relationship(
         back_populates="company", cascade="all, delete-orphan"
     )
     subsidiaries: Mapped[list["Company"]] = relationship(

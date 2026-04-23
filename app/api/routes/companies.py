@@ -22,7 +22,7 @@ from app.models.company import (
     CompanyScore,
     CompanySupplyRelationship,
 )
-from app.models.facility import Facility
+from app.models.facility import CompanyFacility, Facility
 from app.models.regulatory import (
     CompanyRegulationExposure,
     Regulation,
@@ -39,6 +39,8 @@ from app.schemas.company import (
     CompanyEventRead,
     CompanyListItem,
     CompanySummary,
+    EventReviewResponse,
+    EventReviewUpdate,
     ExposureRead,
     FacilityRead,
     RegulationExposureRead,
@@ -477,11 +479,56 @@ def get_company_events(
             summary=ev.summary,
             severity_score=ev.severity_score,
             confidence_score=ev.confidence_score,
+            event_link_id=str(link.id),
             relevance_score=link.relevance_score,
             match_reason=link.match_reason,
+            review_status=link.review_status,
+            review_note=link.review_note,
         )
         for ev, link in rows
     ]
+
+
+_VALID_REVIEW_STATUSES = frozenset({"pending", "confirmed", "excluded"})
+
+
+@router.patch(
+    "/{company_id}/events/{event_link_id}/review",
+    response_model=EventReviewResponse,
+)
+def set_event_review_status(
+    company_id: uuid.UUID,
+    event_link_id: uuid.UUID,
+    body: EventReviewUpdate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> EventReviewResponse:
+    """Set the triage review status on a company-event junction row.
+
+    Only the junction row that belongs to this company can be updated here —
+    the company_id is re-validated on the link row to prevent cross-company writes.
+    """
+    if body.review_status not in _VALID_REVIEW_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"review_status must be one of: {sorted(_VALID_REVIEW_STATUSES)}",
+        )
+    link = db.scalar(
+        select(RiskEventCompany).where(
+            RiskEventCompany.id == event_link_id,
+            RiskEventCompany.company_id == company_id,
+        )
+    )
+    if link is None:
+        raise HTTPException(status_code=404, detail="Event link not found")
+    link.review_status = body.review_status
+    link.review_note = body.review_note
+    db.commit()
+    return EventReviewResponse(
+        event_link_id=str(link.id),
+        review_status=link.review_status,
+        review_note=link.review_note,
+    )
 
 
 @router.get("/{company_id}/facilities", response_model=list[FacilityRead])
@@ -491,16 +538,32 @@ def get_company_facilities(
     db: Session = Depends(get_db),
 ) -> list[FacilityRead]:
     _get_company_or_404(db, company_id)
-    rows = (
-        db.execute(
-            select(Facility)
-            .where(Facility.company_id == company_id)
-            .order_by(Facility.country, Facility.city.asc().nullslast())
+    rows = db.execute(
+        select(CompanyFacility, Facility)
+        .join(Facility, Facility.id == CompanyFacility.facility_id)
+        .where(CompanyFacility.company_id == company_id)
+        .order_by(Facility.country, Facility.city.asc().nullslast())
+    ).all()
+
+    return [
+        FacilityRead(
+            id=f.id,
+            facility_type=f.facility_type,
+            country=f.country,
+            region=f.region,
+            city=f.city,
+            status=f.status,
+            capacity_notes=f.capacity_notes,
+            latitude=f.latitude,
+            longitude=f.longitude,
+            data_source=f.data_source,
+            company_facility_id=link.id,
+            ownership_type=link.ownership_type,
+            ownership_pct=link.ownership_pct,
+            verified=link.verified,
         )
-        .scalars()
-        .all()
-    )
-    return [FacilityRead.model_validate(f) for f in rows]
+        for link, f in rows
+    ]
 
 
 @router.get("/{company_id}/vehicle-models", response_model=list[VehicleModelRead])
@@ -831,6 +894,37 @@ def set_vehicle_model_verified(
 ) -> VerifiedResponse:
     row = _get_company_vehicle_model_or_404(db, company_id, model_id)
     return _set_verified(db, row, body.verified)
+
+
+@router.patch(
+    "/{company_id}/facilities/{company_facility_id}/verified",
+    response_model=VerifiedResponse,
+)
+def set_company_facility_verified(
+    company_id: uuid.UUID,
+    company_facility_id: uuid.UUID,
+    body: VerifiedUpdate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> VerifiedResponse:
+    """Toggle the verified flag on a company–facility junction row.
+
+    ``company_facility_id`` is the UUID of the ``company_facilities`` row, not
+    the facility itself. Only the junction row that belongs to this company can
+    be updated here.
+    """
+    _get_company_or_404(db, company_id)
+    link = db.scalar(
+        select(CompanyFacility).where(
+            CompanyFacility.id == company_facility_id,
+            CompanyFacility.company_id == company_id,
+        )
+    )
+    if link is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Company-facility link not found"
+        )
+    return _set_verified(db, link, body.verified)
 
 
 @router.post("/{company_id}/rescore", status_code=202)

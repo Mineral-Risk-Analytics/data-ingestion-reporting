@@ -57,7 +57,7 @@ from app.models.company import (
     CompanyScore,
     CompanySupplyRelationship,
 )
-from app.models.facility import Facility
+from app.models.facility import CompanyFacility, Facility
 from app.models.regulatory import (
     CompanyRegulationExposure,
     Regulation,
@@ -158,6 +158,7 @@ def get_events_for_company(
         .join(RiskEventCompany, RiskEventCompany.risk_event_id == RiskEvent.id)
         .where(
             RiskEventCompany.company_id == company_id,
+            RiskEventCompany.review_status != "excluded",
             RiskEvent.risk_categories_json.contains([category.value]),
         )
         .order_by(RiskEvent.event_date.desc())
@@ -320,6 +321,7 @@ def get_filing_signals(
         .join(RiskEventCompany, RiskEventCompany.risk_event_id == RiskEvent.id)
         .where(
             RiskEventCompany.company_id == company_id,
+            RiskEventCompany.review_status != "excluded",
             RiskEvent.risk_categories_json.contains(
                 [RiskCategory.FINANCIAL_PRESSURE.value]
             ),
@@ -393,13 +395,21 @@ def get_facilities_for_company(
     *,
     scope: ScoringScope = ScoringScope.ALL,
 ) -> list[Facility]:
-    """All ``Facility`` rows owned by this company.
+    """All ``Facility`` rows linked to this company via ``company_facilities``.
 
     Used by both the geopolitical aggregator (facility countries widen
     ``country_concentration``) and the operational aggregator (planned /
     under_construction facilities lift ``structural_dependency``).
+
+    Joins through the junction table so that JV/co-owned facilities are
+    returned for every company that holds a link row, without duplicating
+    the underlying facility record.
     """
-    stmt = select(Facility).where(Facility.company_id == company_id)
+    stmt = (
+        select(Facility)
+        .join(CompanyFacility, CompanyFacility.facility_id == Facility.id)
+        .where(CompanyFacility.company_id == company_id)
+    )
     if scope.facility_ids is not None:
         stmt = stmt.where(Facility.id.in_(scope.facility_ids))
     if scope.country_codes is not None:

@@ -14,10 +14,10 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
-from app.models.facility import Facility
+from app.models.facility import CompanyFacility, Facility
 from app.models.reporting import AnalystNote
 from app.schemas.common import PaginatedResponse, VerifiedResponse, VerifiedUpdate
-from app.schemas.company import FacilityRead
+from app.schemas.company import FacilityGlobalRead
 from app.schemas.note import AnalystNoteCreate, AnalystNoteRead
 
 router = APIRouter(prefix="/facilities", tags=["facilities"])
@@ -34,7 +34,7 @@ def _get_facility_or_404(db: Session, facility_id: uuid.UUID) -> Facility:
 # GET /facilities
 # ---------------------------------------------------------------------------
 
-@router.get("", response_model=PaginatedResponse[FacilityRead])
+@router.get("", response_model=PaginatedResponse[FacilityGlobalRead])
 def list_facilities(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=200),
@@ -45,7 +45,7 @@ def list_facilities(
     facility_status: Optional[str] = Query(None, alias="status"),
     _user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> PaginatedResponse[FacilityRead]:
+) -> PaginatedResponse[FacilityGlobalRead]:
     q = select(Facility)
 
     if search:
@@ -57,7 +57,10 @@ def list_facilities(
             )
         )
     if company_id:
-        q = q.where(Facility.company_id == company_id)
+        # Filter via junction table — Facility no longer carries company_id directly.
+        q = q.join(
+            CompanyFacility, CompanyFacility.facility_id == Facility.id
+        ).where(CompanyFacility.company_id == company_id)
     if country:
         q = q.where(Facility.country == country.upper())
     if facility_type:
@@ -73,7 +76,7 @@ def list_facilities(
     ).all()
 
     return PaginatedResponse(
-        data=[FacilityRead.model_validate(f) for f in rows],
+        data=[FacilityGlobalRead.model_validate(f) for f in rows],
         total=total or 0,
         page=page,
         limit=limit,

@@ -257,6 +257,13 @@ class RiskEventCompany(Base):
     relevance_score: Mapped[float] = mapped_column(Float, nullable=False)
     match_reason: Mapped[Optional[str]] = mapped_column(String(64))
     # named_company | geography | material_hs | category_broad
+    review_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="pending", index=True
+    )
+    # pending | confirmed | excluded
+    # pending/confirmed both count toward score; excluded is filtered out by
+    # evidence_query.get_events_for_company() and get_filing_signals().
+    review_note: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
