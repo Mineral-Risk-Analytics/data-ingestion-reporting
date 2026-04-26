@@ -70,14 +70,24 @@ def test_unique_constraint_registered():
 
 def _patch_sqlite_jsonb():
     """
-    Make SQLite's DDL compiler render JSONB columns as JSON.
+    Make SQLite's DDL compiler render PG-only column types as JSON.
     Called before create_all so the patch is in place for schema creation.
-    No JSONB query operators (e.g. @>) are used in these tests.
+
+    Patches:
+      - JSONB → JSON (used by several intel/regulatory models)
+      - ARRAY → JSON (used by ``insight_posts.materials/geographies``;
+        InsightPost was added in foundation Phase 1 and is unrelated to
+        these tests, but it's now in ``Base.metadata`` so create_all sees it)
+
+    No JSONB query operators (e.g. @>) or ARRAY indexing are used in these
+    tests, so the runtime behaviour is unaffected by the DDL substitution.
     """
     from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
 
     if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
         SQLiteTypeCompiler.visit_JSONB = SQLiteTypeCompiler.visit_JSON
+    if not hasattr(SQLiteTypeCompiler, "visit_ARRAY"):
+        SQLiteTypeCompiler.visit_ARRAY = SQLiteTypeCompiler.visit_JSON
 
 
 @pytest.fixture()
@@ -95,6 +105,21 @@ def db():
     yield session
     session.close()
     engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _enable_event_company_linking(monkeypatch):
+    """
+    Foundation phase 3 disables RiskEventCompany inserts in the live ingestion
+    pipeline (see ``app/services/ingestion/feature_flags.py``). The upsert-
+    semantics tests in this file still need the writer to run end-to-end so
+    the dedupe / upgrade behaviour is regression-tested for when Phase 5
+    re-enables the flag. Flip it on for the duration of each test.
+    """
+    monkeypatch.setattr(
+        "app.services.ingestion.feature_flags.LINK_EVENTS_TO_COMPANIES",
+        True,
+    )
 
 
 # ---------------------------------------------------------------------------

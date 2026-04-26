@@ -21,9 +21,10 @@ from __future__ import annotations
 # Calibrated so a fully non_compliant UFLPA entity reaches 25/100 from obligations
 # alone before any event signal.  Hard-capped at 40 to reserve headroom for events.
 COMPLIANCE_OBLIGATIONS: dict[str, int] = {
-    "UFLPA":          25,   # confirmed Xinjiang / forced-labour supply exposure
-    "EU_BATTERY_REG": 20,   # sells into EU but lacks required compliance documentation
-    "IRA_DOMESTIC":   15,   # materials do not qualify for IRA domestic content credits
+    "UFLPA":               25,   # confirmed Xinjiang / forced-labour supply exposure
+    "EU_BATTERY_REG_2023": 20,   # sells into EU but lacks required compliance documentation
+    "CRMA_2024":           15,   # strategic raw material supply benchmarks (≥10% extraction, ≥40% processing, ≥15% recycling by 2030)
+    "IRA_DOMESTIC":        15,   # materials do not qualify for IRA domestic content credits
 }
 
 

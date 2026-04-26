@@ -40,9 +40,13 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.constants import RiskCategory
 from app.models.battery_chemistry import BatteryChemistry, BatteryChemistryMaterial, ChemistryRiskScore
 from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.supply import HsCodeMaterialMapping, Material, TradeFlow
+from app.services.scoring.decay import compute_recency_multiplier
+from app.services.scoring.event_impact import compute_event_impact
+from app.services.scoring.evidence_query import EventWithRelevance, get_events_for_material
 from app.services.scoring.material_risk import score_material_exposure
 
 log = structlog.get_logger(__name__)
@@ -78,6 +82,50 @@ _DEFAULT_GEO_CONCENTRATION = 0.5
 
 # High-concentration geographies used as the denominator for geo_concentration.
 _HIGH_CONC_GEOS = {"CN", "CD", "RU"}
+
+# Maximum possible event_impact value used to normalise averaged impacts to [0,1].
+# Mirrors ``market_aggregator._MAX_EVENT_IMPACT`` — kept in sync deliberately.
+_MAX_EVENT_IMPACT = 1.56
+
+# Trade-volatility default applied when a material has no GEOPOLITICAL_TRADE
+# events in the evidence window. Matches the market layer convention so the
+# absence of events reads as "neutral", not zero risk.
+_DEFAULT_TRADE_VOLATILITY = 0.3
+
+
+# ---------------------------------------------------------------------------
+# Event impact helpers (chemistry-local copy of the market-layer helpers)
+#
+# Kept module-local rather than imported from market_aggregator to avoid the
+# circular import chain market_aggregator → chemistry contexts → chemistry_risk.
+# If a third caller appears, lift these into ``_scoring_utils.py``.
+# ---------------------------------------------------------------------------
+
+def _event_impact(
+    ew: EventWithRelevance,
+    category: RiskCategory,
+    as_of_date: datetime.date,
+) -> float:
+    ev_date = ew.event.event_date.date() if ew.event.event_date else as_of_date
+    recency = compute_recency_multiplier(category, ev_date, as_of_date)
+    return compute_event_impact(
+        severity=float(ew.event.severity_score or 0.5),
+        confidence=float(ew.event.confidence_score or 0.5),
+        recency_multiplier=recency,
+        relevance_multiplier=ew.relevance_score,
+    )
+
+
+def _avg_impact_normalised(
+    events: list[EventWithRelevance],
+    category: RiskCategory,
+    as_of_date: datetime.date,
+) -> float:
+    """Average per-event impact, normalised to [0, 1.0]."""
+    if not events:
+        return 0.0
+    impacts = [_event_impact(ew, category, as_of_date) for ew in events]
+    return min(1.0, sum(impacts) / len(impacts) / _MAX_EVENT_IMPACT)
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +292,10 @@ def score_chemistry(
     patent_modifiers_applied: dict[str, float] = {}
     no_benchmark_materials: list[str] = []
     trade_flows_vintage: Optional[str] = None
+    # Per-material trade_volatility values derived from GEOPOLITICAL_TRADE
+    # events. Falls back to _DEFAULT_TRADE_VOLATILITY when no events exist.
+    trade_volatility_by_material: dict[str, float] = {}
+    trade_event_counts: dict[str, int] = {}
 
     for junc in active_rows:
         material = materials_by_id.get(junc.material_id)
@@ -289,19 +341,36 @@ def score_chemistry(
         # We don't have it readily available here — would need an extra query.
         # Left as "unknown" if trade_flows is empty.
 
-        # 4. Per-material risk score via existing material_risk scorer
+        # 4. Per-material trade volatility from GEOPOLITICAL_TRADE events.
+        # Pulls events tagged to this material via risk_event_materials and
+        # converts the average normalised impact into a [0,1] volatility input.
+        # Falls back to _DEFAULT_TRADE_VOLATILITY when no events exist so the
+        # absence of news reads as "neutral", not zero risk.
+        mat_trade_events = get_events_for_material(
+            session, material.id, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
+        )
+        if mat_trade_events:
+            trade_volatility = _avg_impact_normalised(
+                mat_trade_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
+            )
+        else:
+            trade_volatility = _DEFAULT_TRADE_VOLATILITY
+        trade_volatility_by_material[name] = round(trade_volatility, 4)
+        trade_event_counts[name] = len(mat_trade_events)
+
+        # 5. Per-material risk score via existing material_risk scorer
         mat_score = score_material_exposure(
             criticality=criticality,
             concentration=geo_conc,
-            trade_volatility=0.3,  # neutral default; no chemistry-level trade volatility yet
+            trade_volatility=trade_volatility,
         )
 
-        # 5. Weighted accumulation
+        # 6. Weighted accumulation
         weighted_material_sum += intensity * criticality * 100.0
         weighted_geo_sum += intensity * geo_conc * 100.0
         total_intensity += intensity
 
-        # 6. Data availability confidence penalty
+        # 7. Data availability confidence penalty
         avail = material.data_availability or "commercial"
         conf_factor = DATA_AVAILABILITY_CONFIDENCE.get(avail, 1.00)
         confidence_product *= conf_factor
@@ -337,6 +406,8 @@ def score_chemistry(
         "trade_flows_vintage": trade_flows_vintage or "none",
         "no_benchmark_materials": no_benchmark_materials,
         "score_confidence": score_confidence,
+        "trade_volatility_by_material": trade_volatility_by_material,
+        "trade_event_counts": trade_event_counts,
     }
 
     log.info(

@@ -1,7 +1,15 @@
-"""Battery chemistries routes — Phase 2 reference-data browser."""
+"""Battery chemistries routes — Phase 2 reference-data browser.
+
+Foundation Phase 1 additions:
+  * GET    /chemistries/{id}                — composition + latest risk score
+  * GET    /chemistries/{id}/risk/history   — risk score history (default 12 runs)
+  * POST   /chemistries/rescore             — rescore every active chemistry
+  * POST   /chemistries/{id}/rescore        — rescore a single chemistry
+"""
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -9,11 +17,25 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_user, get_db
-from app.models.battery_chemistry import BatteryChemistry, ChemistryRiskScore
+from app.models.battery_chemistry import (
+    BatteryChemistry,
+    BatteryChemistryMaterial,
+    ChemistryRiskScore,
+)
 from app.models.reporting import AnalystNote
-from app.schemas.chemistries import BatteryChemistryRead, ChemistryRiskScoreRead
+from app.models.supply import Material
+from app.schemas.chemistries import (
+    BatteryChemistryRead,
+    ChemistryDetailRead,
+    ChemistryMaterialRead,
+    ChemistryRiskScoreRead,
+)
 from app.schemas.common import PaginatedResponse, VerifiedResponse, VerifiedUpdate
 from app.schemas.note import AnalystNoteCreate, AnalystNoteRead
+from app.services.scoring.chemistry_risk import (
+    rescore_all_chemistries,
+    rescore_one_chemistry,
+)
 
 router = APIRouter(prefix="/chemistries", tags=["chemistries"])
 
@@ -74,6 +96,128 @@ def list_chemistries(
         items.append(item)
 
     return PaginatedResponse(data=items, total=total or 0, page=page, limit=limit)
+
+
+# ---------------------------------------------------------------------------
+# POST /chemistries/rescore  (must be defined BEFORE /{chemistry_id} routes
+# so FastAPI doesn't try to coerce "rescore" to int.)
+# ---------------------------------------------------------------------------
+
+@router.post("/rescore", response_model=list[dict])
+def rescore_all(
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Rescore every active chemistry against today's date.
+
+    Returns one ``{slug, composite_risk_score, score_confidence}`` dict per
+    successfully scored chemistry. Failures are logged inside
+    ``rescore_all_chemistries`` and skipped — partial results still commit.
+    """
+    return rescore_all_chemistries(db, date.today())
+
+
+# ---------------------------------------------------------------------------
+# GET /chemistries/{id}
+# ---------------------------------------------------------------------------
+
+@router.get("/{chemistry_id}", response_model=ChemistryDetailRead)
+def get_chemistry(
+    chemistry_id: int,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ChemistryDetailRead:
+    chem = _get_chemistry_or_404(db, chemistry_id)
+
+    today = date.today()
+    junction_rows = db.scalars(
+        select(BatteryChemistryMaterial)
+        .where(
+            BatteryChemistryMaterial.battery_chemistry_id == chemistry_id,
+            BatteryChemistryMaterial.valid_from <= today,
+            (
+                (BatteryChemistryMaterial.valid_to.is_(None))
+                | (BatteryChemistryMaterial.valid_to >= today)
+            ),
+        )
+        .order_by(BatteryChemistryMaterial.material_id)
+    ).all()
+
+    material_ids = [r.material_id for r in junction_rows]
+    name_by_id: dict[int, str] = {}
+    if material_ids:
+        name_by_id = {
+            mid: name
+            for mid, name in db.execute(
+                select(Material.id, Material.canonical_name).where(
+                    Material.id.in_(material_ids)
+                )
+            ).all()
+        }
+
+    active_materials: list[ChemistryMaterialRead] = []
+    for row in junction_rows:
+        active_materials.append(
+            ChemistryMaterialRead(
+                id=row.id,
+                material_id=row.material_id,
+                material_canonical_name=name_by_id.get(row.material_id, "(unknown)"),
+                role=row.role,
+                intensity=row.intensity,
+                is_substitutable=row.is_substitutable,
+                valid_from=row.valid_from,
+                valid_to=row.valid_to,
+                notes=row.notes,
+            )
+        )
+
+    detail = ChemistryDetailRead.model_validate(chem)
+    detail.latest_risk_score = _latest_risk_score(db, chem.id)
+    detail.active_materials = active_materials
+    return detail
+
+
+# ---------------------------------------------------------------------------
+# GET /chemistries/{id}/risk/history
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/{chemistry_id}/risk/history",
+    response_model=list[ChemistryRiskScoreRead],
+)
+def get_chemistry_risk_history(
+    chemistry_id: int,
+    limit: int = Query(12, ge=1, le=200),
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[ChemistryRiskScoreRead]:
+    _get_chemistry_or_404(db, chemistry_id)
+    rows = db.scalars(
+        select(ChemistryRiskScore)
+        .where(ChemistryRiskScore.battery_chemistry_id == chemistry_id)
+        .order_by(ChemistryRiskScore.as_of_date.desc(), ChemistryRiskScore.id.desc())
+        .limit(limit)
+    ).all()
+    return [ChemistryRiskScoreRead.model_validate(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# POST /chemistries/{id}/rescore
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/{chemistry_id}/rescore",
+    response_model=ChemistryRiskScoreRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def rescore_chemistry(
+    chemistry_id: int,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ChemistryRiskScoreRead:
+    _get_chemistry_or_404(db, chemistry_id)
+    score = rescore_one_chemistry(db, chemistry_id, date.today())
+    return ChemistryRiskScoreRead.model_validate(score)
 
 
 # ---------------------------------------------------------------------------

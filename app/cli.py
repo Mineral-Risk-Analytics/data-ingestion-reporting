@@ -310,6 +310,157 @@ def rescore_chemistry_cmd(
         s.close()
 
 
+@app.command("rescore-market")
+def rescore_market_cmd(
+    as_of: Optional[str] = typer.Option(
+        None,
+        "--as-of",
+        help="Point-in-time date for scoring (YYYY-MM-DD). Default: today.",
+    ),
+    material_id: Optional[int] = typer.Option(
+        None,
+        "--material-id",
+        help=(
+            "Score only this material across its primary producing countries "
+            "(plus any geography that has events for it). "
+            "Default: all active materials."
+        ),
+    ),
+    geographies: Optional[str] = typer.Option(
+        None,
+        "--geographies",
+        help=(
+            "Comma-separated ISO2 country codes to score against (e.g. 'CN,CL,AU'). "
+            "Default: derived from each material's primary_producing_countries plus "
+            "any country with linked risk events."
+        ),
+    ),
+) -> None:
+    """Compute and persist material_geography_risk_scores rows.
+
+    Runs the market-level (company-agnostic) scoring engine across all active
+    materials and their associated geographies. Safe to re-run — results are
+    upserted by (material_id, geography_code, as_of_date).
+
+    Run this AFTER ingest-worldbank and ingest-comtrade so that commodity
+    price and trade-flow signals are available to the scoring engine.
+
+    \b
+    Examples:
+      bdi-ingest rescore-market
+      bdi-ingest rescore-market --as-of 2025-01-01
+      bdi-ingest rescore-market --material-id 3
+      bdi-ingest rescore-market --geographies CN,CL,AU
+
+    Intended usage order after ingestion:
+
+    \b
+      bdi-ingest ingest-worldbank --since-year 2015
+      bdi-ingest ingest-comtrade --years 2021,2022,2023
+      bdi-ingest rescore-market
+    """
+    import datetime
+    import uuid
+
+    from app.models.regulatory import RiskEventGeography, RiskEventMaterial
+    from app.models.supply import Material
+    from app.services.scoring.market_aggregator import (
+        score_all_active_materials,
+        score_material_geography,
+    )
+
+    as_of_date = datetime.date.fromisoformat(as_of) if as_of else datetime.date.today()
+    geo_filter = (
+        [g.strip().upper() for g in geographies.split(",") if g.strip()]
+        if geographies
+        else None
+    )
+
+    s = _session()
+    try:
+        if material_id is not None:
+            # Single-material path. ``score_all_active_materials`` does not
+            # currently support a material filter, so derive the geography
+            # set the same way it would and call ``score_material_geography``
+            # per pair, committing per pair to mirror the batch function's
+            # transaction discipline.
+            mat = s.get(Material, material_id)
+            if mat is None:
+                typer.echo(
+                    f"rescore-market failed: no material with id={material_id}",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+
+            if geo_filter is not None:
+                geos: list[str] = list(geo_filter)
+            else:
+                geos = []
+                if mat.primary_producing_countries:
+                    geos.extend(g.upper() for g in mat.primary_producing_countries)
+                event_geo_rows = s.execute(
+                    select(RiskEventGeography.country_code)
+                    .join(
+                        RiskEventMaterial,
+                        RiskEventMaterial.risk_event_id == RiskEventGeography.risk_event_id,
+                    )
+                    .where(RiskEventMaterial.material_id == mat.id)
+                    .distinct()
+                ).all()
+                geos = sorted({*geos, *(row[0] for row in event_geo_rows if row[0])})
+
+            if not geos:
+                typer.echo(
+                    f"rescore-market: no geographies derivable for material "
+                    f"id={material_id} ({mat.canonical_name}). Nothing to score.",
+                )
+                return
+
+            run_id = f"cli-{uuid.uuid4()}"
+            scored = 0
+            for geo in geos:
+                try:
+                    score_material_geography(
+                        s,
+                        mat.id,
+                        geo,
+                        as_of_date,
+                        run_id=f"{run_id}-{mat.id}-{geo}",
+                        persist=True,
+                    )
+                    s.commit()
+                    scored += 1
+                except Exception as inner_exc:
+                    s.rollback()
+                    typer.echo(
+                        f"  - skipped {mat.canonical_name} × {geo}: {inner_exc}",
+                        err=True,
+                    )
+
+            typer.echo(
+                f"rescore-market complete: {scored} (material, geography) pair(s) "
+                f"scored for {mat.canonical_name} (id={mat.id}) at {as_of_date}"
+            )
+        else:
+            results = score_all_active_materials(
+                s,
+                as_of_date,
+                geography_codes=geo_filter,
+            )
+            scored = len(results)
+            typer.echo(
+                f"rescore-market complete: {scored} (material, geography) pair(s) "
+                f"scored for {as_of_date}"
+            )
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        typer.echo(f"rescore-market failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("ingest-comtrade")
 def ingest_comtrade_cmd(
     years: str = typer.Option(
@@ -551,6 +702,142 @@ def seed_regulations_cmd() -> None:
     s = _session()
     try:
         result = seed_regulations(s)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("ingest-eurlex")
+def ingest_eurlex_cmd(
+    no_fetch: bool = typer.Option(
+        False,
+        "--no-fetch",
+        help="Skip fetching summary text from EUR-Lex (faster, no network required).",
+    ),
+) -> None:
+    """Upsert EU battery supply chain regulations from the EUR-Lex manifest.
+
+    Seeds the regulations table with the EU Battery Regulation (2023/1542),
+    CRMA (2024/1252), CBAM, CSDDD, Conflict Minerals Regulation, and REACH
+    cobalt restrictions — along with their material and geography scope records.
+
+    Idempotent: re-running will not duplicate rows. Fetches plain-text summaries
+    from EUR-Lex HTML unless --no-fetch is passed.
+
+    Run this after seed-materials so material_id lookups resolve correctly:
+
+    \b
+      bdi-ingest seed-materials
+      bdi-ingest ingest-eurlex
+    """
+    from app.services.ingestion.eurlex import ingest_eurlex
+
+    s = _session()
+    try:
+        result = ingest_eurlex(session=s, fetch_summaries=not no_fetch)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("ingest-gta")
+def ingest_gta_cmd(
+    since_year: int = typer.Option(
+        2018,
+        "--since-year",
+        help="Only ingest interventions from this year onward. Default: 2018.",
+    ),
+    url: Optional[str] = typer.Option(
+        None,
+        "--url",
+        help="Override the GTA CSV download URL.",
+    ),
+    local_file: Optional[str] = typer.Option(
+        None,
+        "--local-file",
+        help=(
+            "Path to a locally-downloaded GTA CSV file. Skips the HTTP download. "
+            "Use this when the bulk download requires authentication — download "
+            "manually from https://globaltradealert.org/data-center and pass the path here."
+        ),
+    ),
+    hs_prefixes: Optional[str] = typer.Option(
+        None,
+        "--hs-prefixes",
+        help=(
+            "Comma-separated HS prefixes to filter (e.g. '2604,2602'). "
+            "Default: all battery-material prefixes."
+        ),
+    ),
+    skip_hs_filter: bool = typer.Option(
+        False,
+        "--skip-hs-filter",
+        help=(
+            "Skip the HS code prefix filter. Use this when ingesting a pre-filtered "
+            "curated export from the GTA data center (e.g. 'Harmful Trade Policy "
+            "Interventions: Batteries') where GTA has already applied product-level "
+            "filtering using its own internal classification codes rather than HS codes."
+        ),
+    ),
+) -> None:
+    """Ingest Global Trade Alert harmful trade interventions into risk_events.
+
+    GTA now requires registration for bulk data access. Two modes:
+
+    \b
+    1. Local file (recommended — download from GTA data center):
+         bdi-ingest ingest-gta --local-file /path/to/gta_state_acts.csv
+
+    \b
+    2. Pre-filtered curated export (e.g. "Batteries" dataset):
+         bdi-ingest ingest-gta --local-file /path/to/interventions.csv --skip-hs-filter
+
+    \b
+    3. Direct download (only if GTA restores public bulk access):
+         bdi-ingest ingest-gta --since-year 2018
+
+    Ingests Red (harmful) interventions whose affected HS codes match
+    battery-critical materials. All events inserted with verified=False.
+
+    \b
+      bdi-ingest seed-materials
+      bdi-ingest seed-hs-mappings
+      bdi-ingest ingest-gta --local-file /path/to/gta_state_acts.csv
+    """
+    from app.services.ingestion.gta import (
+        BATTERY_HS_PREFIXES,  # noqa: F401  - re-exported for users running --help
+        GTA_DOWNLOAD_URL,
+        ingest_gta,
+    )
+
+    if local_file is None and url is None:
+        typer.echo(
+            "Warning: no --local-file provided. Attempting direct download — "
+            "this may fail. Download manually from "
+            "https://globaltradealert.org/data-center and use --local-file.",
+            err=True,
+        )
+
+    hs_list = (
+        [h.strip() for h in hs_prefixes.split(",") if h.strip()] if hs_prefixes else None
+    )
+
+    s = _session()
+    try:
+        result = ingest_gta(
+            session=s,
+            url=url or GTA_DOWNLOAD_URL,
+            since_year=since_year,
+            hs_prefixes=hs_list,
+            local_file=local_file,
+            skip_hs_filter=skip_hs_filter,
+        )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)

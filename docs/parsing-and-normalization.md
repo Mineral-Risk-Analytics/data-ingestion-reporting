@@ -46,8 +46,8 @@ The legacy `SupplierResolver` (alias-based substring matching) is used during ea
 
 - `app/services/ingestion/entity_resolution.py` → `resolve_suppliers_for_event`
 - Applies four priority-ordered rules: named match, geography match, material/HS match, broad category match.
-- Writes `risk_event_companies` junction rows with `relevance_score` and `match_reason`.
-- See [Ingestion pipeline](ingestion-pipeline.md) for how this integrates with `_add_risk_event`.
+- **Persists `risk_event_companies` junction rows** with `relevance_score` and `match_reason` — but **only when `LINK_EVENTS_TO_COMPANIES` is `True`** (default `False` as of Phase 3, April 2026). Resolution itself still runs; only the write step is short-circuited.
+- See [Ingestion pipeline](ingestion-pipeline.md#entity-resolution-_add_risk_event) for how this integrates with `_add_risk_event` and the feature-flag gate.
 
 ### `event_normalizer.py`
 
@@ -84,7 +84,7 @@ For each source type, the pipeline generally:
 2. **Upsert** `source_documents` (dedupe key: `source_id` + `external_id`).
 3. **Insert/update** domain entity (`regulations`, `trade_flows`, …).
 4. **Build draft** via normalizer → `RiskEvent` row(s).
-5. **Entity resolve** — `_add_risk_event` calls `entity_resolution` to write `risk_event_companies`.
+5. **Entity resolve** — `_add_risk_event` calls `entity_resolution`. `risk_event_companies` writes are gated by `LINK_EVENTS_TO_COMPANIES` (default `False`); `risk_event_materials` and `risk_event_geographies` writes are unaffected.
 
 Idempotency: re-running ingest **updates** existing documents by external id; `risk_events` may duplicate unless you add dedupe on `content_hash`.
 

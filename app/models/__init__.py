@@ -10,6 +10,7 @@ from app.models.company import (
     CompanySupplyRelationship,
 )
 from app.models.documents import DocumentChunk, SourceDocument
+from app.models.intelligence import InsightPost
 from app.models.facility import Facility
 from app.models.ingestion import IngestionRun, RawApiPayload
 from app.models.platform import Tenant, UsageEvent, User
@@ -33,7 +34,7 @@ from app.models.reporting import (
     ReportTemplateFocusEntity,
 )
 from app.models.review import SeedReviewFinding, SeedReviewRun
-from app.models.scoring import GeographyScore, MaterialScore
+from app.models.scoring import GeographyScore, MaterialGeographyRiskScore, MaterialScore
 from app.models.source import Source
 from app.models.supply_chain_context import SupplyChainContext
 from app.models.supply import (
@@ -59,6 +60,8 @@ __all__ = [
     # Documents
     "DocumentChunk",
     "SourceDocument",
+    # Intelligence hub
+    "InsightPost",
     # Facility
     "Facility",
     # Ingestion
@@ -90,6 +93,7 @@ __all__ = [
     "SeedReviewFinding",
     # Scoring
     "GeographyScore",
+    "MaterialGeographyRiskScore",
     "MaterialScore",
     # Source
     "Source",

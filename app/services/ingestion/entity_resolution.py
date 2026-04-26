@@ -29,6 +29,7 @@ from app.constants import RiskCategory
 from app.models.company import Company, CompanyAlias, CompanyMaterialExposure
 from app.models.regulatory import RiskEvent, RiskEventCompany
 from app.models.supply import Material
+from app.services.ingestion import feature_flags
 
 log = structlog.get_logger(__name__)
 
@@ -170,10 +171,25 @@ def persist_company_links(
     duplicates. The UniqueConstraint on (risk_event_id, company_id) provides the
     secondary safety net.
 
+    Foundation phase 3 disables ingestion-time event → company linking via the
+    ``feature_flags.LINK_EVENTS_TO_COMPANIES`` toggle. When False (the default),
+    this function logs a single WARNING with the suppressed match count and
+    returns without writing rows. The Phase 5 company overlay will compute these
+    relationships from configured exposure profiles instead.
+
     TODO (Postgres-only): replace the loop with a single pg INSERT ... ON CONFLICT
     DO UPDATE once SQLite test compatibility is no longer required.
     """
     if not matches:
+        return
+
+    if not feature_flags.LINK_EVENTS_TO_COMPANIES:
+        log.warning(
+            "entity_resolution.persist_company_links.suppressed",
+            event_id=str(event.id),
+            suppressed_match_count=len(matches),
+            reason="LINK_EVENTS_TO_COMPANIES feature flag is disabled",
+        )
         return
 
     for company_id, relevance, reason in matches:

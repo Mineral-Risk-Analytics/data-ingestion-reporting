@@ -2,12 +2,15 @@
 
 > **Last updated: April 2026**
 
-The platform has two independent scoring systems:
+The platform has three independent scoring systems:
 
 1. **Company risk scoring** (six-pillar, v3.0) — rates a specific supply chain company's risk across material concentration, geopolitical, regulatory, operational, financial, and supply-chain-propagation dimensions. Output: `company_scores`.
 2. **Chemistry risk scoring** — rates a battery cell chemistry's supply risk based on its material composition, criticality signals, and geographic concentration of its constituent minerals. Output: `chemistry_risk_scores`.
+3. **Market risk scoring** (foundation phase, April 2026) — rates the **material × geography intersection** independent of any specific company. Powers the public intelligence hub. Output: `material_geography_risk_scores`. See [§ Market Risk Scoring](#market-risk-scoring) below.
 
-Both systems are **stateless, pure-function, and transparent**: component functions return raw `float` values with no database reads. Persistence happens after computation, never inside the scoring layer.
+All three systems are **stateless, pure-function, and transparent**: component functions return raw `float` values with no database reads. Persistence happens after computation, never inside the pure scoring layer.
+
+> **Phase 3 architecture change (April 2026).** Ingestion **no longer auto-rescores companies.** The post-run rescore hook in `IngestionPipeline` was removed; company rescoring is now CLI / API only. In addition, ingestion no longer writes `risk_event_companies` rows by default — that behaviour is gated by `LINK_EVENTS_TO_COMPANIES` in `app/services/ingestion/feature_flags.py`. The two weekly Inngest cron jobs (chemistry + market) take over the "things automatically stay fresh" responsibility for the company-agnostic layers.
 
 > **v3.0 highlights** — see "Scoring v3.0 (April 2026): six pillars, chemistry refinement, ScoringScope" below for the full change log. The seed-staleness reviewers (`docs/seed-review.md`) feed the v3.0 inputs by keeping `CompanyMaterialExposure`, `Facility`, `CompanySupplyRelationship`, `CompanyVehicleModel`, and `CompanyRegulationExposure` rows fresh.
 
@@ -429,6 +432,8 @@ See `tests/scoring/` for the v3.0 surface area:
 
 **CLI:** `bdi-ingest rescore-chemistry [--slug nmc] [--as-of 2024-01-01]`
 
+**Scheduled:** Mondays 02:00 UTC via the Inngest cron `rescore-all-chemistries` (see [§ Scheduled rescores (Inngest)](#scheduled-rescores-inngest)).
+
 ### Inputs
 
 | Data | Source table | Notes |
@@ -496,11 +501,107 @@ Appended as a new row in `chemistry_risk_scores`. Never overwrites existing rows
 
 ---
 
+## Market Risk Scoring
+
+### Overview
+
+`app/services/scoring/market_aggregator.py` scores **(material, geography)** pairs without any company context. It is the primary intelligence layer powering the public hub at `mineralriskanalytics.com`; the company-overlay scoring (`orchestrator.py`) is built on top of these market signals.
+
+**CLI:**
+```bash
+bdi-ingest rescore-market                              # all active materials × derived geographies
+bdi-ingest rescore-market --material-id 7 --geographies CN,CL,AU
+```
+
+**API:**
+- `GET /api/v1/materials/{id}/market-scores` — latest score per geography for a material
+- `GET /api/v1/materials/{id}/market-scores/{geo}` — full rationale for one pair
+- `GET /api/v1/market/scores` — paginated list across all pairs (filterable by material, geography, `min_overall`)
+- `POST /api/v1/market/rescore` — synchronously rescore every active pair
+
+**Scheduled:** Mondays 03:00 UTC via the Inngest cron `rescore-market-scores` (one hour after the chemistry rescore so the new chemistry composites are visible).
+
+### Pillar weights (renormalised)
+
+Supply-chain propagation is excluded (no company graph at the market level). Financial pressure is **kept** but reframed with market-level inputs (commodity price volatility + producer-stress events), not company filings. The remaining five v3.0 weights (sum 0.85) are renormalised:
+
+| Pillar | Source weight | Market weight |
+|--------|--------------:|--------------:|
+| Material Concentration | 0.25 | **≈ 0.294** |
+| Geopolitical / Trade | 0.20 | **≈ 0.235** |
+| Regulatory & Compliance | 0.20 | **≈ 0.235** |
+| Operational | 0.10 | **≈ 0.118** |
+| Financial Pressure (reframed) | 0.10 | **≈ 0.118** |
+
+These constants live in `MARKET_PILLAR_WEIGHTS` in `market_aggregator.py`.
+
+### Inputs (where each pillar's signals come from)
+
+| Pillar | Market-level inputs |
+|--------|---------------------|
+| Material Concentration | `MaterialCriticalitySignal` (HHI + criticality_score, source priority `eu_crma > iea_report > usgs_mcs > manual > patstat`) + High-Concentration Geography uplift for `CN/CD/RU` + average normalised `event_impact` for `GEOPOLITICAL_TRADE` events tagged to the material or geography. |
+| Geopolitical / Trade | Binary HCG `country_concentration` for the target geography + classified events: `EXPORT_RESTRICTION` and `TARIFF`/`TRADE_POLICY` subtypes (or keyword-matched titles). |
+| Regulatory & Compliance | Regulations linked via `RegulationMaterialScope` or `RegulationGeographyScope` (weight 0.50, "unknown compliance" since there is no company to assess against) + scoped `REGULATORY_COMPLIANCE` events + 90-day proximity adjustment (1.15×) when an event has a near-future `effective_date`. |
+| Operational | `SINGLE_SOURCE` / `CAPACITY_CONSTRAINT` events lift `structural_dependency` from the 0.3 baseline; weighted average of `OPERATIONAL` event impacts. |
+| Financial Pressure (reframed) | `CommodityPrice` rows over a 180-day window: coefficient of variation → `base_filing_signal` (0–40), price spike → `leverage_warning_bonus` (0–30), price crash → `liquidity_stress_bonus` (0–30). Augmented with `FINANCIAL_PRESSURE` events tagged `PRICE_SURGE`/`MARKET_SQUEEZE` and `PRODUCER_EXIT`/`MINE_CLOSURE`/`BANKRUPTCY`. |
+
+The reused pure-function scorers (`material_risk.score_material_exposure`, `geopolitical_risk.score_geopolitical_trade`, `regulatory_risk.score_regulatory_profile`, `financial_pressure.score_financial_pressure`) are called unchanged. Operational scoring uses a small market-specific helper (`_score_operational_market`) that mirrors the company-layer formula.
+
+### Output: `material_geography_risk_scores`
+
+Migration `011_material_geography_risk_scores.py`. One row per `(material_id, geography_code, as_of_date)` (unique constraint). Columns:
+
+- Five pillar scores: `material_concentration_score`, `geopolitical_trade_score`, `regulatory_compliance_score`, `operational_score`, `financial_pressure_score`.
+- `overall_risk_score` (weighted aggregate using `MARKET_PILLAR_WEIGHTS`).
+- `event_count` — number of distinct events used.
+- `rationale_json` — full sub-input breakdown, pillar scores, weights used, criticality signal source, event counts, and a human-readable `notes` string.
+- `scoring_version` — currently `"3.0"` (matches the company-layer version constant).
+
+Rows are appended (never overwritten); the `(material_id, geography_code, as_of_date)` unique constraint prevents duplicate same-day re-runs.
+
+### Transaction contract
+
+`score_material_geography()` calls `db.flush()` but **does not commit** — caller owns the transaction (consistent with `rescore_company`). The batch helper `score_all_active_materials()` does commit per pair, with `db.rollback()` and a structured-log error on per-pair failures so one bad pair never aborts the whole run.
+
+---
+
+## Scheduled rescores (Inngest)
+
+The chemistry and market layers are kept fresh by two weekly cron jobs registered with Inngest:
+
+| Function | Cron (UTC) | What it does |
+|----------|-----------|--------------|
+| `rescore-all-chemistries` | `0 2 * * MON` | Re-runs `rescore_all_chemistries` for every active battery chemistry. |
+| `rescore-market-scores` | `0 3 * * MON` | Re-runs `score_all_active_materials` for every active material across its derived geographies. |
+
+Why one hour apart: market scoring reads chemistry composites indirectly through criticality signals (and downstream API consumers of both layers expect consistent vintages). Running market scoring after chemistry guarantees the new vintages are committed before market reads them.
+
+Architecture:
+
+- `app/core/inngest.py` initialises the shared `inngest_client`. `is_production` is derived from `Settings.app_env`; anything other than `"production"` (or setting `INNGEST_DEV=1`) boots the SDK in dev mode (no signing key required, talks to a local Inngest Dev Server).
+- `app/tasks/scoring_jobs.py` defines both functions. Each opens a fresh `Session` via `get_session_factory()` (workers are concurrent — never share sessions), wraps the synchronous scoring function in `asyncio.to_thread`, and always closes the session in `finally`. Run-ids are stable `cron-<YYYY-MM-DD>` strings.
+- `app/main.py` calls `inngest.fast_api.serve(app, inngest_client, SCHEDULED_FUNCTIONS)` to expose the discovery endpoint at `/api/inngest`.
+
+Local dev workflow:
+
+```bash
+# Terminal 1: FastAPI (app_env=development → dev mode)
+uvicorn app.main:app --reload
+
+# Terminal 2: Inngest Dev Server (auto-discovers /api/inngest)
+npx --ignore-scripts=false inngest-cli@latest dev \
+    -u http://127.0.0.1:8000/api/inngest --no-discovery
+```
+
+Company scoring (six pillar) is **not** scheduled — it is on-demand only, via `bdi-ingest rescore-all` / `bdi-ingest rescore-company` or the API rescore endpoint.
+
+---
+
 ## Related reading
 
 - [Overview](overview.md)
 - [Data sources](data-sources.md) — what feeds the scoring inputs
 - [Parsing & normalization](parsing-and-normalization.md) — event drafts and RiskCategory tags
-- [Ingestion pipeline](ingestion-pipeline.md) — how post-ingestion rescoring is triggered
-- [Reports & AI](reports-and-ai.md) — where scored narratives surface
+- [Ingestion pipeline](ingestion-pipeline.md) — `LINK_EVENTS_TO_COMPANIES` gate and CLI rescore commands
+- [Reports & AI](reports-and-ai.md) — where scored narratives surface (and how `InsightPost` differs from `ReportInsight`)
 - [Seed staleness review](seed-review.md) — keeps `CompanyMaterialExposure`, `Facility`, `CompanySupplyRelationship`, and `CompanyVehicleModel` rows fresh, which directly drives the v3.0 chemistry-aware material pillar, geographic fold-in, and supply-chain-propagation pillar.

@@ -14,6 +14,8 @@ This document is the single reference for every data source the platform ingests
 | World Bank Pink Sheet | **Live** | `bdi-ingest ingest-worldbank` | `commodity_prices` |
 | OpenSanctions | **Live** | `bdi-ingest ingest-opensanctions` | `companies`, `company_aliases` |
 | UN Comtrade | **Live** | `bdi-ingest ingest-comtrade` | `trade_flows`, `source_documents` |
+| EUR-Lex (EU regulations) | **Live** | `bdi-ingest ingest-eurlex` | `regulations`, `regulation_material_scope`, `regulation_geography_scope` |
+| Global Trade Alert (GTA) | **Live** | `bdi-ingest ingest-gta` | `risk_events`, `risk_event_materials`, `risk_event_geographies` |
 | Federal Register | **Live** | `bdi-ingest ingest federal-register` | `regulations`, `risk_events`, `source_documents` |
 | SEC EDGAR | **Live** | `bdi-ingest ingest sec-edgar` | `risk_events`, `source_documents` |
 | U.S. Census Trade | **Live** | `bdi-ingest ingest census-trade` | `trade_flows`, `risk_events`, `source_documents` |
@@ -156,6 +158,78 @@ This document is the single reference for every data source the platform ingests
 
 ---
 
+### EUR-Lex (EU regulations)
+
+**Purpose:** Curated EU regulations covering battery supply chains — EU Battery Regulation (2023/1542), Critical Raw Materials Act (2024/1252), CBAM, CSDDD, Conflict Minerals Regulation, and REACH cobalt. These are the European-side counterpart to the Federal Register source for U.S. regulations.
+
+**File:** `app/services/ingestion/eurlex.py`
+**CLI:** `uv run bdi-ingest ingest-eurlex`
+
+**What it provides:**
+- Curated list of seven EU regulations defined as `BATTERY_REGULATIONS` constants in the module (CELEX id, title, issuing body, status, publication / effective dates, policy theme, material scopes, geography scopes).
+- Plain-text summaries fetched live from the EUR-Lex public summary HTML when available.
+
+**Tables written:**
+
+| Table | Operation | Key |
+|-------|-----------|-----|
+| `regulations` | Upsert | `regulation_key` (e.g. `EU_BATTERY_REG_2023`, `CRMA_2024`) |
+| `regulation_material_scope` | Insert (idempotent) | `(regulation_id, material_id)` |
+| `regulation_geography_scope` | Insert (idempotent) | `(regulation_id, country_code)` |
+
+**Relationships and scores:**
+- `regulation_material_scope` and `regulation_geography_scope` rows feed the **Regulatory** pillar at both layers — `_derive_market_regulatory_inputs()` in `market_aggregator.py` and `derive_regulatory_inputs()` in the company aggregator.
+- `CRMA_2024` material scopes use `scope_type = "strategic_raw_material"` rather than `"covered"` so scoring queries can differentiate the EU's higher-burden Strategic tier from the Critical tier.
+- `EU_BATTERY_REG` and `IRA_DOMESTIC` are obligation keys recognised by `score_regulatory_profile()` for the obligation uplift component.
+
+**Idempotency:** Upsert by `regulation_key`; scope rows are idempotent on their natural keys. Re-running the command never duplicates.
+
+**Adding a new EU regulation:** append a dict to `BATTERY_REGULATIONS` with the keys `regulation_key`, `celex`, `title`, `issuing_body`, `geography`, `status`, `publication_date`, `effective_date`, `policy_theme`, `material_scopes` (list of `(material_canonical_name, scope_type)` tuples), and `geography_scopes`. Material `canonical_name`s must already exist (run `seed-materials` first).
+
+**Re-run cadence:** As EU regulations are amended or new ones land. Currently a one-shot seed; the live HTML summary fetch keeps the body text current on each run.
+
+---
+
+### Global Trade Alert (GTA)
+
+**Purpose:** State-level export controls and harmful trade interventions affecting battery materials — China graphite export licensing (2023), Indonesia nickel ore export ban (2019–2023), DRC cobalt restrictions, etc. This is the platform's primary source of `GEOPOLITICAL_TRADE` `RiskEvent` rows.
+
+**File:** `app/services/ingestion/gta.py`
+**CLI:** `uv run bdi-ingest ingest-gta [--since-year 2018] [--local-file path/to/gta.csv] [--skip-hs-filter]`
+
+**What it provides:**
+- Bulk CSV of "Red" (harmful) state acts: intervention type, in-force flag, announcement date, implementer + targeted countries, affected HS codes, free-text description.
+- Filtered to battery-relevant HS prefixes (`BATTERY_HS_PREFIXES`) by default; `--skip-hs-filter` ingests all Red interventions (use only with curated GTA Data Center exports that are already product-filtered).
+
+**Tables written:**
+
+| Table | Operation | Key |
+|-------|-----------|-----|
+| `risk_events` | Insert | `content_hash` (also `metadata_json.gta_id`) |
+| `risk_event_materials` | Insert | `(risk_event_id, material_id)` resolved via `hs_code_material_mappings` |
+| `risk_event_geographies` | Insert | `(risk_event_id, country_code)` for implementing + targeted countries |
+| `sources` | Upsert | One Source row for `gta` |
+
+**Severity calibration** (`_severity_for`):
+- `0.9` — explicit export bans (supply blocked outright)
+- `0.7` — other active "Red" interventions (in force)
+- `0.3` — inactive / removed Red interventions (historical signal)
+
+The scoring engine then applies recency decay on top of these base values via the `GEOPOLITICAL_TRADE` decay schedule.
+
+**Relationships and scores:**
+- Events are tagged with `RiskCategory.GEOPOLITICAL_TRADE` and feed both the company-level `derive_geopolitical_inputs()` and the market-level `_derive_market_geopolitical_inputs()` (export-restriction + tariff classification by event subtype / title keyword).
+- HS-code → material resolution reuses `hs_code_material_mappings` (seeded by `bdi-ingest seed-hs-mappings`).
+- **Note:** Following Phase 3, this source does **not** create `risk_event_companies` rows — the gate `LINK_EVENTS_TO_COMPANIES` is `False` by default. Material- and geography-tagged events still drive the market layer fully.
+
+**Authentication:** GTA's bulk download URL may require manual authentication. Use `--local-file` to point at a CSV downloaded manually from <https://globaltradealert.org/data-center>.
+
+**Idempotency:** Skips events already present by `content_hash` or `metadata_json.gta_id`. Re-running with the same export is safe.
+
+**Re-run cadence:** Quarterly (or after any major export-control announcement).
+
+---
+
 ### Federal Register
 
 **Purpose:** U.S. federal regulations relevant to battery supply chains — UFLPA enforcement, IRA domestic content rules, export controls, trade remedy orders.
@@ -173,7 +247,7 @@ This document is the single reference for every data source the platform ingests
 |-------|-----------|-----|
 | `regulations` | Upsert | `external_id = document_number` |
 | `risk_events` | Insert | `content_hash` |
-| `risk_event_companies` | Insert | `(risk_event_id, company_id)` via entity resolution |
+| `risk_event_companies` | Insert (gated) | `(risk_event_id, company_id)` via entity resolution — **suppressed by default** under `LINK_EVENTS_TO_COMPANIES=False` |
 | `source_documents` | Upsert | `(source_id, external_id)` |
 | `document_chunks` | Insert | After embedding step |
 
@@ -203,7 +277,7 @@ This document is the single reference for every data source the platform ingests
 | Table | Operation | Key |
 |-------|-----------|-----|
 | `risk_events` | Insert | Per filing, `FINANCIAL_PRESSURE` or `OPERATIONAL` category |
-| `risk_event_companies` | Insert | Via entity resolution |
+| `risk_event_companies` | Insert (gated) | Via entity resolution — **suppressed by default** under `LINK_EVENTS_TO_COMPANIES=False` |
 | `source_documents` | Upsert | Accession number as `external_id` |
 
 **Relationships and scores:**
@@ -382,6 +456,8 @@ flowchart TD
         FR[Federal Register API]
         SEC[SEC EDGAR API]
         CEN[U.S. Census Trade API]
+        EUR[EUR-Lex HTML]
+        GTA[Global Trade Alert CSV]
         SEED[seed-materials CLI]
         HS[seed-hs-mappings CLI]
     end
@@ -394,10 +470,14 @@ flowchart TD
         HSM[hs_code_material_mappings]
         CO[companies / company_aliases]
         RE[risk_events]
-        REC[risk_event_companies]
+        REC[risk_event_companies — gated]
+        REM[risk_event_materials]
+        REG[risk_event_geographies]
+        REGS_T[regulations + scopes]
         BCH[battery_chemistries]
         BCM[battery_chemistry_materials]
         CRS[chemistry_risk_scores]
+        MGRS[material_geography_risk_scores]
         COMSC[company_scores]
     end
 
@@ -408,6 +488,7 @@ flowchart TD
         FINS[score_financial_pressure]
         OPS[_score_operational]
         CHEM[score_chemistry]
+        MARKET[market_aggregator]
         AGG[aggregate_supplier_risk]
     end
 
@@ -417,22 +498,30 @@ flowchart TD
     OS -->|canonical names, aliases| CO
     CT -->|export values by HS + country| TF
     FR -->|regulations, severity| RE
+    FR --> REGS_T
     SEC -->|filing signals| RE
     CEN -->|trade concentration| TF
+    EUR -->|regulations + scopes| REGS_T
+    GTA -->|GEOPOLITICAL_TRADE events| RE
+    GTA --> REM
+    GTA --> REG
     SEED -->|REEs, Sodium| MAT
     SEED -->|intensity weights| BCM
     HS -->|HS prefix → material_id| HSM
 
     MAT --> MATS
     MCS --> CHEM
+    MCS --> MARKET
     TF --> GEOS
     TF -->|via HSM| CHEM
     HSM --> CHEM
-    RE -->|via REC| MATS
-    RE -->|via REC| GEOS
-    RE -->|via REC| REGS
-    RE -->|via REC| FINS
-    RE -->|via REC| OPS
+    RE -->|via REM/REG| MARKET
+    REGS_T --> MARKET
+    RE -->|via REC (gated)| MATS
+    RE -->|via REC (gated)| GEOS
+    RE -->|via REC (gated)| REGS
+    RE -->|via REC (gated)| FINS
+    RE -->|via REC (gated)| OPS
     BCM --> CHEM
     BCH --> CHEM
 
@@ -443,6 +532,7 @@ flowchart TD
     OPS --> AGG
     AGG --> COMSC
     CHEM --> CRS
+    MARKET --> MGRS
 ```
 
 ---
@@ -480,7 +570,7 @@ Currently only `usgs_mcs` and `manual` signals exist. Higher-priority sources wi
 
 ## Related reading
 
-- [Database architecture](database_architecture.md) — full table reference including new tables from migrations 002 and 003
-- [Scoring](scoring.md) — five-pillar company scoring and chemistry risk scoring
-- [Ingestion pipeline](ingestion-pipeline.md) — step-by-step ingestion execution
+- [Database architecture](database_architecture.md) — full table reference including `material_geography_risk_scores` (migration 011) and `insight_posts` (migration 012)
+- [Scoring](scoring.md) — six-pillar company scoring, market-layer scoring, and chemistry risk scoring
+- [Ingestion pipeline](ingestion-pipeline.md) — step-by-step ingestion execution and the `LINK_EVENTS_TO_COMPANIES` gate
 - [Overview](overview.md) — system architecture

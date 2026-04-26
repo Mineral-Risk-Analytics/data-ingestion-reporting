@@ -53,6 +53,7 @@ from sqlalchemy.orm import Session
 
 from app.constants import RiskCategory
 from app.models.company import CompanyMaterialExposure
+from app.services.ingestion import feature_flags
 from app.models.regulatory import (
     RiskEvent,
     RiskEventCompany,
@@ -171,13 +172,33 @@ def _link_companies(
     material_id: int,
     reporter_country: str,
 ) -> int:
-    """Link all companies sourcing material_id from reporter_country. Returns count."""
+    """Link all companies sourcing material_id from reporter_country.
+
+    Returns the number of links written. Foundation phase 3 disables ingestion-
+    time event → company linking via ``feature_flags.LINK_EVENTS_TO_COMPANIES``;
+    when False (the default), this function counts the matches that *would*
+    have been written, emits one ``structlog`` WARNING per call, and returns 0
+    so the upstream ``company_links`` counter stays honest.
+    """
     rows = db.scalars(
         select(CompanyMaterialExposure).where(
             CompanyMaterialExposure.material_id == material_id,
             CompanyMaterialExposure.source_geography == reporter_country,
         )
     ).all()
+
+    if not feature_flags.LINK_EVENTS_TO_COMPANIES:
+        suppressed = len({exposure.company_id for exposure in rows})
+        if suppressed:
+            log.warning(
+                "trade_signal_builder.link_companies.suppressed",
+                event_id=event_id,
+                material_id=material_id,
+                reporter_country=reporter_country,
+                suppressed_company_count=suppressed,
+                reason="LINK_EVENTS_TO_COMPANIES feature flag is disabled",
+            )
+        return 0
 
     linked = 0
     seen_company_ids: set = set()

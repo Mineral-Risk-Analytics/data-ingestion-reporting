@@ -62,6 +62,7 @@ from sqlalchemy.orm import Session
 
 from app.models.company import Company, CompanyAlias
 from app.models.regulatory import RiskEvent, RiskEventCompany, RiskEventGeography
+from app.services.ingestion import feature_flags
 
 log = structlog.get_logger(__name__)
 
@@ -447,14 +448,26 @@ def ingest_opensanctions(
         session.add(event)
         session.flush()
 
-        session.add(
-            RiskEventCompany(
-                risk_event_id=event.id,
-                company_id=company.id,
-                relevance_score=1.0,
-                match_reason="named_company",
+        if feature_flags.LINK_EVENTS_TO_COMPANIES:
+            session.add(
+                RiskEventCompany(
+                    risk_event_id=event.id,
+                    company_id=company.id,
+                    relevance_score=1.0,
+                    match_reason="named_company",
+                )
             )
-        )
+        else:
+            # Foundation phase 3: ingestion no longer materialises company
+            # links. The RiskEvent is still inserted so the market layer can
+            # see the geography signal; company-event relevance now derives
+            # from the Phase 5 exposure-overlay engine.
+            log.warning(
+                "opensanctions.company_link.suppressed",
+                event_id=str(event.id),
+                company=company.canonical_name,
+                reason="LINK_EVENTS_TO_COMPANIES feature flag is disabled",
+            )
 
         # One RiskEventGeography per unique country across all matched entities
         seen_countries: set[str] = set()

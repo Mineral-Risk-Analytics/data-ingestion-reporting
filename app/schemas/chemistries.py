@@ -19,6 +19,7 @@ class ChemistryRiskScoreRead(BaseModel):
     composite_risk_score: Optional[float] = None
     score_confidence: Optional[float] = None
     computed_at: datetime
+    metadata_json: Optional[dict[str, Any]] = None
 
 
 class BatteryChemistryRead(BaseModel):
@@ -37,3 +38,25 @@ class BatteryChemistryRead(BaseModel):
     updated_at: datetime
 
     latest_risk_score: Optional[ChemistryRiskScoreRead] = None
+
+
+class ChemistryMaterialRead(BaseModel):
+    """One active row from ``battery_chemistry_materials`` joined to its material."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    material_id: int
+    material_canonical_name: str
+    role: str
+    intensity: float
+    is_substitutable: bool
+    valid_from: date
+    valid_to: Optional[date] = None
+    notes: Optional[str] = None
+
+
+class ChemistryDetailRead(BatteryChemistryRead):
+    """Single-chemistry detail view: full record + latest risk score + active composition."""
+
+    active_materials: list[ChemistryMaterialRead] = []

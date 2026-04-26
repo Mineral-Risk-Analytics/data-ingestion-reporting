@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import inngest.fast_api
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,13 +23,16 @@ from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.facilities import router as facilities_router
 from app.api.routes.health import router as health_router
 from app.api.routes.ingestion import router as ingestion_router
+from app.api.routes.market_scores import router as market_scores_router
 from app.api.routes.materials import router as materials_router
 from app.api.routes.regulations import router as regulations_router
 from app.api.routes.risk_events import router as risk_events_router
 from app.api.routes.sources import router as sources_router
 from app.api.routes.trade_flows import router as trade_flows_router
 from app.core.config import get_settings
+from app.core.inngest import inngest_client
 from app.core.logging import configure_logging
+from app.tasks import SCHEDULED_FUNCTIONS
 
 
 @asynccontextmanager
@@ -100,3 +104,12 @@ app.include_router(risk_events_router, prefix="/api/v1")
 app.include_router(materials_router, prefix="/api/v1")
 app.include_router(facilities_router, prefix="/api/v1")
 app.include_router(chemistries_router, prefix="/api/v1")
+
+# Foundation Phase 2 — market intelligence scores (material × geography)
+app.include_router(market_scores_router, prefix="/api/v1")
+
+# Foundation Phase 3 — Inngest scheduled scoring jobs.
+# Serves the standard ``/api/inngest`` discovery + invocation endpoint that
+# the Inngest Dev Server (and Inngest Cloud) expects. ``SCHEDULED_FUNCTIONS``
+# is populated by the import side-effects in ``app.tasks``.
+inngest.fast_api.serve(app, inngest_client, SCHEDULED_FUNCTIONS)
