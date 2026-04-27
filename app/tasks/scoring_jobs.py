@@ -308,7 +308,7 @@ async def rescore_market_scores_job(ctx: inngest.Context) -> dict:
     """
     today_iso = _today_utc().isoformat()
     run_id = f"cron-{today_iso}"
-    ctx.logger.info("scoring_jobs.market_geo.start", today=today_iso)
+    log.info("scoring_jobs.market_geo.start", today=today_iso)
 
     # Step 1: discover materials
     material_ids: list[int] = await ctx.step.run(
@@ -328,7 +328,7 @@ async def rescore_market_scores_job(ctx: inngest.Context) -> dict:
         )
         total_pairs += result.get("pairs_scored", 0)
 
-    ctx.logger.info(
+    log.info(
         "scoring_jobs.market_geo.done",
         total_pairs=total_pairs,
         run_id=run_id,
@@ -358,7 +358,7 @@ async def rescore_global_rollups_job(ctx: inngest.Context) -> dict:
     """
     today_iso = _today_utc().isoformat()
     run_id = f"global-cron-{today_iso}"
-    ctx.logger.info("scoring_jobs.global_rollup.start", today=today_iso)
+    log.info("scoring_jobs.global_rollup.start", today=today_iso)
 
     # Step 1: find materials with geo scores to roll up
     material_ids: list[int] = await ctx.step.run(
@@ -380,7 +380,7 @@ async def rescore_global_rollups_job(ctx: inngest.Context) -> dict:
         if not result.get("error") and not result.get("skipped"):
             scored += 1
 
-    ctx.logger.info(
+    log.info(
         "scoring_jobs.global_rollup.done",
         scored_materials=scored,
         run_id=run_id,
@@ -410,7 +410,7 @@ async def rescore_chemistries_job(ctx: inngest.Context) -> dict:
     the work is fast (pure in-Python math over pre-computed rollups).
     """
     today_iso = _today_utc().isoformat()
-    ctx.logger.info("scoring_jobs.chemistry.start", today=today_iso)
+    log.info("scoring_jobs.chemistry.start", today=today_iso)
 
     result: dict = await ctx.step.run(
         "rescore-all-chemistries",
@@ -418,7 +418,7 @@ async def rescore_chemistries_job(ctx: inngest.Context) -> dict:
         today_iso,
     )
 
-    ctx.logger.info(
+    log.info(
         "scoring_jobs.chemistry.done",
         rescored=result.get("rescored"),
         today=today_iso,
