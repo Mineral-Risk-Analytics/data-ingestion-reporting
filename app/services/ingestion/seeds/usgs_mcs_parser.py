@@ -698,7 +698,7 @@ def parse_usgs_csv(filepath: str | Path) -> list[dict]:
         # Criticality score: normalised HHI on mine production.
         criticality = round(_hhi(country_prod), 4) if country_prod else None
 
-        # World totals for notes.
+        # World totals for notes and share computation.
         world_prod = (
             _parse_number(world_total_row["PROD_2023"])
             or _parse_number(world_total_row["PROD_EST_ 2024"])
@@ -708,6 +708,19 @@ def parse_usgs_csv(filepath: str | Path) -> list[dict]:
         ) if world_total_row else None
 
         unit = world_total_row["UNIT_MEAS"].strip() if world_total_row else ""
+
+        # Build production share rows — fraction of world total per country.
+        # Stored under _production_shares so the CLI can persist them separately
+        # from the Material row (same pattern as _hhi_score).
+        production_shares: list[dict] = []
+        if country_prod and world_prod and world_prod > 0:
+            for iso2, vol in country_prod.items():
+                production_shares.append({
+                    "country_code": iso2,
+                    "production_volume": vol,
+                    "production_share": round(vol / world_prod, 6),
+                    "unit_of_measure": unit or None,
+                })
         prod_type = world_total_row["TYPE"].strip() if world_total_row else ""
 
         notes_parts = [
@@ -749,6 +762,9 @@ def parse_usgs_csv(filepath: str | Path) -> list[dict]:
             # hhi_score is same as criticality_score (both are normalised HHI 0–1)
             # but named separately for clarity when writing material_criticality_signals.
             "_hhi_score": criticality,
+            # Production shares stripped before creating Material ORM objects;
+            # persisted separately by ingest-usgs into material_production_shares.
+            "_production_shares": production_shares,
             "notes": " ".join(notes_parts),
         }
         results.append(material)

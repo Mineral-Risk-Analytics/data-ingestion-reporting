@@ -181,6 +181,27 @@ class ChemistryRiskScore(Base):
         Float, nullable=True,
         comment="Intensity-weighted geopolitical concentration sub-score 0–100.",
     )
+    regulatory_compliance_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "Intensity-weighted regulatory compliance sub-score 0–100. "
+            "NULL for rows written by methodology_version < 2.0."
+        ),
+    )
+    operational_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "Intensity-weighted operational sub-score 0–100. "
+            "NULL for rows written by methodology_version < 2.0."
+        ),
+    )
+    financial_pressure_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "Intensity-weighted financial pressure sub-score 0–100. "
+            "NULL for rows written by methodology_version < 2.0."
+        ),
+    )
     composite_risk_score: Mapped[Optional[float]] = mapped_column(
         Float, nullable=True,
         comment="Blended risk score 0–100.",

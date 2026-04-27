@@ -128,10 +128,14 @@ def ingest_usgs_cmd(
             }, indent=2))
             raise typer.Exit(code=1)
 
+        from app.models.supply import MaterialProductionShare
+
         inserted = updated = signals_written = 0
+        shares_written = 0
         for m in materials:
-            # Separate the internal _hhi_score key before creating ORM objects.
+            # Strip internal keys before creating ORM objects.
             hhi_score = m.pop("_hhi_score", None)
+            production_shares = m.pop("_production_shares", [])
 
             row = s.scalar(select(Material).where(Material.canonical_name == m["canonical_name"]))
             if row is None:
@@ -173,6 +177,32 @@ def ingest_usgs_cmd(
                 existing_signal.trend_direction = trend
                 signals_written += 1
 
+            # Upsert production share rows for each producing country.
+            for share in production_shares:
+                existing_share = s.scalar(
+                    select(MaterialProductionShare).where(
+                        MaterialProductionShare.material_id == row.id,
+                        MaterialProductionShare.country_code == share["country_code"],
+                        MaterialProductionShare.reference_year == mcs_year,
+                    )
+                )
+                if existing_share is None:
+                    s.add(MaterialProductionShare(
+                        material_id=row.id,
+                        country_code=share["country_code"],
+                        reference_year=mcs_year,
+                        production_volume=share["production_volume"],
+                        production_share=share["production_share"],
+                        unit_of_measure=share.get("unit_of_measure"),
+                        data_source="usgs_mcs",
+                    ))
+                    shares_written += 1
+                elif force:
+                    existing_share.production_volume = share["production_volume"]
+                    existing_share.production_share = share["production_share"]
+                    existing_share.unit_of_measure = share.get("unit_of_measure")
+                    shares_written += 1
+
         s.commit()
         typer.echo(json.dumps({
             "ok": True,
@@ -180,6 +210,7 @@ def ingest_usgs_cmd(
             "inserted": inserted,
             "updated": updated,
             "signals_written": signals_written,
+            "shares_written": shares_written,
             "materials": [m["canonical_name"] for m in materials],
         }, indent=2))
     finally:
@@ -531,13 +562,19 @@ def ingest_opensanctions_cmd(
         "--geos",
         help='Comma-separated ISO2 high-concentration geo codes. Default: "CN,CD,RU,IR,KP"',
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Skip the interval gate and run regardless of when the last ingest occurred.",
+    ),
 ) -> None:
     """Match companies against OpenSanctions consolidated sanctions lists.
 
     Downloads the free daily bulk export (no API key required).
     Creates RiskEvent rows for company name matches and geography-level signals.
     Idempotent: skips events whose content_hash already exists.
-    Re-run daily or weekly to catch new listings.
+
+    Skips the download if the last run was within 6 days. Use --force to override.
     """
     from app.services.ingestion.opensanctions import OPENSANCTIONS_CSV_URL, ingest_opensanctions
 
@@ -549,6 +586,7 @@ def ingest_opensanctions_cmd(
             session=s,
             url=url or OPENSANCTIONS_CSV_URL,
             high_concentration_geos=geo_list,
+            min_interval_days=0 if force else 6,
         )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
@@ -591,6 +629,61 @@ def seed_facilities_cmd() -> None:
     s = _session()
     try:
         result = seed_facilities(s)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("ingest-mrds")
+def ingest_mrds_cmd(
+    local_file: Optional[str] = typer.Option(
+        None,
+        "--local-file",
+        help=(
+            "Path to a locally-downloaded MRDS CSV or ZIP file. "
+            "Download from: https://mrdata.usgs.gov/mrds/mrds-csv.zip "
+            "If omitted, the ingester downloads directly from USGS."
+        ),
+    ),
+) -> None:
+    """Ingest USGS MRDS mine data into facilities + facility_material_links.
+
+    Populates mining and processing facility records for battery-critical minerals
+    (Lithium, Cobalt, Nickel, Manganese, Natural Graphite, Copper, REE) from the
+    USGS Mineral Resources Data System (~300k global mine records). Feeds the
+    operational scoring pillar with real facility status data.
+
+    Deduplication: existing facilities matched by mrds_dep_id are updated in-place.
+    New facilities are inserted. Records no longer in MRDS are NOT automatically removed.
+
+    MRDS does not publish annual capacity figures — annual_capacity_tpy will be NULL
+    for all MRDS-sourced rows. The operational pillar falls back to event-derived
+    structural_dependency when no capacity data is available.
+
+    \b
+    Run order:
+      bdi-ingest seed-companies        # companies must exist (for company_facility links)
+      bdi-ingest ingest-mrds           # live download, or pass --local-file
+      bdi-ingest rescore-market        # picks up updated facility data in operational pillar
+
+    \b
+    Notes:
+      - Cell factories, pack plants, and recycling facilities are NOT in MRDS.
+        Keep running seed-facilities for those types.
+      - MRDS covers mines (surface/underground/brine) and processing (mills/smelters).
+      - Re-run periodically — MRDS is updated irregularly, not on a fixed schedule.
+    """
+    from app.services.ingestion.mrds import ingest_mrds
+
+    s = _session()
+    try:
+        # ingest_mrds commits in batches internally — already-committed rows
+        # are NOT rolled back if an error occurs partway through, so re-running
+        # after a failure will skip rows already persisted (dep_id dedup).
+        result = ingest_mrds(session=s, local_file=local_file)
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
@@ -1061,12 +1154,19 @@ def ingest_worldbank_cmd(
         "--url",
         help="Override the Pink Sheet download URL (default: current World Bank URL).",
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Skip the interval gate and run regardless of when the last ingest occurred.",
+    ),
 ) -> None:
     """Download the World Bank Pink Sheet and ingest commodity prices.
 
     Fetches CMO-Historical-Data-Monthly.xlsx directly from the World Bank.
     Idempotent: skips rows that already exist in commodity_prices.
-    Re-run monthly after World Bank publishes an update (usually first week of month).
+
+    Skips the download if the most recent price row is less than 25 days old.
+    Use --force to override (e.g. if the World Bank re-publishes a correction).
     """
     from app.services.ingestion.worldbank_pinksheet import PINK_SHEET_URL, ingest_pink_sheet
 
@@ -1076,6 +1176,7 @@ def ingest_worldbank_cmd(
             session=s,
             url=url or PINK_SHEET_URL,
             since_year=since_year,
+            min_interval_days=0 if force else 25,
         )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:

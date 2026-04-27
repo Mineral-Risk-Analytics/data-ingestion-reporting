@@ -11,7 +11,7 @@ from app.models.company import (
 )
 from app.models.documents import DocumentChunk, SourceDocument
 from app.models.intelligence import InsightPost
-from app.models.facility import Facility
+from app.models.facility import CompanyFacility, Facility, FacilityMaterialLink
 from app.models.ingestion import IngestionRun, RawApiPayload
 from app.models.platform import Tenant, UsageEvent, User
 from app.models.regulatory import (
@@ -34,13 +34,14 @@ from app.models.reporting import (
     ReportTemplateFocusEntity,
 )
 from app.models.review import SeedReviewFinding, SeedReviewRun
-from app.models.scoring import GeographyScore, MaterialGeographyRiskScore, MaterialScore
+from app.models.scoring import GeographyScore, MaterialGeographyRiskScore, MaterialGlobalRiskScore, MaterialScore
 from app.models.source import Source
 from app.models.supply_chain_context import SupplyChainContext
 from app.models.supply import (
     CommodityPrice,
     HsCodeMaterialMapping,
     Material,
+    MaterialProductionShare,
     TradeFlow,
 )
 from app.models.vehicle import CompanyVehicleModel, VehicleModelChemistry
@@ -63,7 +64,9 @@ __all__ = [
     # Intelligence hub
     "InsightPost",
     # Facility
+    "CompanyFacility",
     "Facility",
+    "FacilityMaterialLink",
     # Ingestion
     "IngestionRun",
     "RawApiPayload",
@@ -94,6 +97,7 @@ __all__ = [
     # Scoring
     "GeographyScore",
     "MaterialGeographyRiskScore",
+    "MaterialGlobalRiskScore",
     "MaterialScore",
     # Source
     "Source",
@@ -103,6 +107,7 @@ __all__ = [
     "CommodityPrice",
     "HsCodeMaterialMapping",
     "Material",
+    "MaterialProductionShare",
     "TradeFlow",
     # Vehicle (chemistry mix)
     "CompanyVehicleModel",

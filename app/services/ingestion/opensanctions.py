@@ -52,12 +52,12 @@ import hashlib
 import io
 import re
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.company import Company, CompanyAlias
@@ -365,10 +365,35 @@ def _content_hash(title: str, summary: str, event_date: Optional[datetime]) -> s
 # Main ingest
 # ---------------------------------------------------------------------------
 
+_OPENSANCTIONS_EVENT_TYPES = {"sanctions_listing", "geography_sanctions_exposure"}
+
+
+def _days_since_last_run(session: Session) -> Optional[int]:
+    """Return days since the most recent OpenSanctions ingest completed.
+
+    Uses ``MAX(created_at)`` on ``risk_events`` for the two event types this
+    ingester produces as a proxy for the last run. Returns ``None`` if no rows
+    exist yet (i.e. first run).
+    """
+    max_created = session.scalar(
+        select(func.max(RiskEvent.created_at)).where(
+            RiskEvent.event_type.in_(_OPENSANCTIONS_EVENT_TYPES)
+        )
+    )
+    if max_created is None:
+        return None
+    now = datetime.now(timezone.utc)
+    # created_at is tz-aware; ensure max_created is too.
+    if max_created.tzinfo is None:
+        max_created = max_created.replace(tzinfo=timezone.utc)
+    return (now - max_created).days
+
+
 def ingest_opensanctions(
     session: Session,
     url: str = OPENSANCTIONS_CSV_URL,
     high_concentration_geos: Optional[list[str]] = None,
+    min_interval_days: int = 6,
 ) -> dict[str, int]:
     """Download, parse, match, and insert OpenSanctions data as RiskEvents.
 
@@ -377,6 +402,11 @@ def ingest_opensanctions(
         url:                      Override download URL (useful for tests).
         high_concentration_geos:  ISO2 codes to treat as high-risk geographies.
                                   Defaults to CN, CD, RU, IR, KP.
+        min_interval_days:        Skip the download if the most recent
+                                  OpenSanctions event was created within this
+                                  many days. Default 6 — prevents re-downloading
+                                  the full ~300 MB snapshot more than once a
+                                  week. Pass 0 to force a run.
 
     Returns:
         {
@@ -385,8 +415,26 @@ def ingest_opensanctions(
             "geography_events_inserted": int,
             "companies_matched": int,
             "total_entities_parsed": int,
+            "skipped_too_recent": bool,
         }
     """
+    if min_interval_days > 0:
+        days_ago = _days_since_last_run(session)
+        if days_ago is not None and days_ago < min_interval_days:
+            log.info(
+                "opensanctions.ingest.skipped_too_recent",
+                days_since_last_run=days_ago,
+                min_interval_days=min_interval_days,
+            )
+            return {
+                "company_events_inserted": 0,
+                "company_events_skipped_existing": 0,
+                "geography_events_inserted": 0,
+                "companies_matched": 0,
+                "total_entities_parsed": 0,
+                "skipped_too_recent": True,
+            }
+
     if high_concentration_geos is None:
         high_concentration_geos = list(_DEFAULT_HIGH_CONCENTRATION_GEOS)
 
@@ -577,4 +625,5 @@ def ingest_opensanctions(
         "geography_events_inserted": geography_events_inserted,
         "companies_matched": len(matches),
         "total_entities_parsed": len(entities),
+        "skipped_too_recent": False,
     }

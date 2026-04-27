@@ -28,7 +28,7 @@ from typing import Optional
 
 import httpx
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.supply import CommodityPrice, Material
@@ -226,28 +226,65 @@ def parse_pink_sheet(raw_bytes: bytes) -> list[dict]:
     return results
 
 
+def _days_since_last_run(session: Session) -> Optional[int]:
+    """Return days since the most recent Pink Sheet price row was inserted.
+
+    Uses ``MAX(price_date)`` from ``commodity_prices`` for this source as a
+    proxy for the last successful run. Returns ``None`` if no rows exist yet
+    (i.e. first run).
+    """
+    max_date = session.scalar(
+        select(func.max(CommodityPrice.price_date)).where(
+            CommodityPrice.source == _SOURCE
+        )
+    )
+    if max_date is None:
+        return None
+    return (date.today() - max_date).days
+
+
 def ingest_pink_sheet(
     session: Session,
     url: str = PINK_SHEET_URL,
     since_year: Optional[int] = None,
+    min_interval_days: int = 25,
 ) -> dict[str, int]:
     """Download, parse, and upsert Pink Sheet prices into ``commodity_prices``.
 
     Args:
-        session:    SQLAlchemy session. Commits internally in batches.
-        url:        Override download URL (useful for tests with a local fixture).
-        since_year: If set, only ingest rows from this year onward (e.g. 2015).
-                    The Pink Sheet goes back to ~1960; limiting to recent years
-                    reduces the initial load significantly (~130 rows/commodity
-                    per decade).
+        session:           SQLAlchemy session. Commits internally in batches.
+        url:               Override download URL (useful for tests).
+        since_year:        If set, only ingest rows from this year onward.
+                           The Pink Sheet goes back to ~1960; limiting to recent
+                           years reduces the initial load significantly.
+        min_interval_days: Skip the download if the most recent price row is
+                           younger than this many days. Default 25 — slightly
+                           less than a month so the scheduled job always catches
+                           the new monthly release. Pass 0 to force a run.
 
     Returns:
         {
             "inserted": int,
             "skipped_unknown_material": int,
             "skipped_existing": int,
+            "skipped_too_recent": bool,   # True when the gate fires
         }
     """
+    if min_interval_days > 0:
+        days_ago = _days_since_last_run(session)
+        if days_ago is not None and days_ago < min_interval_days:
+            log.info(
+                "pinksheet.ingest.skipped_too_recent",
+                days_since_last_run=days_ago,
+                min_interval_days=min_interval_days,
+            )
+            return {
+                "inserted": 0,
+                "skipped_unknown_material": 0,
+                "skipped_existing": 0,
+                "skipped_too_recent": True,
+            }
+
     raw_bytes = download_pink_sheet(url)
     observations = parse_pink_sheet(raw_bytes)
 
@@ -345,4 +382,5 @@ def ingest_pink_sheet(
         "inserted": inserted,
         "skipped_unknown_material": skipped_unknown,
         "skipped_existing": skipped_existing,
+        "skipped_too_recent": False,
     }

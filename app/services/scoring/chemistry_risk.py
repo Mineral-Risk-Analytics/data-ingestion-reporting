@@ -478,6 +478,252 @@ def rescore_all_chemistries(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Rollup-based chemistry scorer (methodology_version 2.0)
+# ---------------------------------------------------------------------------
+# Replaces the direct event/criticality signal approach with a clean read from
+# MaterialGlobalRiskScore. The old score_chemistry() function is preserved for
+# backward compatibility and can be retired once all chemistries have global
+# rollup scores available.
+
+METHODOLOGY_VERSION_ROLLUP = "2.0"
+
+
+def score_chemistry_from_rollup(
+    session: Session,
+    chemistry_id: int,
+    as_of_date: datetime.date,
+) -> ChemistryRiskScore:
+    """Compute and persist a ChemistryRiskScore from MaterialGlobalRiskScore rows.
+
+    For each active constituent material, reads its most recent
+    MaterialGlobalRiskScore ≤ as_of_date and intensity-weights all five pillars.
+    Produces a ChemistryRiskScore with methodology_version=2.0 and all five
+    pillar columns populated.
+
+    Falls back per-material: if no MaterialGlobalRiskScore exists for a material
+    (e.g. first run, or material has no geo scores yet), that material is logged
+    at WARNING and excluded from the weighted average. A score computed with
+    missing materials is still written — ``score_confidence`` is penalised by
+    data_availability as usual, and the rationale records which materials were
+    missing.
+
+    Does NOT commit — caller is responsible.
+
+    Raises ValueError if the chemistry doesn't exist, has no active materials,
+    or ALL constituent materials are missing global scores.
+    """
+    from app.models.scoring import MaterialGlobalRiskScore
+    from app.services.scoring.market_aggregator import MARKET_PILLAR_WEIGHTS
+
+    chemistry = session.get(BatteryChemistry, chemistry_id)
+    if chemistry is None:
+        raise ValueError(f"BatteryChemistry id={chemistry_id} not found")
+
+    active_rows = session.scalars(
+        select(BatteryChemistryMaterial)
+        .where(
+            BatteryChemistryMaterial.battery_chemistry_id == chemistry_id,
+            BatteryChemistryMaterial.valid_from <= as_of_date,
+            (
+                (BatteryChemistryMaterial.valid_to == None) |  # noqa: E711
+                (BatteryChemistryMaterial.valid_to >= as_of_date)
+            ),
+        )
+        .order_by(BatteryChemistryMaterial.material_id)
+    ).all()
+
+    if not active_rows:
+        raise ValueError(
+            f"No active battery_chemistry_materials for slug='{chemistry.slug}' "
+            f"as_of {as_of_date}."
+        )
+
+    material_ids = [r.material_id for r in active_rows]
+    materials_by_id: dict[int, Material] = {
+        m.id: m
+        for m in session.scalars(select(Material).where(Material.id.in_(material_ids))).all()
+    }
+
+    # Pre-load the most recent MaterialGlobalRiskScore per material
+    from sqlalchemy import func as sqlfunc
+    latest_global_subq = (
+        select(
+            MaterialGlobalRiskScore.material_id,
+            sqlfunc.max(MaterialGlobalRiskScore.as_of_date).label("max_date"),
+        )
+        .where(
+            MaterialGlobalRiskScore.material_id.in_(material_ids),
+            MaterialGlobalRiskScore.as_of_date <= as_of_date,
+        )
+        .group_by(MaterialGlobalRiskScore.material_id)
+        .subquery()
+    )
+    global_scores: dict[int, MaterialGlobalRiskScore] = {
+        gs.material_id: gs
+        for gs in session.scalars(
+            select(MaterialGlobalRiskScore)
+            .join(
+                latest_global_subq,
+                (MaterialGlobalRiskScore.material_id == latest_global_subq.c.material_id)
+                & (MaterialGlobalRiskScore.as_of_date == latest_global_subq.c.max_date),
+            )
+        ).all()
+    }
+
+    # ── Weighted accumulation across constituent materials ──────────────────
+    pillar_sums = {
+        "material_concentration_score": 0.0,
+        "geopolitical_trade_score": 0.0,
+        "regulatory_compliance_score": 0.0,
+        "operational_score": 0.0,
+        "financial_pressure_score": 0.0,
+    }
+    total_intensity = 0.0
+    confidence_product = 1.0
+
+    # Metadata
+    material_scores_used: dict[str, dict] = {}
+    materials_missing_global: list[str] = []
+    no_benchmark_materials: list[str] = []
+
+    for junc in active_rows:
+        material = materials_by_id.get(junc.material_id)
+        if material is None:
+            continue
+
+        name = material.canonical_name
+        intensity = junc.intensity
+        gs = global_scores.get(junc.material_id)
+
+        if gs is None:
+            log.warning(
+                "chemistry_risk.missing_global_score",
+                chemistry=chemistry.slug,
+                material=name,
+                note="No MaterialGlobalRiskScore found — material excluded from rollup",
+            )
+            materials_missing_global.append(name)
+            continue
+
+        for col in pillar_sums:
+            val = getattr(gs, col)
+            if val is not None:
+                pillar_sums[col] += intensity * float(val)
+
+        total_intensity += intensity
+
+        avail = material.data_availability or "commercial"
+        conf_factor = DATA_AVAILABILITY_CONFIDENCE.get(avail, 1.00)
+        confidence_product *= conf_factor
+        if avail == "no_benchmark":
+            no_benchmark_materials.append(name)
+
+        material_scores_used[name] = {
+            "material_id": junc.material_id,
+            "intensity": intensity,
+            "global_score_date": gs.as_of_date.isoformat(),
+            "geo_count": gs.trade_weighted_geo_count,
+            "weight_source": (gs.rationale_json or {}).get("weight_source"),
+            "pillars": {col: getattr(gs, col) for col in pillar_sums},
+            "overall": gs.overall_risk_score,
+        }
+
+    if total_intensity == 0.0:
+        raise ValueError(
+            f"No materials with global scores for chemistry slug='{chemistry.slug}'. "
+            f"Run score_all_material_global_rollups() first."
+        )
+
+    # Normalise by total intensity
+    normalised = {col: round(v / total_intensity, 2) for col, v in pillar_sums.items()}
+
+    # Composite = MARKET_PILLAR_WEIGHTS weighted average of all five pillars
+    composite_risk_score = round(
+        MARKET_PILLAR_WEIGHTS["material"]     * normalised["material_concentration_score"]
+        + MARKET_PILLAR_WEIGHTS["geopolitical"] * normalised["geopolitical_trade_score"]
+        + MARKET_PILLAR_WEIGHTS["regulatory"]   * normalised["regulatory_compliance_score"]
+        + MARKET_PILLAR_WEIGHTS["operational"]  * normalised["operational_score"]
+        + MARKET_PILLAR_WEIGHTS["financial"]    * normalised["financial_pressure_score"],
+        2,
+    )
+    score_confidence = round(max(0.30, confidence_product), 3)
+
+    metadata = {
+        "methodology": "rollup_v2",
+        "materials_scored": list(material_scores_used.keys()),
+        "materials_missing_global_score": materials_missing_global,
+        "no_benchmark_materials": no_benchmark_materials,
+        "score_confidence": score_confidence,
+        "pillar_weights_used": MARKET_PILLAR_WEIGHTS,
+        "material_detail": material_scores_used,
+    }
+
+    log.info(
+        "chemistry_risk.rollup_scored",
+        chemistry=chemistry.slug,
+        composite_risk_score=composite_risk_score,
+        score_confidence=score_confidence,
+        materials_scored=len(material_scores_used),
+        materials_missing=len(materials_missing_global),
+    )
+
+    score_row = ChemistryRiskScore(
+        battery_chemistry_id=chemistry_id,
+        as_of_date=as_of_date,
+        methodology_version=METHODOLOGY_VERSION_ROLLUP,
+        material_concentration_score=normalised["material_concentration_score"],
+        geopolitical_score=normalised["geopolitical_trade_score"],
+        regulatory_compliance_score=normalised["regulatory_compliance_score"],
+        operational_score=normalised["operational_score"],
+        financial_pressure_score=normalised["financial_pressure_score"],
+        composite_risk_score=composite_risk_score,
+        score_confidence=score_confidence,
+        metadata_json=metadata,
+    )
+    session.add(score_row)
+    session.flush()
+    return score_row
+
+
+def score_all_chemistries_from_rollup(
+    session: Session,
+    as_of_date: datetime.date,
+) -> list[dict]:
+    """Score all active chemistries using MaterialGlobalRiskScore rollup data.
+
+    Commits per-chemistry to avoid one failure rolling back the batch.
+    Returns list of dicts: {slug, composite_risk_score, score_confidence,
+    materials_scored, materials_missing}.
+    """
+    chemistries: list[BatteryChemistry] = session.scalars(
+        select(BatteryChemistry).where(BatteryChemistry.is_active == True)  # noqa: E712
+    ).all()
+
+    results = []
+    for chem in chemistries:
+        try:
+            score = score_chemistry_from_rollup(session, chem.id, as_of_date)
+            session.commit()
+            meta = score.metadata_json or {}
+            results.append({
+                "slug": chem.slug,
+                "composite_risk_score": score.composite_risk_score,
+                "score_confidence": score.score_confidence,
+                "materials_scored": len(meta.get("materials_scored", [])),
+                "materials_missing": len(meta.get("materials_missing_global_score", [])),
+            })
+        except Exception as exc:
+            session.rollback()
+            log.warning(
+                "chemistry_risk.rollup_score_failed",
+                chemistry=chem.slug,
+                error=str(exc),
+            )
+
+    return results
+
+
 def _sync_patent_trend(session: Session, material_id: int) -> None:
     """Update materials.patent_occurrence_trend from the latest signal.
 

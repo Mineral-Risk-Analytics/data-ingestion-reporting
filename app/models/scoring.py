@@ -147,6 +147,95 @@ class MaterialGeographyRiskScore(Base):
     )
 
 
+class MaterialGlobalRiskScore(Base):
+    """
+    Trade-flow-weighted rollup of MaterialGeographyRiskScore rows into a single
+    global risk view per material.
+
+    Sits one level above the geo scores and one level below ChemistryRiskScore:
+
+        material_geography_risk_scores  (per-geo, five pillars)
+                  ↓  trade-flow weighted avg across geographies
+        material_global_risk_scores     (this table — one row per material per date)
+                  ↓  intensity-weighted avg across minerals
+        chemistry_risk_scores           (per chemistry, five pillars)
+
+    Unique on (material_id, as_of_date) — one row per scoring run.
+    Append-only: historical rows preserved for trend analysis.
+
+    trade_weighted_geo_count:
+        How many geographies contributed to the weighted average. Shown in
+        the UI as a data coverage indicator — a global score built from only
+        two geographies is less reliable than one built from seven.
+
+    total_trade_value_usd:
+        The sum of trade_value_usd values used as the denominator. NULL when
+        the weights came from MaterialProductionShare or equal weighting
+        (i.e. TradeFlow had no coverage for this material).
+    """
+
+    __tablename__ = "material_global_risk_scores"
+    __table_args__ = (
+        UniqueConstraint(
+            "material_id", "as_of_date",
+            name="uq_material_global_risk_score",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    material_id: Mapped[int] = mapped_column(
+        ForeignKey("materials.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    as_of_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+
+    # ---- five active pillars ------------------------------------------------
+    material_concentration_score: Mapped[Optional[float]] = mapped_column(
+        Float, comment="0–100, trade-flow-weighted avg across geographies"
+    )
+    geopolitical_trade_score: Mapped[Optional[float]] = mapped_column(
+        Float, comment="0–100, trade-flow-weighted avg across geographies"
+    )
+    regulatory_compliance_score: Mapped[Optional[float]] = mapped_column(
+        Float, comment="0–100, trade-flow-weighted avg across geographies"
+    )
+    operational_score: Mapped[Optional[float]] = mapped_column(
+        Float, comment="0–100, trade-flow-weighted avg across geographies"
+    )
+    financial_pressure_score: Mapped[Optional[float]] = mapped_column(
+        Float, comment="0–100, trade-flow-weighted avg across geographies"
+    )
+
+    # ---- overall ------------------------------------------------------------
+    overall_risk_score: Mapped[Optional[float]] = mapped_column(
+        Float, comment="0–100, weighted average of five pillars using MARKET_PILLAR_WEIGHTS"
+    )
+
+    # ---- weight auditability ------------------------------------------------
+    trade_weighted_geo_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Number of geographies that contributed a non-zero weight"
+    )
+    total_trade_value_usd: Mapped[Optional[float]] = mapped_column(
+        Float,
+        comment=(
+            "Sum of trade_value_usd used as the weighting denominator. "
+            "NULL when production shares or equal weights were used instead."
+        ),
+    )
+
+    # ---- metadata -----------------------------------------------------------
+    rationale_json: Mapped[Optional[Any]] = mapped_column(
+        JSONB,
+        comment="Per-geography weights, weight source (trade/production/equal), pillar breakdown"
+    )
+    scoring_version: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default="1.0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class GeographyScore(Base):
     """
     Aggregate risk score at the geography (country) level. Aggregates company scores

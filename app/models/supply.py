@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -82,6 +82,64 @@ class Material(Base):
     chemistry_uses: Mapped[list["BatteryChemistryMaterial"]] = relationship(
         back_populates="material"
     )
+    production_shares: Mapped[list["MaterialProductionShare"]] = relationship(
+        back_populates="material", cascade="all, delete-orphan"
+    )
+
+
+class MaterialProductionShare(Base):
+    """
+    Country-level production volume and share for a material in a given year.
+
+    Populated by ``bdi-ingest ingest-usgs`` from the USGS Mineral Commodity
+    Summaries world data CSV. One row per (material, country, reference_year).
+
+    ``production_volume`` is the raw tonnage from MCS (unit varies by material
+    — see ``unit_of_measure``). ``production_share`` is the fraction of world
+    total (0.0–1.0), computed at ingest time from the same CSV row.
+
+    Used by the global material score rollup to weight geography-level risk
+    scores by each country's share of world production, giving a trade-flow-
+    weighted composite for the material as a whole.
+    """
+
+    __tablename__ = "material_production_shares"
+    __table_args__ = (
+        UniqueConstraint(
+            "material_id", "country_code", "reference_year",
+            name="uq_material_production_share",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    material_id: Mapped[int] = mapped_column(
+        ForeignKey("materials.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    country_code: Mapped[str] = mapped_column(String(2), nullable=False, index=True)
+    reference_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    production_volume: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="Raw production volume from MCS (unit in unit_of_measure)",
+    )
+    production_share: Mapped[float] = mapped_column(
+        Float, nullable=False,
+        comment="Fraction of world total production (0.0–1.0)",
+    )
+    unit_of_measure: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True,
+        comment="Unit from MCS UNIT_MEAS column, e.g. 'metric tons', 'kilograms'",
+    )
+    data_source: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="usgs_mcs",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    material: Mapped["Material"] = relationship(back_populates="production_shares")
 
 
 class TradeFlow(Base):

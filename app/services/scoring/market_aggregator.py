@@ -374,46 +374,186 @@ def _derive_market_regulatory_inputs(
     return top_event_impacts, scope_obligations, policy_proximity_adjustment
 
 
+def _facility_structural_dependency(
+    db: Session,
+    material_id: int,
+    geography_code: Optional[str],
+) -> Optional[float]:
+    """Compute structural_dependency from MRDS facility data.
+
+    Returns the fraction of known production assets that are NOT currently
+    operating (status 'mothballed' or 'closed') for this (material, geography)
+    pair. Returns None only when no facilities are found at all.
+
+    Two-tier internal logic:
+      1. Capacity-weighted (preferred): uses annual_capacity_tpy when present.
+         Currently NULL for all MRDS-sourced rows — reserved for future data
+         enrichment or a supplementary source with tonnage figures.
+      2. Count-based fallback: uses site counts when capacity is absent.
+         This is the active path for MRDS data.
+
+    "Total" for the count-based denominator is operating + mothballed + closed
+    (actual and former production assets). Planned / under_construction sites
+    are excluded — they represent future capacity, not curtailed supply.
+
+    Rationale: if 40% of known lithium mine sites in Chile are non-operational
+    (closed or mothballed), that IS a structural supply risk regardless of
+    whether a risk_event has been ingested.
+
+    Geography filter: applied when geography_code is provided, skipped when
+    None (enables a global material-level fallback).
+    """
+    from app.models.facility import Facility, FacilityMaterialLink
+    from sqlalchemy import func as sqlfunc
+
+    # "closed" is intentionally excluded from both sets. MRDS closed/historical
+    # records frequently date back decades and represent permanently lost capacity,
+    # not curtailed supply. Including them inflates the denominator with irrelevant
+    # history and conflates "mine shut forever" with "mine temporarily idled."
+    # The metric is: what fraction of the live supply pool is currently curtailed?
+    _AT_RISK_STATUSES = {"mothballed"}
+    _PRODUCTION_ASSET_STATUSES = {"operating", "mothballed"}
+
+    base_filter = [FacilityMaterialLink.material_id == material_id]
+    if geography_code:
+        base_filter.append(Facility.country == geography_code)
+
+    # ── Tier 1: capacity-weighted (active if annual_capacity_tpy is populated) ──
+    total_tpy = db.scalar(
+        select(sqlfunc.sum(FacilityMaterialLink.annual_capacity_tpy))
+        .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
+        .where(
+            *base_filter,
+            FacilityMaterialLink.annual_capacity_tpy.is_not(None),
+        )
+    )
+
+    if total_tpy:
+        at_risk_tpy = db.scalar(
+            select(sqlfunc.sum(FacilityMaterialLink.annual_capacity_tpy))
+            .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
+            .where(
+                *base_filter,
+                FacilityMaterialLink.annual_capacity_tpy.is_not(None),
+                Facility.status.in_(_AT_RISK_STATUSES),
+            )
+        ) or 0.0
+        dep = at_risk_tpy / total_tpy
+        log.debug(
+            "market_aggregator.facility_structural_dependency",
+            material_id=material_id,
+            geography_code=geography_code,
+            method="capacity_weighted",
+            at_risk_tpy=at_risk_tpy,
+            total_tpy=total_tpy,
+            structural_dependency=round(dep, 4),
+        )
+        return min(1.0, dep)
+
+    # ── Tier 2: count-based (MRDS path — no capacity figures available) ──────
+    total_sites = db.scalar(
+        select(sqlfunc.count(Facility.id))
+        .join(FacilityMaterialLink, FacilityMaterialLink.facility_id == Facility.id)
+        .where(
+            *base_filter,
+            Facility.status.in_(_PRODUCTION_ASSET_STATUSES),
+        )
+    ) or 0
+
+    if not total_sites:
+        return None  # No facility data for this material / geography
+
+    at_risk_sites = db.scalar(
+        select(sqlfunc.count(Facility.id))
+        .join(FacilityMaterialLink, FacilityMaterialLink.facility_id == Facility.id)
+        .where(
+            *base_filter,
+            Facility.status.in_(_AT_RISK_STATUSES),
+        )
+    ) or 0
+
+    dep = at_risk_sites / total_sites
+    log.debug(
+        "market_aggregator.facility_structural_dependency",
+        material_id=material_id,
+        geography_code=geography_code,
+        method="count_based",
+        at_risk_sites=at_risk_sites,
+        total_sites=total_sites,
+        structural_dependency=round(dep, 4),
+    )
+    return min(1.0, dep)
+
+
 def _derive_market_operational_inputs(
+    db: Session,
+    material_id: int,
+    geography_code: str,
     operational_events: list[EventWithRelevance],
     as_of_date: date,
 ) -> tuple[float, list[float]]:
     """
     Returns (structural_dependency, weighted_event_impacts).
 
-    structural_dependency:
-        At the market level there are no facility records to assess planned
-        vs. operational capacity, so this defaults to 0.3 (the same
-        conservative baseline used for companies with no facility data).
-        Events with SINGLE_SOURCE or CAPACITY_CONSTRAINT subtypes override
-        the baseline when present.
+    structural_dependency — three-tier resolution:
+
+      1. MRDS geography-level: fraction of known production-asset sites in this
+         geography that are mothballed or closed. Uses capacity-weighting when
+         annual_capacity_tpy is populated; falls back to site counts for
+         MRDS-sourced rows (MRDS does not publish capacity figures).
+
+      2. MRDS global fallback: if no MRDS sites exist for this specific
+         geography, try the global material-level fraction (all geographies).
+         Discounted by 0.5 to reflect that it's a broader, less specific signal.
+
+      3. Event baseline: if no MRDS data exists for this material at all,
+         fall back to SINGLE_SOURCE / CAPACITY_CONSTRAINT event severity, or
+         the conservative 0.3 default.
 
     weighted_event_impacts:
-        event_impact for each operational event.
+        event_impact for each operational event, regardless of structural_dependency
+        source. Events and capacity data are complementary, not redundant.
     """
-    struct_events = [
-        ew for ew in operational_events
-        if (ew.event.metadata_json or {}).get("event_subtype", "") in (
-            "SINGLE_SOURCE", "CAPACITY_CONSTRAINT"
-        ) or any(
-            kw in (ew.event.title or "").lower()
-            for kw in ("single source", "single-source", "capacity constraint")
-        )
-    ]
+    # Tier 1: geography-specific MRDS site fraction
+    struct_dep = _facility_structural_dependency(db, material_id, geography_code)
 
-    if struct_events:
-        structural_dependency = sum(
-            float(ew.event.severity_score or 0.5) for ew in struct_events
-        ) / len(struct_events)
-    else:
-        structural_dependency = 0.3
+    # Tier 2: global MRDS fraction (discounted) — when no sites in this geography
+    if struct_dep is None:
+        global_dep = _facility_structural_dependency(db, material_id, geography_code=None)
+        if global_dep is not None:
+            struct_dep = global_dep * 0.5
+            log.debug(
+                "market_aggregator.facility_global_fallback",
+                material_id=material_id,
+                geography_code=geography_code,
+                global_dep=global_dep,
+                discounted=struct_dep,
+            )
+
+    # Tier 3: event-derived baseline — when no MRDS data exists for this material
+    if struct_dep is None:
+        struct_events = [
+            ew for ew in operational_events
+            if (ew.event.metadata_json or {}).get("event_subtype", "") in (
+                "SINGLE_SOURCE", "CAPACITY_CONSTRAINT"
+            ) or any(
+                kw in (ew.event.title or "").lower()
+                for kw in ("single source", "single-source", "capacity constraint")
+            )
+        ]
+        if struct_events:
+            struct_dep = sum(
+                float(ew.event.severity_score or 0.5) for ew in struct_events
+            ) / len(struct_events)
+        else:
+            struct_dep = 0.3
 
     weighted_event_impacts = [
         _event_impact(ew, RiskCategory.OPERATIONAL, as_of_date)
         for ew in operational_events
     ]
 
-    return structural_dependency, weighted_event_impacts
+    return struct_dep, weighted_event_impacts
 
 
 def _score_operational_market(
@@ -426,46 +566,213 @@ def _score_operational_market(
     return min(100.0, raw)
 
 
+def _derive_company_financial_signal(
+    db: Session,
+    material_id: int,
+    as_of_date: date,
+) -> tuple[float, float, list[dict]]:
+    """
+    Compute a production-share-weighted average of SEC EDGAR company financial
+    pressure scores for producers of this material.
+
+    Returns (weighted_avg_fp, coverage_weight, detail_records).
+
+    weighted_avg_fp (0-100):
+        Σ(company.financial_pressure_score × production_share) / Σ(production_share)
+        for companies whose source_geography appears in MaterialProductionShare.
+        Returns 0.0 when no qualifying company scores exist.
+
+    coverage_weight (0.0–1.0):
+        Sum of production shares represented by companies with SEC filings.
+        Caps at 1.0. This is the credibility multiplier — materials where no
+        major producers file with the SEC (e.g. Gallium, Germanium) contribute
+        nothing; materials with well-covered producers (Li, Co, Cu) contribute
+        proportionally.
+
+    detail_records:
+        List of per-company dicts for rationale_json. Empty when no data.
+
+    Coverage notes (as of 2025):
+        Strong:  Li (Albemarle, SQM), Co/Cu (Freeport, Vale), Ni (BHP, Rio Tinto)
+        Partial: REE (MP Materials), Mn, Ti
+        Thin:    Natural Graphite (CATL not SEC-registered), PGMs (Sibanye is JSE)
+        Zero:    Gallium, Germanium, Tellurium, Indium — no major SEC filers
+    """
+    from app.models.company import Company, CompanyMaterialExposure, CompanyScore
+    from app.models.supply import MaterialProductionShare
+    from sqlalchemy import func as sqlfunc
+
+    # Step 1: Production shares for most recent reference year
+    latest_year_subq = (
+        select(sqlfunc.max(MaterialProductionShare.reference_year))
+        .where(MaterialProductionShare.material_id == material_id)
+        .scalar_subquery()
+    )
+    share_stmt = select(
+        MaterialProductionShare.country_code,
+        MaterialProductionShare.production_share,
+    ).where(
+        MaterialProductionShare.material_id == material_id,
+        MaterialProductionShare.reference_year == latest_year_subq,
+        MaterialProductionShare.production_share > 0,
+    )
+    shares_by_country: dict[str, float] = {
+        row.country_code: float(row.production_share)
+        for row in db.execute(share_stmt).all()
+    }
+
+    if not shares_by_country:
+        return 0.0, 0.0, []
+
+    producing_countries = list(shares_by_country.keys())
+
+    # Step 2: Companies with exposure to this material whose source_geography
+    # matches a producing country
+    exposure_stmt = select(
+        Company.id,
+        Company.canonical_name,
+        CompanyMaterialExposure.source_geography,
+        CompanyMaterialExposure.exposure_score,
+    ).join(
+        CompanyMaterialExposure, CompanyMaterialExposure.company_id == Company.id
+    ).where(
+        CompanyMaterialExposure.material_id == material_id,
+        CompanyMaterialExposure.source_geography.in_(producing_countries),
+    )
+    exposure_rows = db.execute(exposure_stmt).all()
+
+    if not exposure_rows:
+        return 0.0, 0.0, []
+
+    # Step 3: Latest financial_pressure_score for each company
+    company_ids = list({row.id for row in exposure_rows})
+    latest_score_subq = (
+        select(
+            CompanyScore.company_id,
+            sqlfunc.max(CompanyScore.as_of_date).label("max_date"),
+        )
+        .where(
+            CompanyScore.company_id.in_(company_ids),
+            CompanyScore.financial_pressure_score.is_not(None),
+            CompanyScore.as_of_date <= as_of_date,
+        )
+        .group_by(CompanyScore.company_id)
+        .subquery()
+    )
+    score_stmt = select(
+        CompanyScore.company_id,
+        CompanyScore.financial_pressure_score,
+    ).join(
+        latest_score_subq,
+        (CompanyScore.company_id == latest_score_subq.c.company_id)
+        & (CompanyScore.as_of_date == latest_score_subq.c.max_date),
+    )
+    scores_by_company: dict = {
+        row.company_id: float(row.financial_pressure_score)
+        for row in db.execute(score_stmt).all()
+    }
+
+    # Step 4: Per-company, keep the source_geography with the highest production
+    # share so each company counts exactly once in the weighted sum.
+    best_by_company: dict = {}  # company_id → (name, geo, prod_share, fp_score)
+    for exp_row in exposure_rows:
+        company_id = exp_row.id
+        geo = exp_row.source_geography
+        fp_score = scores_by_company.get(company_id)
+        if fp_score is None:
+            continue  # No CompanyScore — SEC coverage gap
+        prod_share = shares_by_country.get(geo, 0.0)
+        if prod_share <= 0.0:
+            continue
+        existing = best_by_company.get(company_id)
+        if existing is None or prod_share > existing[2]:
+            best_by_company[company_id] = (exp_row.canonical_name, geo, prod_share, fp_score)
+
+    if not best_by_company:
+        return 0.0, 0.0, []
+
+    # Step 5: Weighted average
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    details: list[dict] = []
+    for company_id, (name, geo, prod_share, fp_score) in best_by_company.items():
+        weighted_sum += fp_score * prod_share
+        weight_sum += prod_share
+        details.append({
+            "company": name,
+            "geography": geo,
+            "production_share": round(prod_share, 4),
+            "financial_pressure_score": round(fp_score, 2),
+            "weighted_contribution": round(fp_score * prod_share, 4),
+        })
+
+    weighted_avg = weighted_sum / weight_sum
+    coverage_weight = min(1.0, weight_sum)
+
+    log.debug(
+        "market_aggregator.company_financial_signal",
+        material_id=material_id,
+        companies_used=len(details),
+        weighted_avg_fp=round(weighted_avg, 2),
+        coverage_weight=round(coverage_weight, 4),
+    )
+    return weighted_avg, coverage_weight, details
+
+
+# Maximum contribution (in base_filing_signal points) from the company-weighted
+# SEC signal. Scaled by coverage_weight so materials with thin SEC coverage
+# contribute proportionally less. 15 pts out of a 40-pt max = 37.5% ceiling
+# when coverage is perfect — leaves room for price volatility to dominate.
+_COMPANY_SIGNAL_MAX_CONTRIBUTION = 15.0
+
+
 def _derive_market_financial_inputs(
     db: Session,
     material_id: int,
     as_of_date: date,
-) -> tuple[float, float, float, int]:
+) -> tuple[float, float, float, int, dict]:
     """
-    Market-level financial pressure sub-inputs. Same tuple signature as
-    ``derive_financial_inputs()`` so ``fp_module.score_financial_pressure()``
-    can be called unchanged.
+    Market-level financial pressure sub-inputs.
 
-    Mapping (company layer → market reframe):
+    Returns a 5-tuple: (base_filing_signal, leverage_warning_bonus,
+    liquidity_stress_bonus, filing_count, company_signal_meta).
+
+    ``company_signal_meta`` is a dict for rationale_json — it is NOT passed to
+    ``fp_module.score_financial_pressure()``, which still takes the first four
+    values unchanged.
+
+    Signal sources (three tiers, all additive):
     ─────────────────────────────────────────────────────────────────────
-    base_filing_signal (0-40)   ← commodity price VOLATILITY
+    Tier 1 — Commodity price series (primary market signal):
+
+    base_filing_signal (0-40)   ← price VOLATILITY
         CV = std(prices) / mean(prices) over _PRICE_WINDOW_DAYS.
         Scaled: min(CV / _PRICE_CV_MAX, 1.0) × 40.
-        Rationale: high price volatility signals supply-demand instability
-        and financial uncertainty for both buyers and producers.
 
-    leverage_warning_bonus (0-30) ← commodity price SPIKE
+    leverage_warning_bonus (0-30) ← price SPIKE
         If price rose > _PRICE_SPIKE_PCT over the window, buyers face
-        increased procurement costs → financial stress proxy.
-        Bonus = min(pct_change / _PRICE_SPIKE_PCT, 1.0) × 30 when positive.
-        Also accumulates from FINANCIAL_PRESSURE events with "price_surge"
-        or "market_squeeze" subtypes tagged to this material.
+        increased procurement costs.
 
-    liquidity_stress_bonus (0-30) ← commodity price CRASH + producer stress
-        If price fell > _PRICE_CRASH_PCT, producers face margin pressure →
-        potential supply cuts.
-        Bonus = min(abs(pct_change) / _PRICE_CRASH_PCT, 1.0) × 30 when negative.
-        Also accumulates from FINANCIAL_PRESSURE events with "producer_exit",
-        "mine_closure", "bankruptcy" subtypes.
+    liquidity_stress_bonus (0-30) ← price CRASH
+        If price fell > _PRICE_CRASH_PCT, producers face margin pressure.
+
+    Tier 2 — FINANCIAL_PRESSURE events tagged to this material:
+        "price_surge" / "market_squeeze" → adds to leverage_warning_bonus
+        "producer_exit" / "mine_closure" / "bankruptcy" → liquidity_stress_bonus
+        generic → base_filing_signal
+
+    Tier 3 — SEC EDGAR producer scores weighted by production share:
+        Σ(company.financial_pressure_score × production_share) / Σ(production_share)
+        Scaled to at most _COMPANY_SIGNAL_MAX_CONTRIBUTION (15 pts) on
+        base_filing_signal, further multiplied by coverage_weight (fraction
+        of world production represented by companies with SEC filings).
+        Materials with no SEC filers (Gallium, Germanium, …) contribute 0.
 
     filing_count:
-        Number of price data points available in the window. When < 2,
-        ``score_financial_pressure()`` applies its sparse-evidence cap —
-        which cleanly handles the case where we have no price history yet.
+        Price data points + event count. Drives sparse-evidence cap in scorer.
     ─────────────────────────────────────────────────────────────────────
-    Falls back gracefully when no price data exists: returns (0, 0, 0, 0)
-    which scores to 0.0 rather than a false mid-point. Upstream rationale
-    records this as a data gap, not a risk signal.
+    Falls back gracefully when no price or company data exists — returns
+    (0, 0, 0, 0, {}) which scores to 0.0 (data gap, not a false signal).
     """
     from datetime import timedelta
 
@@ -541,16 +848,41 @@ def _derive_market_financial_inputs(
     # the full evidence pool (prices + events).
     filing_count = filing_count + len(fin_events)
 
+    # Tier 3: SEC EDGAR producer scores weighted by production share
+    company_weighted_fp, coverage_weight, company_details = _derive_company_financial_signal(
+        db, material_id, as_of_date
+    )
+    company_contribution = (
+        (company_weighted_fp / 100.0) * _COMPANY_SIGNAL_MAX_CONTRIBUTION * coverage_weight
+    )
+    base_filing_signal = min(40.0, base_filing_signal + company_contribution)
+
+    company_signal_meta: dict = {
+        "weighted_avg_fp": round(company_weighted_fp, 2),
+        "coverage_weight": round(coverage_weight, 4),
+        "contribution_to_base_signal": round(company_contribution, 2),
+        "max_possible_contribution": _COMPANY_SIGNAL_MAX_CONTRIBUTION,
+        "companies": company_details,
+        "note": (
+            "SEC EDGAR company financial pressure scores weighted by production share. "
+            "Coverage is strong for Li, Co, Cu, Ni; partial for REE, Mn; "
+            "effectively zero for Ga, Ge, Te, In — coverage_weight reflects this."
+        ),
+    }
+
     log.debug(
         "market_aggregator.financial_inputs",
         material_id=material_id,
         price_points=len(price_rows),
         fin_events=len(fin_events),
+        company_fp_weighted_avg=round(company_weighted_fp, 2),
+        company_coverage=round(coverage_weight, 4),
+        company_contribution=round(company_contribution, 2),
         base_signal=round(base_filing_signal, 2),
         leverage_bonus=round(leverage_warning_bonus, 2),
         liquidity_bonus=round(liquidity_stress_bonus, 2),
     )
-    return base_filing_signal, leverage_warning_bonus, liquidity_stress_bonus, filing_count
+    return base_filing_signal, leverage_warning_bonus, liquidity_stress_bonus, filing_count, company_signal_meta
 
 
 def _aggregate_market_score(
@@ -644,8 +976,8 @@ def score_material_geography(
         db, material_id, geography_code, as_of_date
     )
 
-    # Financial pressure: reframed inputs from commodity prices + producer events
-    base_sig, lev_bon, liq_bon, fin_count = _derive_market_financial_inputs(
+    # Financial pressure: commodity prices + producer events + SEC EDGAR weighted signal
+    base_sig, lev_bon, liq_bon, fin_count, company_fin_meta = _derive_market_financial_inputs(
         db, material_id, as_of_date
     )
 
@@ -662,7 +994,9 @@ def score_material_geography(
     ctry_conc, exp_rest, tariff = _derive_market_geopolitical_inputs(
         geography_code, geo_trade_events, as_of_date
     )
-    struct_dep, op_impacts = _derive_market_operational_inputs(all_op_events, as_of_date)
+    struct_dep, op_impacts = _derive_market_operational_inputs(
+        db, material_id, geography_code, all_op_events, as_of_date
+    )
 
     # --- STEP 4: Score each pillar ---
     mat_score = material_risk.score_material_exposure(crit, conc, trade_vol)
@@ -712,11 +1046,17 @@ def score_material_geography(
                 "event_impact_count": len(op_impacts),
             },
             "financial_pressure": {
-                "note": "Reframed for market level: price volatility + directional trend + producer stress events",
+                "note": (
+                    "Three-tier market signal: "
+                    "(1) commodity price volatility + directional trend, "
+                    "(2) producer stress events, "
+                    "(3) SEC EDGAR company scores weighted by production share."
+                ),
                 "base_filing_signal": base_sig,
                 "leverage_warning_bonus": lev_bon,
                 "liquidity_stress_bonus": liq_bon,
                 "evidence_count": fin_count,
+                "sec_edgar_company_signal": company_fin_meta,
             },
         },
         "pillar_scores": {
@@ -736,7 +1076,7 @@ def score_material_geography(
             f"Overall {overall:.1f}. "
             f"Dominant: {max(('material', mat_score), ('geopolitical', geo_score), ('regulatory', reg_score), ('operational', op_score), ('financial', fin_score), key=lambda x: x[1])[0]} "
             f"({max(mat_score, geo_score, reg_score, op_score, fin_score):.1f}). "
-            f"Financial pressure reframed: price volatility + directional trend + producer stress events. "
+            f"Financial pressure: three-tier (price volatility + producer events + SEC EDGAR weighted by production share, coverage={company_fin_meta.get('coverage_weight', 0.0):.2f}). "
             f"Supply-chain propagation excluded (requires company graph). "
             f"Scoring version {SCORING_VERSION}."
         ),
