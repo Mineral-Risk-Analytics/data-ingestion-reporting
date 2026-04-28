@@ -30,4 +30,4 @@ EXPOSE 8000
 # Railway injects $PORT. Fall back to 8000 for local `docker run`.
 # Migrations run first — if alembic fails, the container exits and Railway
 # marks the deploy failed before any traffic hits the new code.
-CMD uv run alembic upgrade head && python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD alembic upgrade head && python -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
