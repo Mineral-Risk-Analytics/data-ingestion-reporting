@@ -47,6 +47,31 @@ class MaterialGeographyScoreDetail(MaterialGeographyScoreRead):
     rationale_json: Optional[dict[str, Any]] = None
 
 
+class MaterialGlobalScoreRead(BaseModel):
+    """Trade-flow-weighted rollup across all geographies for one material.
+
+    Mirrors ``material_global_risk_scores`` (one row per material per date).
+    Used by the admin material-detail overview and the chemistry risk scorer.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    material_id: int
+    as_of_date: date
+
+    material_concentration_score: Optional[float] = None
+    geopolitical_trade_score: Optional[float] = None
+    regulatory_compliance_score: Optional[float] = None
+    operational_score: Optional[float] = None
+    financial_pressure_score: Optional[float] = None
+    overall_risk_score: Optional[float] = None
+
+    trade_weighted_geo_count: int = 0
+    total_trade_value_usd: Optional[float] = None
+    created_at: datetime
+
+
 class RescoredResult(BaseModel):
     """Response payload for ``POST /market/rescore``."""
 

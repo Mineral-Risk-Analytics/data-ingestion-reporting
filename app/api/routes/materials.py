@@ -13,6 +13,7 @@ from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_user, get_db
+from app.models.battery_chemistry import BatteryChemistry
 from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.reporting import AnalystNote
 from app.models.supply import HsCodeMaterialMapping, Material
@@ -230,9 +231,31 @@ def get_material(
     annotated_mappings = [_annotate_mapping(m, mat, cross_mapped) for m in mat.hs_mappings]
     health = _compute_health(annotated_mappings)
 
+    # Enrich chemistry_uses with slug + name from the parent chemistry row.
+    chemistry_ids = [u.battery_chemistry_id for u in mat.chemistry_uses]
+    chem_by_id: dict[int, BatteryChemistry] = {}
+    if chemistry_ids:
+        chem_by_id = {
+            c.id: c
+            for c in db.scalars(
+                select(BatteryChemistry).where(BatteryChemistry.id.in_(chemistry_ids))
+            ).all()
+        }
+
+    from app.schemas.materials import ChemistryUseRead as _ChemUseRead  # local to avoid circular
+    enriched_uses: list[_ChemUseRead] = []
+    for use in mat.chemistry_uses:
+        row = _ChemUseRead.model_validate(use)
+        chem = chem_by_id.get(use.battery_chemistry_id)
+        if chem:
+            row.chemistry_slug = chem.slug
+            row.chemistry_name = chem.name
+        enriched_uses.append(row)
+
     detail = MaterialDetail.model_validate(mat)
     detail.hs_mappings = annotated_mappings
     detail.mapping_health = health
+    detail.chemistry_uses = enriched_uses
     return detail
 
 

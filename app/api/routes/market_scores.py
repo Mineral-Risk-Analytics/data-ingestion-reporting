@@ -27,12 +27,13 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
-from app.models.scoring import MaterialGeographyRiskScore
+from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
 from app.models.supply import Material
 from app.schemas.common import PaginatedResponse
 from app.schemas.market_scores import (
     MaterialGeographyScoreDetail,
     MaterialGeographyScoreRead,
+    MaterialGlobalScoreRead,
     RescoredResult,
 )
 from app.services.scoring.market_aggregator import score_all_active_materials
@@ -78,6 +79,45 @@ def _latest_per_pair() -> Select:
             MaterialGeographyRiskScore.id.desc(),
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /materials/{material_id}/global-score
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/materials/{material_id}/global-score",
+    response_model=MaterialGlobalScoreRead,
+)
+def get_material_global_score(
+    material_id: int,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MaterialGlobalScoreRead:
+    """Return the most recent trade-flow-weighted global rollup for this material.
+
+    This is the score that feeds chemistry risk scoring — one row per material
+    per scoring date. Returns 404 when no rollup has been computed yet.
+    """
+    _ensure_material_exists(db, material_id)
+    row = db.scalars(
+        select(MaterialGlobalRiskScore)
+        .where(MaterialGlobalRiskScore.material_id == material_id)
+        .order_by(
+            MaterialGlobalRiskScore.as_of_date.desc(),
+            MaterialGlobalRiskScore.id.desc(),
+        )
+        .limit(1)
+    ).first()
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No global score for material {material_id}. "
+                "Trigger a rescore via POST /market/rescore."
+            ),
+        )
+    return MaterialGlobalScoreRead.model_validate(row)
 
 
 # ---------------------------------------------------------------------------

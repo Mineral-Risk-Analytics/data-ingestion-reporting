@@ -61,12 +61,15 @@ class CriticalitySignalRead(BaseModel):
 
 
 class ChemistryUseRead(BaseModel):
-    """Minimal view of a ``BatteryChemistryMaterial`` row shown on material detail."""
+    """Junction row shown on material detail — enriched with chemistry name/slug."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     battery_chemistry_id: int
+    # Populated by the route handler via a join — not a direct ORM field.
+    chemistry_slug: Optional[str] = None
+    chemistry_name: Optional[str] = None
     role: str
     intensity: float
     is_substitutable: bool
