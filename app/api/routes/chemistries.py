@@ -50,10 +50,16 @@ def _get_chemistry_or_404(db: Session, chemistry_id: int) -> BatteryChemistry:
 def _latest_risk_score(
     db: Session, chemistry_id: int
 ) -> Optional[ChemistryRiskScoreRead]:
+    # Prefer the most recent date, then methodology_version="2.0" (rollup) over
+    # "1.0" (simple), then most recently inserted id as final tiebreaker.
     row = db.scalars(
         select(ChemistryRiskScore)
         .where(ChemistryRiskScore.battery_chemistry_id == chemistry_id)
-        .order_by(ChemistryRiskScore.as_of_date.desc())
+        .order_by(
+            ChemistryRiskScore.as_of_date.desc(),
+            ChemistryRiskScore.methodology_version.desc(),  # "2.0" > "1.0" lexicographically
+            ChemistryRiskScore.id.desc(),
+        )
         .limit(1)
     ).first()
     return ChemistryRiskScoreRead.model_validate(row) if row else None

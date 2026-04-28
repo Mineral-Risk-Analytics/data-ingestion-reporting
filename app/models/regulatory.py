@@ -53,6 +53,16 @@ class Regulation(Base):
     effective_date: Mapped[Optional[date]] = mapped_column(Date)
     summary: Mapped[Optional[str]] = mapped_column(Text)
     metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB)
+    geography_compliance_weights: Mapped[Optional[Any]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment=(
+            "Per-geography compliance risk weights (0.0–1.0). "
+            "Keys: ISO2 country codes or 'DEFAULT'. "
+            "1.0 = highest risk (targeted/non-compliant); 0.0 = exempt. "
+            "NULL = use 0.50 universal default (no curation)."
+        ),
+    )
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

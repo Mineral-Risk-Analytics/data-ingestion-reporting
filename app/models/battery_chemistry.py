@@ -157,6 +157,14 @@ class ChemistryRiskScore(Base):
     """
 
     __tablename__ = "chemistry_risk_scores"
+    __table_args__ = (
+        UniqueConstraint(
+            "battery_chemistry_id",
+            "as_of_date",
+            "methodology_version",
+            name="uq_chemistry_risk_score_key",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     battery_chemistry_id: Mapped[int] = mapped_column(

@@ -43,12 +43,13 @@ from typing import Optional
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.constants import RiskCategory
 from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.scoring import MaterialGeographyRiskScore
-from app.models.supply import Material
+from app.models.supply import Material, MaterialProductionShare
 from app.services.scoring import (
     financial_pressure as fp_module,
     geopolitical_risk,
@@ -263,6 +264,8 @@ def _derive_market_material_inputs(
 
 
 def _derive_market_geopolitical_inputs(
+    db: Session,
+    material_id: int,
     geography_code: str,
     geo_trade_events: list[EventWithRelevance],
     as_of_date: date,
@@ -272,14 +275,42 @@ def _derive_market_geopolitical_inputs(
     each on [0, 1.0].
 
     country_concentration:
-        1.0 for HCG countries (CN, CD, RU), 0.0 otherwise. At the single-
-        geography level this is binary — no blending with facility data (no
-        facilities at market level).
+        The geography's share of global production for this material from
+        MaterialProductionShare (most recent reference year).  Uses the
+        fraction directly — e.g. China ≈ 0.70 for Graphite, Chile ≈ 0.30 for
+        Lithium, Australia ≈ 0.50 for Lithium — so scores differentiate
+        meaningfully across geographies and materials.
+
+        Falls back to the legacy HCG binary flag (1.0 for CN/CD/RU, 0.0
+        otherwise) when no production share data exists for this pair,
+        logging a debug message so coverage gaps are visible.
 
     export_restriction_exposure / tariff_exposure:
         Average normalised event_impact for events classified by subtype/keyword.
     """
-    country_concentration = 1.0 if geography_code in HIGH_CONCENTRATION_GEOS else 0.0
+    # Primary: production share from MaterialProductionShare
+    share_row = db.scalar(
+        select(MaterialProductionShare)
+        .where(
+            MaterialProductionShare.material_id == material_id,
+            MaterialProductionShare.country_code == geography_code,
+            MaterialProductionShare.production_share > 0,
+        )
+        .order_by(MaterialProductionShare.reference_year.desc())
+        .limit(1)
+    )
+    if share_row is not None:
+        country_concentration = float(share_row.production_share)
+    else:
+        # Fallback: HCG binary flag for well-known concentrated geographies.
+        # Fires when production share data has not been ingested for this pair.
+        country_concentration = 1.0 if geography_code in HIGH_CONCENTRATION_GEOS else 0.0
+        log.debug(
+            "market_aggregator.geo.production_share_fallback",
+            material_id=material_id,
+            geography_code=geography_code,
+            fallback_value=country_concentration,
+        )
 
     export_events, tariff_events = _classify_geo_events(geo_trade_events)
     export_exposure = _avg_impact_normalised(
@@ -290,6 +321,24 @@ def _derive_market_geopolitical_inputs(
     )
 
     return country_concentration, export_exposure, tariff_exposure
+
+
+def _resolve_compliance_weight(
+    geo_weights: Optional[dict],
+    geography_code: str,
+) -> float:
+    """Resolve a per-geography compliance risk weight from the regulation's JSONB column.
+
+    Lookup order:
+      1. Exact ISO2 match in ``geo_weights``
+      2. "DEFAULT" fallback within ``geo_weights``
+      3. Universal 0.50 default when the column is NULL or empty
+
+    Returns a value in [0.0, 1.0].
+    """
+    if not geo_weights:
+        return 0.50
+    return float(geo_weights.get(geography_code, geo_weights.get("DEFAULT", 0.50)))
 
 
 def _derive_market_regulatory_inputs(
@@ -303,8 +352,16 @@ def _derive_market_regulatory_inputs(
 
     scope_obligations:
         Regulations linked via RegulationMaterialScope to this material OR via
-        RegulationGeographyScope to this geography. All arrive at weight 0.50
-        (unknown compliance status — no company to assess against).
+        RegulationGeographyScope to this geography, each paired with its resolved
+        compliance risk weight for ``geography_code``.
+
+        Weights come from ``Regulation.geography_compliance_weights`` (JSONB):
+          - Exact ISO2 match → that weight
+          - "DEFAULT" key → fallback weight
+          - NULL column (not yet curated) → 0.50 universal default
+
+        This replaces the previous hardcoded 0.50 for all obligations, allowing
+        UFLPA to score CN at 1.0 while US scores 0.05 for the same regulation.
 
     top_event_impacts:
         Normalised event_impact values for regulatory events scoped to this
@@ -321,24 +378,28 @@ def _derive_market_regulatory_inputs(
     )
     from datetime import datetime as _dt
 
-    # Scope-derived regulations (material + geography)
+    # Scope-derived regulations (material + geography).
+    # weights maps regulation_key → resolved compliance risk weight for this geography.
     weights: dict[str, float] = {}
 
     mat_stmt = (
-        select(Regulation.regulation_key)
+        select(Regulation.regulation_key, Regulation.geography_compliance_weights)
         .join(RegulationMaterialScope, RegulationMaterialScope.regulation_id == Regulation.id)
         .where(RegulationMaterialScope.material_id == material_id)
     )
-    for (key,) in db.execute(mat_stmt).all():
-        weights[key] = 0.50
+    for key, geo_weights in db.execute(mat_stmt).all():
+        weights[key] = _resolve_compliance_weight(geo_weights, geography_code)
 
     geo_stmt = (
-        select(Regulation.regulation_key)
+        select(Regulation.regulation_key, Regulation.geography_compliance_weights)
         .join(RegulationGeographyScope, RegulationGeographyScope.regulation_id == Regulation.id)
         .where(RegulationGeographyScope.country_code == geography_code)
     )
-    for (key,) in db.execute(geo_stmt).all():
-        weights[key] = max(weights.get(key, 0.0), 0.50)
+    for key, geo_weights in db.execute(geo_stmt).all():
+        resolved = _resolve_compliance_weight(geo_weights, geography_code)
+        # Take the higher weight if the regulation was already added via material scope
+        if resolved > weights.get(key, 0.0):
+            weights[key] = resolved
 
     scope_obligations = sorted(weights.items())
 
@@ -491,9 +552,9 @@ def _derive_market_operational_inputs(
     geography_code: str,
     operational_events: list[EventWithRelevance],
     as_of_date: date,
-) -> tuple[float, list[float]]:
+) -> tuple[float, list[float], str]:
     """
-    Returns (structural_dependency, weighted_event_impacts).
+    Returns (structural_dependency, weighted_event_impacts, dep_source).
 
     structural_dependency — three-tier resolution:
 
@@ -513,15 +574,30 @@ def _derive_market_operational_inputs(
     weighted_event_impacts:
         event_impact for each operational event, regardless of structural_dependency
         source. Events and capacity data are complementary, not redundant.
+
+    dep_source:
+        Provenance tag stored in rationale_json so post-run queries can identify
+        which (material, geography) pairs are hitting the conservative default
+        rather than real facility data.  One of:
+            "mrds_geography"        — real site fraction for this specific geo
+            "mrds_global_discounted"— global site fraction × 0.5 (geo had no sites)
+            "event_derived"         — average severity of capacity-constraint events
+            "default_0.3"           — no facility data and no relevant events;
+                                      conservative placeholder, data gap
     """
+    dep_source: str
+
     # Tier 1: geography-specific MRDS site fraction
     struct_dep = _facility_structural_dependency(db, material_id, geography_code)
+    if struct_dep is not None:
+        dep_source = "mrds_geography"
 
     # Tier 2: global MRDS fraction (discounted) — when no sites in this geography
     if struct_dep is None:
         global_dep = _facility_structural_dependency(db, material_id, geography_code=None)
         if global_dep is not None:
             struct_dep = global_dep * 0.5
+            dep_source = "mrds_global_discounted"
             log.debug(
                 "market_aggregator.facility_global_fallback",
                 material_id=material_id,
@@ -545,15 +621,23 @@ def _derive_market_operational_inputs(
             struct_dep = sum(
                 float(ew.event.severity_score or 0.5) for ew in struct_events
             ) / len(struct_events)
+            dep_source = "event_derived"
         else:
             struct_dep = 0.3
+            dep_source = "default_0.3"
+            log.debug(
+                "market_aggregator.structural_dependency_default",
+                material_id=material_id,
+                geography_code=geography_code,
+                note="No MRDS facility data and no capacity-constraint events; using 0.3 placeholder",
+            )
 
     weighted_event_impacts = [
         _event_impact(ew, RiskCategory.OPERATIONAL, as_of_date)
         for ew in operational_events
     ]
 
-    return struct_dep, weighted_event_impacts
+    return struct_dep, weighted_event_impacts, dep_source
 
 
 def _score_operational_market(
@@ -570,6 +654,8 @@ def _derive_company_financial_signal(
     db: Session,
     material_id: int,
     as_of_date: date,
+    *,
+    geography_code: Optional[str] = None,
 ) -> tuple[float, float, list[dict]]:
     """
     Compute a production-share-weighted average of SEC EDGAR company financial
@@ -579,15 +665,22 @@ def _derive_company_financial_signal(
 
     weighted_avg_fp (0-100):
         Σ(company.financial_pressure_score × production_share) / Σ(production_share)
-        for companies whose source_geography appears in MaterialProductionShare.
+        for companies whose source_geography matches the target geography (or all
+        producing countries when geography_code is None).
         Returns 0.0 when no qualifying company scores exist.
 
     coverage_weight (0.0–1.0):
-        Sum of production shares represented by companies with SEC filings.
-        Caps at 1.0. This is the credibility multiplier — materials where no
-        major producers file with the SEC (e.g. Gallium, Germanium) contribute
-        nothing; materials with well-covered producers (Li, Co, Cu) contribute
-        proportionally.
+        Sum of production shares represented by companies with SEC filings,
+        capped at 1.0.  When geography_code is provided this reflects what
+        fraction of that geography's production is backed by SEC filings.
+        Materials/geographies where no producers file with the SEC contribute
+        nothing (Gallium, Germanium, most CN-only producers).
+
+    geography_code:
+        When provided, restricts the signal to companies whose source_geography
+        matches this code.  This ensures that Chilean Lithium producers' financial
+        health only influences the CL geography score, not the AU or CN scores.
+        When None, aggregates across all producing countries (backward-compatible).
 
     detail_records:
         List of per-company dicts for rationale_json. Empty when no data.
@@ -599,23 +692,27 @@ def _derive_company_financial_signal(
         Zero:    Gallium, Germanium, Tellurium, Indium — no major SEC filers
     """
     from app.models.company import Company, CompanyMaterialExposure, CompanyScore
-    from app.models.supply import MaterialProductionShare
     from sqlalchemy import func as sqlfunc
 
-    # Step 1: Production shares for most recent reference year
+    # Step 1: Production shares for most recent reference year, optionally
+    # filtered to a single geography.
     latest_year_subq = (
         select(sqlfunc.max(MaterialProductionShare.reference_year))
         .where(MaterialProductionShare.material_id == material_id)
         .scalar_subquery()
     )
-    share_stmt = select(
-        MaterialProductionShare.country_code,
-        MaterialProductionShare.production_share,
-    ).where(
+    share_filters = [
         MaterialProductionShare.material_id == material_id,
         MaterialProductionShare.reference_year == latest_year_subq,
         MaterialProductionShare.production_share > 0,
-    )
+    ]
+    if geography_code:
+        share_filters.append(MaterialProductionShare.country_code == geography_code)
+
+    share_stmt = select(
+        MaterialProductionShare.country_code,
+        MaterialProductionShare.production_share,
+    ).where(*share_filters)
     shares_by_country: dict[str, float] = {
         row.country_code: float(row.production_share)
         for row in db.execute(share_stmt).all()
@@ -712,6 +809,7 @@ def _derive_company_financial_signal(
     log.debug(
         "market_aggregator.company_financial_signal",
         material_id=material_id,
+        geography_code=geography_code,
         companies_used=len(details),
         weighted_avg_fp=round(weighted_avg, 2),
         coverage_weight=round(coverage_weight, 4),
@@ -729,6 +827,7 @@ _COMPANY_SIGNAL_MAX_CONTRIBUTION = 15.0
 def _derive_market_financial_inputs(
     db: Session,
     material_id: int,
+    geography_code: str,
     as_of_date: date,
 ) -> tuple[float, float, float, int, dict]:
     """
@@ -848,9 +947,10 @@ def _derive_market_financial_inputs(
     # the full evidence pool (prices + events).
     filing_count = filing_count + len(fin_events)
 
-    # Tier 3: SEC EDGAR producer scores weighted by production share
+    # Tier 3: SEC EDGAR producer scores weighted by production share,
+    # filtered to companies whose source_geography matches this geography.
     company_weighted_fp, coverage_weight, company_details = _derive_company_financial_signal(
-        db, material_id, as_of_date
+        db, material_id, as_of_date, geography_code=geography_code
     )
     company_contribution = (
         (company_weighted_fp / 100.0) * _COMPANY_SIGNAL_MAX_CONTRIBUTION * coverage_weight
@@ -978,7 +1078,7 @@ def score_material_geography(
 
     # Financial pressure: commodity prices + producer events + SEC EDGAR weighted signal
     base_sig, lev_bon, liq_bon, fin_count, company_fin_meta = _derive_market_financial_inputs(
-        db, material_id, as_of_date
+        db, material_id, geography_code, as_of_date
     )
 
     total_event_count = len({
@@ -992,9 +1092,9 @@ def score_material_geography(
         criticality_signal, geography_code, all_trade_events, as_of_date
     )
     ctry_conc, exp_rest, tariff = _derive_market_geopolitical_inputs(
-        geography_code, geo_trade_events, as_of_date
+        db, material_id, geography_code, geo_trade_events, as_of_date
     )
-    struct_dep, op_impacts = _derive_market_operational_inputs(
+    struct_dep, op_impacts, dep_source = _derive_market_operational_inputs(
         db, material_id, geography_code, all_op_events, as_of_date
     )
 
@@ -1043,6 +1143,7 @@ def score_material_geography(
             },
             "operational": {
                 "structural_dependency": struct_dep,
+                "structural_dependency_source": dep_source,
                 "event_impact_count": len(op_impacts),
             },
             "financial_pressure": {
@@ -1098,8 +1199,44 @@ def score_material_geography(
     )
 
     if persist:
-        db.add(score_row)
-        db.flush()  # populates score_row.id — caller owns db.commit()
+        # Upsert: re-running rescore-market on the same date refreshes scores
+        # rather than crashing on the uq_mat_geo_risk_score unique constraint
+        # (material_id, geography_code, as_of_date).
+        upsert_vals = {
+            "material_id":                    material_id,
+            "geography_code":                 geography_code,
+            "as_of_date":                     as_of_date,
+            "material_concentration_score":   mat_score,
+            "geopolitical_trade_score":       geo_score,
+            "regulatory_compliance_score":    reg_score,
+            "operational_score":              op_score,
+            "financial_pressure_score":       fin_score,
+            "overall_risk_score":             overall,
+            "event_count":                    total_event_count,
+            "rationale_json":                 rationale,
+            "scoring_version":                SCORING_VERSION,
+        }
+        stmt = (
+            pg_insert(MaterialGeographyRiskScore)
+            .values(**upsert_vals)
+            .on_conflict_do_update(
+                constraint="uq_mat_geo_risk_score",
+                set_={
+                    "material_concentration_score": mat_score,
+                    "geopolitical_trade_score":     geo_score,
+                    "regulatory_compliance_score":  reg_score,
+                    "operational_score":            op_score,
+                    "financial_pressure_score":     fin_score,
+                    "overall_risk_score":           overall,
+                    "event_count":                  total_event_count,
+                    "rationale_json":               rationale,
+                    "scoring_version":              SCORING_VERSION,
+                },
+            )
+            .returning(MaterialGeographyRiskScore.id)
+        )
+        row_id = db.execute(stmt).scalar_one()
+        score_row.id = row_id
 
     log.info(
         "market_aggregator.score.done",

@@ -38,6 +38,7 @@ from typing import Optional
 
 import structlog
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.constants import RiskCategory
@@ -91,6 +92,30 @@ _MAX_EVENT_IMPACT = 1.56
 # events in the evidence window. Matches the market layer convention so the
 # absence of events reads as "neutral", not zero risk.
 _DEFAULT_TRADE_VOLATILITY = 0.3
+
+
+def _upsert_chemistry_score(
+    session: Session,
+    values: dict,
+) -> int:
+    """Insert-or-update one chemistry_risk_scores row on the logical key.
+
+    Key = (battery_chemistry_id, as_of_date, methodology_version)
+    """
+    key_cols = {"battery_chemistry_id", "as_of_date", "methodology_version"}
+    update_cols = {k: v for k, v in values.items() if k not in key_cols}
+    update_cols["computed_at"] = func.now()
+
+    stmt = (
+        pg_insert(ChemistryRiskScore)
+        .values(**values)
+        .on_conflict_do_update(
+            constraint="uq_chemistry_risk_score_key",
+            set_=update_cols,
+        )
+        .returning(ChemistryRiskScore.id)
+    )
+    return int(session.execute(stmt).scalar_one())
 
 
 # ---------------------------------------------------------------------------
@@ -418,18 +443,24 @@ def score_chemistry(
         missing_hs_count=len(materials_missing_hs),
     )
 
-    score_row = ChemistryRiskScore(
-        battery_chemistry_id=chemistry_id,
-        as_of_date=as_of_date,
-        methodology_version=METHODOLOGY_VERSION,
-        material_concentration_score=material_concentration_score,
-        geopolitical_score=geopolitical_score,
-        composite_risk_score=composite_risk_score,
-        score_confidence=score_confidence,
-        metadata_json=metadata,
-    )
-    session.add(score_row)
-    session.flush()
+    upsert_vals = {
+        "battery_chemistry_id": chemistry_id,
+        "as_of_date": as_of_date,
+        "methodology_version": METHODOLOGY_VERSION,
+        "material_concentration_score": material_concentration_score,
+        "geopolitical_score": geopolitical_score,
+        "composite_risk_score": composite_risk_score,
+        "score_confidence": score_confidence,
+        "metadata_json": metadata,
+        # v1 scorer does not populate these fields
+        "regulatory_compliance_score": None,
+        "operational_score": None,
+        "financial_pressure_score": None,
+    }
+    row_id = _upsert_chemistry_score(session, upsert_vals)
+    score_row = session.get(ChemistryRiskScore, row_id)
+    if score_row is None:
+        raise ValueError("Failed to persist chemistry score row")
     return score_row
 
 
@@ -668,21 +699,23 @@ def score_chemistry_from_rollup(
         materials_missing=len(materials_missing_global),
     )
 
-    score_row = ChemistryRiskScore(
-        battery_chemistry_id=chemistry_id,
-        as_of_date=as_of_date,
-        methodology_version=METHODOLOGY_VERSION_ROLLUP,
-        material_concentration_score=normalised["material_concentration_score"],
-        geopolitical_score=normalised["geopolitical_trade_score"],
-        regulatory_compliance_score=normalised["regulatory_compliance_score"],
-        operational_score=normalised["operational_score"],
-        financial_pressure_score=normalised["financial_pressure_score"],
-        composite_risk_score=composite_risk_score,
-        score_confidence=score_confidence,
-        metadata_json=metadata,
-    )
-    session.add(score_row)
-    session.flush()
+    upsert_vals = {
+        "battery_chemistry_id": chemistry_id,
+        "as_of_date": as_of_date,
+        "methodology_version": METHODOLOGY_VERSION_ROLLUP,
+        "material_concentration_score": normalised["material_concentration_score"],
+        "geopolitical_score": normalised["geopolitical_trade_score"],
+        "regulatory_compliance_score": normalised["regulatory_compliance_score"],
+        "operational_score": normalised["operational_score"],
+        "financial_pressure_score": normalised["financial_pressure_score"],
+        "composite_risk_score": composite_risk_score,
+        "score_confidence": score_confidence,
+        "metadata_json": metadata,
+    }
+    row_id = _upsert_chemistry_score(session, upsert_vals)
+    score_row = session.get(ChemistryRiskScore, row_id)
+    if score_row is None:
+        raise ValueError("Failed to persist chemistry rollup row")
     return score_row
 
 

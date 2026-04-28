@@ -127,32 +127,6 @@ _REGULATIONS: list[dict] = [
         },
     },
     {
-        "regulation_key": "EU_BATTERY_REG",
-        "title": "EU Battery Regulation 2023/1542",
-        "issuing_body": "European Parliament and Council",
-        "geography": "EU",
-        "policy_theme": "product_compliance_sustainability",
-        "status": "effective",
-        "publication_date": date(2023, 7, 28),
-        "effective_date": date(2024, 2, 18),
-        "summary": (
-            "Comprehensive EU regulation governing batteries placed on the EU market. "
-            "Requires supply chain due diligence for cobalt, natural graphite, lithium, "
-            "and nickel from 2025; mandatory carbon footprint declarations from 2025; "
-            "recycled content minimum targets from 2027 (cobalt 16%, lithium 6%, nickel 6%); "
-            "battery passport (QR code traceability) from 2026 for industrial and EV batteries. "
-            "Replaces the 2006 Battery Directive. Non-compliance = market exclusion from EU."
-        ),
-        "metadata_json": {
-            "regulation_number": "2023/1542",
-            "due_diligence_effective": "2025-08-18",
-            "carbon_footprint_effective": "2025-02-18",
-            "battery_passport_effective": "2026-02-18",
-            "recycled_content_targets_effective": "2027-08-18",
-            "covered_materials": ["Cobalt", "Natural Graphite", "Lithium", "Nickel"],
-        },
-    },
-    {
         "regulation_key": "CRMA_2024",
         "title": "EU Critical Raw Materials Act",
         "issuing_body": "European Council",

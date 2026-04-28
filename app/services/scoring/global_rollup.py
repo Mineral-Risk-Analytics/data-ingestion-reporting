@@ -34,6 +34,7 @@ from typing import Optional
 import structlog
 from sqlalchemy import func as sqlfunc
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
@@ -324,8 +325,45 @@ def score_material_global_rollup(
     )
 
     if persist:
-        db.add(score_row)
-        db.flush()
+        # Upsert: re-running global rollups on the same date should refresh
+        # material_global_risk_scores rather than failing on the unique
+        # constraint (material_id, as_of_date).
+        upsert_vals = {
+            "material_id": material_id,
+            "as_of_date": as_of_date,
+            "material_concentration_score": round(pillar_sums["material_concentration_score"], 2),
+            "geopolitical_trade_score": round(pillar_sums["geopolitical_trade_score"], 2),
+            "regulatory_compliance_score": round(pillar_sums["regulatory_compliance_score"], 2),
+            "operational_score": round(pillar_sums["operational_score"], 2),
+            "financial_pressure_score": round(pillar_sums["financial_pressure_score"], 2),
+            "overall_risk_score": round(overall, 2),
+            "trade_weighted_geo_count": trade_weighted_geo_count,
+            "total_trade_value_usd": total_trade_value,
+            "rationale_json": rationale,
+            "scoring_version": ROLLUP_VERSION,
+        }
+        stmt = (
+            pg_insert(MaterialGlobalRiskScore)
+            .values(**upsert_vals)
+            .on_conflict_do_update(
+                constraint="uq_material_global_risk_score",
+                set_={
+                    "material_concentration_score": upsert_vals["material_concentration_score"],
+                    "geopolitical_trade_score": upsert_vals["geopolitical_trade_score"],
+                    "regulatory_compliance_score": upsert_vals["regulatory_compliance_score"],
+                    "operational_score": upsert_vals["operational_score"],
+                    "financial_pressure_score": upsert_vals["financial_pressure_score"],
+                    "overall_risk_score": upsert_vals["overall_risk_score"],
+                    "trade_weighted_geo_count": trade_weighted_geo_count,
+                    "total_trade_value_usd": total_trade_value,
+                    "rationale_json": rationale,
+                    "scoring_version": ROLLUP_VERSION,
+                },
+            )
+            .returning(MaterialGlobalRiskScore.id)
+        )
+        row_id = db.execute(stmt).scalar_one()
+        score_row.id = row_id
 
     log.info(
         "global_rollup.done",

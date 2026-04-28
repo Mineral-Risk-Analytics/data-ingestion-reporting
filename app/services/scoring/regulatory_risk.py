@@ -2,9 +2,9 @@
 
 Two-part score:
   1. Event-driven rollup — top-3 computed event_impact values, scaled to 0-60.
-  2. Obligation uplift — hard legal obligations (UFLPA, EU Battery Reg, IRA) add
-     additive points capped at 40.  These are not regular policy events; they carry
-     enforcement deadlines and are scored separately to avoid dilution.
+  2. Obligation uplift — hard legal obligations add additive points capped at 40.
+     These are not regular policy events; they carry enforcement deadlines and are
+     scored separately to avoid dilution.
 
 Obligation uplift is weighted by compliance_status severity:
   non_compliant × 1.00  (confirmed violation — full statutory risk)
@@ -13,18 +13,42 @@ Obligation uplift is weighted by compliance_status severity:
 
 This prevents partially-compliant OEMs from scoring identically to confirmed FEOC
 entities with full non-compliance on the same obligations.
+
+For market-level scoring (no company), the weight comes from the regulation's
+geography_compliance_weights JSONB column (resolved by _resolve_compliance_weight
+in market_aggregator.py) rather than a compliance_status lookup.
 """
 
 from __future__ import annotations
 
-# Base uplift points per active compliance obligation (before status multiplier).
+# Base uplift points per active compliance obligation (before weight multiplier).
+#
 # Calibrated so a fully non_compliant UFLPA entity reaches 25/100 from obligations
 # alone before any event signal.  Hard-capped at 40 to reserve headroom for events.
+#
+# Ordering reflects enforcement severity and battery supply chain directness:
+#   Tier 1 (import prohibition / credit disqualification): UFLPA, EU_BATTERY_REG_2023,
+#           CRMA_2024, IRA_DOMESTIC
+#   Tier 2 (broad due diligence mandates, not yet fully effective): EU_CSDDD,
+#           EU_REACH_COBALT
+#   Tier 3 (indirect / narrow battery relevance): EU_CBAM, EU_CONFLICT_MINERALS
+#   Excluded: SEC_CLIMATE_2024 (stayed by federal court as of 2025 — disclosure
+#             rule only, no sourcing prohibition)
+#
+# Geography-specific weights for each regulation are stored in
+# regulations.geography_compliance_weights (seeded in migration 017).
 COMPLIANCE_OBLIGATIONS: dict[str, int] = {
-    "UFLPA":               25,   # confirmed Xinjiang / forced-labour supply exposure
-    "EU_BATTERY_REG_2023": 20,   # sells into EU but lacks required compliance documentation
-    "CRMA_2024":           15,   # strategic raw material supply benchmarks (≥10% extraction, ≥40% processing, ≥15% recycling by 2030)
-    "IRA_DOMESTIC":        15,   # materials do not qualify for IRA domestic content credits
+    # Tier 1 — direct enforcement consequences for battery supply chains
+    "UFLPA":               25,   # rebuttable presumption: Xinjiang goods = forced labour, import ban
+    "EU_BATTERY_REG_2023": 20,   # due diligence + battery passport; non-compliance = EU market exclusion
+    "CRMA_2024":           15,   # 65% single-country cap on strategic raw materials
+    "IRA_DOMESTIC":        15,   # FEOC materials disqualify battery components from IRA credits
+    # Tier 2 — significant but not yet fully effective or more general scope
+    "EU_CSDDD":            10,   # human rights + environmental due diligence across full value chain (effective 2027)
+    "EU_REACH_COBALT":      8,   # cobalt SVHC authorisation requirements for EU manufacturers
+    # Tier 3 — indirect battery relevance
+    "EU_CBAM":              5,   # carbon border certificates for copper/aluminium from 2026
+    "EU_CONFLICT_MINERALS": 3,   # 3TG responsible sourcing (covers BMS electronics, not cathode materials)
 }
 
 

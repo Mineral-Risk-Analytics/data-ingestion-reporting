@@ -559,6 +559,7 @@ def ingest_mrds(
     skipped_no_country   = 0
     skipped_no_commodity = 0
     skipped_no_coords    = 0
+    skipped_planned      = 0
     rows_scanned         = 0
     rows_matched         = 0
     link_material_ids_by_facility: dict[uuid.UUID, set[int]] = {}
@@ -611,8 +612,13 @@ def ingest_mrds(
         # ── Status ────────────────────────────────────────────────────────
         status_raw = str(row.get("dev_stat", "") or "").lower().strip()
         status = MRDS_STATUS_MAP.get(status_raw, "planned")
-        # Default "planned" for unknowns is conservative — avoids inflating
-        # operational capacity with uncertain records.
+        # Skip occurrences, prospects, and anything else that resolves to
+        # "planned" — these are mineral occurrences or speculative prospects
+        # that are excluded from operational scoring and add no signal.
+        # Unknown dev_stat values also default to "planned" and are skipped.
+        if status == "planned":
+            skipped_planned += 1
+            continue
 
         # ── Region and mine name ──────────────────────────────────────────
         region   = str(row.get("state", "") or "").strip() or None
@@ -751,6 +757,7 @@ def ingest_mrds(
                 rows_matched=rows_matched,
                 facilities_inserted=facilities_inserted,
                 facilities_updated=facilities_updated,
+                skipped_planned=skipped_planned,
             )
 
     # Final commit for the last partial batch
@@ -766,6 +773,7 @@ def ingest_mrds(
         "skipped_no_country":   skipped_no_country,
         "skipped_no_commodity": skipped_no_commodity,
         "skipped_no_coords":    skipped_no_coords,
+        "skipped_planned":      skipped_planned,
     }
     log.info("mrds.done", **result)
     return result

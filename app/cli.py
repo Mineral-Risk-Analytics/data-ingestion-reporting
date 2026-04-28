@@ -492,6 +492,80 @@ def rescore_market_cmd(
         s.close()
 
 
+@app.command("rescore-global-rollups")
+def rescore_global_rollups_cmd(
+    as_of: Optional[str] = typer.Option(
+        None,
+        "--as-of",
+        help="Point-in-time date for rollup scoring (YYYY-MM-DD). Default: today.",
+    ),
+    material_id: Optional[int] = typer.Option(
+        None,
+        "--material-id",
+        help=(
+            "Roll up only this material_id into material_global_risk_scores. "
+            "Default: all materials that have geo scores."
+        ),
+    ),
+) -> None:
+    """Compute and persist material_global_risk_scores rows.
+
+    This is step 2 in the market scoring chain:
+      1) rescore-market (material × geography)
+      2) rescore-global-rollups (material-only global rollup)
+    """
+    import datetime
+    import uuid
+
+    from app.models.supply import Material
+    from app.services.scoring.global_rollup import (
+        score_all_material_global_rollups,
+        score_material_global_rollup,
+    )
+
+    as_of_date = datetime.date.fromisoformat(as_of) if as_of else datetime.date.today()
+
+    s = _session()
+    try:
+        if material_id is not None:
+            mat = s.get(Material, material_id)
+            if mat is None:
+                typer.echo(
+                    f"rescore-global-rollups failed: no material with id={material_id}",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+
+            run_id = f"global-cli-{uuid.uuid4()}"
+            score = score_material_global_rollup(
+                s,
+                material_id=mat.id,
+                as_of_date=as_of_date,
+                run_id=f"{run_id}-{mat.id}",
+                persist=True,
+            )
+            s.commit()
+            typer.echo(
+                "rescore-global-rollups complete: "
+                f"{mat.canonical_name} (id={mat.id}) overall={score.overall_risk_score} "
+                f"as_of={as_of_date}"
+            )
+        else:
+            results = score_all_material_global_rollups(s, as_of_date=as_of_date)
+            typer.echo(
+                "rescore-global-rollups complete: "
+                f"{len(results)} material(s) rolled up for {as_of_date}"
+            )
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        s.rollback()
+        typer.echo(f"rescore-global-rollups failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("ingest-comtrade")
 def ingest_comtrade_cmd(
     years: str = typer.Option(
@@ -1859,6 +1933,129 @@ def _format_review_markdown(result, *, dry_run: bool) -> str:
                 )
             lines.append("")
     return "\n".join(lines)
+
+
+@app.command("ingest-iea-policy-tracker")
+def ingest_iea_policy_tracker_cmd(
+    file_path: str = typer.Option(
+        "data/iea_policy_tracker.csv",
+        "--file-path",
+        help=(
+            "Path to the downloaded IEA Policy Tracker CSV (or XLSX). "
+            "Download from https://www.iea.org/data-and-statistics/data-tools/"
+            "critical-minerals-policy-tracker"
+        ),
+    ),
+    run_id: Optional[str] = typer.Option(
+        None,
+        "--run-id",
+        help="Optional identifier for this ingestion run (logged in metadata_json).",
+    ),
+) -> None:
+    """Ingest IEA Critical Minerals Policy Tracker into risk_events.
+
+    Parses the downloadable CSV export from IEA's Policy and Measures database.
+    Creates low-severity RiskEvent rows (POLICY_MILESTONE | INVESTMENT_PLEDGE)
+    for positive-policy signals: investment pledges, recycling mandates,
+    domestic-content milestones, and strategic reserve announcements.
+
+    These are constructive signals, not risk events — severity is capped at 0.20
+    so they contribute minimally to scores.  Their primary value is rationale
+    context: explaining why a geography scores lower than raw supply-concentration
+    data alone would suggest.
+
+    Idempotent: rows are deduplicated by content_hash (title + countries + year).
+
+    \b
+    Run order:
+      bdi-ingest seed-materials    # material lookups must exist
+      bdi-ingest ingest-iea-policy-tracker --file-path data/iea_policy_tracker.csv
+      bdi-ingest rescore-market    # picks up new policy events
+    """
+    from app.services.ingestion.iea_policy_tracker import ingest_policy_tracker
+
+    s = _session()
+    try:
+        result = ingest_policy_tracker(s, xls_path=file_path, run_id=run_id)
+        s.commit()
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("ingest-iea-reports")
+def ingest_iea_reports_cmd(
+    report_year: Optional[int] = typer.Option(
+        None,
+        "--report-year",
+        help=(
+            "Only ingest reports whose reference_year matches this value. "
+            "Default: all enabled reports in the catalogue."
+        ),
+    ),
+    timeout: int = typer.Option(
+        120,
+        "--timeout",
+        help="HTTP timeout in seconds for each PDF download.",
+    ),
+) -> None:
+    """Download IEA Critical Minerals PDF reports and extract criticality signals.
+
+    Fetches enabled reports from the IEA_REPORTS catalogue (currently the 2024
+    and 2023 Critical Minerals Market Reviews).  Extracts MaterialCriticalitySignal
+    rows using pdfplumber — section text and tables are parsed for supply
+    concentration figures and demand trend keywords per mineral.
+
+    Signals are upserted with source="iea_report", which ranks above "usgs_mcs"
+    in the market_aggregator scoring hierarchy, so these forward-looking IEA
+    signals will override USGS-derived criticality scores where available.
+
+    Idempotent: re-running refreshes signals from the latest parsed data.
+
+    \b
+    Run order:
+      bdi-ingest seed-materials        # material lookups must exist
+      bdi-ingest ingest-iea-reports    # this command (downloads PDFs)
+      bdi-ingest rescore-market        # picks up updated criticality signals
+
+    \b
+    Examples:
+      bdi-ingest ingest-iea-reports
+      bdi-ingest ingest-iea-reports --report-year 2024
+      bdi-ingest ingest-iea-reports --timeout 180
+    """
+    from app.services.ingestion.iea_reports import IEA_REPORTS, ingest_iea_reports
+
+    reports = [r for r in IEA_REPORTS if r.enabled]
+    if report_year is not None:
+        reports = [r for r in reports if r.reference_year == report_year]
+        if not reports:
+            typer.echo(
+                f"No enabled reports found for reference_year={report_year}. "
+                f"Available years: {sorted({r.reference_year for r in IEA_REPORTS if r.enabled})}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+    typer.echo(f"Ingesting {len(reports)} IEA report(s)…")
+    for r in reports:
+        typer.echo(f"  • {r.title}")
+
+    s = _session()
+    try:
+        result = ingest_iea_reports(s, reports=reports, timeout=timeout)
+        s.commit()
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
 
 
 def main() -> None:
