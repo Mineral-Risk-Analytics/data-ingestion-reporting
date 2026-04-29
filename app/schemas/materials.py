@@ -89,6 +89,16 @@ class MaterialListItem(BaseModel):
     hs_mapping_count: int = 0
     mapping_mismatch_count: int = 0
     verified: bool = False
+    # Top producing countries — sourced from the JSONB column on Material.
+    primary_producing_countries: Optional[List[str]] = None
+    # Latest global composite risk score (0–100). Populated by route handler via subquery.
+    latest_overall_risk_score: Optional[float] = None
+
+
+class CountryShareItem(BaseModel):
+    """One country's share of world production for a material."""
+    code: str
+    share_pct: int  # rounded integer percentage, e.g. 47
 
 
 class MaterialDetail(BaseModel):
@@ -101,6 +111,9 @@ class MaterialDetail(BaseModel):
     hs_codes: Optional[Any] = None
     criticality_score: Optional[float] = None
     primary_producing_countries: Optional[Any] = None
+    # Production share breakdown — populated by route handler from material_production_shares.
+    # Sorted by share descending; only latest reference_year. Empty list if no data.
+    country_production_shares: List[CountryShareItem] = []
     price_unit: Optional[str] = None
     is_ira_critical_mineral: bool
     is_eu_crma_critical: bool

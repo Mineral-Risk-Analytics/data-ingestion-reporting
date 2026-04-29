@@ -16,9 +16,11 @@ from app.api.deps import get_current_user, get_db
 from app.models.battery_chemistry import BatteryChemistry
 from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.reporting import AnalystNote
-from app.models.supply import HsCodeMaterialMapping, Material
+from app.models.scoring import MaterialGlobalRiskScore
+from app.models.supply import HsCodeMaterialMapping, Material, MaterialProductionShare
 from app.schemas.common import PaginatedResponse, VerifiedResponse, VerifiedUpdate
 from app.schemas.materials import (
+    CountryShareItem,
     HsMappingRead,
     HsMismatchItem,
     MappingHealth,
@@ -191,11 +193,39 @@ def list_materials(
                 )
             )
 
+    # Latest global risk score per material — one bulk query using a ranked subquery.
+    global_risk_scores: dict[int, float] = {}
+    if material_ids:
+        latest_score_sq = (
+            select(
+                MaterialGlobalRiskScore.material_id,
+                MaterialGlobalRiskScore.overall_risk_score,
+                func.row_number()
+                .over(
+                    partition_by=MaterialGlobalRiskScore.material_id,
+                    order_by=MaterialGlobalRiskScore.as_of_date.desc(),
+                )
+                .label("rn"),
+            )
+            .where(MaterialGlobalRiskScore.material_id.in_(material_ids))
+            .subquery()
+        )
+        score_rows = db.execute(
+            select(
+                latest_score_sq.c.material_id,
+                latest_score_sq.c.overall_risk_score,
+            ).where(latest_score_sq.c.rn == 1)
+        ).all()
+        for mid, score in score_rows:
+            if score is not None:
+                global_risk_scores[mid] = score
+
     items: list[MaterialListItem] = []
     for mat in materials:
         item = MaterialListItem.model_validate(mat)
         item.hs_mapping_count = mapping_counts.get(mat.id, 0)
         item.mapping_mismatch_count = mismatch_counts.get(mat.id, 0)
+        item.latest_overall_risk_score = global_risk_scores.get(mat.id)
         if has_mismatched_mappings is True and item.mapping_mismatch_count == 0:
             continue
         if has_mismatched_mappings is False and item.mapping_mismatch_count > 0:
@@ -252,10 +282,34 @@ def get_material(
             row.chemistry_name = chem.name
         enriched_uses.append(row)
 
+    # Production shares — latest reference_year only, sorted by share descending.
+    latest_year_sq = db.scalar(
+        select(func.max(MaterialProductionShare.reference_year))
+        .where(MaterialProductionShare.material_id == material_id)
+    )
+    country_shares: list[CountryShareItem] = []
+    if latest_year_sq is not None:
+        share_rows = db.scalars(
+            select(MaterialProductionShare)
+            .where(
+                MaterialProductionShare.material_id == material_id,
+                MaterialProductionShare.reference_year == latest_year_sq,
+            )
+            .order_by(MaterialProductionShare.production_share.desc())
+        ).all()
+        country_shares = [
+            CountryShareItem(
+                code=row.country_code.upper(),
+                share_pct=round(row.production_share * 100),
+            )
+            for row in share_rows
+        ]
+
     detail = MaterialDetail.model_validate(mat)
     detail.hs_mappings = annotated_mappings
     detail.mapping_health = health
     detail.chemistry_uses = enriched_uses
+    detail.country_production_shares = country_shares
     return detail
 
 
