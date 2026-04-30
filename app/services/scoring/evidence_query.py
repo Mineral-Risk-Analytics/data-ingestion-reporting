@@ -77,6 +77,29 @@ log = structlog.get_logger(__name__)
 
 HIGH_CONCENTRATION_GEOS = frozenset({"CN", "CD", "RU"})
 
+# Weight applied to scope-only regulation hits (no CompanyRegulationExposure row)
+# keyed by RegulationMaterialScope.scope_type.
+#
+# Rationale for each tier:
+#   strategic_raw_material  0.65  CRMA Annex II: binding 2030 extraction/processing/recycling
+#                                 benchmarks; stronger enforcement obligation than disclosure alone.
+#   restricted              0.60  Active restrictions (e.g. REACH SVHC authorisation); enforcement
+#                                 is live but narrower in scope than a strategic designation.
+#   disclosure_required     0.50  Standard disclosure / due-diligence mandate; default assumption
+#                                 when no CompanyRegulationExposure status is recorded.
+#   covered                 0.40  Indirect coverage (e.g. CBAM carbon certificate); less direct
+#                                 enforcement exposure than a disclosure or restriction obligation.
+#   targeted_country        0.50  Used only on geography scopes, not material scopes; included for
+#                                 completeness in case scope_type is ever added there.
+#
+# Unknown scope_type values fall back to 0.50 (same as disclosure_required).
+_SCOPE_TYPE_WEIGHT: dict[str, float] = {
+    "strategic_raw_material": 0.65,
+    "restricted":             0.60,
+    "disclosure_required":    0.50,
+    "covered":                0.40,
+}
+
 
 @dataclass
 class EventWithRelevance:
@@ -502,26 +525,27 @@ def get_regulations_scoping_company(
     """UNION of regulations that apply to this company by exposure or scope.
 
     Three sources:
-      1. Existing ``CompanyRegulationExposure`` rows (status-weighted).
+      1. Existing ``CompanyRegulationExposure`` rows (status-weighted, highest authority).
       2. ``Regulation`` rows linked via ``RegulationMaterialScope`` to one of
-         this company's exposed materials.
+         this company's exposed materials. Weight is derived from ``scope_type``
+         via ``_SCOPE_TYPE_WEIGHT`` — ``strategic_raw_material`` (0.65) ranks
+         above ``disclosure_required`` (0.50) which ranks above ``covered`` (0.40).
       3. ``Regulation`` rows linked via ``RegulationGeographyScope`` to one of
-         this company's source-geographies / facility countries.
+         this company's source-geographies / facility countries (flat 0.50).
 
-    Scope-only hits (no exposure row) are weighted ``0.50`` — the same
-    ``unknown`` convention used by ``get_active_compliance_obligations``.
-    Dedup keeps the max weight per ``regulation_key``.
+    Dedup keeps the max weight per ``regulation_key`` across all three sources,
+    so a structured exposure row always wins over a scope-derived hit.
     """
     weights: dict[str, float] = {}
 
-    # Source 1: structured exposures (status-weighted)
+    # Source 1: structured exposures (status-weighted — highest authority)
     for key, weight in get_active_compliance_obligations(db, company_id, scope=scope):
         weights[key] = max(weights.get(key, 0.0), weight)
 
-    # Source 2: material-scoped regulations
+    # Source 2: material-scoped regulations — weight varies by scope_type
     if material_ids:
         stmt = (
-            select(Regulation.regulation_key)
+            select(Regulation.regulation_key, RegulationMaterialScope.scope_type)
             .join(
                 RegulationMaterialScope,
                 RegulationMaterialScope.regulation_id == Regulation.id,
@@ -530,10 +554,11 @@ def get_regulations_scoping_company(
         )
         if scope.regulation_keys is not None:
             stmt = stmt.where(Regulation.regulation_key.in_(scope.regulation_keys))
-        for (key,) in db.execute(stmt).all():
-            weights[key] = max(weights.get(key, 0.0), 0.50)
+        for key, scope_type in db.execute(stmt).all():
+            w = _SCOPE_TYPE_WEIGHT.get(scope_type or "", 0.50)
+            weights[key] = max(weights.get(key, 0.0), w)
 
-    # Source 3: geography-scoped regulations
+    # Source 3: geography-scoped regulations (flat 0.50 — no scope_type on geo rows)
     if country_codes:
         stmt = (
             select(Regulation.regulation_key)

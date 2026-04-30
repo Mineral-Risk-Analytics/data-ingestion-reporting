@@ -44,6 +44,16 @@ _SOURCE = "worldbank_pink_sheet"
 
 # Maps Pink Sheet column headers → materials.canonical_name values.
 # Only commodities present in this dict are ingested; all others are silently skipped.
+#
+# Coverage notes:
+#   - Tin, Zinc: LME-traded industrial metals used in battery/EV components and solder.
+#   - Platinum: Used as the benchmark price for "platinum-group metals". Palladium is
+#     excluded because both share the same material_id and the unique constraint on
+#     (material_id, price_date, source) would cause silent data loss.
+#   - Many battery-critical materials (REEs, Silicon, Gallium, Germanium, Vanadium,
+#     Tungsten, Niobium, Tantalum, Fluorspar, Antimony) have no public benchmark price
+#     and cannot be sourced from the Pink Sheet. These score flat zero on the financial
+#     pillar, which is a data-gap ambiguity rather than a true low-risk signal.
 _COMMODITY_TO_MATERIAL: dict[str, str] = {
     "Cobalt": "Cobalt",
     "Copper": "Copper",
@@ -56,6 +66,15 @@ _COMMODITY_TO_MATERIAL: dict[str, str] = {
     "Manganese": "Manganese",
     "Graphite": "Natural Graphite",
     "Natural graphite": "Natural Graphite",
+    # --- Added: industrial metals with direct Pink Sheet columns ----------------
+    "Tin": "Tin",
+    "Tin, LME": "Tin",          # alternate header seen in some Pink Sheet editions
+    "Zinc": "Zinc",
+    # Platinum used as the representative benchmark for the PGM group.
+    # Palladium is intentionally excluded: both share the same material_id
+    # ("Platinum-Group Metals") and the unique constraint on (material_id,
+    # price_date, source) would cause one to silently overwrite the other.
+    "Platinum": "Platinum-Group Metals",
 }
 
 _UNIT_MAP: dict[str, str] = {

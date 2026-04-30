@@ -33,8 +33,8 @@ from app.schemas.chemistries import (
 from app.schemas.common import PaginatedResponse, VerifiedResponse, VerifiedUpdate
 from app.schemas.note import AnalystNoteCreate, AnalystNoteRead
 from app.services.scoring.chemistry_risk import (
-    rescore_all_chemistries,
-    rescore_one_chemistry,
+    score_all_chemistries_from_rollup,
+    score_chemistry_from_rollup,
 )
 
 router = APIRouter(prefix="/chemistries", tags=["chemistries"])
@@ -114,13 +114,13 @@ def rescore_all(
     _user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    """Rescore every active chemistry against today's date.
+    """Rescore every active chemistry against today's date using the v2.0 rollup path.
 
-    Returns one ``{slug, composite_risk_score, score_confidence}`` dict per
-    successfully scored chemistry. Failures are logged inside
-    ``rescore_all_chemistries`` and skipped — partial results still commit.
+    Returns one dict per successfully scored chemistry. Failures are logged
+    inside ``score_all_chemistries_from_rollup`` and skipped — partial results
+    are still committed.
     """
-    return rescore_all_chemistries(db, date.today())
+    return score_all_chemistries_from_rollup(db, date.today())
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +222,8 @@ def rescore_chemistry(
     db: Session = Depends(get_db),
 ) -> ChemistryRiskScoreRead:
     _get_chemistry_or_404(db, chemistry_id)
-    score = rescore_one_chemistry(db, chemistry_id, date.today())
+    score = score_chemistry_from_rollup(db, chemistry_id, date.today())
+    db.commit()
     return ChemistryRiskScoreRead.model_validate(score)
 
 

@@ -1,6 +1,7 @@
 """ORM models — import side effects register all metadata with Base."""
 
 from app.models.battery_chemistry import BatteryChemistry, BatteryChemistryMaterial, ChemistryRiskScore
+from app.models.country import Country
 from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.company import (
     Company,
@@ -34,7 +35,7 @@ from app.models.reporting import (
     ReportTemplateFocusEntity,
 )
 from app.models.review import SeedReviewFinding, SeedReviewRun
-from app.models.scoring import GeographyScore, MaterialGeographyRiskScore, MaterialGlobalRiskScore, MaterialScore
+from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
 from app.models.source import Source
 from app.models.supply_chain_context import SupplyChainContext
 from app.models.supply import (
@@ -51,6 +52,8 @@ __all__ = [
     "BatteryChemistry",
     "BatteryChemistryMaterial",
     "ChemistryRiskScore",
+    # Country reference
+    "Country",
     "MaterialCriticalitySignal",
     # Company layer
     "Company",
@@ -95,10 +98,8 @@ __all__ = [
     "SeedReviewRun",
     "SeedReviewFinding",
     # Scoring
-    "GeographyScore",
     "MaterialGeographyRiskScore",
     "MaterialGlobalRiskScore",
-    "MaterialScore",
     # Source
     "Source",
     # Domain config

@@ -39,14 +39,16 @@ dev = [
 bdi-ingest = "app.cli:main"
 
 [tool.hatch.envs.default.scripts]
-ingest-usgs = "bdi-ingest ingest-usgs ./data/mineral_commodities/MCS2025_World_Data.csv"
-ingest-usgs-force = "bdi-ingest ingest-usgs ./data/mineral_commodities/MCS2025_World_Data.csv --force"
+ingest-usgs = "bdi-ingest ingest-usgs ./data/mineral-commodities/MCS2025_World_Data.csv"
+ingest-usgs-force = "bdi-ingest ingest-usgs ./data/mineral-commodities/MCS2025_World_Data.csv --force"
 ingest-worldbank = "bdi-ingest ingest-worldbank"
 ingest-worldbank-full = "bdi-ingest ingest-worldbank --since-year 1960"
 ingest-opensanctions = "bdi-ingest ingest-opensanctions"
 ingest-comtrade = "bdi-ingest ingest-comtrade"
-ingest-comtrade-recent = "bdi-ingest ingest-comtrade --years 2021,2022,2023"
-ingest-comtrade-cn-only = "bdi-ingest ingest-comtrade --reporters CN --years 2021,2022,2023"
+ingest-comtrade-recent = "bdi-ingest ingest-comtrade --years 2023,2024,2025"
+ingest-comtrade-imports = "bdi-ingest ingest-comtrade --flow-code M --years 2023,2024,2025"
+ingest-comtrade-imports-full = "bdi-ingest ingest-comtrade --flow-code M --years 2021,2022,2023,2024,2025"
+ingest-comtrade-cn-only = "bdi-ingest ingest-comtrade --reporters CN --years 2023,2024,2025"
 ingest-gleif = "bdi-ingest ingest-gleif"
 ingest-sec = "bdi-ingest ingest-sec-edgar"
 ingest-federal-register = "bdi-ingest ingest-federal-register"
@@ -64,14 +66,15 @@ seed-materials = "bdi-ingest seed-materials"
 seed-hs-mappings-force = "bdi-ingest seed-hs-mappings --force"
 build-trade-signals = "bdi-ingest build-trade-signals"
 rescore-chemistry = "bdi-ingest rescore-chemistry"
-rescore-chemistry-lfp = "bdi-ingest rescore-chemistry --slug lfp"
-rescore-chemistry-nmc = "bdi-ingest rescore-chemistry --slug nmc"
 rescore-market = "bdi-ingest rescore-market"
 rescore-global-rollups = "bdi-ingest rescore-global-rollups"
 rescore-all = "bdi-ingest rescore-all"
 show-scores = "bdi-ingest show-scores"
 ingest-iea-policy-tracker = "bdi-ingest ingest-iea-policy-tracker --file-path data/iea_policy_tracker.csv"
 ingest-iea-reports = "bdi-ingest ingest-iea-reports"
+setup-all = "bdi-ingest setup-all --usgs-file ./data/mineral-commodities/MCS2025_World_Data.csv"
+full-score = "bdi-ingest full-score"
+
 
 [build-system]
 requires = ["hatchling"]

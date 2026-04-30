@@ -120,18 +120,41 @@ BATTERY_REGULATIONS: list[dict] = [
         "effective_date": date(2024, 5, 23),
         "policy_theme": "critical_materials_supply_security",
         "material_scopes": [
-            # All six battery-relevant materials appear in the EU's 17 Strategic
-            # Raw Materials list (CRMA Annex II). Strategic classification is a
-            # higher compliance burden than "critical": EU member states must hit
-            # binding 2030 benchmarks (≥10% domestic extraction, ≥40% processing,
-            # ≥15% recycling). Use scope_type "strategic_raw_material" rather than
-            # "covered" so scoring queries can differentiate the two tiers.
-            ("Lithium",          "strategic_raw_material"),
-            ("Cobalt",           "strategic_raw_material"),
-            ("Nickel",           "strategic_raw_material"),
-            ("Manganese",        "strategic_raw_material"),
-            ("Natural Graphite", "strategic_raw_material"),
-            ("Copper",           "strategic_raw_material"),
+            # CRMA Annex II: Strategic Raw Materials — the full designation list.
+            # "Strategic" is a higher classification than "critical" (Annex I).
+            # EU member states face binding 2030 benchmarks:
+            #   ≥10% domestic extraction, ≥40% processing, ≥15% recycling.
+            # scope_type "strategic_raw_material" is used (rather than "covered")
+            # so that scoring can apply a higher obligation weight than the default
+            # for Annex I critical materials. See evidence_query._SCOPE_TYPE_WEIGHT.
+            #
+            # Canonical names must match materials.canonical_name exactly.
+            # Any name not found in the DB is logged as a warning and skipped.
+            #
+            # Battery / EV drivetrain materials (cathode, anode, current collector)
+            ("Lithium",                "strategic_raw_material"),
+            ("Cobalt",                 "strategic_raw_material"),
+            ("Nickel",                 "strategic_raw_material"),
+            ("Manganese",              "strategic_raw_material"),
+            ("Natural Graphite",       "strategic_raw_material"),
+            ("Copper",                 "strategic_raw_material"),
+            # Industrial + electronics materials
+            ("Boron",                  "strategic_raw_material"),
+            ("Gallium",                "strategic_raw_material"),
+            ("Germanium",              "strategic_raw_material"),
+            ("Magnesium",              "strategic_raw_material"),
+            ("Silicon (Anode Grade)",  "strategic_raw_material"),  # covers silicon metal broadly
+            ("Titanium",               "strategic_raw_material"),
+            ("Tungsten",               "strategic_raw_material"),
+            ("Niobium",                "strategic_raw_material"),
+            ("Bismuth",                "strategic_raw_material"),
+            # Platinum-group metals (fuel cell catalysts, sensors)
+            ("Platinum-Group Metals",  "strategic_raw_material"),
+            # Magnet rare earth elements (EV traction motors)
+            ("Neodymium",              "strategic_raw_material"),
+            ("Praseodymium",           "strategic_raw_material"),
+            ("Dysprosium",             "strategic_raw_material"),
+            ("Terbium",                "strategic_raw_material"),
         ],
         "geography_scopes": [
             ("EU", "jurisdiction"),

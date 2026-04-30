@@ -7,7 +7,6 @@ Phase 1 implements federal register, census trade, SEC EDGAR, and news stub flow
 from __future__ import annotations
 
 import json
-import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -98,8 +97,6 @@ class IngestionPipeline:
 
         # Cache all companies once per run to avoid N+1 queries during entity resolution.
         company_cache: list[CachedCompanyInfo] = build_company_cache(self._db)
-        # Accumulate company IDs (UUID) touched by new risk events for post-run rescoring.
-        touched_company_ids: set[uuid.UUID] = set()
 
         try:
             if adapter_cls is NewsAdapter:
@@ -120,19 +117,19 @@ class IngestionPipeline:
 
                 if source.source_type == SourceType.FEDERAL_REGISTER.value:
                     written = self._ingest_federal_items(
-                        run, source, bundle, company_cache, touched_company_ids
+                        run, source, bundle, company_cache
                     )
                 elif source.source_type == SourceType.CENSUS_TRADE.value:
                     written = self._ingest_census_items(
-                        run, source, bundle, merged, company_cache, touched_company_ids
+                        run, source, bundle, merged, company_cache
                     )
                 elif source.source_type == SourceType.SEC_EDGAR.value:
                     written = self._ingest_sec_items(
-                        run, source, bundle, merged, company_cache, touched_company_ids
+                        run, source, bundle, merged, company_cache
                     )
                 elif source.source_type == SourceType.NEWS.value:
                     written = self._ingest_news_items(
-                        run, source, bundle, company_cache, touched_company_ids
+                        run, source, bundle, company_cache
                     )
                 else:
                     raise NotImplementedError(
@@ -142,24 +139,8 @@ class IngestionPipeline:
                 self._tracker.add_stat(run, "items_written", written)
 
             self._tracker.complete(run, IngestionStatus.SUCCESS)
-
-            # Rescore every company touched by new risk events.
-            # A scoring failure must not roll back successfully ingested events —
-            # the try/except is intentional. The next ingestion run will rescore
-            # the company when it reappears in touched_company_ids.
-            from app.services.scoring.orchestrator import rescore_company
-            for company_id in touched_company_ids:
-                try:
-                    rescore_company(self._db, company_id, run_id=str(run.id))
-                except Exception as score_exc:
-                    log.error(
-                        "pipeline.rescore_failed",
-                        company_id=str(company_id),
-                        run_id=run.id,
-                        error=str(score_exc),
-                        exc_info=True,
-                    )
-
+            # Rescoring is handled by the scheduled Inngest cron (scoring_jobs.py),
+            # not triggered inline here. See docs/ingestion-pipeline.md §Phase 3 decoupling.
             self._db.commit()
             return run.id
         except Exception as exc:
@@ -193,7 +174,6 @@ class IngestionPipeline:
         source: Source,
         bundle: FetchBundle,
         company_cache: list[CachedCompanyInfo],
-        touched_company_ids: set[uuid.UUID],
     ) -> int:
         count = 0
         for item in bundle.items:
@@ -239,7 +219,7 @@ class IngestionPipeline:
                 extra_meta={"source_api": "federal_register"},
             )
             self._add_risk_event(
-                doc, build_regulatory_risk_event(parsed), company_cache, touched_company_ids
+                doc, build_regulatory_risk_event(parsed), company_cache
             )
             count += 1
         _ = run  # reserved for future per-run metrics
@@ -252,7 +232,6 @@ class IngestionPipeline:
         bundle: FetchBundle,
         merged: dict[str, Any],
         company_cache: list[CachedCompanyInfo],
-        touched_company_ids: set[uuid.UUID],
     ) -> int:
         _ = run
         count = 0
@@ -311,7 +290,7 @@ class IngestionPipeline:
                     trade_value_usd=max_val or sample.trade_value_usd,
                     import_export=ie,
                 )
-                self._add_risk_event(doc, draft, company_cache, touched_company_ids)
+                self._add_risk_event(doc, draft, company_cache)
         self._db.flush()
         return count
 
@@ -322,7 +301,6 @@ class IngestionPipeline:
         bundle: FetchBundle,
         merged: dict[str, Any],
         company_cache: list[CachedCompanyInfo],
-        touched_company_ids: set[uuid.UUID],
     ) -> int:
         _ = merged, run
         count = 0
@@ -364,7 +342,6 @@ class IngestionPipeline:
                         narrative=pf.narrative_excerpt,
                     ),
                     company_cache,
-                    touched_company_ids,
                 )
                 count += 1
         self._db.flush()
@@ -376,7 +353,6 @@ class IngestionPipeline:
         source: Source,
         bundle: FetchBundle,
         company_cache: list[CachedCompanyInfo],
-        touched_company_ids: set[uuid.UUID],
     ) -> int:
         _ = run
         count = 0
@@ -395,7 +371,7 @@ class IngestionPipeline:
                 metadata_json={"source": article.source_name, **article.raw},
                 checksum=sha256_bytes(json.dumps(item, default=str).encode("utf-8")),
             )
-            self._add_risk_event(doc, build_news_event(article), company_cache, touched_company_ids)
+            self._add_risk_event(doc, build_news_event(article), company_cache)
             count += 1
         self._db.flush()
         return count
@@ -499,7 +475,6 @@ class IngestionPipeline:
         doc: SourceDocument,
         draft: RiskEventDraft,
         company_cache: list[CachedCompanyInfo],
-        touched_company_ids: set[uuid.UUID],
     ) -> RiskEvent:
         ev = RiskEvent(
             source_document_id=doc.id,
@@ -519,6 +494,5 @@ class IngestionPipeline:
 
         matches = resolve_companies_for_event(self._db, ev, company_cache)
         persist_company_links(self._db, ev, matches)
-        touched_company_ids.update(company_id for company_id, _, _ in matches)
 
         return ev

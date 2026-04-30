@@ -225,10 +225,13 @@ def _link_companies(
 
 def _get_annual_totals(
     db: Session,
+    import_export_flag: str = "export",
 ) -> dict[tuple[int, str, int], float]:
     """
-    Query trade_flows for WLD partner (total reporter exports) and sum by
-    (material_id, reporter_country, year).
+    Query trade_flows for WLD partner and sum by (material_id, reporter_country, year).
+
+    Args:
+        import_export_flag: ``"export"`` (default) or ``"import"``.
 
     Returns {(material_id, reporter_country, year): total_trade_value_usd}.
     Only includes rows with partner_country='WLD' and material_id IS NOT NULL.
@@ -242,6 +245,7 @@ def _get_annual_totals(
         )
         .where(
             TradeFlow.partner_country == "WLD",
+            TradeFlow.import_export_flag == import_export_flag,
             TradeFlow.material_id.is_not(None),
             TradeFlow.trade_value_usd.is_not(None),
         )
@@ -277,43 +281,59 @@ def build_trade_signals(
     """
     Derive GEOPOLITICAL_TRADE risk events from trade_flows and persist them.
 
+    Processes both export flows (from ingest-comtrade --flow-code X) and import
+    flows (from ingest-comtrade --flow-code M). Safe to run when only one set is
+    present — missing flows produce zero events for that signal type.
+
     Args:
         db:    SQLAlchemy session. Commits internally after all events are created.
         years: Restrict analysis to these years. Default: all years in trade_flows.
 
     Returns:
         {
-            "concentration_events": int,  # TRADE_CONCENTRATION events created
-            "drop_events": int,           # EXPORT_DROP events created
+            "concentration_events": int,  # TRADE_CONCENTRATION (export share ≥60%)
+            "export_drop_events": int,    # EXPORT_DROP (producer exports fell ≥20% YoY)
+            "import_drop_events": int,    # IMPORT_DROP (consumer imports fell ≥20% YoY)
             "company_links": int,         # risk_event_companies rows created
             "skipped_existing": int,      # events skipped (content_hash exists)
         }
     """
     log.info("trade_signal_builder.start")
 
-    annual_totals = _get_annual_totals(db)
-    if not annual_totals:
+    annual_totals = _get_annual_totals(db, import_export_flag="export")
+    annual_import_totals = _get_annual_totals(db, import_export_flag="import")
+
+    if not annual_totals and not annual_import_totals:
         log.warning("trade_signal_builder.no_trade_flows")
-        return {"concentration_events": 0, "drop_events": 0,
-                "company_links": 0, "skipped_existing": 0}
+        return {"concentration_events": 0, "export_drop_events": 0,
+                "import_drop_events": 0, "company_links": 0, "skipped_existing": 0}
 
     material_names = _get_material_names(db)
 
-    # Determine available years (optionally filtered)
-    all_years = sorted({year for (_, _, year) in annual_totals.keys()})
+    # Determine available years across both export and import flows.
+    all_export_years = {year for (_, _, year) in annual_totals.keys()}
+    all_import_years = {year for (_, _, year) in annual_import_totals.keys()}
+    all_years = sorted(all_export_years | all_import_years)
     if years:
         all_years = [y for y in all_years if y in years]
 
-    # Group by (material_id, year) → {country: total_usd}
+    # Group export flows: (material_id, year) → {country: total_usd}
     by_mat_year: dict[tuple[int, int], dict[str, float]] = {}
     for (mat_id, country, year), total in annual_totals.items():
         if year not in all_years:
             continue
-        key = (mat_id, year)
-        by_mat_year.setdefault(key, {})[country] = total
+        by_mat_year.setdefault((mat_id, year), {})[country] = total
+
+    # Group import flows: (material_id, year) → {country: total_usd}
+    by_mat_year_imports: dict[tuple[int, int], dict[str, float]] = {}
+    for (mat_id, country, year), total in annual_import_totals.items():
+        if year not in all_years:
+            continue
+        by_mat_year_imports.setdefault((mat_id, year), {})[country] = total
 
     concentration_events = 0
-    drop_events = 0
+    export_drop_events = 0
+    import_drop_events = 0
     company_links = 0
     skipped_existing = 0
 
@@ -422,10 +442,80 @@ def build_trade_signals(
             _link_material(db, event_id, mat_id)
             linked = _link_companies(db, event_id, mat_id, country)
             company_links += linked
-            drop_events += 1
+            export_drop_events += 1
 
             log.info(
-                "trade_signal_builder.drop_event",
+                "trade_signal_builder.export_drop_event",
+                country=country,
+                material=mat_name,
+                year=year,
+                drop_fraction=round(drop_fraction, 3),
+                severity=severity,
+                companies_linked=linked,
+            )
+
+    # ── IMPORT_DROP signals ───────────────────────────────────────────────────
+    # Raised when a consuming country's total imports of a material fall ≥20% YoY.
+    # Indicates supply stress for that importer — possible production disruption
+    # upstream, policy shift, or alternative sourcing (lower confidence than
+    # EXPORT_DROP since demand-side changes can also explain a drop).
+    for (mat_id, year), country_totals in sorted(by_mat_year_imports.items()):
+        mat_name = material_names.get(mat_id, f"material_{mat_id}")
+        prev_year = year - 1
+        prev_totals = by_mat_year_imports.get((mat_id, prev_year), {})
+        if not prev_totals:
+            continue
+
+        for country, current_total in country_totals.items():
+            prev_total = prev_totals.get(country)
+            if prev_total is None or prev_total < _MIN_TRADE_VALUE_USD:
+                continue
+
+            drop_fraction = (prev_total - current_total) / prev_total
+            if drop_fraction < _DROP_THRESHOLD:
+                continue
+
+            severity = _drop_severity(drop_fraction)
+            title = (
+                f"{country} {mat_name} imports fell {drop_fraction:.0%} "
+                f"YoY ({prev_year}→{year})"
+            )
+            summary = (
+                f"{country} recorded a {drop_fraction:.1%} year-on-year decline in "
+                f"{mat_name} imports ({year} vs {prev_year}): "
+                f"USD {current_total:,.0f} vs USD {prev_total:,.0f}. "
+                f"Significant import drops may indicate upstream supply constraints, "
+                f"export restrictions by producing countries, or demand-side shifts "
+                f"(lower signal confidence than producer-side export drops)."
+            )
+            event_date = datetime(year, 12, 31, tzinfo=timezone.utc)
+
+            event_id = _insert_event(
+                db,
+                title=title,
+                summary=summary,
+                event_date=event_date,
+                severity=severity,
+                event_subtype="IMPORT_DISRUPTION",
+                reporter_country=country,
+                material_id=mat_id,
+                material_name=mat_name,
+                year=year,
+            )
+            if event_id is None:
+                skipped_existing += 1
+                continue
+
+            _link_material(db, event_id, mat_id)
+            # For import signals, the reporter is the consuming country —
+            # link companies that source this material from any geography
+            # (not just the consuming country itself).
+            linked = _link_companies(db, event_id, mat_id, country)
+            company_links += linked
+            import_drop_events += 1
+
+            log.info(
+                "trade_signal_builder.import_drop_event",
                 country=country,
                 material=mat_name,
                 year=year,
@@ -439,13 +529,15 @@ def build_trade_signals(
     log.info(
         "trade_signal_builder.done",
         concentration_events=concentration_events,
-        drop_events=drop_events,
+        export_drop_events=export_drop_events,
+        import_drop_events=import_drop_events,
         company_links=company_links,
         skipped_existing=skipped_existing,
     )
     return {
         "concentration_events": concentration_events,
-        "drop_events": drop_events,
+        "export_drop_events": export_drop_events,
+        "import_drop_events": import_drop_events,
         "company_links": company_links,
         "skipped_existing": skipped_existing,
     }

@@ -72,7 +72,8 @@ from sqlalchemy.orm import Session
 from app.constants import RiskCategory
 from app.models.documents import SourceDocument
 from app.models.enums import DocumentType, ImplementationPhase, SourceType
-from app.models.regulatory import RiskEvent, RiskEventCompany
+from app.models.regulatory import RiskEvent, RiskEventCompany, RiskEventGeography, RiskEventMaterial
+from app.models.supply import Material
 from app.models.source import Source
 from app.services.ingestion.entity_resolution import (
     build_company_cache,
@@ -95,6 +96,194 @@ _API_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=10.0, pool=10.0)
 
 # Severity boost per keyword hit; base is set by doc type (see _severity())
 _KEYWORD_BOOST = 0.12
+
+# ---------------------------------------------------------------------------
+# Geography detection
+# ---------------------------------------------------------------------------
+
+# Maps lowercase text patterns → ISO2 code + context label.
+# Ordered from most- to least-specific so "democratic republic of congo"
+# matches CD before the bare "congo" fallback would.
+# context: "primary" = directly sanctioned/targeted; "mentioned" = referenced
+# in context (e.g. "Chinese supply chains").  Both result in RiskEventGeography
+# rows; primary gets relevance_score=0.9, mentioned gets 0.6.
+_GEO_PATTERNS: list[tuple[str, str, str]] = [
+    # China — highest volume in FR documents
+    ("xinjiang",                    "CN", "primary"),
+    ("china",                       "CN", "primary"),
+    ("chinese",                     "CN", "mentioned"),
+    ("prc",                         "CN", "primary"),
+    # Russia
+    ("russia",                      "RU", "primary"),
+    ("russian",                     "RU", "mentioned"),
+    # DRC — dominant cobalt source
+    ("democratic republic of congo","CD", "primary"),
+    ("drc",                         "CD", "primary"),
+    ("congo (kinshasa)",            "CD", "primary"),
+    ("congo",                       "CD", "mentioned"),
+    # Chile — dominant lithium
+    ("chile",                       "CL", "primary"),
+    ("chilean",                     "CL", "mentioned"),
+    # Australia — lithium, nickel, rare earths
+    ("australia",                   "AU", "primary"),
+    ("australian",                  "AU", "mentioned"),
+    # Indonesia — nickel, cobalt
+    ("indonesia",                   "ID", "primary"),
+    ("indonesian",                  "ID", "mentioned"),
+    # South Africa — PGMs, manganese, chromium
+    ("south africa",                "ZA", "primary"),
+    ("south african",               "ZA", "mentioned"),
+    # Philippines — nickel
+    ("philippines",                 "PH", "primary"),
+    ("philippine",                  "PH", "mentioned"),
+    # Peru — copper, zinc, silver
+    ("peru",                        "PE", "primary"),
+    ("peruvian",                    "PE", "mentioned"),
+    # Argentina — lithium
+    ("argentina",                   "AR", "primary"),
+    ("argentinian",                 "AR", "mentioned"),
+    # Kazakhstan — uranium, chromium, rare earths
+    ("kazakhstan",                  "KZ", "primary"),
+    ("kazakhstani",                 "KZ", "mentioned"),
+    # Canada — nickel, cobalt, rare earths
+    ("canada",                      "CA", "primary"),
+    ("canadian",                    "CA", "mentioned"),
+    # Brazil — iron ore, niobium, manganese, graphite
+    ("brazil",                      "BR", "primary"),
+    ("brazilian",                   "BR", "mentioned"),
+    # Zambia — copper, cobalt
+    ("zambia",                      "ZM", "primary"),
+    ("zambian",                     "ZM", "mentioned"),
+    # Zimbabwe — lithium, platinum
+    ("zimbabwe",                    "ZW", "primary"),
+    ("zimbabwean",                  "ZW", "mentioned"),
+    # Morocco — phosphate, cobalt
+    ("morocco",                     "MA", "primary"),
+    ("moroccan",                    "MA", "mentioned"),
+    # Guinea — bauxite (aluminum)
+    ("guinea",                      "GN", "primary"),
+]
+
+_GEO_RELEVANCE: dict[str, float] = {"primary": 0.9, "mentioned": 0.6}
+
+
+def _detect_geographies(text: str) -> list[tuple[str, str, float]]:
+    """
+    Scan lowercased text for country references.
+    Returns list of (iso2, geography_context, relevance_score), deduplicated
+    by ISO2 — if a country matches both primary and mentioned patterns, primary wins.
+    """
+    lower = text.lower()
+    seen: dict[str, tuple[str, float]] = {}  # iso2 → (context, relevance)
+    for pattern, iso2, context in _GEO_PATTERNS:
+        if pattern not in lower:
+            continue
+        score = _GEO_RELEVANCE[context]
+        existing = seen.get(iso2)
+        if existing is None or score > existing[1]:
+            seen[iso2] = (context, score)
+    return [(iso2, ctx, score) for iso2, (ctx, score) in seen.items()]
+
+
+# ---------------------------------------------------------------------------
+# Material detection
+# ---------------------------------------------------------------------------
+
+# Additional keyword aliases beyond canonical_name / symbol_or_code.
+# Keys are lowercase canonical_name values; values are extra match terms.
+# Only include aliases specific enough to avoid false positives.
+_MATERIAL_ALIASES: dict[str, list[str]] = {
+    "lithium":                  ["li-ion", "lithium-ion", "spodumene", "lithium brine",
+                                 "lithium carbonate", "lithium hydroxide", "lifepo4"],
+    "cobalt":                   ["cobaltous", "cobalt sulfate", "cobalt hydroxide"],
+    "nickel":                   ["nickel sulfate", "nickel laterite", "class 1 nickel",
+                                 "mixed hydroxide precipitate", "mhp"],
+    "natural graphite":         ["graphite", "natural graphite", "spherical graphite",
+                                 "anode material", "anode graphite"],
+    "manganese":                ["high-purity manganese", "manganese sulfate", "hpmsm"],
+    "copper":                   ["copper cathode", "copper concentrate"],
+    "aluminum":                 ["aluminium", "bauxite", "alumina"],
+    "rare earth elements":      ["rare earth", "rare-earth", "ree", "neodymium",
+                                 "dysprosium", "praseodymium", "lanthanum", "cerium",
+                                 "permanent magnet", "ndfeb"],
+    "phosphate (battery grade)":["lithium iron phosphate", "lfp", "iron phosphate",
+                                 "phosphoric acid", "phosphate rock"],
+    "silicon (anode grade)":    ["silicon anode", "silicon carbide", "sio2"],
+    "platinum-group metals":    ["pgm", "platinum", "palladium", "rhodium",
+                                 "platinum group", "fuel cell catalyst"],
+    "gallium":                  ["gallium arsenide", "gaas", "gallium nitride"],
+    "germanium":                ["germanium dioxide"],
+    "chromium":                 ["ferrochrome", "chromite", "chromium ore"],
+    "manganese":                ["ferromanganese", "silicomanganese"],
+    "niobium":                  ["ferroniobium", "columbium"],
+    "tantalum":                 ["coltan", "tantalite"],
+    "vanadium":                 ["vanadium redox", "vrb", "vanadium pentoxide"],
+    "tungsten":                 ["wolframite", "scheelite", "tungsten carbide"],
+    "fluorspar":                ["fluorite", "hydrogen fluoride", "hydrofluoric acid"],
+    "tin":                      ["cassiterite", "tin solder"],
+    "antimony":                 ["antimony trioxide"],
+    "zinc":                     ["zinc oxide", "zinc sulfate"],
+}
+
+
+class MaterialCache:
+    """
+    Pre-built lookup of material keywords → (material_id, relevance_score).
+    Built once per ingest run from the materials table and reused across events.
+    """
+
+    def __init__(self, entries: list[tuple[str, int, float]]) -> None:
+        # entries: [(keyword_lower, material_id, base_relevance)]
+        self._entries = entries
+
+    @classmethod
+    def build(cls, session: Session) -> "MaterialCache":
+        rows = session.execute(
+            select(Material.id, Material.canonical_name, Material.symbol_or_code)
+        ).all()
+
+        entries: list[tuple[str, int, float]] = []
+        seen_keywords: set[str] = set()
+
+        def _add(keyword: str, mat_id: int, relevance: float) -> None:
+            kw = keyword.lower().strip()
+            if not kw or len(kw) < 3:
+                return
+            entries.append((kw, mat_id, relevance))
+            seen_keywords.add(f"{kw}:{mat_id}")
+
+        for mat_id, canonical_name, symbol_or_code in rows:
+            # canonical_name → high confidence
+            _add(canonical_name, mat_id, 0.9)
+
+            # symbol (e.g. "Li", "Co") — lower confidence; short symbols risk
+            # false positives so they only contribute at 0.5
+            if symbol_or_code and len(symbol_or_code) >= 2:
+                _add(symbol_or_code, mat_id, 0.5)
+
+            # Additional aliases from the lookup table
+            aliases = _MATERIAL_ALIASES.get(canonical_name.lower(), [])
+            for alias in aliases:
+                _add(alias, mat_id, 0.8)
+
+        return cls(entries)
+
+    def detect(self, text: str) -> list[tuple[int, float, str]]:
+        """
+        Scan text for material keywords.
+        Returns [(material_id, relevance_score, match_reason)], one entry per
+        material (highest relevance wins if multiple keywords match).
+        """
+        lower = text.lower()
+        best: dict[int, tuple[float, str]] = {}  # material_id → (score, matched_kw)
+        for keyword, mat_id, relevance in self._entries:
+            if keyword not in lower:
+                continue
+            existing = best.get(mat_id)
+            if existing is None or relevance > existing[0]:
+                best[mat_id] = (relevance, keyword)
+        return [(mat_id, score, kw) for mat_id, (score, kw) in best.items()]
+
 
 # Keywords that signal high relevance to battery supply chain
 _HIGH_SIGNAL_KEYWORDS = frozenset({
@@ -149,10 +338,13 @@ TARGETED_QUERIES: list[QueryConfig] = [
         name="uflpa",
         # UFLPA alone is highly specific — every UFLPA document is supply-chain relevant.
         # "UFLPA forced labor" co-occurrence is rare in document text so the paired query returns 0.
+        # UFLPA events affect both regulatory compliance AND operational risk: entities added to the
+        # UFLPA Entity List disrupt supplier relationships and mine/processing continuity directly.
         term="UFLPA",
         event_subtype="REGULATORY_COMPLIANCE",
         risk_categories=[
             RiskCategory.REGULATORY_COMPLIANCE.value,
+            RiskCategory.OPERATIONAL.value,
         ],
         base_severity_boost=0.20,
     ),
@@ -178,6 +370,475 @@ TARGETED_QUERIES: list[QueryConfig] = [
         base_severity_boost=0.0,
     ),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Persist helpers for new junction rows
+# ---------------------------------------------------------------------------
+
+def _persist_material_links(
+    session: Session,
+    event: RiskEvent,
+    matches: list[tuple[int, float, str]],
+) -> int:
+    """
+    Write RiskEventMaterial rows for each detected material.
+    Idempotent: skips pairs that already exist (unique constraint on
+    risk_event_id + material_id).
+    Returns the number of rows written.
+    """
+    written = 0
+    for material_id, relevance, matched_keyword in matches:
+        existing = session.scalar(
+            select(RiskEventMaterial).where(
+                RiskEventMaterial.risk_event_id == event.id,
+                RiskEventMaterial.material_id == material_id,
+            ).limit(1)
+        )
+        if existing is not None:
+            continue
+        session.add(RiskEventMaterial(
+            risk_event_id=event.id,
+            material_id=material_id,
+            relevance_score=relevance,
+            match_reason=f"keyword_match:{matched_keyword[:48]}",
+        ))
+        written += 1
+    if written:
+        session.flush()
+    return written
+
+
+def _persist_geography_links(
+    session: Session,
+    event: RiskEvent,
+    geos: list[tuple[str, str, float]],
+) -> int:
+    """
+    Write RiskEventGeography rows for each detected country.
+    Idempotent: skips pairs already present.
+    Returns the number of rows written.
+    """
+    written = 0
+    for iso2, context, relevance in geos:
+        existing = session.scalar(
+            select(RiskEventGeography).where(
+                RiskEventGeography.risk_event_id == event.id,
+                RiskEventGeography.country_code == iso2,
+            ).limit(1)
+        )
+        if existing is not None:
+            continue
+        session.add(RiskEventGeography(
+            risk_event_id=event.id,
+            country_code=iso2,
+            geography_context=context,
+            relevance_score=relevance,
+        ))
+        written += 1
+    if written:
+        session.flush()
+    return written
+
+
+# ---------------------------------------------------------------------------
+# Targeted patch for existing events
+# ---------------------------------------------------------------------------
+
+# Doc types where publication date and effective date meaningfully diverge.
+# Notices and proposed rules rarely have a separate effective date — only
+# final rules and presidential documents typically do.
+_EFFECTIVE_DATE_DOC_TYPES = frozenset({
+    "rule", "final rule", "interim final rule",
+    "presidential document", "executive order", "proclamation",
+})
+
+
+def patch_fr_events(
+    session: Session,
+    *,
+    fix_uflpa_routing: bool = True,
+    fix_effective_dates: bool = True,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """
+    Retroactively apply two improvements to existing Federal Register events:
+
+    1. UFLPA routing (fix_uflpa_routing=True):
+       Adds RiskCategory.OPERATIONAL to the risk_categories_json of events
+       ingested under the 'uflpa' query.  These events affect operational
+       risk (supplier/mine continuity) as well as regulatory compliance, but
+       the original ingest only tagged them REGULATORY_COMPLIANCE.
+       Pure DB update — no API calls required.
+
+    2. effective_on date (fix_effective_dates=True):
+       Updates event_date on existing FR events from publication_date to
+       effective_on where they differ.  Re-fetches effective_on from the
+       Federal Register API in batches of 100 documents using the
+       conditions[document_number][] parameter.  Only targets event types
+       where the gap is meaningful (final rules, executive orders,
+       presidential documents). Notices and proposed rules are skipped.
+
+    Args:
+        session:              SQLAlchemy session. Commits after each fix.
+        fix_uflpa_routing:    Add OPERATIONAL category to UFLPA events.
+        fix_effective_dates:  Re-fetch and apply effective_on dates.
+        dry_run:              Compute changes but do NOT write or commit.
+
+    Returns:
+        {
+            "uflpa_events_patched": int,
+            "effective_dates_fetched": int,
+            "effective_dates_updated": int,
+            "api_errors": int,
+        }
+    """
+    uflpa_patched = 0
+    effective_fetched = 0
+    effective_updated = 0
+    api_errors = 0
+
+    # ── Fix 1: UFLPA → OPERATIONAL routing ──────────────────────────────────
+    if fix_uflpa_routing:
+        uflpa_events = list(session.scalars(
+            select(RiskEvent).where(
+                RiskEvent.event_type == "federal_register_notice",
+                # JSONB path operator: metadata_json->>'query_name' = 'uflpa'
+                RiskEvent.metadata_json["query_name"].astext == "uflpa",
+            )
+        ).all())
+
+        operational_val = RiskCategory.OPERATIONAL.value
+        for ev in uflpa_events:
+            cats: list = list(ev.risk_categories_json or [])
+            if operational_val not in cats:
+                if not dry_run:
+                    cats.append(operational_val)
+                    ev.risk_categories_json = cats
+                uflpa_patched += 1
+
+        if not dry_run and uflpa_patched:
+            session.commit()
+
+        log.info(
+            "patch_fr_events.uflpa_routing",
+            dry_run=dry_run,
+            patched=uflpa_patched,
+        )
+
+    # ── Fix 2: effective_on dates ────────────────────────────────────────────
+    if fix_effective_dates:
+        from app.models.documents import SourceDocument
+
+        # Only target doc types where publication ≠ effective matters.
+        # metadata_json->>'doc_type' is stored by _upsert_source_document.
+        candidate_rows = list(session.execute(
+            select(RiskEvent, SourceDocument)
+            .join(
+                SourceDocument,
+                SourceDocument.id == RiskEvent.source_document_id,
+            )
+            .where(
+                RiskEvent.event_type == "federal_register_notice",
+                # Lower-case comparison for safety; FR returns mixed-case types.
+                # Use func.lower on the JSONB text extraction.
+                SourceDocument.metadata_json["doc_type"].astext.ilike(
+                    "%rule%"
+                )
+                | SourceDocument.metadata_json["doc_type"].astext.ilike(
+                    "%presidential%"
+                )
+                | SourceDocument.metadata_json["doc_type"].astext.ilike(
+                    "%executive order%"
+                )
+                | SourceDocument.metadata_json["doc_type"].astext.ilike(
+                    "%proclamation%"
+                ),
+            )
+        ).all())
+
+        if not candidate_rows:
+            log.info("patch_fr_events.effective_dates.no_candidates")
+        else:
+            log.info(
+                "patch_fr_events.effective_dates.candidates",
+                count=len(candidate_rows),
+            )
+
+            # Build (doc_number → (event, source_doc)) mapping
+            doc_map: dict[str, tuple] = {}
+            for ev, src in candidate_rows:
+                doc_number = (
+                    (src.metadata_json or {}).get("document_number")
+                    or src.external_id
+                )
+                if doc_number:
+                    doc_map[doc_number] = (ev, src)
+
+            # Batch-fetch effective_on from the FR API, 100 documents per call.
+            # The FR API supports conditions[document_number][] for multi-doc lookup.
+            doc_numbers = list(doc_map.keys())
+            _BATCH = 100
+
+            with httpx.Client(follow_redirects=True) as client:
+                for batch_start in range(0, len(doc_numbers), _BATCH):
+                    batch = doc_numbers[batch_start: batch_start + _BATCH]
+                    time.sleep(_RATE_LIMIT_DELAY)
+
+                    try:
+                        effective_map = _fetch_effective_on_batch(client, batch)
+                        effective_fetched += len(effective_map)
+                    except Exception as exc:
+                        log.warning(
+                            "patch_fr_events.effective_dates.api_error",
+                            batch_start=batch_start,
+                            error=str(exc),
+                        )
+                        api_errors += 1
+                        continue
+
+                    for doc_num, effective_on in effective_map.items():
+                        if doc_num not in doc_map:
+                            continue
+                        ev, src = doc_map[doc_num]
+                        if not effective_on:
+                            continue
+
+                        new_dt = datetime.combine(
+                            effective_on, datetime.min.time(), tzinfo=timezone.utc
+                        )
+
+                        # Skip if the stored event_date already matches
+                        if ev.event_date and abs(
+                            (ev.event_date.replace(tzinfo=timezone.utc)
+                             if ev.event_date.tzinfo is None
+                             else ev.event_date)
+                            - new_dt
+                        ).days == 0:
+                            continue
+
+                        if not dry_run:
+                            ev.event_date = new_dt
+                            # Store pub_date in metadata_json if not already there
+                            meta = dict(ev.metadata_json or {})
+                            if "publication_date" not in meta and src.published_at:
+                                meta["publication_date"] = src.published_at.date().isoformat()
+                            meta["effective_on"] = effective_on.isoformat()
+                            ev.metadata_json = meta
+
+                        effective_updated += 1
+                        log.debug(
+                            "patch_fr_events.effective_dates.updated",
+                            doc_number=doc_num,
+                            old_date=ev.event_date.isoformat() if ev.event_date else None,
+                            new_date=new_dt.isoformat(),
+                        )
+
+            if not dry_run and effective_updated:
+                session.commit()
+
+        log.info(
+            "patch_fr_events.effective_dates",
+            dry_run=dry_run,
+            fetched=effective_fetched,
+            updated=effective_updated,
+            api_errors=api_errors,
+        )
+
+    log.info(
+        "patch_fr_events.done",
+        dry_run=dry_run,
+        uflpa_patched=uflpa_patched,
+        effective_updated=effective_updated,
+    )
+
+    return {
+        "uflpa_events_patched": uflpa_patched,
+        "effective_dates_fetched": effective_fetched,
+        "effective_dates_updated": effective_updated,
+        "api_errors": api_errors,
+    }
+
+
+def _fetch_effective_on_batch(
+    client: httpx.Client,
+    document_numbers: list[str],
+) -> dict[str, date]:
+    """
+    Fetch effective_on dates for a list of document numbers using the FR API
+    single-document endpoint (/documents/{doc_number}.json).
+
+    The search endpoint does not support conditions[document_number][] bulk
+    lookup, so we call the per-document endpoint once per number. Callers
+    should pass batches of reasonable size (≤100) and respect rate limits
+    between calls. Returns {document_number: effective_on_date} for documents
+    that have a non-null effective_on. Documents without one are omitted.
+    """
+    result: dict[str, date] = {}
+    for doc_num in document_numbers:
+        url = f"{_BASE_URL}/documents/{doc_num}.json?fields[]=effective_on&fields[]=publication_date"
+        try:
+            resp = client.get(url, timeout=_API_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            raw_eff = data.get("effective_on")
+            if raw_eff:
+                result[doc_num] = datetime.strptime(raw_eff[:10], "%Y-%m-%d").date()
+        except Exception as exc:
+            log.debug(
+                "patch_fr_events.effective_dates.doc_fetch_error",
+                doc_number=doc_num,
+                error=str(exc),
+            )
+        time.sleep(_RATE_LIMIT_DELAY)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Historical backfill
+# ---------------------------------------------------------------------------
+
+def backfill_fr_links(
+    session: Session,
+    *,
+    force: bool = False,
+    batch_size: int = 100,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """
+    Retroactively tag existing Federal Register risk events with
+    RiskEventMaterial and RiskEventGeography rows.
+
+    Events ingested before material/geography detection was added have no
+    junction rows and are invisible to get_events_for_material() and any
+    geography-filtered queries. This function scans those events and fills
+    in the missing rows using the same detection logic as the live ingester.
+
+    Idempotent: the persist helpers skip pairs that already exist, so re-runs
+    are safe. Use --force to re-scan events that already have some links (useful
+    after adding new aliases or geo patterns).
+
+    Args:
+        session:    SQLAlchemy session. Commits after each batch of events.
+        force:      If True, run detection on ALL FR events regardless of
+                    whether they already have links. The per-row uniqueness
+                    constraint means no duplicates will be created.
+                    Default False: skips events that already have at least one
+                    material link OR at least one geography link.
+        batch_size: Number of events to process before committing. Default 100.
+        dry_run:    Detect and count but do NOT write or commit any rows.
+
+    Returns:
+        {
+            "events_scanned": int,
+            "events_skipped": int,    # already fully tagged (no-force mode)
+            "events_tagged": int,     # had at least one new link written
+            "material_links_written": int,
+            "geography_links_written": int,
+        }
+    """
+    material_cache = MaterialCache.build(session)
+
+    # Subqueries to check existing links — used only in non-force mode to
+    # skip events already tagged. exists() is much cheaper than COUNT for
+    # large event tables.
+    def _has_material_link(event_id: int) -> bool:
+        return session.scalar(
+            select(RiskEventMaterial.material_id)
+            .where(RiskEventMaterial.risk_event_id == event_id)
+            .limit(1)
+        ) is not None
+
+    def _has_geography_link(event_id: int) -> bool:
+        return session.scalar(
+            select(RiskEventGeography.country_code)
+            .where(RiskEventGeography.risk_event_id == event_id)
+            .limit(1)
+        ) is not None
+
+    # Only process FR-sourced events.
+    # event_type is set to "federal_register_notice" by _insert_risk_event.
+    events: list[RiskEvent] = list(
+        session.scalars(
+            select(RiskEvent).where(
+                RiskEvent.event_type == "federal_register_notice"
+            )
+        ).all()
+    )
+
+    events_scanned = 0
+    events_skipped = 0
+    events_tagged = 0
+    material_links_written = 0
+    geography_links_written = 0
+    pending_since_commit = 0
+
+    for ev in events:
+        events_scanned += 1
+
+        # In default mode skip events that already have links on both sides.
+        if not force:
+            if _has_material_link(ev.id) and _has_geography_link(ev.id):
+                events_skipped += 1
+                continue
+
+        # Reconstruct search text from stored title + summary.
+        search_text = " ".join(filter(None, [ev.title, ev.summary]))
+        if not search_text.strip():
+            events_skipped += 1
+            continue
+
+        detected_materials = material_cache.detect(search_text)
+        detected_geos = _detect_geographies(search_text)
+
+        if dry_run:
+            if detected_materials or detected_geos:
+                events_tagged += 1
+                material_links_written += len(detected_materials)
+                geography_links_written += len(detected_geos)
+            continue
+
+        mat_written = _persist_material_links(session, ev, detected_materials)
+        geo_written = _persist_geography_links(session, ev, detected_geos)
+
+        if mat_written or geo_written:
+            events_tagged += 1
+            material_links_written += mat_written
+            geography_links_written += geo_written
+
+        pending_since_commit += 1
+        if pending_since_commit >= batch_size:
+            session.commit()
+            pending_since_commit = 0
+
+        log.debug(
+            "backfill_fr_links.event_tagged",
+            event_id=ev.id,
+            materials=mat_written,
+            geographies=geo_written,
+        )
+
+    if not dry_run and pending_since_commit:
+        session.commit()
+
+    log.info(
+        "backfill_fr_links.done",
+        dry_run=dry_run,
+        force=force,
+        events_scanned=events_scanned,
+        events_skipped=events_skipped,
+        events_tagged=events_tagged,
+        material_links_written=material_links_written,
+        geography_links_written=geography_links_written,
+    )
+
+    return {
+        "events_scanned": events_scanned,
+        "events_skipped": events_skipped,
+        "events_tagged": events_tagged,
+        "material_links_written": material_links_written,
+        "geography_links_written": geography_links_written,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +970,10 @@ def _insert_risk_event(
             "query_name": query.name,
             "agencies": agencies[:8],
             "source": "federal_register_api",
+            # publication_date preserved here so callers can distinguish
+            # from event_date (which may be effective_on for final rules).
+            "publication_date": doc.published_at.date().isoformat()
+            if doc.published_at else None,
         },
     )
     session.add(ev)
@@ -421,6 +1086,7 @@ def ingest_federal_register(
 
     source = _get_or_create_source(session)
     company_cache = build_company_cache(session)
+    material_cache = MaterialCache.build(session)
 
     # Track document_numbers claimed by earlier queries to avoid duplicate events
     # when the same FR document matches multiple search terms.
@@ -429,6 +1095,8 @@ def ingest_federal_register(
     documents_created = 0
     events_created = 0
     company_links = 0
+    material_links = 0
+    geography_links = 0
     skipped_existing = 0
     api_errors = 0
 
@@ -505,6 +1173,18 @@ def ingest_federal_register(
                         if parsed.publication_date else None
                     )
 
+                    # Prefer effective_on over publication_date for event_date.
+                    # Using pub_dt alone biases regulations as "older" than they are
+                    # in effect — a rule published in January but effective in July
+                    # would be time-weighted as a 6-month-old signal on day one.
+                    effective_dt = (
+                        datetime.combine(
+                            parsed.effective_date, datetime.min.time(), tzinfo=timezone.utc
+                        )
+                        if parsed.effective_date else None
+                    )
+                    event_dt = effective_dt or pub_dt
+
                     doc, is_new = _upsert_source_document(
                         session=session,
                         source=source,
@@ -519,6 +1199,8 @@ def ingest_federal_register(
                             "topics": parsed.topics[:10],
                             "doc_type": parsed.doc_type,
                             "query_name": query.name,
+                            "effective_on": parsed.effective_date.isoformat()
+                            if parsed.effective_date else None,
                         },
                     )
 
@@ -529,20 +1211,27 @@ def ingest_federal_register(
                         parsed.doc_type, parsed.abstract_text, parsed.title, query
                     )
 
-                    # Detect primary geography from agency names / abstract
+                    # Detect geographies and materials from title + abstract
+                    search_text = " ".join(filter(None, [parsed.title, parsed.abstract_text]))
+                    detected_geos = _detect_geographies(search_text)
+                    detected_materials = material_cache.detect(search_text)
+
+                    # Set geo_primary to the highest-relevance primary geography
+                    # (used for display in RiskEvent.geography_json)
                     geo_primary = None
-                    text = " ".join(filter(None, [parsed.abstract_text, parsed.title])).lower()
-                    if any(w in text for w in ("china", "chinese", "cn ", "prc")):
-                        geo_primary = "CN"
-                    elif any(w in text for w in ("russia", "russian", "ru ")):
-                        geo_primary = "RU"
+                    primary_geos = [
+                        (iso2, score) for iso2, ctx, score in detected_geos
+                        if ctx == "primary"
+                    ]
+                    if primary_geos:
+                        geo_primary = max(primary_geos, key=lambda x: x[1])[0]
 
                     ev = _insert_risk_event(
                         session=session,
                         doc=doc,
                         title=parsed.title or doc_number,
                         summary=parsed.abstract_text,
-                        event_date=pub_dt,
+                        event_date=event_dt,
                         severity=severity,
                         risk_categories=query.risk_categories,
                         query=query,
@@ -552,10 +1241,18 @@ def ingest_federal_register(
                     )
                     events_created += 1
 
+                    # Tag materials detected in title/abstract
+                    mat_written = _persist_material_links(session, ev, detected_materials)
+                    material_links += mat_written
+
+                    # Tag geographies detected in title/abstract
+                    geo_written = _persist_geography_links(session, ev, detected_geos)
+                    geography_links += geo_written
+
                     # Resolve and link companies
-                    matches = resolve_companies_for_event(session, ev, company_cache)
-                    persist_company_links(session, ev, matches)
-                    linked = len(matches)
+                    co_matches = resolve_companies_for_event(session, ev, company_cache)
+                    persist_company_links(session, ev, co_matches)
+                    linked = len(co_matches)
                     company_links += linked
 
                     log.debug(
@@ -564,6 +1261,8 @@ def ingest_federal_register(
                         subtype=query.event_subtype,
                         severity=severity,
                         companies_linked=linked,
+                        materials_linked=mat_written,
+                        geographies_linked=geo_written,
                     )
 
                 # Commit after each page to return DB connection to pool
@@ -584,6 +1283,8 @@ def ingest_federal_register(
         documents_created=documents_created,
         events_created=events_created,
         company_links=company_links,
+        material_links=material_links,
+        geography_links=geography_links,
         skipped_existing=skipped_existing,
         api_errors=api_errors,
     )
@@ -591,6 +1292,8 @@ def ingest_federal_register(
         "documents_created": documents_created,
         "events_created": events_created,
         "company_links": company_links,
+        "material_links": material_links,
+        "geography_links": geography_links,
         "skipped_existing": skipped_existing,
         "api_errors": api_errors,
     }

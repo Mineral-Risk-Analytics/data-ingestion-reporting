@@ -35,6 +35,40 @@ def seed_cmd() -> None:
         s.close()
 
 
+@app.command("seed-countries")
+def seed_countries_cmd() -> None:
+    """Upsert the countries reference table.
+
+    Inserts or updates all rows in the ``countries`` table — ISO2 codes,
+    canonical names, Comtrade numeric reporter codes, common-name aliases
+    (used for name→ISO2 resolution in GTA and other ingesters), and
+    ``is_major_producer`` / ``is_major_consumer`` flags (used by
+    ingest-comtrade to select reporter country sets).
+
+    Idempotent: re-running refreshes all columns without touching
+    ``created_at``.  Safe to run after adding or renaming entries.
+
+    Run this before ingest-gta and ingest-comtrade.
+
+    \b
+    Examples:
+      bdi-ingest seed-countries
+    """
+    from app.services.ingestion.seed_countries import seed_countries
+
+    s = _session()
+    try:
+        result = seed_countries(s)
+        s.commit()
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("ingest")
 def ingest_cmd(
     source: str = typer.Argument(
@@ -135,6 +169,10 @@ def ingest_usgs_cmd(
         for m in materials:
             # Strip internal keys before creating ORM objects.
             hhi_score = m.pop("_hhi_score", None)
+            reserve_hhi_score = m.pop("_reserve_hhi_score", None)
+            reserve_life_index = m.pop("_reserve_life_index", None)
+            production_yoy_pct = m.pop("_production_yoy_pct", None)
+            capacity_utilization = m.pop("_capacity_utilization", None)
             production_shares = m.pop("_production_shares", [])
 
             row = s.scalar(select(Material).where(Material.canonical_name == m["canonical_name"]))
@@ -168,12 +206,20 @@ def ingest_usgs_cmd(
                     criticality_score=row.criticality_score,
                     trend_direction=trend,
                     hhi_score=hhi_score,
+                    reserve_hhi_score=reserve_hhi_score,
+                    reserve_life_index=reserve_life_index,
+                    production_yoy_pct=production_yoy_pct,
+                    capacity_utilization=capacity_utilization,
                     metadata_json={"mcs_publication_year": mcs_year},
                 ))
                 signals_written += 1
             elif force:
                 existing_signal.criticality_score = row.criticality_score
                 existing_signal.hhi_score = hhi_score
+                existing_signal.reserve_hhi_score = reserve_hhi_score
+                existing_signal.reserve_life_index = reserve_life_index
+                existing_signal.production_yoy_pct = production_yoy_pct
+                existing_signal.capacity_utilization = capacity_utilization
                 existing_signal.trend_direction = trend
                 signals_written += 1
 
@@ -301,7 +347,10 @@ def rescore_chemistry_cmd(
     Re-run after: ingest-usgs, seed-materials, or whenever new criticality signals arrive.
     """
     import datetime
-    from app.services.scoring.chemistry_risk import rescore_all_chemistries, rescore_one_chemistry
+    from app.services.scoring.chemistry_risk import (
+        score_all_chemistries_from_rollup,
+        score_chemistry_from_rollup,
+    )
     from app.models.battery_chemistry import BatteryChemistry
 
     as_of_date = datetime.date.fromisoformat(as_of) if as_of else datetime.date.today()
@@ -313,23 +362,28 @@ def rescore_chemistry_cmd(
             if chem is None:
                 typer.echo(json.dumps({"ok": False, "error": f"Chemistry slug '{slug}' not found"}), err=True)
                 raise typer.Exit(code=1)
-            score = rescore_one_chemistry(s, chem.id, as_of_date)
+            score = score_chemistry_from_rollup(s, chem.id, as_of_date)
+            s.commit()
             typer.echo(json.dumps({
                 "ok": True,
                 "chemistry": slug,
+                "methodology_version": score.methodology_version,
                 "composite_risk_score": score.composite_risk_score,
                 "score_confidence": score.score_confidence,
             }, indent=2))
         else:
-            results = rescore_all_chemistries(s, as_of_date)
+            results = score_all_chemistries_from_rollup(s, as_of_date)
             typer.echo(json.dumps({
                 "ok": True,
                 "rescored": len(results),
                 "scores": [
                     {
                         "chemistry": r["slug"],
+                        "methodology_version": "2.0",
                         "composite_risk_score": r["composite_risk_score"],
                         "score_confidence": r["score_confidence"],
+                        "materials_scored": r.get("materials_scored"),
+                        "materials_missing": r.get("materials_missing"),
                     }
                     for r in results
                 ],
@@ -576,33 +630,56 @@ def ingest_comtrade_cmd(
     reporters: Optional[str] = typer.Option(
         None,
         "--reporters",
-        help="Comma-separated ISO2 reporter codes to limit scope (e.g. 'CN,CL,AU'). Default: all 14 configured reporters.",
+        help=(
+            "Comma-separated ISO2 reporter codes to limit scope (e.g. 'CN,CL,AU'). "
+            "Default: REPORTER_COUNTRIES for exports, CONSUMER_COUNTRIES for imports."
+        ),
     ),
     hs_prefixes: Optional[str] = typer.Option(
         None,
         "--hs-prefixes",
         help="Comma-separated HS prefixes to query (e.g. '2604,2602'). Default: reads from supply_chain_contexts.",
     ),
+    flow_code: str = typer.Option(
+        "X",
+        "--flow-code",
+        help="'X' for exports (default) or 'M' for imports.",
+    ),
 ) -> None:
-    """Ingest UN Comtrade annual export trade flows for battery-critical HS codes.
+    """Ingest UN Comtrade annual trade flows for battery-critical HS codes.
 
-    Fetches export data (flowCode=X) for configured reporter countries × HS prefixes × years.
-    Idempotent: skips reporter/HS/year combinations already present in source_documents.
-    Re-run annually when a new data year becomes available (typically ~3-month lag).
+    Run with --flow-code X (default) to capture supply-side concentration from
+    producing countries. Run with --flow-code M to capture demand-side dependency
+    from consuming countries (US, JP, KR, DE, FR, GB, BE, IN).
 
-    API call count = len(reporters) × len(hs_prefixes) × len(years).
-    With defaults (14 reporters × 6 HS codes × 3 years = 252 calls).
-    Paid tier handles this comfortably; free tier (500/day) handles it in one run.
+    Both runs are idempotent. Re-run annually when new data becomes available
+    (~3-month lag from Comtrade). Run build-trade-signals after both runs to
+    generate EXPORT_DROP and IMPORT_DROP risk events.
+
+    \b
+    Examples:
+      bdi-ingest ingest-comtrade --years 2021,2022,2023
+      bdi-ingest ingest-comtrade --years 2021,2022,2023 --flow-code M
+      bdi-ingest ingest-comtrade --years 2023 --flow-code M --reporters US,JP,KR,DE
     """
-    from app.services.ingestion.comtrade import REPORTER_COUNTRIES, ingest_comtrade
+    from app.services.ingestion.comtrade import (
+        CONSUMER_COUNTRIES,
+        REPORTER_COUNTRIES,
+        ingest_comtrade,
+    )
 
     year_list = [int(y.strip()) for y in years.split(",")]
+    flow = flow_code.strip().upper()
+    if flow not in ("X", "M"):
+        typer.echo("--flow-code must be 'X' (exports) or 'M' (imports).", err=True)
+        raise typer.Exit(code=1)
 
     reporter_filter = None
     if reporters:
+        all_countries = {**REPORTER_COUNTRIES, **CONSUMER_COUNTRIES}
         codes = [r.strip().upper() for r in reporters.split(",")]
-        reporter_filter = {k: v for k, v in REPORTER_COUNTRIES.items() if k in codes}
-        unknown = set(codes) - set(REPORTER_COUNTRIES.keys())
+        reporter_filter = {k: v for k, v in all_countries.items() if k in codes}
+        unknown = set(codes) - set(all_countries.keys())
         if unknown:
             typer.echo(f"Warning: unknown reporter codes ignored: {unknown}", err=True)
 
@@ -615,6 +692,7 @@ def ingest_comtrade_cmd(
             years=year_list,
             reporters=reporter_filter,
             hs_prefixes=hs_list,
+            flow_code=flow,
         )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
@@ -1423,6 +1501,143 @@ def ingest_federal_register_cmd(
         s.close()
 
 
+@app.command("patch-fr-events")
+def patch_fr_events_cmd(
+    fix_uflpa_routing: bool = typer.Option(
+        True,
+        "--fix-uflpa-routing/--no-fix-uflpa-routing",
+        help=(
+            "Add OPERATIONAL to risk_categories_json for all UFLPA-query events. "
+            "Pure DB update — no API calls. Default: enabled."
+        ),
+    ),
+    fix_effective_dates: bool = typer.Option(
+        True,
+        "--fix-effective-dates/--no-fix-effective-dates",
+        help=(
+            "Re-fetch effective_on from the FR API and update event_date for "
+            "final rules, executive orders, and presidential documents where "
+            "publication date and effective date differ. Default: enabled."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Compute and report changes without writing anything to the DB.",
+    ),
+) -> None:
+    """Retroactively fix two data quality gaps in existing FR events.
+
+    \b
+    Fix 1 — UFLPA operational routing:
+      Existing UFLPA events were tagged REGULATORY_COMPLIANCE only. UFLPA
+      Entity List additions also disrupt supplier/mine continuity (operational
+      risk). This adds OPERATIONAL to their risk_categories_json so they feed
+      the operational scoring pillar. Pure DB update, no API calls.
+
+    \b
+    Fix 2 — effective_on dates:
+      Existing FR events use publication_date as event_date. For final rules
+      and executive orders, the effective date may be weeks or months later,
+      causing time-weighting to treat active regulations as older than they
+      are. Re-fetches effective_on from the FR API in batches and updates
+      event_date where they differ. Only targets rule/exec-order doc types.
+
+    \b
+    Examples:
+      bdi-ingest patch-fr-events --dry-run
+      bdi-ingest patch-fr-events
+      bdi-ingest patch-fr-events --no-fix-effective-dates
+      bdi-ingest patch-fr-events --no-fix-uflpa-routing
+    """
+    from app.services.ingestion.ingest_federal_register import patch_fr_events
+
+    typer.echo(
+        f"Patching FR events"
+        f"{' [DRY RUN]' if dry_run else ''}"
+        f" — uflpa_routing={'yes' if fix_uflpa_routing else 'no'}"
+        f", effective_dates={'yes' if fix_effective_dates else 'no'}…"
+    )
+
+    s = _session()
+    try:
+        result = patch_fr_events(
+            s,
+            fix_uflpa_routing=fix_uflpa_routing,
+            fix_effective_dates=fix_effective_dates,
+            dry_run=dry_run,
+        )
+        typer.echo(json.dumps({"ok": True, "dry_run": dry_run, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("backfill-fr-links")
+def backfill_fr_links_cmd(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Re-scan ALL FR events, including those that already have links. "
+            "The per-row uniqueness constraint prevents duplicates, so this is "
+            "safe to run after adding new material aliases or geography patterns."
+        ),
+    ),
+    batch_size: int = typer.Option(
+        100,
+        "--batch-size",
+        help="Number of events to process before each DB commit. Default: 100.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Detect and report counts, but do NOT write or commit any rows.",
+    ),
+) -> None:
+    """Retroactively tag existing FR events with material and geography links.
+
+    Federal Register events ingested before material/geography detection was added
+    have no RiskEventMaterial or RiskEventGeography rows, making them invisible to
+    get_events_for_material() and geography-filtered queries. This command scans
+    all historical FR events and fills in the missing junction rows.
+
+    Idempotent: re-runs skip pairs that already exist. Use --force to re-scan
+    fully-tagged events after updating _MATERIAL_ALIASES or _GEO_PATTERNS.
+
+    \b
+    Examples:
+      bdi-ingest backfill-fr-links
+      bdi-ingest backfill-fr-links --dry-run
+      bdi-ingest backfill-fr-links --force
+      bdi-ingest backfill-fr-links --batch-size 50
+    """
+    from app.services.ingestion.ingest_federal_register import backfill_fr_links
+
+    typer.echo(
+        f"Backfilling FR event links"
+        f"{' [DRY RUN — no writes]' if dry_run else ''}"
+        f"{' [--force: re-scanning all events]' if force else ''}…"
+    )
+
+    s = _session()
+    try:
+        result = backfill_fr_links(
+            s,
+            force=force,
+            batch_size=batch_size,
+            dry_run=dry_run,
+        )
+        typer.echo(json.dumps({"ok": True, "dry_run": dry_run, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("rescore-all")
 def rescore_all_cmd(
     as_of: Optional[str] = typer.Option(
@@ -2056,6 +2271,202 @@ def ingest_iea_reports_cmd(
         raise typer.Exit(code=1)
     finally:
         s.close()
+
+
+@app.command("setup-all")
+def setup_all_cmd(
+    usgs_file: Optional[str] = typer.Option(
+        None,
+        "--usgs-file",
+        help=(
+            "Path to MCS world data CSV (e.g. MCS2025_World_Data.csv). "
+            "Download from https://pubs.usgs.gov/publication/mcs2025. "
+            "If omitted, the USGS step is skipped and must be run separately "
+            "with: bdi-ingest ingest-usgs <path>"
+        ),
+    ),
+    mcs_year: int = typer.Option(
+        2025,
+        "--mcs-year",
+        help="MCS publication year (forwarded to ingest-usgs).",
+    ),
+    skip_gleif: bool = typer.Option(
+        False,
+        "--skip-gleif",
+        help="Skip GLEIF enrichment (useful when offline or rate-limited).",
+    ),
+    skip_mrds: bool = typer.Option(
+        False,
+        "--skip-mrds",
+        help="Skip USGS MRDS ingest (downloads ~300 MB; skip if offline).",
+    ),
+) -> None:
+    """One-shot first-time environment bootstrap.
+
+    Runs every seed and reference-data ingest command in dependency order so you
+    don't have to remember the sequence.  Safe to re-run — all steps are idempotent.
+
+    \b
+    Execution order:
+      1.  seed-countries          ISO country reference table (Comtrade codes, name aliases)
+      2.  seed                    sources, reference aliases
+      3.  ingest-usgs             USGS MCS world data  (requires --usgs-file)
+      4.  seed-materials          non-USGS minerals + battery chemistry junctions
+      5.  seed-hs-mappings        HS code → material lookup table
+      6.  seed-companies          curated supply-chain company list
+      7.  seed-facilities         known physical facilities per company
+      8.  ingest-mrds             USGS MRDS mine/processing facility data
+      9.  seed-supply-relationships  upstream/downstream supplier graph
+      10. seed-material-exposures    company × material exposure weights
+      11. seed-regulations        curated regulatory seed rows
+      12. ingest-gleif            LEI enrichment for company entities
+
+    \b
+    After setup-all, run the periodic ingestion commands (ingest-comtrade,
+    ingest-worldbank, etc.) and then full-score to compute scores.
+
+    \b
+    Examples:
+      bdi-ingest setup-all --usgs-file ~/Downloads/MCS2025_World_Data.csv
+      bdi-ingest setup-all --usgs-file path/to/MCS2025.csv --skip-gleif
+      bdi-ingest setup-all --skip-mrds   # if no USGS file yet — run ingest-usgs manually first
+    """
+    import sys
+    import subprocess
+
+    def _run(step_name: str, args: list[str]) -> None:
+        typer.echo(f"\n{'='*60}")
+        typer.echo(f"  setup-all  ▶  {step_name}")
+        typer.echo(f"{'='*60}")
+        result = subprocess.run(
+            [sys.executable, "-m", "app.cli"] + args,
+            check=False,
+        )
+        if result.returncode != 0:
+            typer.echo(
+                f"\n✗  setup-all aborted: '{step_name}' exited with code {result.returncode}.",
+                err=True,
+            )
+            raise typer.Exit(code=result.returncode)
+
+    _run("seed-countries", ["seed-countries"])
+    _run("seed", ["seed"])
+
+    if usgs_file:
+        _run("ingest-usgs", ["ingest-usgs", usgs_file, "--mcs-year", str(mcs_year)])
+    else:
+        typer.echo(
+            "\n⚠  Skipping ingest-usgs (no --usgs-file provided). "
+            "Run 'bdi-ingest ingest-usgs <path>' manually before scoring.",
+            err=True,
+        )
+
+    _run("seed-materials", ["seed-materials"])
+    _run("seed-hs-mappings", ["seed-hs-mappings"])
+    _run("seed-companies", ["seed-companies"])
+    _run("seed-facilities", ["seed-facilities"])
+
+    if not skip_mrds:
+        _run("ingest-mrds", ["ingest-mrds"])
+    else:
+        typer.echo("\n⚠  Skipping ingest-mrds (--skip-mrds set).")
+
+    _run("seed-supply-relationships", ["seed-supply-relationships"])
+    _run("seed-material-exposures", ["seed-material-exposures"])
+    _run("seed-regulations", ["seed-regulations"])
+
+    if not skip_gleif:
+        _run("ingest-gleif", ["ingest-gleif"])
+    else:
+        typer.echo("\n⚠  Skipping ingest-gleif (--skip-gleif set).")
+
+    typer.echo("\n✓  setup-all complete.")
+    typer.echo(
+        "\nNext steps:\n"
+        "  bdi-ingest ingest-comtrade --years <years>\n"
+        "  bdi-ingest ingest-comtrade --flow-code M --years <years>\n"
+        "  bdi-ingest ingest-worldbank\n"
+        "  bdi-ingest ingest-federal-register\n"
+        "  bdi-ingest full-score\n"
+    )
+
+
+@app.command("full-score")
+def full_score_cmd(
+    as_of: Optional[str] = typer.Option(
+        None,
+        "--as-of",
+        help="Point-in-time date for all scoring steps (YYYY-MM-DD). Default: today.",
+    ),
+    skip_trade_signals: bool = typer.Option(
+        False,
+        "--skip-trade-signals",
+        help="Skip build-trade-signals (use when trade_flows has not changed).",
+    ),
+) -> None:
+    """Run the full scoring pipeline from trade signals through company scores.
+
+    Executes all scoring steps in dependency order.  Two passes of rescore-all
+    are intentional: the first pass scores each company independently; the second
+    pass picks up supply-chain propagation scores that depend on upstream results
+    from the first pass.
+
+    \b
+    Execution order:
+      1.  build-trade-signals     derive GEOPOLITICAL_TRADE events from trade_flows
+      2.  rescore-market          material × geography risk scores
+      3.  rescore-global-rollups  material-level global rollup from geo scores
+      4.  rescore-chemistry       chemistry risk from material rollups
+      5.  rescore-all  (pass 1)   company six-pillar scores
+      6.  rescore-all  (pass 2)   re-score with propagation scores now available
+
+    \b
+    Prerequisites: setup-all must have run, plus at minimum:
+      bdi-ingest ingest-comtrade  (for trade signals + market scoring)
+      bdi-ingest ingest-worldbank (for commodity price signal)
+
+    \b
+    Examples:
+      bdi-ingest full-score
+      bdi-ingest full-score --as-of 2025-01-01
+      bdi-ingest full-score --skip-trade-signals
+    """
+    import sys
+    import subprocess
+
+    def _run(step_name: str, args: list[str]) -> None:
+        typer.echo(f"\n{'='*60}")
+        typer.echo(f"  full-score  ▶  {step_name}")
+        typer.echo(f"{'='*60}")
+        result = subprocess.run(
+            [sys.executable, "-m", "app.cli"] + args,
+            check=False,
+        )
+        if result.returncode != 0:
+            typer.echo(
+                f"\n✗  full-score aborted: '{step_name}' exited with code {result.returncode}.",
+                err=True,
+            )
+            raise typer.Exit(code=result.returncode)
+
+    as_of_args = ["--as-of", as_of] if as_of else []
+
+    if not skip_trade_signals:
+        _run("build-trade-signals", ["build-trade-signals"])
+    else:
+        typer.echo("\n⚠  Skipping build-trade-signals (--skip-trade-signals set).")
+
+    _run("rescore-market", ["rescore-market"] + as_of_args)
+    _run("rescore-global-rollups", ["rescore-global-rollups"] + as_of_args)
+    _run("rescore-chemistry", ["rescore-chemistry"] + as_of_args)
+
+    typer.echo("\n  rescore-all pass 1 of 2 (individual company scores)…")
+    _run("rescore-all (pass 1)", ["rescore-all", "--skip-existing"] + as_of_args)
+
+    typer.echo("\n  rescore-all pass 2 of 2 (propagation)…")
+    _run("rescore-all (pass 2)", ["rescore-all"] + as_of_args)
+
+    typer.echo("\n✓  full-score complete.")
 
 
 def main() -> None:

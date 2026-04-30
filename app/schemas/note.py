@@ -49,7 +49,3 @@ class AnalystNoteCreate(AnalystNoteBase):
     """
 
     pass
-
-
-# Kept for backward compat — Phase 1 companies route used this name.
-CompanyNoteCreate = AnalystNoteCreate

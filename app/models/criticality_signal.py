@@ -33,7 +33,7 @@ class MaterialCriticalitySignal(Base):
     from multiple independent sources so the chemistry risk scorer can prefer
     more authoritative signals (eu_crma, iea_report) over baseline USGS data.
 
-    Source hierarchy used by chemistry_risk.score_chemistry():
+    Source hierarchy used by chemistry_risk.score_chemistry_from_rollup():
         1. eu_crma      — EU Critical Raw Materials Act assessments
         2. iea_report   — IEA Critical Minerals annual reports
         3. usgs_mcs     — USGS Mineral Commodity Summaries (default baseline)
@@ -77,7 +77,36 @@ class MaterialCriticalitySignal(Base):
     )
     hhi_score: Mapped[Optional[float]] = mapped_column(
         Float, nullable=True,
-        comment="Raw HHI 0.0–1.0 (Σ share_i²). Stored for methodological transparency.",
+        comment="Raw HHI 0.0–1.0 (Σ share_i²) on mine production. Stored for methodological transparency.",
+    )
+    # ── Supply metrics promoted from USGS MCS CSV (migration 019) ─────────────
+    reserve_hhi_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "HHI of reserve distribution by country (0–1). Forward-looking "
+            "concentration signal independent of production HHI."
+        ),
+    )
+    reserve_life_index: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "World reserves / world annual production (years). "
+            "Lower = nearer-term scarcity risk."
+        ),
+    )
+    production_yoy_pct: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "YoY change in world mine production as a signed fraction "
+            "(e.g. -0.05 = -5%). Negative = contracting supply."
+        ),
+    )
+    capacity_utilization: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "World mine production / world mine capacity (0–1). "
+            "High = tight market with little buffer."
+        ),
     )
     metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

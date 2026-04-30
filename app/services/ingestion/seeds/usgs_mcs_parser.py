@@ -677,16 +677,19 @@ def parse_usgs_csv(filepath: str | Path) -> list[dict]:
 
         # Build {iso2: production} from PROD_2023, fall back to PROD_EST_2024.
         country_prod: dict[str, float] = {}
+        country_reserves: dict[str, float] = {}
         for r in country_rows:
             prod = _parse_number(r["PROD_2023"]) or _parse_number(r["PROD_EST_ 2024"])
-            if prod is None:
-                continue
             country_name = r["COUNTRY"].strip()
             iso2 = _COUNTRY_ISO2.get(country_name)
             if iso2 is None:
                 continue
-            # Accumulate in case the same country appears on multiple rows.
-            country_prod[iso2] = country_prod.get(iso2, 0.0) + prod
+            if prod is not None:
+                # Accumulate in case the same country appears on multiple rows.
+                country_prod[iso2] = country_prod.get(iso2, 0.0) + prod
+            reserves = _parse_number(r["RESERVES_2024"])
+            if reserves is not None:
+                country_reserves[iso2] = country_reserves.get(iso2, 0.0) + reserves
 
         # Rank countries by production descending.
         ranked_countries = [
@@ -698,14 +701,50 @@ def parse_usgs_csv(filepath: str | Path) -> list[dict]:
         # Criticality score: normalised HHI on mine production.
         criticality = round(_hhi(country_prod), 4) if country_prod else None
 
-        # World totals for notes and share computation.
-        world_prod = (
-            _parse_number(world_total_row["PROD_2023"])
-            or _parse_number(world_total_row["PROD_EST_ 2024"])
-        ) if world_total_row else None
+        # Reserve HHI: same methodology applied to reserve distribution.
+        reserve_hhi = round(_hhi(country_reserves), 4) if country_reserves else None
+
+        # World totals for notes, share computation, and derived metrics.
+        world_prod_2023 = _parse_number(world_total_row["PROD_2023"]) if world_total_row else None
+        world_prod_est_2024 = _parse_number(world_total_row["PROD_EST_ 2024"]) if world_total_row else None
+        world_prod = world_prod_2023 or world_prod_est_2024
         world_reserves = (
             _parse_number(world_total_row["RESERVES_2024"])
         ) if world_total_row else None
+
+        # World capacity from CAP_2023 (prefer) or CAP_EST_2024.
+        world_capacity = None
+        if world_total_row:
+            world_capacity = (
+                _parse_number(world_total_row.get("CAP_2023", ""))
+                or _parse_number(world_total_row.get("CAP_EST_ 2024", ""))
+            )
+
+        # Reserve life index: years of supply at current production rate.
+        # Plausibility guard: MCS reserves and production occasionally use
+        # different scales for the same row (e.g. production in metric tons,
+        # reserves in thousands of metric tons), producing RLI values well
+        # below 1.0 that are clearly erroneous. We null these out rather than
+        # attempt per-commodity unit inference; the scoring engine will fall back
+        # to a neutral 0.5 scarcity signal for affected materials.
+        _RLI_MIN_PLAUSIBLE = 2.0  # years — anything below this is a data artefact
+        reserve_life_index: Optional[float] = None
+        if world_reserves is not None and world_prod and world_prod > 0:
+            rli_candidate = round(world_reserves / world_prod, 1)
+            if rli_candidate >= _RLI_MIN_PLAUSIBLE:
+                reserve_life_index = rli_candidate
+
+        # Production YoY %: (est 2024 - actual 2023) / actual 2023.
+        production_yoy_pct: Optional[float] = None
+        if world_prod_2023 and world_prod_2023 > 0 and world_prod_est_2024 is not None:
+            production_yoy_pct = round(
+                (world_prod_est_2024 - world_prod_2023) / world_prod_2023, 4
+            )
+
+        # Capacity utilization: production / capacity.
+        capacity_utilization: Optional[float] = None
+        if world_capacity and world_capacity > 0 and world_prod is not None:
+            capacity_utilization = round(world_prod / world_capacity, 4)
 
         unit = world_total_row["UNIT_MEAS"].strip() if world_total_row else ""
 
@@ -728,19 +767,32 @@ def parse_usgs_csv(filepath: str | Path) -> list[dict]:
             f"(https://pubs.usgs.gov/publication/mcs2025).",
             f"Production type: {prod_type}.",
         ]
-        if world_prod is not None:
+        if world_prod_2023 is not None:
+            notes_parts.append(f"World mine production 2023: {world_prod_2023:,.0f} {unit}.")
+        if world_prod_est_2024 is not None:
+            notes_parts.append(f"World mine production est. 2024: {world_prod_est_2024:,.0f} {unit}.")
+        if production_yoy_pct is not None:
             notes_parts.append(
-                f"World mine production 2023: {world_prod:,.0f} {unit}."
+                f"Production YoY change (2023→est.2024): {production_yoy_pct:+.1%}."
             )
         if world_reserves is not None:
-            notes_parts.append(
-                f"World reserves 2024: {world_reserves:,.0f} {unit}."
-            )
+            notes_parts.append(f"World reserves 2024: {world_reserves:,.0f} {unit}.")
+        if reserve_life_index is not None:
+            notes_parts.append(f"Reserve life index: {reserve_life_index:.0f} years.")
+        if world_capacity is not None:
+            notes_parts.append(f"World capacity 2023/est.2024: {world_capacity:,.0f} {unit}.")
+        if capacity_utilization is not None:
+            notes_parts.append(f"Capacity utilization: {capacity_utilization:.1%}.")
         notes_parts.append(
             f"criticality_score methodology: normalised HHI computed from "
             f"country shares of world mine production (PROD_2023). "
             f"Range 0 (perfectly distributed) – 1 (single-country monopoly)."
         )
+        if reserve_hhi is not None:
+            notes_parts.append(
+                f"reserve_hhi_score: normalised HHI on country reserve shares "
+                f"(RESERVES_2024). Same methodology as criticality_score."
+            )
         if ranked_countries:
             notes_parts.append(
                 f"Top producing countries (ranked): {', '.join(ranked_countries[:5])}."
@@ -762,6 +814,12 @@ def parse_usgs_csv(filepath: str | Path) -> list[dict]:
             # hhi_score is same as criticality_score (both are normalised HHI 0–1)
             # but named separately for clarity when writing material_criticality_signals.
             "_hhi_score": criticality,
+            # Supply metric signals — stripped before ORM Material creation,
+            # written to material_criticality_signals by ingest-usgs.
+            "_reserve_hhi_score": reserve_hhi,
+            "_reserve_life_index": reserve_life_index,
+            "_production_yoy_pct": production_yoy_pct,
+            "_capacity_utilization": capacity_utilization,
             # Production shares stripped before creating Material ORM objects;
             # persisted separately by ingest-usgs into material_production_shares.
             "_production_shares": production_shares,

@@ -1,3 +1,5 @@
+# FUTURE: Phase 3 reporting — tied to the intelligence hub roadmap.
+# No callers in the current pipeline. See docs/deprecation-audit.md §I6.
 """
 Assemble OEM-facing narrative reports from `report_runs` + `report_insights`.
 

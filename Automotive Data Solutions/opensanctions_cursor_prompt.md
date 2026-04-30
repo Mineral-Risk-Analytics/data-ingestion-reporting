@@ -5,7 +5,7 @@ Create an OpenSanctions ingestion script for the battery-data-intelligence-engin
 OpenSanctions publishes a free bulk download of consolidated sanctions lists (OFAC SDN, EU Financial Sanctions, UN Security Council, and ~100 others). The data is updated daily. This ingestion serves two purposes:
 
 1. **Company matching** — check if any company in the `companies` table appears on a sanctions list. Each match becomes a `RiskEvent` of type `"sanctions_listing"` linked via `RiskEventCompany`.
-2. **Geography signalling** — track the volume of sanctioned entities by country to feed `GeographyScore` inputs, particularly for high-concentration-geo countries (CN, CD, RU, IR, KP).
+2. **Geography signalling** — track the volume of sanctioned entities by country as `RiskEvent` rows tagged via `RiskEventGeography`, feeding the `geopolitical_trade_score` pillar of `MaterialGeographyRiskScore` for high-concentration-geo countries (CN, CD, RU, IR, KP).
 
 The schema uses an append-only `risk_events` table with a `content_hash` column (SHA-256 of title + summary + event_date) for idempotency. No raw sanctions data is persisted — only structured `RiskEvent` rows for confirmed matches and geography signals.
 

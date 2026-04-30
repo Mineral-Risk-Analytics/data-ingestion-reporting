@@ -216,43 +216,87 @@ def _derive_market_material_inputs(
     Returns (criticality, concentration, trade_volatility) each on [0, 1.0].
 
     criticality:
-        Normalised criticality_score from the best available
-        MaterialCriticalitySignal. Default 0.5 when no signal exists (data gap —
-        caller should log a warning; don't assume zero risk).
+        Blend of production HHI criticality_score (70%) and a reserve scarcity
+        signal derived from reserve_life_index (30%). Default 0.5 when no signal
+        exists (data gap — caller should log a warning; don't assume zero risk).
+
+        Reserve scarcity thresholds:
+          RLI <= 20 years  → scarcity_signal = 1.0  (near-term constraint)
+          RLI >= 80 years  → scarcity_signal = 0.0  (abundant; not a near-term risk)
+          Linear interpolation between 20 and 80.
+        When RLI is absent the scarcity component defaults to 0.5 (unknown = neutral).
 
     concentration:
-        Composite of HHI from the criticality signal (supply concentration signal)
-        + binary uplift when the target geography is a High-Concentration Geography
-        (CN, CD, RU). Weighted 60% HHI / 40% HCG uplift.
-        When HHI is absent, falls back to 0.5 baseline + 0.5 HCG uplift.
+        Five-component composite, each [0, 1]:
+          0.45 × production HHI (hhi_score)
+          0.15 × reserve HHI    (reserve_hhi_score) — forward-looking concentration
+          0.25 × HCG binary     (1.0 if geography is CN/CD/RU, else 0.0)
+          0.10 × capacity stress (capacity_utilization normalised; high util = tight market)
+          0.05 × supply trend    (production YoY contraction only; growth = no extra risk)
+        All weights sum to 1.0.  Any absent component falls back to a neutral 0.5.
 
     trade_volatility:
         Average normalised event_impact for GEOPOLITICAL_TRADE events for this
         (material, geography) pair. Default 0.3 when no events.
     """
-    # criticality
-    if criticality_signal and criticality_signal.criticality_score is not None:
-        criticality = float(criticality_signal.criticality_score)
+    sig = criticality_signal  # alias for brevity
+
+    # ── criticality ──────────────────────────────────────────────────────────
+    if sig and sig.criticality_score is not None:
+        hhi_criticality = float(sig.criticality_score)
     else:
         log.warning(
             "market_aggregator.no_criticality_signal",
             geography_code=geography_code,
         )
-        criticality = 0.5
+        hhi_criticality = 0.5
 
-    # concentration
+    # Reserve scarcity signal: lower RLI = higher scarcity risk.
+    _RLI_HIGH = 80.0  # years — effectively no near-term scarcity concern
+    _RLI_LOW  = 20.0  # years — meaningful constraint horizon
+    if sig and sig.reserve_life_index is not None:
+        rli = float(sig.reserve_life_index)
+        scarcity_signal = max(0.0, min(1.0, (_RLI_HIGH - rli) / (_RLI_HIGH - _RLI_LOW)))
+    else:
+        scarcity_signal = 0.5  # absent = neutral; don't penalise data-sparse materials
+
+    criticality = 0.70 * hhi_criticality + 0.30 * scarcity_signal
+
+    # ── concentration ────────────────────────────────────────────────────────
     is_hcg = geography_code in HIGH_CONCENTRATION_GEOS
     hcg_component = 1.0 if is_hcg else 0.0
 
-    if criticality_signal and criticality_signal.hhi_score is not None:
-        hhi = float(criticality_signal.hhi_score)
-        concentration = 0.60 * hhi + 0.40 * hcg_component
-    else:
-        # No HHI data — use 0.5 baseline shifted by HCG status
-        concentration = 0.5 + 0.5 * hcg_component * 0.5  # max 0.75 when HCG, no HHI
-        concentration = min(1.0, concentration)
+    prod_hhi = float(sig.hhi_score) if sig and sig.hhi_score is not None else 0.5
+    res_hhi  = float(sig.reserve_hhi_score) if sig and sig.reserve_hhi_score is not None else 0.5
 
-    # trade_volatility
+    # Capacity utilization stress: >= 0.90 → 1.0 (very tight), <= 0.50 → 0.0 (slack).
+    _CAP_HIGH = 0.90
+    _CAP_LOW  = 0.50
+    if sig and sig.capacity_utilization is not None:
+        cap_util = float(sig.capacity_utilization)
+        cap_stress = max(0.0, min(1.0, (cap_util - _CAP_LOW) / (_CAP_HIGH - _CAP_LOW)))
+    else:
+        cap_stress = 0.5  # absent = neutral
+
+    # Supply trend: only contractions are a risk signal; growth eases pressure.
+    # Max meaningful contraction for single-year shift: ~15%.
+    _YOY_CONTRACTION_MAX = 0.15
+    if sig and sig.production_yoy_pct is not None:
+        yoy_contraction = max(0.0, -float(sig.production_yoy_pct))  # positive = contraction
+        trend_stress = min(1.0, yoy_contraction / _YOY_CONTRACTION_MAX)
+    else:
+        trend_stress = 0.0  # absent = no extra stress (conservative; don't assume contraction)
+
+    concentration = (
+        0.45 * prod_hhi
+        + 0.15 * res_hhi
+        + 0.25 * hcg_component
+        + 0.10 * cap_stress
+        + 0.05 * trend_stress
+    )
+    concentration = min(1.0, concentration)
+
+    # ── trade_volatility ─────────────────────────────────────────────────────
     if not trade_events:
         trade_volatility = 0.3
     else:

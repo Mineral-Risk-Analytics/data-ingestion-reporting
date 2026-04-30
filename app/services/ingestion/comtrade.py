@@ -56,6 +56,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.models.country import Country
 from app.models.documents import SourceDocument
 from app.models.source import Source
 from app.models.supply import HsCodeMaterialMapping, TradeFlow
@@ -67,29 +68,73 @@ log = structlog.get_logger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-# Comtrade numeric reporter codes for key battery supply chain actors.
+# Hardcoded fallback reporter / consumer country sets.
+# These are used ONLY when the ``countries`` table has not been seeded
+# (e.g. a fresh environment before ``bdi-ingest seed-countries`` has run).
+# Once seeded, ``get_reporter_countries()`` and ``get_consumer_countries()``
+# query the DB instead of reading these dicts.
+#
+# To add or remove a country from Comtrade ingestion, update the
+# ``is_major_producer`` / ``is_major_consumer`` flags via ``seed-countries``
+# rather than editing these dicts.
 REPORTER_COUNTRIES: dict[str, int] = {
-    "CN": 156,  # China — graphite, lithium processing, cells
-    "CL": 152,  # Chile — lithium
-    "AU": 36,   # Australia — lithium, nickel
-    "CD": 180,  # DRC — cobalt
-    "ID": 360,  # Indonesia — nickel
-    "RU": 643,  # Russia — nickel
-    "US": 842,  # United States
-    "JP": 392,  # Japan
-    "KR": 410,  # South Korea
-    "DE": 276,  # Germany
-    "CA": 124,  # Canada
-    "ZA": 710,  # South Africa — manganese, platinum group
-    "PH": 608,  # Philippines — nickel
-    "MZ": 508,  # Mozambique — graphite
+    "CN": 156,  "CL": 152,  "AU": 36,   "CD": 180,  "ID": 360,
+    "RU": 643,  "US": 842,  "JP": 392,  "KR": 410,  "DE": 276,
+    "CA": 124,  "ZA": 710,  "PH": 608,  "MZ": 508,
+}
+CONSUMER_COUNTRIES: dict[str, int] = {
+    "US": 842,  "JP": 392,  "KR": 410,  "DE": 276,
+    "FR": 251,  "GB": 826,  "BE": 56,   "IN": 699,
 }
 
 # Reverse map: Comtrade numeric code → ISO2. Used to translate partner codes.
+# Re-built at runtime by get_reporter_countries() when the DB is available.
 _CODE_TO_ISO2: dict[int, str] = {v: k for k, v in REPORTER_COUNTRIES.items()}
 
 # Comtrade uses 0 for "all partners" (world aggregate).
 WORLD_PARTNER_CODE = 0
+
+
+def get_reporter_countries(session: Session) -> dict[str, int]:
+    """Return ISO2 → Comtrade code map for major-producer countries.
+
+    Queries the ``countries`` table for rows where ``is_major_producer = True``
+    and ``comtrade_code IS NOT NULL``.  Falls back to the hardcoded
+    ``REPORTER_COUNTRIES`` dict if the table is empty (not yet seeded).
+    """
+    rows = session.scalars(
+        select(Country)
+        .where(Country.is_major_producer.is_(True))
+        .where(Country.comtrade_code.is_not(None))
+    ).all()
+    if not rows:
+        log.warning(
+            "comtrade.get_reporter_countries.fallback",
+            hint="Run 'bdi-ingest seed-countries' to populate the countries table.",
+        )
+        return dict(REPORTER_COUNTRIES)
+    return {r.iso2: r.comtrade_code for r in rows}
+
+
+def get_consumer_countries(session: Session) -> dict[str, int]:
+    """Return ISO2 → Comtrade code map for major-consumer countries.
+
+    Queries the ``countries`` table for rows where ``is_major_consumer = True``
+    and ``comtrade_code IS NOT NULL``.  Falls back to the hardcoded
+    ``CONSUMER_COUNTRIES`` dict if the table is empty (not yet seeded).
+    """
+    rows = session.scalars(
+        select(Country)
+        .where(Country.is_major_consumer.is_(True))
+        .where(Country.comtrade_code.is_not(None))
+    ).all()
+    if not rows:
+        log.warning(
+            "comtrade.get_consumer_countries.fallback",
+            hint="Run 'bdi-ingest seed-countries' to populate the countries table.",
+        )
+        return dict(CONSUMER_COUNTRIES)
+    return {r.iso2: r.comtrade_code for r in rows}
 
 _SOURCE_NAME = "UN Comtrade API"
 _SOURCE_TYPE = "comtrade"
@@ -180,10 +225,13 @@ def fetch_annual_exports(
     year: int,
     api_key: str,
     base_url: str,
+    flow_code: str = "X",
 ) -> list[dict]:
-    """Fetch annual export records for one reporter × HS prefix × year.
+    """Fetch annual trade records for one reporter × HS prefix × year.
 
-    Queries flowCode=X (exports), partnerCode=0 (world aggregate).
+    Args:
+        flow_code: ``"X"`` for exports (default), ``"M"`` for imports.
+                   Both use ``partnerCode=0`` (world aggregate).
 
     Returns the list of data rows from the Comtrade response, or [] if no data.
     Each row is a raw dict from the API ``data`` array.
@@ -194,7 +242,7 @@ def fetch_annual_exports(
         "partnerCode": WORLD_PARTNER_CODE,
         "period": year,
         "cmdCode": hs_prefix,
-        "flowCode": "X",
+        "flowCode": flow_code,
         "maxRecords": 100000,
         "includeDesc": "true",
     }
@@ -220,6 +268,7 @@ def parse_comtrade_rows(
     reporter_iso2: str,
     hs_prefix: str,
     year: int,
+    flow_code: str = "X",
 ) -> list[dict]:
     """Normalise raw Comtrade API rows into TradeFlow insert dicts.
 
@@ -229,7 +278,11 @@ def parse_comtrade_rows(
     Converts numeric ``partnerCode`` to ISO2 using the reverse of
     ``REPORTER_COUNTRIES``; falls back to ``str(partnerCode)`` for unknown codes.
     ``partnerCode=0`` is mapped to the string ``"WLD"``.
+
+    ``flow_code`` sets ``import_export_flag``: ``"X"`` → ``"export"``,
+    ``"M"`` → ``"import"``.  Defaults to ``"X"`` for backward compatibility.
     """
+    _FLOW_FLAG = {"X": "export", "M": "import"}
     results: list[dict] = []
 
     for row in rows:
@@ -269,12 +322,12 @@ def parse_comtrade_rows(
                 "partner_country": partner_country,
                 "hs_code": str(row.get("cmdCode") or ""),
                 "hs_description": row.get("cmdDesc") or None,
-                "import_export_flag": "export",
+                "import_export_flag": _FLOW_FLAG.get(flow_code, flow_code),
                 "quantity": quantity,
                 "quantity_unit": "kg" if quantity is not None else None,
                 "trade_value_usd": trade_value_usd,
                 "metadata_json": {
-                    "comtrade_flow_code": "X",
+                    "comtrade_flow_code": flow_code,
                     "comtrade_period": year,
                     "hs_prefix_queried": hs_prefix,
                 },
@@ -312,8 +365,10 @@ def _get_or_create_comtrade_source(session: Session) -> int:
     return source.id
 
 
-def _external_id(reporter_iso2: str, hs_prefix: str, year: int) -> str:
-    return f"comtrade_C_A_HS_{hs_prefix}_{reporter_iso2}_{year}"
+def _external_id(reporter_iso2: str, hs_prefix: str, year: int, flow_code: str = "X") -> str:
+    # flow_code included so export and import runs for the same reporter/HS/year
+    # produce distinct source_documents and don't skip each other's idempotency check.
+    return f"comtrade_{flow_code}_A_HS_{hs_prefix}_{reporter_iso2}_{year}"
 
 
 def _create_source_document(
@@ -323,13 +378,14 @@ def _create_source_document(
     hs_prefix: str,
     year: int,
     row_count: int,
+    flow_code: str = "X",
 ) -> int:
     """Create a SourceDocument for one API call batch. Returns source_document.id.
 
     If a document with this external_id already exists (source_id + external_id
     unique constraint), returns the existing row's id without inserting a duplicate.
     """
-    ext_id = _external_id(reporter_iso2, hs_prefix, year)
+    ext_id = _external_id(reporter_iso2, hs_prefix, year, flow_code=flow_code)
     existing = session.scalar(
         select(SourceDocument).where(
             SourceDocument.source_id == source_id,
@@ -339,15 +395,17 @@ def _create_source_document(
     if existing is not None:
         return existing.id
 
+    direction = "imports" if flow_code == "M" else "exports"
     doc = SourceDocument(
         source_id=source_id,
         external_id=ext_id,
-        title=f"UN Comtrade: {reporter_iso2} HS {hs_prefix} exports {year}",
+        title=f"UN Comtrade: {reporter_iso2} HS {hs_prefix} {direction} {year}",
         document_type="trade_data",
         metadata_json={
             "reporter": reporter_iso2,
             "hs_prefix": hs_prefix,
             "year": year,
+            "flow_code": flow_code,
             "row_count": row_count,
         },
     )
@@ -360,27 +418,67 @@ def _create_source_document(
 # HS → material mapping
 # ---------------------------------------------------------------------------
 
-def _build_hs_material_map(session: Session) -> dict[str, Optional[int]]:
-    """Return a dict of hs_code_prefix → material_id from hs_code_material_mappings.
+def _build_hs_material_map(
+    session: Session,
+) -> dict[str, list[tuple[int, float]]]:
+    """Return all hs_code_material_mappings keyed by normalised prefix.
 
-    Covers 4-digit prefixes. For a given 6-digit hs_code from Comtrade, callers
-    should check whether any key in the returned dict is a prefix of the code.
-    Returns None for unmatched codes — callers should still insert the TradeFlow
-    row with material_id=None.
+    Returns ``{prefix: [(material_id, confidence), ...]}``.  A single prefix
+    may resolve to multiple materials (e.g. "2615" covers Vanadium, Niobium,
+    Tantalum, Zirconium).  ``_resolve_material_id`` uses confidence scores to
+    disambiguate or explicitly returns None for ambiguous cases rather than
+    picking arbitrarily.
+
+    Prefixes are stored without dots so comparison against raw Comtrade HS
+    codes (which also have no dots) is straightforward.
     """
     rows = session.scalars(select(HsCodeMaterialMapping)).all()
-    return {r.hs_code_prefix: r.material_id for r in rows}
+    result: dict[str, list[tuple[int, float]]] = {}
+    for r in rows:
+        prefix = r.hs_code_prefix.replace(".", "")
+        result.setdefault(prefix, []).append((r.material_id, r.confidence))
+    return result
 
 
 def _resolve_material_id(
     hs_code: str,
-    hs_material_map: dict[str, Optional[int]],
+    hs_material_map: dict[str, list[tuple[int, float]]],
 ) -> Optional[int]:
-    """Return material_id for a 6-digit hs_code, or None if no mapping exists."""
-    for prefix, material_id in hs_material_map.items():
-        if hs_code.startswith(prefix):
-            return material_id
-    return None
+    """Return material_id for a 6-digit hs_code using a two-pass strategy.
+
+    Pass 1 — exact match on the full hs_code string (up to 6 digits).
+        If exactly one material maps to this code, return it.
+        If multiple map to it, return the highest-confidence one; if tied,
+        return None (genuinely ambiguous at this granularity).
+
+    Pass 2 — 4-digit prefix fallback.
+        Collect all mapping rows whose 4-digit prefix is a prefix of hs_code.
+        Apply the same single/highest-confidence/tie-means-None logic.
+
+    Returning None for ambiguous shared-prefix codes is intentional — a NULL
+    material_id is honest; a wrong material_id silently poisons scoring.
+    """
+    # Pass 1: exact 6-digit (or shorter if stored that way) match.
+    exact = hs_material_map.get(hs_code)
+    if exact:
+        if len(exact) == 1:
+            return exact[0][0]
+        max_conf = max(c for _, c in exact)
+        top = [(mid, c) for mid, c in exact if c == max_conf]
+        return top[0][0] if len(top) == 1 else None
+
+    # Pass 2: 4-digit prefix fallback.
+    candidates: list[tuple[int, float]] = []
+    for prefix, entries in hs_material_map.items():
+        if len(prefix) == 4 and hs_code.startswith(prefix):
+            candidates.extend(entries)
+
+    if not candidates:
+        return None
+
+    max_conf = max(c for _, c in candidates)
+    top = [(mid, c) for mid, c in candidates if c == max_conf]
+    return top[0][0] if len(top) == 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -393,17 +491,23 @@ def ingest_comtrade(
     reporters: Optional[dict[str, int]] = None,
     hs_prefixes: Optional[list[str]] = None,
     api_key: Optional[str] = None,
+    flow_code: str = "X",
 ) -> dict[str, int]:
-    """Fetch and ingest UN Comtrade annual export data into trade_flows.
+    """Fetch and ingest UN Comtrade annual trade flow data into trade_flows.
 
     Args:
         session:     SQLAlchemy session. Commits internally at the end.
         years:       List of years to fetch (e.g. [2021, 2022, 2023]).
         reporters:   Override dict of ISO2→comtrade_code. Defaults to
-                     REPORTER_COUNTRIES.
+                     REPORTER_COUNTRIES for exports or CONSUMER_COUNTRIES
+                     for imports — pass explicitly to mix or restrict scope.
         hs_prefixes: Override HS code prefixes. Defaults to reading from
                      supply_chain_contexts WHERE slug='ev_battery'.
         api_key:     Override API key. Defaults to settings.comtrade_api_key.
+        flow_code:   ``"X"`` (exports, default) or ``"M"`` (imports).
+                     Exports from REPORTER_COUNTRIES show supply-side
+                     concentration. Imports from CONSUMER_COUNTRIES show
+                     demand-side dependency and enable import-drop signals.
 
     Returns:
         {
@@ -426,7 +530,20 @@ def ingest_comtrade(
             "api_key= directly. The UN Comtrade API requires a subscription key."
         )
 
-    resolved_reporters = reporters if reporters is not None else REPORTER_COUNTRIES
+    # Default reporter set depends on flow direction: producers for exports,
+    # consuming nations for imports. Caller can override either way.
+    # DB query is preferred; falls back to hardcoded dicts if table is empty.
+    if reporters is not None:
+        resolved_reporters = reporters
+    elif flow_code == "M":
+        resolved_reporters = get_consumer_countries(session)
+    else:
+        resolved_reporters = get_reporter_countries(session)
+
+    # Rebuild the numeric-code → ISO2 reverse map from the resolved set so
+    # partner_country resolution in parse_comtrade_rows is consistent.
+    global _CODE_TO_ISO2  # noqa: PLW0603 — intentional module-level update
+    _CODE_TO_ISO2 = {v: k for k, v in {**REPORTER_COUNTRIES, **resolved_reporters}.items()}
 
     # --- Resolve HS prefixes from supply_chain_contexts if not provided ------
     if hs_prefixes is None:
@@ -464,7 +581,7 @@ def ingest_comtrade(
     for year in years:
         for iso2, reporter_code in resolved_reporters.items():
             for hs_prefix in resolved_prefixes:
-                ext_id = _external_id(iso2, hs_prefix, year)
+                ext_id = _external_id(iso2, hs_prefix, year, flow_code=flow_code)
 
                 # Idempotency check — skip if already ingested.
                 # Each check gets a fresh connection checkout so pool_pre_ping
@@ -514,6 +631,7 @@ def ingest_comtrade(
                         year=year,
                         api_key=resolved_key,
                         base_url=settings.comtrade_base_url,
+                        flow_code=flow_code,
                     )
                     api_calls_made += 1
                 except (httpx.HTTPStatusError, httpx.TimeoutException, ValueError) as exc:
@@ -542,7 +660,7 @@ def ingest_comtrade(
                 # connection to the pool after each batch. This prevents Neon's
                 # 5-minute idle-connection timeout from killing a run that spans
                 # many slow API calls.
-                normalised = parse_comtrade_rows(raw_rows, iso2, hs_prefix, year)
+                normalised = parse_comtrade_rows(raw_rows, iso2, hs_prefix, year, flow_code=flow_code)
 
                 try:
                     source_doc_id = _create_source_document(
@@ -552,6 +670,7 @@ def ingest_comtrade(
                         hs_prefix=hs_prefix,
                         year=year,
                         row_count=len(normalised),
+                        flow_code=flow_code,
                     )
 
                     batch_added = 0

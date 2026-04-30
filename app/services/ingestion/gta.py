@@ -62,6 +62,9 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from sqlalchemy import text
+
+from app.models.country import Country
 from app.models.documents import SourceDocument
 from app.models.regulatory import (
     RiskEvent,
@@ -102,49 +105,134 @@ _SOURCE_PHASE = "1"
 _SOURCE_BASE_URL = "https://www.globaltradealert.org"
 
 # Filter GTA rows where any affected HS code starts with one of these prefixes.
+# Keep aligned with app/services/ingestion/seed_hs_mappings.py — any material
+# tracked there should have its ore and metal-form HS codes represented here.
 BATTERY_HS_PREFIXES: list[str] = [
-    "2501",   # Salt; sulphur; earths/stone — lithium minerals
-    "2504",   # Natural graphite
+    # ── Lithium ──────────────────────────────────────────────────────────────
+    "2501",   # Salt; sulphur; earths/stone — lithium minerals (spodumene, petalite)
+    "2825",   # Inorganic bases — lithium hydroxide (2825.20); primary battery electrolyte form
+    "2836",   # Carbonates — lithium carbonate (2836.91); primary cathode precursor
+    "2805",   # Alkali + rare earth metals — lithium metal (2805.12); REE metals (2805.30)
+    # ── Natural Graphite ─────────────────────────────────────────────────────
+    "2504",   # Natural graphite — all forms (flake, vein, amorphous)
+    # ── Manganese ────────────────────────────────────────────────────────────
     "2602",   # Manganese ores and concentrates
+    "8111",   # Manganese and articles — unwrought metal
+    # ── Nickel ───────────────────────────────────────────────────────────────
     "2604",   # Nickel ores and concentrates
-    "2825",   # Hydrazine; hydroxylamine; inorganic bases incl. lithium hydroxide/carbonate
-    "2836",   # Carbonates — lithium carbonate
-    "7501",   # Nickel mattes, oxide sinters
+    "7501",   # Nickel mattes, oxide sinters and intermediate products
     "7502",   # Unwrought nickel
+    # ── Cobalt ───────────────────────────────────────────────────────────────
+    "2605",   # Cobalt ores and concentrates  ← DRC / Zambia export restrictions
+    "8105",   # Cobalt mattes; unwrought cobalt; cobalt powders
+    # ── Copper ───────────────────────────────────────────────────────────────
+    "2603",   # Copper ores and concentrates
+    "7402",   # Copper (unrefined); copper anodes for electrolytic refining
+    "7403",   # Refined copper and copper alloys — unwrought
+    # ── Rare Earth Elements (incl. magnet REEs: Nd, Pr, Dy, Tb) ─────────────
+    "2846",   # Compounds of rare earth metals — primary processed trade form
+    # 2805.30 already covered above (rare earth metals unwrought)
+    # ── Platinum-Group Metals (fuel cell catalysts, sensors) ─────────────────
+    "7110",   # Platinum; palladium; rhodium; iridium; osmium; ruthenium
+    "2616",   # Precious metal ores — PGM-bearing ores (2616.90)
+    # ── Tungsten ─────────────────────────────────────────────────────────────
+    "2611",   # Tungsten ores and concentrates
+    "8101",   # Tungsten and articles — unwrought metal, powders
+    # ── Minor critical metals (Ga, Ge, In, Nb, V, Cr) ────────────────────────
+    "8112",   # Chapter 81 minor metals: Ga (8112.21/29), Ge (8112.31/39),
+              # In (8112.61/69), Nb (8112.92), V, Cr — all CRMA Annex II strategic
+    # ── Antimony (battery separator flame retardants) ─────────────────────────
+    "2617",   # Other ores — antimony ores (2617.10); some REE-bearing ores
+    "8110",   # Antimony and articles — unwrought metal
+    # ── Magnesium ────────────────────────────────────────────────────────────
     "8104",   # Magnesium and articles
-    "8107",   # Cobalt and articles
-    "8108",   # Titanium (EV structural materials)
-    "8507",   # Electric accumulators (batteries and cells)
-    "8548",   # Waste and scrap of primary cells, batteries
+    # ── Titanium ─────────────────────────────────────────────────────────────
+    "8108",   # Titanium and articles — metal sponge, EV structural materials
+    # ── Batteries and cells ──────────────────────────────────────────────────
+    "8507",   # Electric accumulators — batteries and cells
+    "8548",   # Waste and scrap of primary cells, batteries (recycling policy signals)
 ]
 
 # Map GTA implementing country names (or ISO2) → ISO2.
 # GTA uses ISO2 codes in some columns and full country names in others.
+# _resolve_country() handles bare ISO2 codes directly; this map only needs to
+# cover full-name variants that appear in GTA CSV exports.
 GTA_COUNTRY_MAP: dict[str, str] = {
+    # ── Major battery material producers ─────────────────────────────────────
     "China": "CN",
     "Indonesia": "ID",
     "Democratic Republic of the Congo": "CD",
     "DRC": "CD",
     "Congo, Democratic Republic": "CD",
+    "Congo, Dem. Rep.": "CD",
     "Russia": "RU",
     "Russian Federation": "RU",
-    "United States of America": "US",
-    "United States": "US",
-    "USA": "US",
     "Chile": "CL",
     "Australia": "AU",
     "South Africa": "ZA",
     "Philippines": "PH",
     "Mozambique": "MZ",
+    "Zimbabwe": "ZW",
+    "Bolivia": "BO",
+    "Bolivia, Plurinational State of": "BO",
+    "Argentina": "AR",
+    "Zambia": "ZM",
+    "Peru": "PE",
+    "Brazil": "BR",
+    "Morocco": "MA",
+    "Madagascar": "MG",
+    "Kazakhstan": "KZ",
+    "Myanmar": "MM",
+    "Burma": "MM",
+    "Lao People's Democratic Republic": "LA",
+    "Laos": "LA",
+    "Malaysia": "MY",
+    "Thailand": "TH",
+    "Vietnam": "VN",
+    "Viet Nam": "VN",
+    "Papua New Guinea": "PG",
+    "Guinea": "GN",
+    "Côte d'Ivoire": "CI",
+    "Ivory Coast": "CI",
+    "Tanzania": "TZ",
+    "Tanzania, United Republic of": "TZ",
+    "Namibia": "NA",
+    "Gabon": "GA",
+    "Ghana": "GH",
+    "Nigeria": "NG",
+    "Ethiopia": "ET",
+    # ── Major consumer / manufacturing economies ──────────────────────────────
+    "United States of America": "US",
+    "United States": "US",
+    "USA": "US",
     "European Union": "EU",
     "Germany": "DE",
+    "France": "FR",
+    "United Kingdom": "GB",
     "Japan": "JP",
     "South Korea": "KR",
     "Korea, Republic of": "KR",
+    "Korea": "KR",
     "Canada": "CA",
-    "Zimbabwe": "ZW",
-    "Bolivia": "BO",
-    "Argentina": "AR",
+    "India": "IN",
+    "Mexico": "MX",
+    "Norway": "NO",
+    "Finland": "FI",
+    "Sweden": "SE",
+    "Netherlands": "NL",
+    "Belgium": "BE",
+    "Poland": "PL",
+    "Czech Republic": "CZ",
+    "Czechia": "CZ",
+    "Spain": "ES",
+    "Italy": "IT",
+    "Portugal": "PT",
+    "Turkey": "TR",
+    "Türkiye": "TR",
+    "Taiwan": "TW",
+    "Taiwan, Province of China": "TW",
+    "Singapore": "SG",
+    "New Zealand": "NZ",
 }
 
 # Map GTA intervention_type → app.constants.RiskCategory string value.
@@ -166,6 +254,30 @@ GTA_INTERVENTION_CATEGORY_MAP: dict[str, str] = {
     "Procurement": "geopolitical_trade",
 }
 DEFAULT_GTA_CATEGORY = "geopolitical_trade"
+
+# Map GTA intervention_type → event_subtype stored in metadata_json["event_subtype"].
+#
+# The scoring engine in market_aggregator.py and evidence_aggregator.py reads
+# this field to route events into the correct signal bucket (export_restriction_exposure,
+# trade_volatility, etc.). Without an explicit subtype the engine falls back to
+# title-text matching ("export" + "ban/restrict/control"), which misses events whose
+# titles describe the measure without those keywords.
+#
+# Supply-side interventions (implementing country restricts outbound trade):
+#   EXPORT_RESTRICTION  → export_restriction_exposure pillar
+# Demand-side interventions (importing country restricts inbound trade):
+#   IMPORT_DISRUPTION   → trade_volatility pillar (lower weight)
+# No subtype is set for instruments that don't map cleanly to either bucket
+# (State aid, Investment measure, Procurement) — text matching handles those.
+_INTERVENTION_SUBTYPE_MAP: dict[str, str] = {
+    "Export taxes":                 "EXPORT_RESTRICTION",
+    "Export quotas":                "EXPORT_RESTRICTION",
+    "Export licensing requirements":"EXPORT_RESTRICTION",
+    "Export bans":                  "EXPORT_RESTRICTION",
+    "Import tariff":                "IMPORT_DISRUPTION",
+    "Import quota":                 "IMPORT_DISRUPTION",
+    "Import ban":                   "IMPORT_DISRUPTION",
+}
 
 # RiskEvent.event_type is String(128); truncate to fit.
 _EVENT_TYPE_MAX = 128
@@ -338,22 +450,81 @@ def _matches_prefix(hs_code: str, prefixes: list[str]) -> bool:
     return any(hs_code.startswith(p) for p in prefixes)
 
 
-def _resolve_country(raw: str) -> Optional[str]:
+def _resolve_country(raw: str, country_name_map: Optional[dict[str, str]] = None) -> Optional[str]:
     """Map a GTA implementing-jurisdiction cell to ISO2, or ``None``.
 
-    Accepts pre-mapped ISO2 codes (``"CN"``) and the names listed in
-    :data:`GTA_COUNTRY_MAP`. Returns ``None`` for anything unrecognised so the
-    caller can log + continue rather than abort.
+    Resolution order:
+      1. Already a 2-letter alpha string → return as-is (upper-cased).
+      2. Lookup in ``country_name_map`` (built from ``countries.common_names``
+         at ingest time via ``_build_country_name_map``).
+      3. Fallback to the hardcoded ``GTA_COUNTRY_MAP`` (covers cases where the
+         countries table has not been seeded yet).
+
+    Returns ``None`` for anything unrecognised so the caller can log + continue
+    rather than abort.
     """
     if not raw:
         return None
     raw = raw.strip()
     if not raw:
         return None
-    # Already ISO2.
+    # 1. Already ISO2.
     if len(raw) == 2 and raw.isalpha():
         return raw.upper()
+    # 2. DB-derived name map.
+    if country_name_map:
+        iso2 = country_name_map.get(raw)
+        if iso2:
+            return iso2
+    # 3. Hardcoded fallback.
     return GTA_COUNTRY_MAP.get(raw)
+
+
+def _build_country_name_map(session: Session) -> dict[str, str]:
+    """Build a full-name → ISO2 lookup from the ``countries`` table.
+
+    Each row's ``common_names`` JSONB array is exploded so every alias maps
+    to the row's ``iso2``.  Falls back gracefully to an empty dict if the
+    table is empty (countries not yet seeded).
+    """
+    rows = session.scalars(select(Country)).all()
+    name_map: dict[str, str] = {}
+    for row in rows:
+        # Always map the canonical name itself.
+        name_map[row.name] = row.iso2
+        if row.common_names:
+            for alias in row.common_names:
+                if alias:
+                    name_map[str(alias)] = row.iso2
+    return name_map
+
+
+def _derive_hs_prefixes_from_db(session: Session) -> list[str]:
+    """Return all HS code prefixes currently stored in ``hs_code_material_mappings``.
+
+    Used by ``ingest_gta`` to derive its filter list dynamically so that adding
+    a new material + HS mapping to the DB automatically expands GTA coverage
+    without requiring a code change.
+
+    Falls back to the hardcoded ``BATTERY_HS_PREFIXES`` list if the table is
+    empty (e.g. HS mappings not yet seeded).
+    """
+    hs_map = _build_hs_material_map(session)
+    if not hs_map:
+        log.warning(
+            "gta.derive_hs_prefixes.empty_table",
+            hint="Run 'bdi-ingest seed-hs-mappings' before ingest-gta.",
+        )
+        return BATTERY_HS_PREFIXES
+    # Normalise: strip dots, take unique 4-digit prefixes to keep the filter
+    # broad (GTA codes are 6-digit but matching on 4 digits avoids sub-code gaps).
+    prefixes: set[str] = set()
+    for raw_prefix in hs_map.keys():
+        clean = raw_prefix.replace(".", "")
+        # Use 4-digit prefix for filtering (same logic as the HS resolver pass-2).
+        if len(clean) >= 4:
+            prefixes.add(clean[:4])
+    return sorted(prefixes)
 
 
 def _to_bool(raw: Any) -> bool:
@@ -369,6 +540,7 @@ def parse_gta_csv(
     hs_prefixes: list[str] = BATTERY_HS_PREFIXES,
     since_year: Optional[int] = 2018,
     skip_hs_filter: bool = False,
+    country_name_map: Optional[dict[str, str]] = None,
 ) -> list[dict]:
     """Parse GTA CSV bytes into a list of normalised intervention dicts.
 
@@ -453,7 +625,8 @@ def parse_gta_csv(
 
         # 4. Country & category resolution.
         implementing_iso2 = _resolve_country(
-            row.get(col["implementing_jurisdiction"]) or ""
+            row.get(col["implementing_jurisdiction"]) or "",
+            country_name_map=country_name_map,
         )
 
         intervention_type = (row.get(col["intervention_type"]) or "").strip()
@@ -688,7 +861,13 @@ def ingest_gta(
             geography_links         RiskEventGeography rows created
             skipped_unknown_country events inserted but with no resolvable country
     """
-    effective_prefixes = list(hs_prefixes) if hs_prefixes else BATTERY_HS_PREFIXES
+    # Derive HS prefix filter from the DB (or fall back to hardcoded list).
+    effective_prefixes = list(hs_prefixes) if hs_prefixes else _derive_hs_prefixes_from_db(session)
+    log.info("gta.ingest.hs_prefixes", count=len(effective_prefixes), source="db" if not hs_prefixes else "override")
+
+    # Build country name → ISO2 map from the DB (or empty dict if not seeded).
+    country_name_map = _build_country_name_map(session)
+    log.info("gta.ingest.country_name_map", entries=len(country_name_map))
 
     if local_file is not None:
         import pathlib
@@ -704,6 +883,7 @@ def ingest_gta(
         hs_prefixes=effective_prefixes,
         since_year=since_year,
         skip_hs_filter=skip_hs_filter,
+        country_name_map=country_name_map,
     )
 
     source_id = _get_or_create_gta_source(session)
@@ -750,6 +930,11 @@ def ingest_gta(
                 raw=intervention["raw_row"].get("implementing_jurisdiction"),
             )
 
+        # event_subtype enables precise signal routing in the scoring engine
+        # (market_aggregator + evidence_aggregator). Falls back to None for
+        # instrument types without a clean supply/demand-side classification.
+        event_subtype = _INTERVENTION_SUBTYPE_MAP.get(intervention_type)
+
         event = RiskEvent(
             source_document_id=source_document_id,
             event_type=intervention_type or "trade_intervention",
@@ -767,6 +952,7 @@ def ingest_gta(
                 "raw_intervention_type": intervention["intervention_type"],
                 "in_force": in_force,
                 "source_url": url,
+                **({"event_subtype": event_subtype} if event_subtype else {}),
             },
             verified=False,
         )

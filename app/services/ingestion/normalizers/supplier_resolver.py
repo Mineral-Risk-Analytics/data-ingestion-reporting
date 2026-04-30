@@ -1,8 +1,10 @@
 """
 Resolve company name variants using `company_aliases` and exact `canonical_name`.
 
-Kept as supplier_resolver.py for import-path compatibility; the underlying
-model is now Company/CompanyAlias (not Supplier/SupplierAlias).
+Reserved for Phase 5 company overlay — not called by the current pipeline.
+``pipeline.py`` uses ``entity_resolution.py`` for company matching during ingestion;
+this class provides a simpler name-only resolver that Phase 5 will use for
+supplier-chain traversal and enrichment passes.
 
 Phase 1: case-insensitive match; Phase 2+ may add fuzzy matching / legal-entity cleanup.
 """
@@ -18,8 +20,8 @@ from app.models.company import Company, CompanyAlias
 class SupplierResolver:
     """Resolves a company name string to a Company ORM row.
 
-    Named SupplierResolver for backward compatibility with callers that
-    import this class. The resolved objects are Company instances.
+    Named SupplierResolver for historical reasons; the resolved objects are
+    Company instances (not a separate Supplier model).
     """
 
     def __init__(self, db: Session) -> None:
