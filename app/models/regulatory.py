@@ -12,7 +12,7 @@ import uuid
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from app.models.company import Company
     from app.models.documents import SourceDocument
     from app.models.facility import Facility
-    from app.models.supply import Material
+    from app.models.supply import HsCodeMaterialMapping, Material
 
 
 class Regulation(Base):
@@ -233,6 +233,9 @@ class RiskEvent(Base):
     facility_links: Mapped[list["RiskEventFacility"]] = relationship(
         back_populates="risk_event", cascade="all, delete-orphan"
     )
+    hs_mapping_links: Mapped[list["RiskEventHsMapping"]] = relationship(
+        back_populates="risk_event", cascade="all, delete-orphan"
+    )
 
 
 class RiskEventCompany(Base):
@@ -405,3 +408,63 @@ class RiskEventFacility(Base):
 
     risk_event: Mapped["RiskEvent"] = relationship(back_populates="facility_links")
     facility: Mapped["Facility"] = relationship()
+
+
+class RiskEventHsMapping(Base):
+    """
+    Junction: a risk event's relevance to a specific HS code mapping node.
+
+    Complements :class:`RiskEventMaterial` with stage-level granularity.
+    Both rows are written when an event has HS attribution; only
+    ``RiskEventMaterial`` is written for pre-redesign historical data and
+    keyword-only matches that lack stage resolution.
+
+    A single event may link to multiple hs_mapping rows when multiple
+    supply chain stages are mentioned (e.g. an article that covers both
+    cobalt mining disruption and battery-grade cobalt sulfate shortages).
+
+    relevance_score convention mirrors risk_event_materials:
+      1.00 — direct HS code match (HS prefix found in document text)
+      0.85 — keyword match with stage disambiguation via mappings table
+
+    This table is the primary input for stage-level evidence scoring in
+    ``evidence_query.get_events_for_material()`` and the trade signal
+    builder's stage attribution logic.
+    """
+
+    __tablename__ = "risk_event_hs_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "risk_event_id", "hs_mapping_id", name="uq_risk_event_hs_mapping"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    risk_event_id: Mapped[int] = mapped_column(
+        ForeignKey("risk_events.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    hs_mapping_id: Mapped[int] = mapped_column(
+        ForeignKey("hs_code_material_mappings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    relevance_score: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=1.0,
+        comment=(
+            "1.00 = direct HS code match; 0.85 = keyword match with stage "
+            "disambiguation.  Mirrors risk_event_materials convention."
+        ),
+    )
+    match_reason: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="hs_code_match | keyword_match | trade_flow_match",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    risk_event: Mapped["RiskEvent"] = relationship(back_populates="hs_mapping_links")
+    hs_mapping: Mapped["HsCodeMaterialMapping"] = relationship()

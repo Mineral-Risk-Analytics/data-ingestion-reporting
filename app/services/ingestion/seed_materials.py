@@ -50,7 +50,6 @@ _NON_USGS_MATERIALS: list[dict] = [
         "symbol_or_code": "Nd",
         "hs_codes": ["2805.30", "2846.90"],
         "criticality_score": 0.87,   # highly concentrated in CN
-        "primary_producing_countries": ["CN"],
         "price_unit": "per_kg",
         "is_ira_critical_mineral": True,
         "is_eu_crma_critical": True,
@@ -70,7 +69,6 @@ _NON_USGS_MATERIALS: list[dict] = [
         "symbol_or_code": "Pr",
         "hs_codes": ["2805.30", "2846.90"],
         "criticality_score": 0.87,
-        "primary_producing_countries": ["CN"],
         "price_unit": "per_kg",
         "is_ira_critical_mineral": True,
         "is_eu_crma_critical": True,
@@ -88,7 +86,6 @@ _NON_USGS_MATERIALS: list[dict] = [
         "symbol_or_code": "Dy",
         "hs_codes": ["2805.30", "2846.90"],
         "criticality_score": 0.91,   # more concentrated than NdPr
-        "primary_producing_countries": ["CN"],
         "price_unit": "per_kg",
         "is_ira_critical_mineral": True,
         "is_eu_crma_critical": True,
@@ -107,7 +104,6 @@ _NON_USGS_MATERIALS: list[dict] = [
         "symbol_or_code": "Tb",
         "hs_codes": ["2805.30", "2846.90"],
         "criticality_score": 0.95,
-        "primary_producing_countries": ["CN"],
         "price_unit": "per_kg",
         "is_ira_critical_mineral": True,
         "is_eu_crma_critical": True,
@@ -126,7 +122,6 @@ _NON_USGS_MATERIALS: list[dict] = [
         "symbol_or_code": "Na",
         "hs_codes": ["2827.10", "2836.20"],
         "criticality_score": 0.05,   # geographically distributed; low concentration risk
-        "primary_producing_countries": ["CN", "US", "DE", "IN"],
         "price_unit": "per_mt",
         "is_ira_critical_mineral": False,
         "is_eu_crma_critical": False,

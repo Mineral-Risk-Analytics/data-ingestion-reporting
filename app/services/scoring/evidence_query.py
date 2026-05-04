@@ -43,7 +43,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.constants import RiskCategory
@@ -66,9 +66,12 @@ from app.models.regulatory import (
     RiskEvent,
     RiskEventCompany,
     RiskEventGeography,
+    RiskEventHsMapping,
     RiskEventMaterial,
     RiskEventRegulation,
 )
+from app.models.scoring import HsCodeGeographyRiskScore
+from app.models.supply import HsCodeMaterialMapping
 from app.models.vehicle import CompanyVehicleModel, VehicleModelChemistry
 from app.services.scoring.decay import EVIDENCE_WINDOWS
 from app.services.scoring.types import ScoringScope
@@ -360,6 +363,75 @@ def get_filing_signals(
 # Material-scoped queries (no company required)
 # ---------------------------------------------------------------------------
 
+# Discount applied to events without HS stage attribution.
+# Events ingested before Phase 1.5 (or keyword-only matches that lack a
+# specific HS code) have no risk_event_hs_mappings row.  They are still
+# included in scoring but down-weighted to reflect the reduced specificity.
+_NO_STAGE_ATTRIBUTION_DISCOUNT = 0.85
+
+
+def _apply_hs_confidence_multiplier(
+    db: Session,
+    material_id: int,
+    results: list[EventWithRelevance],
+) -> list[EventWithRelevance]:
+    """
+    Adjust relevance_score using hs_code_material_mappings.confidence.
+
+    For each event:
+      - If it has at least one risk_event_hs_mappings row whose hs_mapping
+        belongs to ``material_id``, the relevance is multiplied by the
+        *maximum* confidence across those mappings.  This means high-quality
+        curated mappings (confidence=0.95) amplify the relevance, while
+        lower-confidence inferred mappings (confidence=0.70) reduce it.
+      - If the event has no HS stage attribution, the relevance is multiplied
+        by ``_NO_STAGE_ATTRIBUTION_DISCOUNT`` (0.85).  Pre-Phase-1.5 events
+        and pure keyword matches fall into this bucket.
+
+    Called immediately after ``_dedup_event_rows()`` in
+    ``get_events_for_material()`` so dedup has already resolved the best
+    relevance per event before the multiplier is applied.
+    """
+    if not results:
+        return results
+
+    event_ids = [r.event.id for r in results]
+
+    # One row per event: the max confidence across all HS mappings linked to
+    # this event that belong to the requested material_id.
+    confidence_rows = db.execute(
+        select(
+            RiskEventHsMapping.risk_event_id,
+            func.max(HsCodeMaterialMapping.confidence).label("max_confidence"),
+        )
+        .join(
+            HsCodeMaterialMapping,
+            HsCodeMaterialMapping.id == RiskEventHsMapping.hs_mapping_id,
+        )
+        .where(
+            RiskEventHsMapping.risk_event_id.in_(event_ids),
+            HsCodeMaterialMapping.material_id == material_id,
+            HsCodeMaterialMapping.market_scope == "global",
+        )
+        .group_by(RiskEventHsMapping.risk_event_id)
+    ).all()
+
+    confidence_map: dict[int, float] = {
+        row.risk_event_id: row.max_confidence for row in confidence_rows
+    }
+
+    adjusted: list[EventWithRelevance] = []
+    for r in results:
+        multiplier = confidence_map.get(r.event.id, _NO_STAGE_ATTRIBUTION_DISCOUNT)
+        adjusted.append(
+            EventWithRelevance(
+                event=r.event,
+                relevance_score=round(r.relevance_score * multiplier, 4),
+            )
+        )
+    return adjusted
+
+
 def get_events_for_material(
     db: Session,
     material_id: int,
@@ -371,6 +443,11 @@ def get_events_for_material(
     """
     Query risk_events tagged to a specific material via risk_event_materials.
     Enables material-anchored scoring without any company data.
+
+    Phase 1.5: relevance scores are adjusted by ``_apply_hs_confidence_multiplier``
+    after deduplication.  Events with HS stage attribution are multiplied by the
+    mapping confidence; events without are discounted by
+    ``_NO_STAGE_ATTRIBUTION_DISCOUNT`` (0.85).
     """
     if scope.material_ids is not None and material_id not in scope.material_ids:
         return []
@@ -398,6 +475,7 @@ def get_events_for_material(
 
     rows = db.execute(stmt).all()
     results = _dedup_event_rows(rows)
+    results = _apply_hs_confidence_multiplier(db, material_id, results)
 
     log.debug(
         "evidence_query.get_events_for_material",
@@ -479,6 +557,61 @@ def get_events_for_geographies(
     return _dedup_event_rows(rows)
 
 
+def _apply_hs_confidence_multiplier_batch(
+    db: Session,
+    material_ids: set[int],
+    results: list[EventWithRelevance],
+) -> list[EventWithRelevance]:
+    """
+    Batch variant of ``_apply_hs_confidence_multiplier`` for multi-material queries.
+
+    Identical logic to the single-material version: events that have at least one
+    ``risk_event_hs_mappings`` row pointing to a mapping that belongs to *any* of
+    ``material_ids`` are multiplied by the max confidence across those mappings;
+    events with no HS stage attribution are discounted by
+    ``_NO_STAGE_ATTRIBUTION_DISCOUNT`` (0.85).
+
+    Called by ``get_events_for_materials()`` so that the batch path is consistent
+    with the per-material path in ``get_events_for_material()``.
+    """
+    if not results:
+        return results
+
+    event_ids = [r.event.id for r in results]
+
+    confidence_rows = db.execute(
+        select(
+            RiskEventHsMapping.risk_event_id,
+            func.max(HsCodeMaterialMapping.confidence).label("max_confidence"),
+        )
+        .join(
+            HsCodeMaterialMapping,
+            HsCodeMaterialMapping.id == RiskEventHsMapping.hs_mapping_id,
+        )
+        .where(
+            RiskEventHsMapping.risk_event_id.in_(event_ids),
+            HsCodeMaterialMapping.material_id.in_(material_ids),
+            HsCodeMaterialMapping.market_scope == "global",
+        )
+        .group_by(RiskEventHsMapping.risk_event_id)
+    ).all()
+
+    confidence_map: dict[int, float] = {
+        row.risk_event_id: row.max_confidence for row in confidence_rows
+    }
+
+    adjusted: list[EventWithRelevance] = []
+    for r in results:
+        multiplier = confidence_map.get(r.event.id, _NO_STAGE_ATTRIBUTION_DISCOUNT)
+        adjusted.append(
+            EventWithRelevance(
+                event=r.event,
+                relevance_score=round(r.relevance_score * multiplier, 4),
+            )
+        )
+    return adjusted
+
+
 def get_events_for_materials(
     db: Session,
     material_ids: set[int],
@@ -487,7 +620,15 @@ def get_events_for_materials(
     *,
     scope: ScoringScope = ScoringScope.ALL,
 ) -> list[EventWithRelevance]:
-    """Events tagged via ``risk_event_materials`` to any of ``material_ids``."""
+    """Events tagged via ``risk_event_materials`` to any of ``material_ids``.
+
+    Phase 1.5: relevance scores are adjusted by
+    ``_apply_hs_confidence_multiplier_batch`` after deduplication, matching
+    the behaviour of the singular ``get_events_for_material()``.  Events with
+    HS stage attribution for any of the requested materials are multiplied by
+    the mapping confidence; events without are discounted by
+    ``_NO_STAGE_ATTRIBUTION_DISCOUNT`` (0.85).
+    """
     if scope.material_ids is not None:
         material_ids = set(material_ids) & set(scope.material_ids)
     if not material_ids:
@@ -511,7 +652,104 @@ def get_events_for_materials(
             (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
         )
     rows = db.execute(stmt).all()
-    return _dedup_event_rows(rows)
+    results = _dedup_event_rows(rows)
+    results = _apply_hs_confidence_multiplier_batch(db, material_ids, results)
+
+    log.debug(
+        "evidence_query.get_events_for_materials",
+        material_ids=sorted(material_ids),
+        category=category.value,
+        count=len(results),
+    )
+    return results
+
+
+def get_events_for_hs_mapping(
+    db: Session,
+    hs_mapping_id: int,
+    category: RiskCategory,
+    as_of_date: date,
+    *,
+    scope: ScoringScope = ScoringScope.ALL,
+) -> list[EventWithRelevance]:
+    """
+    Query risk_events scoped to a specific HS mapping node via
+    ``risk_event_hs_mappings``.
+
+    Intended for use by Phase 3 ``hs_node_scorer.py``, which scores at the
+    stage level (e.g., "export ban on cobalt hydroxide 282200 from China").
+    Unlike ``get_events_for_material()``, this function queries the HS junction
+    table directly, so every row returned already has confirmed stage attribution.
+    No additional confidence discount is applied.
+
+    The ``relevance_score`` returned is::
+
+        RiskEventHsMapping.relevance_score × HsCodeMaterialMapping.confidence
+
+    where ``confidence`` reflects the quality of the HS mapping itself (curated
+    rows carry 0.90–0.95; inferred rows carry 0.70–0.85).  This means a
+    keyword-matched event (relevance 0.85) on a high-confidence curated mapping
+    (confidence 0.95) scores 0.8075, while a direct HS-code-matched event
+    (relevance 0.90) on the same mapping scores 0.8550.
+
+    Deduplication is by ``event.id``, keeping the highest adjusted score.
+
+    ``scope.material_ids``:  filters to mappings whose ``material_id`` is in the
+        set — useful when the caller wants only events attributable to a specific
+        material even when querying a shared 4-digit HS chapter node.
+    ``scope.country_codes``: filters via ``risk_event_geographies`` as usual.
+    """
+    cutoff = _category_window_cutoff(category, as_of_date)
+
+    stmt = (
+        select(
+            RiskEvent,
+            RiskEventHsMapping.relevance_score,
+            HsCodeMaterialMapping.confidence,
+        )
+        .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
+        .join(
+            HsCodeMaterialMapping,
+            HsCodeMaterialMapping.id == RiskEventHsMapping.hs_mapping_id,
+        )
+        .where(
+            RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
+            RiskEvent.risk_categories_json.contains([category.value]),
+        )
+        .order_by(RiskEvent.event_date.desc())
+    )
+    if cutoff is not None:
+        stmt = stmt.where(
+            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
+        )
+    if scope.country_codes is not None:
+        stmt = stmt.join(
+            RiskEventGeography,
+            RiskEventGeography.risk_event_id == RiskEvent.id,
+        ).where(RiskEventGeography.country_code.in_(scope.country_codes))
+    if scope.material_ids is not None:
+        stmt = stmt.where(
+            HsCodeMaterialMapping.material_id.in_(scope.material_ids)
+        )
+
+    rows = db.execute(stmt).all()
+
+    # Dedup by event id; keep max adjusted score across any duplicate rows.
+    by_id: dict[int, EventWithRelevance] = {}
+    for ev, relevance, confidence in rows:
+        adjusted = round(float(relevance) * float(confidence), 4)
+        existing = by_id.get(ev.id)
+        if existing is None or adjusted > existing.relevance_score:
+            by_id[ev.id] = EventWithRelevance(event=ev, relevance_score=adjusted)
+    results = list(by_id.values())
+
+    log.debug(
+        "evidence_query.get_events_for_hs_mapping",
+        hs_mapping_id=hs_mapping_id,
+        category=category.value,
+        count=len(results),
+    )
+    return results
 
 
 def get_regulations_scoping_company(
@@ -924,6 +1162,74 @@ def get_chemistry_slugs(
     return {cid: slug for cid, slug in db.execute(stmt).all()}
 
 
+def get_hs_nodes_for_material(
+    db: Session,
+    material_id: int,
+    country_code: str,
+    as_of_date: date,
+    *,
+    market_scope: str = "global",
+) -> list[HsCodeGeographyRiskScore]:
+    """Return all Level-0 HS stage node scores for a (material × country) pair.
+
+    Used by ``market_aggregator.score_material_geography()`` to determine
+    whether the stage-weighted rollup path is available (≥2 nodes present)
+    or whether to fall back to the legacy material-level path.
+
+    Rows are ordered by ``HsCodeMaterialMapping.stage_sequence`` so the
+    caller can iterate stages in supply-chain order without sorting.
+
+    Args:
+        db:           Active SQLAlchemy session.
+        material_id:  Primary key of the material in ``materials``.
+        country_code: ISO 3166-1 alpha-2 country code.
+        as_of_date:   Evaluation date — the most recent score row on or before
+                      this date is returned for each HS mapping node.
+        market_scope: ``"global"`` (default) or ``"us"``.  Must match the
+                      ``market_scope`` value written by ``hs_node_scorer``.
+
+    Returns:
+        List of ``HsCodeGeographyRiskScore`` instances, possibly empty if
+        Level-0 scoring has not yet run for this material.
+    """
+    # Subquery: for each hs_mapping_id, find the most recent as_of_date
+    # on or before the requested date — avoids returning stale or future rows.
+    latest_subq = (
+        select(
+            HsCodeGeographyRiskScore.hs_mapping_id,
+            func.max(HsCodeGeographyRiskScore.as_of_date).label("latest_date"),
+        )
+        .where(
+            HsCodeGeographyRiskScore.country_code == country_code,
+            HsCodeGeographyRiskScore.as_of_date <= as_of_date,
+            HsCodeGeographyRiskScore.market_scope == market_scope,
+        )
+        .group_by(HsCodeGeographyRiskScore.hs_mapping_id)
+        .subquery()
+    )
+
+    stmt = (
+        select(HsCodeGeographyRiskScore)
+        .join(
+            HsCodeMaterialMapping,
+            HsCodeMaterialMapping.id == HsCodeGeographyRiskScore.hs_mapping_id,
+        )
+        .join(
+            latest_subq,
+            (latest_subq.c.hs_mapping_id == HsCodeGeographyRiskScore.hs_mapping_id)
+            & (latest_subq.c.latest_date == HsCodeGeographyRiskScore.as_of_date),
+        )
+        .where(
+            HsCodeMaterialMapping.material_id == material_id,
+            HsCodeMaterialMapping.market_scope == market_scope,
+            HsCodeGeographyRiskScore.country_code == country_code,
+        )
+        .order_by(HsCodeMaterialMapping.stage_sequence.asc().nulls_last())
+    )
+
+    return list(db.scalars(stmt).all())
+
+
 __all__ = [
     "EventWithRelevance",
     "SupplierEdge",
@@ -938,6 +1244,8 @@ __all__ = [
     "get_facilities_for_company",
     "get_events_for_geographies",
     "get_events_for_materials",
+    "get_events_for_hs_mapping",
+    "get_hs_nodes_for_material",
     "get_regulations_scoping_company",
     "get_events_for_regulations",
     "get_supplier_chain",

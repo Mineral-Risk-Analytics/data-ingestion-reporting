@@ -22,12 +22,15 @@ from app.models.regulatory import (
     Regulation,
     RegulationGeographyScope,
     RegulationMaterialScope,
+    RiskEvent,
+    RiskEventRegulation,
 )
 from app.models.source import Source
 from app.models.supply import Material
 from app.services.ingestion.eurlex import (
     BATTERY_REGULATIONS,
     EURLEX_HTML_URL,
+    _SEVERITY_BY_STATUS,
     _strip_html,
     fetch_eurlex_summary,
     ingest_eurlex,
@@ -58,6 +61,8 @@ _EURLEX_TABLES = (
     Regulation.__table__,
     RegulationMaterialScope.__table__,
     RegulationGeographyScope.__table__,
+    RiskEvent.__table__,
+    RiskEventRegulation.__table__,
 )
 
 
@@ -270,6 +275,8 @@ class TestIngestEurlexIdempotency:
         assert result2["skipped"] == len(BATTERY_REGULATIONS)
         assert result2["material_scopes"] == 0
         assert result2["geography_scopes"] == 0
+        assert result2["risk_events"] == 0
+        assert result2["regulation_links"] == 0
 
     def test_second_run_does_not_duplicate_regulations(
         self, session: Session, seeded_materials
@@ -404,7 +411,11 @@ class TestManifestData:
             assert f"CELEX:{r['celex']}" in url
 
     def test_scope_types_valid(self):
-        valid_material = {"covered", "restricted", "banned", "disclosure_required"}
+        # "strategic_raw_material" is used by CRMA Annex II designations.
+        valid_material = {
+            "covered", "restricted", "banned", "disclosure_required",
+            "strategic_raw_material",
+        }
         valid_geography = {"jurisdiction", "origin_country", "targeted_country"}
         for r in BATTERY_REGULATIONS:
             for _, scope_type in r["material_scopes"]:
@@ -415,3 +426,102 @@ class TestManifestData:
                 assert scope_type in valid_geography, (
                     f"{r['regulation_key']}: invalid geography scope_type {scope_type!r}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# ingest_eurlex — risk event generation
+# ---------------------------------------------------------------------------
+
+class TestIngestEurlexRiskEvents:
+    """Verify that ingest_eurlex generates RiskEvent + RiskEventRegulation rows."""
+
+    def test_creates_one_risk_event_per_regulation(
+        self, session: Session, seeded_materials
+    ):
+        result = ingest_eurlex(session, fetch_summaries=False)
+
+        assert result["risk_events"] == len(BATTERY_REGULATIONS)
+        assert result["regulation_links"] == len(BATTERY_REGULATIONS)
+
+        events = session.scalars(select(RiskEvent)).all()
+        assert len(events) == len(BATTERY_REGULATIONS)
+
+    def test_risk_event_fields(self, session: Session, seeded_materials):
+        ingest_eurlex(session, fetch_summaries=False)
+
+        events = session.scalars(select(RiskEvent)).all()
+        for ev in events:
+            assert ev.event_type == "REGULATORY_IMPLEMENTATION"
+            assert ev.event_date is None, "Standing regulations use event_date=None"
+            assert ev.confidence_score == 1.0
+            assert ev.verified is True
+            assert ev.risk_categories_json == ["regulatory_compliance"]
+            assert ev.severity_score is not None
+            assert 0.0 < ev.severity_score <= 1.0
+            assert ev.content_hash is not None and len(ev.content_hash) == 64
+            assert ev.metadata_json is not None
+            assert "regulation_key" in ev.metadata_json
+            assert "celex" in ev.metadata_json
+
+    def test_severity_calibrated_by_status(self, session: Session, seeded_materials):
+        ingest_eurlex(session, fetch_summaries=False)
+
+        events = {ev.metadata_json["regulation_key"]: ev for ev in session.scalars(select(RiskEvent)).all()}
+        for reg in BATTERY_REGULATIONS:
+            ev = events[reg["regulation_key"]]
+            expected = _SEVERITY_BY_STATUS.get(reg["status"], 0.35)
+            assert ev.severity_score == pytest.approx(expected), (
+                f"{reg['regulation_key']}: expected severity {expected}, got {ev.severity_score}"
+            )
+
+    def test_risk_event_linked_to_correct_regulation(
+        self, session: Session, seeded_materials
+    ):
+        ingest_eurlex(session, fetch_summaries=False)
+
+        junctions = session.scalars(select(RiskEventRegulation)).all()
+        assert len(junctions) == len(BATTERY_REGULATIONS)
+
+        for junction in junctions:
+            assert junction.relevance_score == pytest.approx(1.0)
+            assert junction.match_reason == "regulation_enacted"
+            # FK integrity: regulation must exist
+            reg = session.get(Regulation, junction.regulation_id)
+            assert reg is not None
+            # FK integrity: risk event must exist
+            ev = session.get(RiskEvent, junction.risk_event_id)
+            assert ev is not None
+
+    def test_effective_date_in_metadata(self, session: Session, seeded_materials):
+        ingest_eurlex(session, fetch_summaries=False)
+
+        events_by_key = {
+            ev.metadata_json["regulation_key"]: ev
+            for ev in session.scalars(select(RiskEvent)).all()
+        }
+        for reg in BATTERY_REGULATIONS:
+            ev = events_by_key[reg["regulation_key"]]
+            if reg.get("effective_date") is not None:
+                assert "effective_date" in ev.metadata_json, (
+                    f"{reg['regulation_key']}: effective_date should be in metadata_json"
+                )
+                assert ev.metadata_json["effective_date"] == reg["effective_date"].isoformat()
+
+    def test_second_run_does_not_duplicate_risk_events(
+        self, session: Session, seeded_materials
+    ):
+        ingest_eurlex(session, fetch_summaries=False)
+        result2 = ingest_eurlex(session, fetch_summaries=False)
+
+        assert result2["risk_events"] == 0
+        assert result2["regulation_links"] == 0
+        assert len(session.scalars(select(RiskEvent)).all()) == len(BATTERY_REGULATIONS)
+        assert len(session.scalars(select(RiskEventRegulation)).all()) == len(BATTERY_REGULATIONS)
+
+    def test_content_hash_unique_across_regulations(
+        self, session: Session, seeded_materials
+    ):
+        ingest_eurlex(session, fetch_summaries=False)
+
+        hashes = [ev.content_hash for ev in session.scalars(select(RiskEvent)).all()]
+        assert len(hashes) == len(set(hashes)), "content_hash must be unique per regulation event"

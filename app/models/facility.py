@@ -136,16 +136,27 @@ class CompanyFacility(Base):
 class FacilityMaterialLink(Base):
     """Maps a facility to the minerals it produces.
 
-    Populated by the GEM ingester. A single mine may produce multiple minerals
-    (e.g. cobalt is a by-product of copper mines in the DRC). ``is_primary_product``
-    distinguishes the main commodity from co-products.
+    Populated by the MRDS/GEM ingester. A single mine may produce multiple
+    minerals (e.g. cobalt is a by-product of copper mines in the DRC).
+    ``is_primary_product`` distinguishes the main commodity from co-products.
 
     ``annual_capacity_tpy`` is the facility's stated nameplate capacity in
-    tonnes per year. NULL when GEM does not publish a capacity figure.
+    tonnes per year. NULL when MRDS does not publish a capacity figure.
 
-    Used by the operational scoring pillar to compute structural_dependency:
-        at_risk_tpy = Σ capacity where status ∈ {mothballed, closed, care_maintenance}
-        structural_dependency = at_risk_tpy / total_tpy  (for this material+geography)
+    ``supply_chain_stage`` (migration 029) records which processing stage the
+    facility operates at — ore, intermediate, battery_grade, etc.  NULL for
+    rows ingested before migration 029.  Used by Phase 3 ``hs_node_scorer.py``
+    to compute stage-specific structural_dependency:
+
+        at_risk_tpy = Σ capacity WHERE
+            material_id   = this material
+            supply_chain_stage = this node's stage
+            status ∈ {mothballed, closed, care_maintenance}
+            country       = this country
+
+    ``hs_mapping_id`` (migration 029) directly links a facility's capacity to
+    a specific HS stage node.  NULL until manually confirmed for rows where
+    MRDS does not resolve a specific HS code.
     """
 
     __tablename__ = "facility_material_links"
@@ -174,6 +185,26 @@ class FacilityMaterialLink(Base):
     )
     is_primary_product: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="true"
+    )
+    supply_chain_stage: Mapped[Optional[str]] = mapped_column(
+        String(16),
+        nullable=True,
+        comment=(
+            "ore | concentrate | intermediate | refined | battery_grade | "
+            "fabricated | scrap.  NULL for rows predating migration 029. "
+            "Stage determines which hs_code_geography_risk_scores node this "
+            "facility's capacity contributes to in the operational scoring pillar."
+        ),
+    )
+    hs_mapping_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("hs_code_material_mappings.id", ondelete="SET NULL"),
+        nullable=True,
+        comment=(
+            "FK to hs_code_material_mappings. NULL for historical rows. "
+            "When set, links this facility's capacity directly to a stage node "
+            "for stage-weighted structural_dependency calculation."
+        ),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

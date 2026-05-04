@@ -1,7 +1,10 @@
 """Scheduled scoring jobs registered with Inngest.
 
-Three weekly cron jobs spaced an hour apart to enforce the pipeline dependency
-order — each step reads from the table written by the previous step:
+Weekly scoring pipeline (four jobs, Monday UTC):
+
+  Job 0 — ``rescore-hs-nodes``           Monday 01:00 UTC
+      Level-0 HS node scores (HHI + trade events per stage × country).
+      → hs_code_geography_risk_scores
 
   Job 1 — ``rescore-market-scores``      Monday 02:00 UTC
       Geo-level scoring for every active material.
@@ -15,6 +18,15 @@ order — each step reads from the table written by the previous step:
       Intensity-weighted chemistry scores from global rollups.
       → chemistry_risk_scores (one row per chemistry)
 
+Daily trade flow ingestion (one job):
+
+  Job D — ``ingest-comtrade-daily``      Daily 06:00 UTC
+      Fetches export + import trade flows from UN Comtrade for the 3 most
+      recently complete calendar years.  Idempotent: already-committed
+      (reporter × HS prefix × year) batches are skipped.  Designed to run
+      daily until full coverage is reached (rate-limited to ~500 calls/day).
+      Runs build-trade-signals after both flow directions complete.
+
 Timeout strategy
 ----------------
 Jobs 1 and 2 previously ran as a single asyncio.to_thread call and exceeded
@@ -26,6 +38,11 @@ failure restarts from the last successful step rather than from scratch.
 Job 3 (chemistry rescore) runs as a single step because it only reads from the
 already-computed global rollups and does pure in-Python math — it completes in
 well under a minute.
+
+Job D (Comtrade) is broken into per-HS-prefix steps for the same timeout reason.
+Each step fetches one prefix across all reporters and target years; already-
+committed batches are skipped immediately.  One step per prefix × flow direction
+= ~96 steps per daily run.
 
 Step handler pattern
 --------------------
@@ -40,7 +57,7 @@ arguments after the handler are forwarded by the SDK via ``*handler_args``.
 
 Registration
 ------------
-Importing this module registers all three functions on ``inngest_client`` via
+Importing this module registers all functions on ``inngest_client`` via
 decorator side-effects.  ``app/tasks/__init__.py`` performs the import;
 ``app/main.py`` then imports ``app.tasks`` so the functions are discoverable
 when ``inngest.fast_api.serve`` is called.
@@ -106,7 +123,7 @@ def _sync_score_material_geos(
     """
     from sqlalchemy import select
     from app.models.regulatory import RiskEventGeography, RiskEventMaterial
-    from app.models.supply import Material
+    from app.models.supply import Material, MaterialProductionShare
     from app.services.scoring.market_aggregator import score_material_geography
 
     as_of_date = _dt.date.fromisoformat(as_of_date_iso)
@@ -117,10 +134,18 @@ def _sync_score_material_geos(
             log.warning("scoring_jobs.step.geo.no_material", material_id=material_id)
             return {"material_id": material_id, "pairs_scored": 0, "skipped": True}
 
-        # Derive geographies: seed producing countries + any geo with events
-        geos: list[str] = []
-        if material.primary_producing_countries:
-            geos = [g.upper() for g in material.primary_producing_countries]
+        # Derive geographies: production share countries + any geo with events.
+        # primary_producing_countries was removed in migration 023; use
+        # material_production_shares as the authoritative source instead.
+        prod_share_geos = list(session.scalars(
+            select(MaterialProductionShare.country_code)
+            .where(
+                MaterialProductionShare.material_id == material.id,
+                MaterialProductionShare.production_share > 0,
+            )
+            .distinct()
+        ).all())
+        geos: list[str] = [g.upper() for g in prod_share_geos]
 
         event_geo_stmt = (
             select(RiskEventGeography.country_code)
@@ -292,6 +317,74 @@ async def _step_rescore_all_chemistries(as_of_date_iso: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Job 0 helpers — Level-0 HS node scores
+# ---------------------------------------------------------------------------
+
+def _sync_rescore_hs_nodes(as_of_date_iso: str) -> dict:
+    """Score every (HS node × country) pair that has production share data.
+
+    Must complete before ``rescore-market-scores`` runs so that
+    ``score_material_geography()`` can find Level-0 rows for the stage rollup.
+    """
+    from app.services.scoring.hs_node_scorer import score_all_hs_nodes
+
+    as_of_date = _dt.date.fromisoformat(as_of_date_iso)
+    session = get_session_factory()()
+    try:
+        result = score_all_hs_nodes(session, as_of_date)
+        return result
+    finally:
+        session.close()
+
+
+async def _step_rescore_hs_nodes(as_of_date_iso: str) -> dict:
+    return await asyncio.to_thread(_sync_rescore_hs_nodes, as_of_date_iso)
+
+
+# ---------------------------------------------------------------------------
+# Job 0 — Level-0 HS node scores
+# ---------------------------------------------------------------------------
+
+@inngest_client.create_function(
+    fn_id="rescore-hs-nodes",
+    trigger=inngest.TriggerCron(cron="0 1 * * MON"),
+)
+async def rescore_hs_nodes_job(ctx: inngest.Context) -> dict:
+    """Weekly Level-0 HS node rescore — runs every Monday at 01:00 UTC.
+
+    Computes HsCodeGeographyRiskScore rows for all (HS mapping × country)
+    pairs that have production share data.  Results feed into the stage-weighted
+    Material Concentration rollup in ``rescore-market-scores`` (02:00 UTC).
+
+    Pipeline order (Monday):
+        01:00 UTC  rescore-hs-nodes           ← this job (Level 0)
+        02:00 UTC  rescore-market-scores      ← Level 1; reads Level-0 rows
+        03:00 UTC  rescore-global-rollups     ← Level 2
+        04:00 UTC  rescore-all-chemistries    ← Level 3
+    """
+    today_iso = _today_utc().isoformat()
+    log.info("scoring_jobs.hs_nodes.start", today=today_iso)
+
+    result: dict = await ctx.step.run(
+        "rescore-hs-nodes",
+        _step_rescore_hs_nodes,
+        today_iso,
+    )
+
+    log.info(
+        "scoring_jobs.hs_nodes.done",
+        pairs_scored=result.get("pairs_scored"),
+        nodes_processed=result.get("nodes_processed"),
+        today=today_iso,
+    )
+    return {
+        "step": "hs_node_scores",
+        "as_of_date": today_iso,
+        **result,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Job 1 — Geo-level market scores
 # ---------------------------------------------------------------------------
 
@@ -430,14 +523,257 @@ async def rescore_chemistries_job(ctx: inngest.Context) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Job D helpers — daily Comtrade trade flow ingestion
+# ---------------------------------------------------------------------------
+
+def _target_years() -> list[int]:
+    """Return the 3 most recently complete calendar years.
+
+    Comtrade annual data for year Y is typically available by March/April of
+    Y+1.  Using current_year - 1 as the ceiling is conservative but safe for
+    year-round scheduling.
+
+    Example (May 2026): [2023, 2024, 2025]
+    """
+    end = _today_utc().year - 1
+    return [end - 2, end - 1, end]
+
+
+def _sync_get_hs_prefixes() -> list[str]:
+    """Return all distinct 4-digit HS prefixes from hs_code_material_mappings.
+
+    Ordered deterministically for Inngest replay safety.
+    """
+    from sqlalchemy import select
+    from app.models.supply import HsCodeMaterialMapping
+
+    session = get_session_factory()()
+    try:
+        rows = session.scalars(
+            select(HsCodeMaterialMapping.hs_code_prefix)
+            .where(HsCodeMaterialMapping.digit_count == 4)
+            .distinct()
+            .order_by(HsCodeMaterialMapping.hs_code_prefix)
+        ).all()
+        return list(rows)
+    finally:
+        session.close()
+
+
+async def _step_get_hs_prefixes() -> list[str]:
+    return await asyncio.to_thread(_sync_get_hs_prefixes)
+
+
+def _sync_ingest_comtrade_prefix(
+    hs_prefix: str,
+    years: list[int],
+    flow_code: str,
+) -> dict:
+    """Fetch and persist Comtrade trade flows for one HS prefix.
+
+    Idempotent: batches with an existing source_document external_id are
+    skipped immediately, so already-committed (reporter × prefix × year)
+    combinations consume no API quota.
+
+    Args:
+        hs_prefix:  4-digit HS prefix to query (e.g. ``"2604"``).
+        years:      Calendar years to fetch.
+        flow_code:  ``"X"`` (exports) or ``"M"`` (imports).
+
+    Returns:
+        JSON-serialisable dict with ``inserted``, ``skipped_existing_doc``,
+        ``api_calls_made``, and ``errors``.
+    """
+    from app.services.ingestion.comtrade import ingest_comtrade
+
+    session = get_session_factory()()
+    try:
+        result = ingest_comtrade(
+            session,
+            years=years,
+            hs_prefixes=[hs_prefix],
+            flow_code=flow_code,
+        )
+        return {**result, "hs_prefix": hs_prefix, "flow_code": flow_code}
+    except ValueError as exc:
+        # Missing API key — surface clearly rather than silently skip
+        log.error(
+            "comtrade_job.prefix.api_key_missing",
+            hs_prefix=hs_prefix,
+            flow_code=flow_code,
+            error=str(exc),
+        )
+        return {
+            "hs_prefix": hs_prefix,
+            "flow_code": flow_code,
+            "error": "api_key_missing",
+            "inserted": 0,
+            "api_calls_made": 0,
+        }
+    except Exception:
+        log.exception(
+            "comtrade_job.prefix.error",
+            hs_prefix=hs_prefix,
+            flow_code=flow_code,
+        )
+        return {
+            "hs_prefix": hs_prefix,
+            "flow_code": flow_code,
+            "error": True,
+            "inserted": 0,
+            "api_calls_made": 0,
+        }
+    finally:
+        session.close()
+
+
+async def _step_ingest_comtrade_prefix(
+    hs_prefix: str,
+    years: list[int],
+    flow_code: str,
+) -> dict:
+    return await asyncio.to_thread(
+        _sync_ingest_comtrade_prefix, hs_prefix, years, flow_code
+    )
+
+
+def _sync_build_trade_signals(years: list[int]) -> dict:
+    """Derive synthetic risk events from trade flow extremes."""
+    from app.services.ingestion.trade_signal_builder import build_trade_signals
+
+    session = get_session_factory()()
+    try:
+        result = build_trade_signals(session, years=years)
+        return result
+    finally:
+        session.close()
+
+
+async def _step_build_trade_signals(years: list[int]) -> dict:
+    return await asyncio.to_thread(_sync_build_trade_signals, years)
+
+
+# ---------------------------------------------------------------------------
+# Job D — Daily Comtrade trade flow ingestion
+# ---------------------------------------------------------------------------
+
+@inngest_client.create_function(
+    fn_id="ingest-comtrade-daily",
+    trigger=inngest.TriggerCron(cron="0 6 * * *"),
+)
+async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
+    """Daily UN Comtrade trade flow ingestion — runs every day at 06:00 UTC.
+
+    Fetches export (flow X) and import (flow M) annual trade data for all
+    4-digit HS prefixes in hs_code_material_mappings, targeting the 3 most
+    recently complete calendar years.
+
+    Rate-limit behaviour
+    --------------------
+    The UN Comtrade API allows ~500 calls/day on a subscription key.  Full
+    coverage across 58 reporters × 48 prefixes × 3 years requires ~8,300
+    calls (~17 days).  Each already-committed (reporter × prefix × year)
+    batch is skipped without an API call, so the job makes steady daily
+    progress until coverage is complete.  Once complete, daily runs are
+    near-instant (all batches skipped, 0 API calls).
+
+    Step structure
+    --------------
+    One Inngest step per (hs_prefix × flow_code) keeps each step well under
+    the ~2 min HTTP timeout.  Inngest checkpoints after every step so a
+    mid-run failure or rate-limit error resumes from the last successful
+    prefix rather than from scratch.
+
+    Post-ingest
+    -----------
+    After all prefixes complete, ``build-trade-signals`` is run to refresh
+    EXPORT_DROP, IMPORT_DROP, and TRADE_CONCENTRATION risk events.
+    """
+    today_iso = _today_utc().isoformat()
+    years = _target_years()
+    log.info("comtrade_job.start", today=today_iso, years=years)
+
+    # Step 1: resolve HS prefixes from DB (not hardcoded — picks up new mappings)
+    hs_prefixes: list[str] = await ctx.step.run(
+        "get-hs-prefixes",
+        _step_get_hs_prefixes,
+    )
+    log.info("comtrade_job.prefixes_resolved", count=len(hs_prefixes))
+
+    # Steps 2–N: one step per prefix for exports, then imports.
+    # Keeping flow directions in separate named steps lets Inngest memo them
+    # independently — if the X pass completes fully and M fails mid-run, the
+    # replay skips all X steps and retries only the failed M step.
+    total_inserted = 0
+    total_api_calls = 0
+    total_errors = 0
+
+    for prefix in hs_prefixes:
+        result: dict = await ctx.step.run(
+            f"ingest-exports-{prefix}",
+            _step_ingest_comtrade_prefix,
+            prefix,
+            years,
+            "X",
+        )
+        total_inserted += result.get("inserted", 0)
+        total_api_calls += result.get("api_calls_made", 0)
+        if result.get("error"):
+            total_errors += 1
+
+    for prefix in hs_prefixes:
+        result = await ctx.step.run(
+            f"ingest-imports-{prefix}",
+            _step_ingest_comtrade_prefix,
+            prefix,
+            years,
+            "M",
+        )
+        total_inserted += result.get("inserted", 0)
+        total_api_calls += result.get("api_calls_made", 0)
+        if result.get("error"):
+            total_errors += 1
+
+    # Final step: refresh synthetic risk events from trade flow data
+    signals: dict = await ctx.step.run(
+        "build-trade-signals",
+        _step_build_trade_signals,
+        years,
+    )
+
+    log.info(
+        "comtrade_job.done",
+        today=today_iso,
+        years=years,
+        total_inserted=total_inserted,
+        total_api_calls=total_api_calls,
+        total_errors=total_errors,
+        trade_signals=signals,
+    )
+    return {
+        "as_of_date": today_iso,
+        "years": years,
+        "prefixes_processed": len(hs_prefixes),
+        "total_inserted": total_inserted,
+        "total_api_calls": total_api_calls,
+        "total_errors": total_errors,
+        "trade_signals": signals,
+    }
+
+
 SCHEDULED_FUNCTIONS = [
-    rescore_market_scores_job,
-    rescore_global_rollups_job,
-    rescore_chemistries_job,
+    ingest_comtrade_job,            # Daily  — 06:00 UTC
+    rescore_hs_nodes_job,           # Level 0 — Mon 01:00 UTC
+    rescore_market_scores_job,      # Level 1 — Mon 02:00 UTC
+    rescore_global_rollups_job,     # Level 2 — Mon 03:00 UTC
+    rescore_chemistries_job,        # Level 3 — Mon 04:00 UTC
 ]
 
 __all__ = [
     "SCHEDULED_FUNCTIONS",
+    "ingest_comtrade_job",
+    "rescore_hs_nodes_job",
     "rescore_market_scores_job",
     "rescore_global_rollups_job",
     "rescore_chemistries_job",

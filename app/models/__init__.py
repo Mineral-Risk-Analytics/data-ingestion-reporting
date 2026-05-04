@@ -24,6 +24,7 @@ from app.models.regulatory import (
     RiskEventCompany,
     RiskEventFacility,
     RiskEventGeography,
+    RiskEventHsMapping,
     RiskEventMaterial,
     RiskEventRegulation,
 )
@@ -35,12 +36,17 @@ from app.models.reporting import (
     ReportTemplateFocusEntity,
 )
 from app.models.review import SeedReviewFinding, SeedReviewRun
-from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
+from app.models.scoring import (
+    HsCodeGeographyRiskScore,
+    MaterialGeographyRiskScore,
+    MaterialGlobalRiskScore,
+)
 from app.models.source import Source
 from app.models.supply_chain_context import SupplyChainContext
 from app.models.supply import (
     CommodityPrice,
     HsCodeMaterialMapping,
+    HsCodeProductionShare,
     Material,
     MaterialProductionShare,
     TradeFlow,
@@ -86,6 +92,7 @@ __all__ = [
     "RiskEventCompany",
     "RiskEventFacility",
     "RiskEventGeography",
+    "RiskEventHsMapping",
     "RiskEventMaterial",
     "RiskEventRegulation",
     # Reporting
@@ -98,6 +105,7 @@ __all__ = [
     "SeedReviewRun",
     "SeedReviewFinding",
     # Scoring
+    "HsCodeGeographyRiskScore",
     "MaterialGeographyRiskScore",
     "MaterialGlobalRiskScore",
     # Source
@@ -107,6 +115,7 @@ __all__ = [
     # Supply
     "CommodityPrice",
     "HsCodeMaterialMapping",
+    "HsCodeProductionShare",
     "Material",
     "MaterialProductionShare",
     "TradeFlow",

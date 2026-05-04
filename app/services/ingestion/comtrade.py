@@ -420,65 +420,71 @@ def _create_source_document(
 
 def _build_hs_material_map(
     session: Session,
-) -> dict[str, list[tuple[int, float]]]:
+) -> dict[str, list[tuple[int, float, int]]]:
     """Return all hs_code_material_mappings keyed by normalised prefix.
 
-    Returns ``{prefix: [(material_id, confidence), ...]}``.  A single prefix
-    may resolve to multiple materials (e.g. "2615" covers Vanadium, Niobium,
-    Tantalum, Zirconium).  ``_resolve_material_id`` uses confidence scores to
-    disambiguate or explicitly returns None for ambiguous cases rather than
-    picking arbitrarily.
+    Returns ``{prefix: [(material_id, confidence, hs_mapping_id), ...]}``.
+    A single prefix may resolve to multiple materials (e.g. "2615" covers
+    Vanadium, Niobium, Tantalum, Zirconium).  ``_resolve_material_id`` uses
+    confidence scores to disambiguate or explicitly returns (None, None) for
+    ambiguous cases rather than picking arbitrarily.
+
+    The ``hs_mapping_id`` (primary key of ``hs_code_material_mappings``) is
+    returned so it can be persisted on ``trade_flows.hs_mapping_id`` at ingest
+    time, enabling stage-level attribution in ``trade_signal_builder.py``.
 
     Prefixes are stored without dots so comparison against raw Comtrade HS
     codes (which also have no dots) is straightforward.
     """
     rows = session.scalars(select(HsCodeMaterialMapping)).all()
-    result: dict[str, list[tuple[int, float]]] = {}
+    result: dict[str, list[tuple[int, float, int]]] = {}
     for r in rows:
         prefix = r.hs_code_prefix.replace(".", "")
-        result.setdefault(prefix, []).append((r.material_id, r.confidence))
+        result.setdefault(prefix, []).append((r.material_id, r.confidence, r.id))
     return result
 
 
 def _resolve_material_id(
     hs_code: str,
-    hs_material_map: dict[str, list[tuple[int, float]]],
-) -> Optional[int]:
-    """Return material_id for a 6-digit hs_code using a two-pass strategy.
+    hs_material_map: dict[str, list[tuple[int, float, int]]],
+) -> tuple[Optional[int], Optional[int]]:
+    """Return ``(material_id, hs_mapping_id)`` for a 6-digit hs_code.
+
+    Uses a two-pass strategy:
 
     Pass 1 — exact match on the full hs_code string (up to 6 digits).
         If exactly one material maps to this code, return it.
         If multiple map to it, return the highest-confidence one; if tied,
-        return None (genuinely ambiguous at this granularity).
+        return (None, None) — genuinely ambiguous at this granularity.
 
     Pass 2 — 4-digit prefix fallback.
         Collect all mapping rows whose 4-digit prefix is a prefix of hs_code.
         Apply the same single/highest-confidence/tie-means-None logic.
 
-    Returning None for ambiguous shared-prefix codes is intentional — a NULL
-    material_id is honest; a wrong material_id silently poisons scoring.
+    Returning (None, None) for ambiguous shared-prefix codes is intentional —
+    NULL values are honest; wrong IDs silently poison scoring.
     """
     # Pass 1: exact 6-digit (or shorter if stored that way) match.
     exact = hs_material_map.get(hs_code)
     if exact:
         if len(exact) == 1:
-            return exact[0][0]
-        max_conf = max(c for _, c in exact)
-        top = [(mid, c) for mid, c in exact if c == max_conf]
-        return top[0][0] if len(top) == 1 else None
+            return exact[0][0], exact[0][2]
+        max_conf = max(c for _, c, _ in exact)
+        top = [(mid, hs_id) for mid, c, hs_id in exact if c == max_conf]
+        return (top[0][0], top[0][1]) if len(top) == 1 else (None, None)
 
     # Pass 2: 4-digit prefix fallback.
-    candidates: list[tuple[int, float]] = []
+    candidates: list[tuple[int, float, int]] = []
     for prefix, entries in hs_material_map.items():
         if len(prefix) == 4 and hs_code.startswith(prefix):
             candidates.extend(entries)
 
     if not candidates:
-        return None
+        return None, None
 
-    max_conf = max(c for _, c in candidates)
-    top = [(mid, c) for mid, c in candidates if c == max_conf]
-    return top[0][0] if len(top) == 1 else None
+    max_conf = max(c for _, c, _ in candidates)
+    top = [(mid, hs_id) for mid, c, hs_id in candidates if c == max_conf]
+    return (top[0][0], top[0][1]) if len(top) == 1 else (None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -675,7 +681,7 @@ def ingest_comtrade(
 
                     batch_added = 0
                     for row_dict in normalised:
-                        material_id = _resolve_material_id(
+                        material_id, hs_mapping_id = _resolve_material_id(
                             row_dict.get("hs_code") or "", hs_material_map
                         )
                         if material_id is None:
@@ -688,6 +694,7 @@ def ingest_comtrade(
                             TradeFlow(
                                 source_document_id=source_doc_id,
                                 material_id=material_id,
+                                hs_mapping_id=hs_mapping_id,
                                 **row_dict,
                             )
                         )

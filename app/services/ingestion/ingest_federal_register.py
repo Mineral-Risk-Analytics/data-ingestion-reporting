@@ -72,14 +72,15 @@ from sqlalchemy.orm import Session
 from app.constants import RiskCategory
 from app.models.documents import SourceDocument
 from app.models.enums import DocumentType, ImplementationPhase, SourceType
-from app.models.regulatory import RiskEvent, RiskEventCompany, RiskEventGeography, RiskEventMaterial
-from app.models.supply import Material
+from app.models.regulatory import RiskEvent, RiskEventCompany, RiskEventGeography, RiskEventHsMapping, RiskEventMaterial
 from app.models.source import Source
 from app.services.ingestion.entity_resolution import (
     build_company_cache,
     persist_company_links,
     resolve_companies_for_event,
 )
+from app.services.ingestion.normalizers.geography_resolver import GeographyCache
+from app.services.ingestion.normalizers.material_resolver import MaterialCache
 from app.services.ingestion.parsers.regulation_parser import parse_federal_register_document
 
 log = structlog.get_logger(__name__)
@@ -101,189 +102,36 @@ _KEYWORD_BOOST = 0.12
 # Geography detection
 # ---------------------------------------------------------------------------
 
-# Maps lowercase text patterns → ISO2 code + context label.
-# Ordered from most- to least-specific so "democratic republic of congo"
-# matches CD before the bare "congo" fallback would.
-# context: "primary" = directly sanctioned/targeted; "mentioned" = referenced
-# in context (e.g. "Chinese supply chains").  Both result in RiskEventGeography
-# rows; primary gets relevance_score=0.9, mentioned gets 0.6.
-_GEO_PATTERNS: list[tuple[str, str, str]] = [
-    # China — highest volume in FR documents
-    ("xinjiang",                    "CN", "primary"),
-    ("china",                       "CN", "primary"),
-    ("chinese",                     "CN", "mentioned"),
-    ("prc",                         "CN", "primary"),
-    # Russia
-    ("russia",                      "RU", "primary"),
-    ("russian",                     "RU", "mentioned"),
-    # DRC — dominant cobalt source
-    ("democratic republic of congo","CD", "primary"),
-    ("drc",                         "CD", "primary"),
-    ("congo (kinshasa)",            "CD", "primary"),
-    ("congo",                       "CD", "mentioned"),
-    # Chile — dominant lithium
-    ("chile",                       "CL", "primary"),
-    ("chilean",                     "CL", "mentioned"),
-    # Australia — lithium, nickel, rare earths
-    ("australia",                   "AU", "primary"),
-    ("australian",                  "AU", "mentioned"),
-    # Indonesia — nickel, cobalt
-    ("indonesia",                   "ID", "primary"),
-    ("indonesian",                  "ID", "mentioned"),
-    # South Africa — PGMs, manganese, chromium
-    ("south africa",                "ZA", "primary"),
-    ("south african",               "ZA", "mentioned"),
-    # Philippines — nickel
-    ("philippines",                 "PH", "primary"),
-    ("philippine",                  "PH", "mentioned"),
-    # Peru — copper, zinc, silver
-    ("peru",                        "PE", "primary"),
-    ("peruvian",                    "PE", "mentioned"),
-    # Argentina — lithium
-    ("argentina",                   "AR", "primary"),
-    ("argentinian",                 "AR", "mentioned"),
-    # Kazakhstan — uranium, chromium, rare earths
-    ("kazakhstan",                  "KZ", "primary"),
-    ("kazakhstani",                 "KZ", "mentioned"),
-    # Canada — nickel, cobalt, rare earths
-    ("canada",                      "CA", "primary"),
-    ("canadian",                    "CA", "mentioned"),
-    # Brazil — iron ore, niobium, manganese, graphite
-    ("brazil",                      "BR", "primary"),
-    ("brazilian",                   "BR", "mentioned"),
-    # Zambia — copper, cobalt
-    ("zambia",                      "ZM", "primary"),
-    ("zambian",                     "ZM", "mentioned"),
-    # Zimbabwe — lithium, platinum
-    ("zimbabwe",                    "ZW", "primary"),
-    ("zimbabwean",                  "ZW", "mentioned"),
-    # Morocco — phosphate, cobalt
-    ("morocco",                     "MA", "primary"),
-    ("moroccan",                    "MA", "mentioned"),
-    # Guinea — bauxite (aluminum)
-    ("guinea",                      "GN", "primary"),
-]
+# NOTE: _GEO_PATTERNS and _detect_geographies() were removed in Phase 2.
+# Geography detection is now handled by GeographyCache (imported above), which
+# loads country detection patterns from countries.detection_patterns (DB-backed).
+# To add or update detection patterns, update seed_countries.py and re-run
+# `bdi-ingest seed-countries` — no code change required.
+#
+# _detect_geographies() is kept as a thin shim for any external callers.
+# Remove in Phase 3.
 
-_GEO_RELEVANCE: dict[str, float] = {"primary": 0.9, "mentioned": 0.6}
-
-
-def _detect_geographies(text: str) -> list[tuple[str, str, float]]:
-    """
-    Scan lowercased text for country references.
-    Returns list of (iso2, geography_context, relevance_score), deduplicated
-    by ISO2 — if a country matches both primary and mentioned patterns, primary wins.
-    """
-    lower = text.lower()
-    seen: dict[str, tuple[str, float]] = {}  # iso2 → (context, relevance)
-    for pattern, iso2, context in _GEO_PATTERNS:
-        if pattern not in lower:
-            continue
-        score = _GEO_RELEVANCE[context]
-        existing = seen.get(iso2)
-        if existing is None or score > existing[1]:
-            seen[iso2] = (context, score)
-    return [(iso2, ctx, score) for iso2, (ctx, score) in seen.items()]
+def _detect_geographies(
+    text: str,
+    _cache: "GeographyCache | None" = None,
+) -> list[tuple[str, str, float]]:  # pragma: no cover
+    """Deprecated shim — callers should build a GeographyCache and call .detect()."""
+    if _cache is not None:
+        return _cache.detect(text)
+    # Fallback: return empty list if no cache provided (avoids DB call here).
+    return []
 
 
 # ---------------------------------------------------------------------------
 # Material detection
 # ---------------------------------------------------------------------------
 
-# Additional keyword aliases beyond canonical_name / symbol_or_code.
-# Keys are lowercase canonical_name values; values are extra match terms.
-# Only include aliases specific enough to avoid false positives.
-_MATERIAL_ALIASES: dict[str, list[str]] = {
-    "lithium":                  ["li-ion", "lithium-ion", "spodumene", "lithium brine",
-                                 "lithium carbonate", "lithium hydroxide", "lifepo4"],
-    "cobalt":                   ["cobaltous", "cobalt sulfate", "cobalt hydroxide"],
-    "nickel":                   ["nickel sulfate", "nickel laterite", "class 1 nickel",
-                                 "mixed hydroxide precipitate", "mhp"],
-    "natural graphite":         ["graphite", "natural graphite", "spherical graphite",
-                                 "anode material", "anode graphite"],
-    "manganese":                ["high-purity manganese", "manganese sulfate", "hpmsm"],
-    "copper":                   ["copper cathode", "copper concentrate"],
-    "aluminum":                 ["aluminium", "bauxite", "alumina"],
-    "rare earth elements":      ["rare earth", "rare-earth", "ree", "neodymium",
-                                 "dysprosium", "praseodymium", "lanthanum", "cerium",
-                                 "permanent magnet", "ndfeb"],
-    "phosphate (battery grade)":["lithium iron phosphate", "lfp", "iron phosphate",
-                                 "phosphoric acid", "phosphate rock"],
-    "silicon (anode grade)":    ["silicon anode", "silicon carbide", "sio2"],
-    "platinum-group metals":    ["pgm", "platinum", "palladium", "rhodium",
-                                 "platinum group", "fuel cell catalyst"],
-    "gallium":                  ["gallium arsenide", "gaas", "gallium nitride"],
-    "germanium":                ["germanium dioxide"],
-    "chromium":                 ["ferrochrome", "chromite", "chromium ore"],
-    "manganese":                ["ferromanganese", "silicomanganese"],
-    "niobium":                  ["ferroniobium", "columbium"],
-    "tantalum":                 ["coltan", "tantalite"],
-    "vanadium":                 ["vanadium redox", "vrb", "vanadium pentoxide"],
-    "tungsten":                 ["wolframite", "scheelite", "tungsten carbide"],
-    "fluorspar":                ["fluorite", "hydrogen fluoride", "hydrofluoric acid"],
-    "tin":                      ["cassiterite", "tin solder"],
-    "antimony":                 ["antimony trioxide"],
-    "zinc":                     ["zinc oxide", "zinc sulfate"],
-}
-
-
-class MaterialCache:
-    """
-    Pre-built lookup of material keywords → (material_id, relevance_score).
-    Built once per ingest run from the materials table and reused across events.
-    """
-
-    def __init__(self, entries: list[tuple[str, int, float]]) -> None:
-        # entries: [(keyword_lower, material_id, base_relevance)]
-        self._entries = entries
-
-    @classmethod
-    def build(cls, session: Session) -> "MaterialCache":
-        rows = session.execute(
-            select(Material.id, Material.canonical_name, Material.symbol_or_code)
-        ).all()
-
-        entries: list[tuple[str, int, float]] = []
-        seen_keywords: set[str] = set()
-
-        def _add(keyword: str, mat_id: int, relevance: float) -> None:
-            kw = keyword.lower().strip()
-            if not kw or len(kw) < 3:
-                return
-            entries.append((kw, mat_id, relevance))
-            seen_keywords.add(f"{kw}:{mat_id}")
-
-        for mat_id, canonical_name, symbol_or_code in rows:
-            # canonical_name → high confidence
-            _add(canonical_name, mat_id, 0.9)
-
-            # symbol (e.g. "Li", "Co") — lower confidence; short symbols risk
-            # false positives so they only contribute at 0.5
-            if symbol_or_code and len(symbol_or_code) >= 2:
-                _add(symbol_or_code, mat_id, 0.5)
-
-            # Additional aliases from the lookup table
-            aliases = _MATERIAL_ALIASES.get(canonical_name.lower(), [])
-            for alias in aliases:
-                _add(alias, mat_id, 0.8)
-
-        return cls(entries)
-
-    def detect(self, text: str) -> list[tuple[int, float, str]]:
-        """
-        Scan text for material keywords.
-        Returns [(material_id, relevance_score, match_reason)], one entry per
-        material (highest relevance wins if multiple keywords match).
-        """
-        lower = text.lower()
-        best: dict[int, tuple[float, str]] = {}  # material_id → (score, matched_kw)
-        for keyword, mat_id, relevance in self._entries:
-            if keyword not in lower:
-                continue
-            existing = best.get(mat_id)
-            if existing is None or relevance > existing[0]:
-                best[mat_id] = (relevance, keyword)
-        return [(mat_id, score, kw) for mat_id, (score, kw) in best.items()]
-
+# NOTE: MaterialCache was defined here through Phase 1 (PR 16b) and moved to
+# normalizers/material_resolver.py in Phase 2 so that other ingesters can
+# import it without a circular dependency.  The import at the top of this file
+# re-exports MaterialCache; any existing callers of
+#   from app.services.ingestion.ingest_federal_register import MaterialCache
+# should be updated to use the normalizers path.
 
 # Keywords that signal high relevance to battery supply chain
 _HIGH_SIGNAL_KEYWORDS = frozenset({
@@ -379,32 +227,56 @@ TARGETED_QUERIES: list[QueryConfig] = [
 def _persist_material_links(
     session: Session,
     event: RiskEvent,
-    matches: list[tuple[int, float, str]],
+    matches: list[tuple[int, float, str, int | None]],
 ) -> int:
     """
-    Write RiskEventMaterial rows for each detected material.
-    Idempotent: skips pairs that already exist (unique constraint on
-    risk_event_id + material_id).
-    Returns the number of rows written.
+    Write RiskEventMaterial rows for each detected material AND
+    RiskEventHsMapping rows where hs_mapping_id is known (stage attribution).
+
+    Idempotent: skips pairs that already exist (unique constraints on
+    risk_event_id + material_id and risk_event_id + hs_mapping_id).
+
+    Returns the number of RiskEventMaterial rows written (not counting
+    RiskEventHsMapping rows, which are a side-effect of stage attribution).
     """
     written = 0
-    for material_id, relevance, matched_keyword in matches:
-        existing = session.scalar(
+    hs_written = 0
+
+    for material_id, relevance, matched_keyword, hs_mapping_id in matches:
+        # ── material-level junction (always) ──────────────────────────────
+        existing_mat = session.scalar(
             select(RiskEventMaterial).where(
                 RiskEventMaterial.risk_event_id == event.id,
                 RiskEventMaterial.material_id == material_id,
             ).limit(1)
         )
-        if existing is not None:
-            continue
-        session.add(RiskEventMaterial(
-            risk_event_id=event.id,
-            material_id=material_id,
-            relevance_score=relevance,
-            match_reason=f"keyword_match:{matched_keyword[:48]}",
-        ))
-        written += 1
-    if written:
+        if existing_mat is None:
+            session.add(RiskEventMaterial(
+                risk_event_id=event.id,
+                material_id=material_id,
+                relevance_score=relevance,
+                match_reason=f"keyword_match:{matched_keyword[:48]}",
+            ))
+            written += 1
+
+        # ── stage-level junction (only when stage is known) ───────────────
+        if hs_mapping_id is not None:
+            existing_hs = session.scalar(
+                select(RiskEventHsMapping).where(
+                    RiskEventHsMapping.risk_event_id == event.id,
+                    RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
+                ).limit(1)
+            )
+            if existing_hs is None:
+                session.add(RiskEventHsMapping(
+                    risk_event_id=event.id,
+                    hs_mapping_id=hs_mapping_id,
+                    relevance_score=relevance,
+                    match_reason="keyword_match",
+                ))
+                hs_written += 1
+
+    if written or hs_written:
         session.flush()
     return written
 
@@ -738,6 +610,7 @@ def backfill_fr_links(
         }
     """
     material_cache = MaterialCache.build(session)
+    geo_cache = GeographyCache.build(session)
 
     # Subqueries to check existing links — used only in non-force mode to
     # skip events already tagged. exists() is much cheaper than COUNT for
@@ -789,7 +662,7 @@ def backfill_fr_links(
             continue
 
         detected_materials = material_cache.detect(search_text)
-        detected_geos = _detect_geographies(search_text)
+        detected_geos = geo_cache.detect(search_text)
 
         if dry_run:
             if detected_materials or detected_geos:
@@ -1087,6 +960,7 @@ def ingest_federal_register(
     source = _get_or_create_source(session)
     company_cache = build_company_cache(session)
     material_cache = MaterialCache.build(session)
+    geo_cache = GeographyCache.build(session)
 
     # Track document_numbers claimed by earlier queries to avoid duplicate events
     # when the same FR document matches multiple search terms.
@@ -1213,7 +1087,7 @@ def ingest_federal_register(
 
                     # Detect geographies and materials from title + abstract
                     search_text = " ".join(filter(None, [parsed.title, parsed.abstract_text]))
-                    detected_geos = _detect_geographies(search_text)
+                    detected_geos = geo_cache.detect(search_text)
                     detected_materials = material_cache.detect(search_text)
 
                     # Set geo_primary to the highest-relevance primary geography

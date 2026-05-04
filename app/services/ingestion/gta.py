@@ -69,6 +69,7 @@ from app.models.documents import SourceDocument
 from app.models.regulatory import (
     RiskEvent,
     RiskEventGeography,
+    RiskEventHsMapping,
     RiskEventMaterial,
 )
 from app.models.source import Source
@@ -858,6 +859,7 @@ def ingest_gta(
             inserted                new RiskEvent rows created
             skipped_existing        rows skipped due to content_hash / gta_id match
             material_links          RiskEventMaterial rows created
+            hs_mapping_links        RiskEventHsMapping rows created (stage attribution)
             geography_links         RiskEventGeography rows created
             skipped_unknown_country events inserted but with no resolvable country
     """
@@ -898,6 +900,7 @@ def ingest_gta(
     skipped_existing = 0
     skipped_unknown_country = 0
     material_links_created = 0
+    hs_mapping_links_created = 0
     geography_links_created = 0
     pending_in_batch = 0
 
@@ -970,34 +973,58 @@ def ingest_gta(
             )
             geography_links_created += 1
 
+        # Phase 1.5 fix: _resolve_material_id returns (material_id, hs_mapping_id).
+        # The old code assigned the full tuple to `material_id` without unpacking,
+        # so the None-check never fired and a tuple was passed as an int FK.
         seen_material_ids: set[int] = set()
+        seen_hs_mapping_ids: set[int] = set()
         for hs_code in matched_hs_codes:
-            material_id = _resolve_material_id(hs_code, hs_material_map)
-            if material_id is None or material_id in seen_material_ids:
-                continue
-            # Defensive: respect the (risk_event_id, material_id) UNIQUE
-            # constraint on the junction table even though the in-memory
-            # set above already prevents duplicates within this event.
-            existing_link = session.scalar(
-                select(RiskEventMaterial).where(
-                    RiskEventMaterial.risk_event_id == event.id,
-                    RiskEventMaterial.material_id == material_id,
-                )
-            )
-            if existing_link is not None:
-                seen_material_ids.add(material_id)
+            material_id, hs_mapping_id = _resolve_material_id(hs_code, hs_material_map)
+            if material_id is None:
                 continue
 
-            session.add(
-                RiskEventMaterial(
-                    risk_event_id=event.id,
-                    material_id=material_id,
-                    relevance_score=0.9,
-                    match_reason="hs_code",
+            # ── material-level junction (always) ─────────────────────────────
+            if material_id not in seen_material_ids:
+                # Defensive check: respects (risk_event_id, material_id) UNIQUE.
+                existing_mat = session.scalar(
+                    select(RiskEventMaterial).where(
+                        RiskEventMaterial.risk_event_id == event.id,
+                        RiskEventMaterial.material_id == material_id,
+                    )
                 )
-            )
-            material_links_created += 1
-            seen_material_ids.add(material_id)
+                if existing_mat is None:
+                    session.add(
+                        RiskEventMaterial(
+                            risk_event_id=event.id,
+                            material_id=material_id,
+                            relevance_score=0.9,
+                            match_reason="hs_code",
+                        )
+                    )
+                    material_links_created += 1
+                seen_material_ids.add(material_id)
+
+            # ── stage-level junction (only when hs_mapping_id is known) ──────
+            # GTA provides actual HS codes in its data, so this is the most
+            # precisely attributable source — every matched code gets a stage row.
+            if hs_mapping_id is not None and hs_mapping_id not in seen_hs_mapping_ids:
+                existing_hs = session.scalar(
+                    select(RiskEventHsMapping).where(
+                        RiskEventHsMapping.risk_event_id == event.id,
+                        RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
+                    )
+                )
+                if existing_hs is None:
+                    session.add(
+                        RiskEventHsMapping(
+                            risk_event_id=event.id,
+                            hs_mapping_id=hs_mapping_id,
+                            relevance_score=0.9,
+                            match_reason="hs_code",
+                        )
+                    )
+                    hs_mapping_links_created += 1
+                seen_hs_mapping_ids.add(hs_mapping_id)
 
         inserted += 1
         pending_in_batch += 1
@@ -1018,6 +1045,7 @@ def ingest_gta(
         "inserted": inserted,
         "skipped_existing": skipped_existing,
         "material_links": material_links_created,
+        "hs_mapping_links": hs_mapping_links_created,
         "geography_links": geography_links_created,
         "skipped_unknown_country": skipped_unknown_country,
     }

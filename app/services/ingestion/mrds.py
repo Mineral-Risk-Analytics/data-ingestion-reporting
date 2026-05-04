@@ -347,6 +347,20 @@ MRDS_OPER_TYPE_MAP: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
+# Facility.facility_type → FacilityMaterialLink.supply_chain_stage
+# ---------------------------------------------------------------------------
+# MRDS collapses all processing facilities into "refinery".  Per the design
+# doc, prefer the *lower* stage (intermediate) when MRDS does not supply
+# enough detail to distinguish intermediate from refined.  This is conservative
+# and avoids attributing full-refinery HHI to smelter/matte facilities.
+# hs_mapping_id is left NULL for all MRDS rows — manual confirmation required.
+
+FACILITY_TYPE_TO_STAGE: dict[str, str] = {
+    "mine":     "ore",
+    "refinery": "intermediate",   # conservative; update manually to "refined" / "battery_grade"
+}
+
+# ---------------------------------------------------------------------------
 # Country full name → ISO2 (MRDS uses full English names)
 # ---------------------------------------------------------------------------
 
@@ -723,6 +737,8 @@ def ingest_mrds(
                     material_id=material_id,
                     annual_capacity_tpy=None,   # MRDS does not publish capacity
                     is_primary_product=is_primary,
+                    supply_chain_stage=FACILITY_TYPE_TO_STAGE.get(facility_type),
+                    hs_mapping_id=None,         # requires manual confirmation
                 )
                 session.add(new_link)
                 pending_links[(facility.id, material_id)] = new_link

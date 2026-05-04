@@ -1,12 +1,14 @@
 """Material-level aggregate risk scores (v3.0 scoring pipeline).
 
-Three active tables in the scoring hierarchy:
+Scoring hierarchy after the HS code redesign (migrations 022–027):
 
-    material_geography_risk_scores  — per (material, geography), five pillars
+    hs_code_geography_risk_scores   — per (hs_mapping, geography) — Level 0 (NEW)
+              ↓  stage-weighted rollup (STAGE_ROLLUP_WEIGHTS)
+    material_geography_risk_scores  — per (material, geography), five pillars — Level 1
               ↓  trade-flow weighted avg
-    material_global_risk_scores     — per material, global rollup
+    material_global_risk_scores     — per material, global rollup — Level 2
               ↓  intensity-weighted avg across minerals
-    chemistry_risk_scores           — per battery chemistry
+    chemistry_risk_scores           — per battery chemistry — Level 3
 
 Legacy tables ``material_scores`` and ``geography_scores`` were dropped in
 migration 021_drop_legacy_scores. See docs/deprecation-audit.md §A1, §A2.
@@ -17,7 +19,10 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Optional
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import (
+    Date, DateTime, Float, ForeignKey, Integer,
+    SmallInteger, String, UniqueConstraint, func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -104,6 +109,105 @@ class MaterialGeographyRiskScore(Base):
     )
     scoring_version: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default="3.0"
+    )
+    # ---- stage rollup annotations (added migration 025) ----------------------
+    stage_rollup_count: Mapped[Optional[int]] = mapped_column(
+        SmallInteger,
+        nullable=True,
+        comment=(
+            "Number of HS stage nodes that contributed to the Material Concentration "
+            "pillar rollup.  NULL for rows produced before the Phase-3 scoring engine."
+        ),
+    )
+    stage_rollup_method: Mapped[Optional[str]] = mapped_column(
+        String(32),
+        nullable=True,
+        comment=(
+            "'stage_weighted' = computed from hs_code_geography_risk_scores; "
+            "'material_fallback' = fewer than 2 stage nodes available, fell back "
+            "to MaterialCriticalitySignal.hhi_score.  NULL for pre-redesign rows."
+        ),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class HsCodeGeographyRiskScore(Base):
+    """
+    Risk score at the HS code mapping node × geography intersection.
+    Level 0 of the scoring stack — the most granular persisted score.
+
+    One row per (hs_mapping_id, country_code, as_of_date, market_scope).
+    These roll up into material_geography_risk_scores (Level 1) via
+    STAGE_ROLLUP_WEIGHTS in market_aggregator.py.
+
+    Sub-scores:
+      production_share   — this country's fraction of world production for this stage node
+      hhi_at_stage       — Σ(share²) across all countries for this HS node and year
+      tariff_exposure    — 0–1, from tariff events scoped to this HS code
+      export_restriction — 0–1, from export restriction events scoped to this HS code
+      composite_node_score — 0–100, weighted combination
+
+    Append-only: historical rows preserved for trend analysis.
+    methodology_version must be stable across all persisted rows — see
+    docs/hs-code-redesign.md § Decision 7.
+    """
+
+    __tablename__ = "hs_code_geography_risk_scores"
+    __table_args__ = (
+        UniqueConstraint(
+            "hs_mapping_id", "country_code", "as_of_date", "market_scope",
+            name="uq_hs_geo_score",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    hs_mapping_id: Mapped[int] = mapped_column(
+        ForeignKey("hs_code_material_mappings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    country_code: Mapped[str] = mapped_column(
+        String(2), nullable=False, index=True,
+        comment="ISO 3166-1 alpha-2 country code",
+    )
+    as_of_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+
+    # ---- sub-scores (raw 0–1 except composite which is 0–100) ----------------
+    production_share: Mapped[Optional[float]] = mapped_column(
+        Float,
+        comment="This country's share of world production for this HS stage node",
+    )
+    hhi_at_stage: Mapped[Optional[float]] = mapped_column(
+        Float,
+        comment="Σ(production_share²) across all countries for this HS node and year",
+    )
+    tariff_exposure: Mapped[Optional[float]] = mapped_column(
+        Float,
+        comment="0–1, derived from tariff risk events scoped to this HS code",
+    )
+    export_restriction: Mapped[Optional[float]] = mapped_column(
+        Float,
+        comment="0–1, derived from export restriction events scoped to this HS code",
+    )
+    composite_node_score: Mapped[Optional[float]] = mapped_column(
+        Float,
+        comment="0–100, weighted combination of sub-scores for this node",
+    )
+
+    # ---- metadata ------------------------------------------------------------
+    market_scope: Mapped[str] = mapped_column(
+        String(8), nullable=False, server_default="global",
+        comment="Inherited from hs_code_material_mappings.market_scope",
+    )
+    methodology_version: Mapped[str] = mapped_column(
+        String(8), nullable=False, server_default="1.0",
+        comment="Must be stable across all persisted rows — see hs-code-redesign.md § Decision 7",
+    )
+    metadata_json: Mapped[Optional[Any]] = mapped_column(
+        JSONB,
+        comment="Event IDs consumed, weight breakdown, data coverage notes",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

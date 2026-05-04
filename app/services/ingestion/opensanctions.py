@@ -61,6 +61,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.company import Company, CompanyAlias
+from app.models.country import Country
 from app.models.regulatory import RiskEvent, RiskEventCompany, RiskEventGeography
 from app.services.ingestion import feature_flags
 
@@ -76,7 +77,12 @@ _BATCH_SIZE = 100
 # Only these schema types are relevant for company matching.
 _COMPANY_SCHEMAS = {"Company", "Organization", "LegalEntity", "PublicBody"}
 
-_DEFAULT_HIGH_CONCENTRATION_GEOS = ["CN", "CD", "RU", "IR", "KP"]
+# NOTE: _DEFAULT_HIGH_CONCENTRATION_GEOS was removed in Phase 2.
+# The list is now loaded from countries.is_sanctions_risk (DB-backed).
+# To change the list, update is_sanctions_risk flags via seed_countries.py
+# and re-run `bdi-ingest seed-countries` — no code change required.
+# CN, CD, RU, IR, KP are seeded as True in seed_countries.py.
+_DEFAULT_HIGH_CONCENTRATION_GEOS: list[str] = []  # unused; kept for test compat
 
 # Legal entity suffixes stripped during name normalisation.  Covers Western,
 # Russian (PJSC/JSC/OAO/PAO/ZAO), CIS, and East-Asian conventions.
@@ -401,7 +407,12 @@ def ingest_opensanctions(
         session:                  SQLAlchemy session. Commits internally.
         url:                      Override download URL (useful for tests).
         high_concentration_geos:  ISO2 codes to treat as high-risk geographies.
-                                  Defaults to CN, CD, RU, IR, KP.
+                                  When None (default), loads from
+                                  ``countries.is_sanctions_risk = True`` — the
+                                  DB-backed replacement for the former hardcoded
+                                  ``_DEFAULT_HIGH_CONCENTRATION_GEOS`` list
+                                  (was: CN, CD, RU, IR, KP).
+                                  Pass an explicit list to override the DB query.
         min_interval_days:        Skip the download if the most recent
                                   OpenSanctions event was created within this
                                   many days. Default 6 — prevents re-downloading
@@ -436,7 +447,17 @@ def ingest_opensanctions(
             }
 
     if high_concentration_geos is None:
-        high_concentration_geos = list(_DEFAULT_HIGH_CONCENTRATION_GEOS)
+        # Load from DB — countries flagged is_sanctions_risk=True.
+        # Falls back to empty list if countries table is not yet seeded.
+        high_concentration_geos = list(
+            session.scalars(
+                select(Country.iso2).where(Country.is_sanctions_risk.is_(True))
+            ).all()
+        )
+        log.info(
+            "opensanctions.high_concentration_geos_from_db",
+            geos=high_concentration_geos,
+        )
 
     # --- Step 1: download and parse ------------------------------------------
     buf = download_sanctions_csv(url)

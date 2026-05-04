@@ -24,6 +24,22 @@ Scoring connection
     activate scoring uplift. ``EU_BATTERY_REG_2023``, ``CRMA_2024``, and
     ``EU_CBAM`` are candidates for uplift entries.
 
+Risk event generation
+    ``ingest_eurlex`` generates one ``RiskEvent`` per regulation and writes a
+    ``RiskEventRegulation`` junction row to populate the ``risk_event_regulations``
+    table. This is what gives the scoring engine's regulatory pillar its
+    event-driven score component via ``get_events_for_regulations()``.
+
+    Events use ``event_date = None`` (standing obligations — always in scope,
+    never fall outside the 365-day evidence window). ``effective_date`` is stored
+    in ``metadata_json`` so the decay engine can apply the ±90-day step-up
+    multiplier when enforcement is imminent.
+
+    Severity calibration (see ``_SEVERITY_BY_STATUS``):
+      effective  → 0.55  (enforcement is live; meaningful compliance pressure)
+      enacted    → 0.40  (passed but not yet in force; deadline visible)
+      proposed   → 0.25  (early signal only)
+
 Update cadence
     Run ``ingest-eurlex`` when a new EU regulation is enacted. No need to run
     more than quarterly — these instruments do not change frequently.
@@ -36,6 +52,7 @@ Geography code "EU"
 
 from __future__ import annotations
 
+import hashlib
 import html
 import re
 from datetime import date
@@ -51,6 +68,8 @@ from app.models.regulatory import (
     Regulation,
     RegulationGeographyScope,
     RegulationMaterialScope,
+    RiskEvent,
+    RiskEventRegulation,
 )
 from app.models.source import Source
 from app.models.supply import Material
@@ -452,6 +471,98 @@ def _upsert_geography_scopes(
 
 
 # ---------------------------------------------------------------------------
+# Risk event generation helpers
+# ---------------------------------------------------------------------------
+
+# Severity by regulation status.
+#
+# Standing regulations use event_date=None so they never fall outside the
+# 365-day evidence window and are always returned by get_events_for_regulations().
+# effective_date is stored in metadata_json so the decay engine can apply the
+# ±90-day step-up multiplier when an enforcement deadline is imminent.
+#
+# Calibration rationale:
+#   effective → 0.55  live enforcement; meaningful compliance pressure on any
+#                     company within scope
+#   enacted   → 0.40  legislatively final but not yet in force (e.g. CSDDD
+#                     effective 2027); compliance cost is already visible
+#   proposed  → 0.25  early-stage signal only; weight kept low until enacted
+_SEVERITY_BY_STATUS: dict[str, float] = {
+    "effective": 0.55,
+    "enacted":   0.40,
+    "proposed":  0.25,
+}
+_DEFAULT_REGULATION_SEVERITY = 0.35
+
+
+def _build_regulation_event(
+    reg: dict,
+    regulation_id: int,
+    source_document_id: int,
+) -> tuple[RiskEvent, RiskEventRegulation]:
+    """Return an unsaved (RiskEvent, RiskEventRegulation) pair for one regulation.
+
+    The caller must ``session.add()`` both objects and ``session.flush()``
+    before the junction row can be committed (since the junction FK requires
+    ``risk_event.id``).
+
+    Design notes
+    ------------
+    ``event_date = None``
+        Regulations are standing obligations, not one-time events. Using NULL
+        means the row always satisfies the ``event_date IS NULL`` branch in the
+        evidence-window query and gets ``recency_multiplier = 1.0`` via the
+        ``_event_date_as_date(ew, fallback=as_of_date)`` fallback.
+
+    ``confidence_score = 1.0``
+        Manifest entries are hand-curated; there is no parser uncertainty.
+
+    ``content_hash``
+        Keyed on ``regulation_key + title`` — stable across re-ingest runs so
+        the content_hash deduplication path in other ingesters would also catch
+        accidental double-inserts.
+    """
+    key = reg["regulation_key"]
+    title = reg["title"]
+    severity = _SEVERITY_BY_STATUS.get(reg.get("status", ""), _DEFAULT_REGULATION_SEVERITY)
+    effective_date: Optional[date] = reg.get("effective_date")
+
+    event_title = f"Regulatory compliance obligation: {title}"
+    content_hash = hashlib.sha256(
+        f"{key}|{event_title}".encode()
+    ).hexdigest()[:64]
+
+    meta: dict = {
+        "regulation_key": key,
+        "celex": reg.get("celex", ""),
+        "policy_theme": reg.get("policy_theme", ""),
+    }
+    if effective_date is not None:
+        meta["effective_date"] = effective_date.isoformat()
+
+    event = RiskEvent(
+        source_document_id=source_document_id,
+        event_type="REGULATORY_IMPLEMENTATION",
+        event_date=None,            # standing obligation — always in evidence window
+        title=event_title,
+        severity_score=severity,
+        confidence_score=1.0,
+        risk_categories_json=["regulatory_compliance"],
+        content_hash=content_hash,
+        metadata_json=meta,
+        verified=True,
+    )
+    # Junction row is returned with risk_event_id intentionally unset here;
+    # caller must flush the event to obtain its id before committing.
+    junction = RiskEventRegulation(
+        regulation_id=regulation_id,
+        relevance_score=1.0,
+        match_reason="regulation_enacted",
+    )
+    return event, junction
+
+
+# ---------------------------------------------------------------------------
 # Main ingest function
 # ---------------------------------------------------------------------------
 
@@ -475,6 +586,8 @@ def ingest_eurlex(
             "skipped": int,         # rows where regulation_key already exists, no changes
             "material_scopes": int, # new RegulationMaterialScope rows
             "geography_scopes": int,# new RegulationGeographyScope rows
+            "risk_events": int,     # new RiskEvent rows created for regulations
+            "regulation_links": int,# new RiskEventRegulation junction rows created
         }``
     """
     source_id = _get_or_create_eurlex_source(session)
@@ -501,6 +614,7 @@ def ingest_eurlex(
 
     inserted = updated = skipped = 0
     material_scopes_inserted = geography_scopes_inserted = 0
+    risk_events_inserted = regulation_links_inserted = 0
 
     for reg in BATTERY_REGULATIONS:
         key = reg["regulation_key"]
@@ -582,6 +696,38 @@ def ingest_eurlex(
             scopes=reg["geography_scopes"],
         )
 
+        # ── Risk event generation ─────────────────────────────────────────────
+        # One RiskEvent per regulation links via RiskEventRegulation to populate
+        # risk_event_regulations — the table get_events_for_regulations() reads.
+        # Idempotent: check for an existing junction row before creating anything.
+        # A regulation may already have a linked event from a prior ingest run.
+        has_event = session.scalar(
+            select(RiskEventRegulation).where(
+                RiskEventRegulation.regulation_id == regulation_id
+            )
+        )
+        if has_event is None:
+            source_doc_for_event = session.scalar(
+                select(Regulation.source_document_id).where(
+                    Regulation.id == regulation_id
+                )
+            )
+            event, junction = _build_regulation_event(
+                reg, regulation_id, source_doc_for_event
+            )
+            session.add(event)
+            session.flush()            # populate event.id before setting FK
+            junction.risk_event_id = event.id
+            session.add(junction)
+            risk_events_inserted += 1
+            regulation_links_inserted += 1
+            log.info(
+                "eurlex.risk_event_created",
+                regulation_key=key,
+                event_id=event.id,
+                severity=event.severity_score,
+            )
+
     session.commit()
 
     result = {
@@ -590,6 +736,8 @@ def ingest_eurlex(
         "skipped": skipped,
         "material_scopes": material_scopes_inserted,
         "geography_scopes": geography_scopes_inserted,
+        "risk_events": risk_events_inserted,
+        "regulation_links": regulation_links_inserted,
     }
     log.info("eurlex.ingest.done", **result)
     return result

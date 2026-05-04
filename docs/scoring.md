@@ -1,9 +1,11 @@
 # Scoring (v3.0) — market → rollups → company
 
-> **Last updated: April 2026**
+> **Last updated: May 2026**
 
 This page is the canonical explanation of **how scores are computed**, at every level:
 
+0. **HS node score**: HS stage node × country (HHI + trade events) → composite  
+   (`hs_code_geography_risk_scores`) ← **Phase 3, new**
 1. **Market pair score**: material × geography (five pillars) → overall  
    (`material_geography_risk_scores`)
 2. **Material rollup**: material × {geographies} (five pillars) → overall  
@@ -21,7 +23,9 @@ For “what data feeds which input”, see [Data sources](data-sources.md).
 
 - **Company weights + overall aggregation**: `PILLAR_WEIGHTS` and `aggregate_supplier_risk()` in
   [`app/services/scoring/supplier_risk.py`](/Users/nicolebush/dev/battery-data-intelligence-engine/app/services/scoring/supplier_risk.py)
-- **Market weights**: `MARKET_PILLAR_WEIGHTS` and `score_material_geography()` in
+- **HS node scorer (Level 0)**: `score_hs_node_geography()` and `score_all_hs_nodes()` in
+  [`app/services/scoring/hs_node_scorer.py`](/Users/nicolebush/dev/battery-data-intelligence-engine/app/services/scoring/hs_node_scorer.py)
+- **Market weights**: `MARKET_PILLAR_WEIGHTS`, `STAGE_ROLLUP_WEIGHTS`, and `score_material_geography()` in
   [`app/services/scoring/market_aggregator.py`](/Users/nicolebush/dev/battery-data-intelligence-engine/app/services/scoring/market_aggregator.py)
 - **Material global rollup**: `score_material_global_rollup()` in
   [`app/services/scoring/global_rollup.py`](/Users/nicolebush/dev/battery-data-intelligence-engine/app/services/scoring/global_rollup.py)
@@ -99,11 +103,36 @@ These are the pillar-level scoring formulas. Each returns a score on `[0, 100]` 
 
 ### Material Concentration
 
-Pure scorer: `score_material_exposure()` in `material_risk.py`.
+Two paths exist, selected at runtime based on Level-0 data availability (Phase 3):
+
+**Stage-weighted path** (`stage_rollup_method = "stage_weighted"`) — used when ≥2
+`HsCodeGeographyRiskScore` nodes exist for the (material × geography) pair:
+
+```
+mat_score = Σ(composite_node_score × stage_weight) / Σ(stage_weight)
+```
+
+Stage weights (`STAGE_ROLLUP_WEIGHTS` in `market_aggregator.py`):
+
+| Stage | Weight |
+|---|---:|
+| `ore` | 0.10 |
+| `concentrate` | 0.15 |
+| `intermediate` | 0.20 |
+| `refined` | 0.25 |
+| `battery_grade` | 0.30 |
+
+Only stages with a populated `composite_node_score` contribute; weights are renormalized to the present stages.
+
+**Fallback path** (`stage_rollup_method = "material_fallback"`) — used when fewer than 2 Level-0 nodes exist (Level-0 data absent or sparse):
 
 ```
 score = (0.35 × criticality + 0.35 × concentration + 0.30 × trade_volatility) × 100
 ```
+
+Pure scorer: `score_material_exposure()` in `material_risk.py`. This path will phase out as Level-0 data fills in after `rescore-hs-nodes` runs with production share data.
+
+`stage_rollup_count` and `stage_rollup_method` are recorded on every `MaterialGeographyRiskScore` row for auditability.
 
 ### Geopolitical / Trade
 
@@ -153,6 +182,27 @@ If no scoreable suppliers exist, the pillar score is `None` and overall renormal
 
 ---
 
+## Level 0 — HS node scoring (stage × country)
+
+**Entry point:** `score_hs_node_geography()` / `score_all_hs_nodes()` in `hs_node_scorer.py`  
+**Output:** one `HsCodeGeographyRiskScore` row per `(hs_mapping_id, country_code, as_of_date, market_scope)`
+
+This is the most granular persisted score. Each row covers one supply chain stage (e.g. cobalt hydroxide, battery_grade) for one country.
+
+Sub-scores:
+
+| Sub-score | Source | Range |
+|---|---|---|
+| `production_share` | `hs_code_production_shares`, most recent year | 0–1 |
+| `hhi_at_stage` | Σ(share²) across all countries for this node + year | 0–1 |
+| `tariff_exposure` | avg top-3 impacts of tariff events via `RiskEventHsMapping` | 0–1 |
+| `export_restriction` | avg top-3 impacts of export-restriction events | 0–1 |
+| `composite_node_score` | 50% HHI + 25% tariff + 25% export | 0–100 |
+
+Must run before Level-1 market scoring. CLI: `bdi-ingest rescore-hs-nodes`.
+
+---
+
 ## Level 1 — Market pair scoring (material × geography)
 
 **Entry point:** `score_material_geography()` in `market_aggregator.py`  
@@ -160,6 +210,7 @@ If no scoreable suppliers exist, the pillar score is `None` and overall renormal
 
 At this level:
 - each pillar is computed with **market-anchored inputs** (criticality signals + price volatility + scoped events + regulation scopes)
+- Material Concentration uses the **stage-weighted rollup** when Level-0 data is available (see above); falls back to `material_risk.score_material_exposure()` otherwise
 - the five pillar scores are aggregated with **`MARKET_PILLAR_WEIGHTS`**
 
 ---
@@ -231,13 +282,23 @@ These are “truthy” gaps in the current system, aligned to code and/or known 
 
 ## Scheduled rescores (Inngest)
 
-The market and chemistry layers are kept fresh by weekly cron jobs; company scoring is on-demand.
+The full scoring stack runs as four sequential Inngest jobs every Monday. Each job reads the output of the previous one, so the cron times are intentionally staggered.
 
-| Function | Cron (UTC) | What it runs |
-|---|---|---|
-| `rescore-market-scores` | `0 2 * * MON` | market pair scoring (material × geography) |
-| `rescore-global-rollups` | `0 3 * * MON` | material global rollups (from market pair scores) |
-| `rescore-all-chemistries` | `0 4 * * MON` | chemistry rollup scoring (from global rollups) |
+| Function | Cron (UTC) | Level | What it runs |
+|---|---|---|---|
+| `rescore-hs-nodes` | `0 1 * * MON` | 0 | HS node scores (HHI + trade events per stage × country) |
+| `rescore-market-scores` | `0 2 * * MON` | 1 | Market pair scoring (material × geography, stage rollup if available) |
+| `rescore-global-rollups` | `0 3 * * MON` | 2 | Material global rollups (from market pair scores) |
+| `rescore-all-chemistries` | `0 4 * * MON` | 3 | Chemistry rollup scoring (from global rollups) |
+
+Company scoring is on-demand only (no cron; called via API or CLI `rescore-company`).
+
+CLI equivalents (for manual or partial rescores):
+```
+bdi-ingest rescore-hs-nodes        # Level 0 — run first
+bdi-ingest rescore-market          # Level 1
+bdi-ingest rescore-chemistry       # Level 3 (skips Level 2; reads latest global rollup)
+```
 
 Local dev: see the Inngest notes in [Overview](overview.md) (will also be merged into `docs/operations.md`).
 

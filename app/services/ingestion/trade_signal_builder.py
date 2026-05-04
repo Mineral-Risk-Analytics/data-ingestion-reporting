@@ -57,6 +57,7 @@ from app.services.ingestion import feature_flags
 from app.models.regulatory import (
     RiskEvent,
     RiskEventCompany,
+    RiskEventHsMapping,
     RiskEventMaterial,
 )
 from app.models.supply import TradeFlow
@@ -157,13 +158,26 @@ def _insert_event(
     return event.id
 
 
-def _link_material(db: Session, event_id: int, material_id: int) -> None:
+def _link_material(
+    db: Session,
+    event_id: int,
+    material_id: int,
+    hs_mapping_ids: list[int] | None = None,
+) -> None:
+    """Write RiskEventMaterial and (when hs_mapping_ids is set) RiskEventHsMapping rows."""
     db.add(RiskEventMaterial(
         risk_event_id=event_id,
         material_id=material_id,
         relevance_score=1.0,
         match_reason="hs_code",
     ))
+    for hs_id in (hs_mapping_ids or []):
+        db.add(RiskEventHsMapping(
+            risk_event_id=event_id,
+            hs_mapping_id=hs_id,
+            relevance_score=1.0,
+            match_reason="trade_flow_match",
+        ))
 
 
 def _link_companies(
@@ -270,6 +284,52 @@ def _get_material_names(db: Session) -> dict[int, str]:
     return {r.id: r.canonical_name for r in rows}
 
 
+def _get_hs_mapping_ids_by_signal(
+    db: Session,
+    import_export_flag: str = "export",
+) -> dict[tuple[int, str, int], list[int]]:
+    """
+    Return all hs_mapping_ids that contributed to each (material_id, country,
+    year) trade signal group.
+
+    Queried once upfront and passed into the main signal loop so each event
+    can populate risk_event_hs_mappings at creation time without a per-event
+    DB round-trip.
+
+    Returns {(material_id, reporter_country, year): [hs_mapping_id, ...]}.
+    Only includes flows with hs_mapping_id IS NOT NULL (i.e. rows ingested
+    after Phase 1.5 or backfilled via the migration 027 backfill query).
+    Historical rows without hs_mapping_id are silently omitted — they still
+    write risk_event_materials via _link_material but contribute no stage
+    attribution.
+    """
+    rows = db.execute(
+        select(
+            TradeFlow.material_id,
+            TradeFlow.reporter_country,
+            TradeFlow.period,
+            TradeFlow.hs_mapping_id,
+        )
+        .where(
+            TradeFlow.partner_country == "WLD",
+            TradeFlow.import_export_flag == import_export_flag,
+            TradeFlow.material_id.is_not(None),
+            TradeFlow.hs_mapping_id.is_not(None),
+        )
+        .distinct()
+    ).all()
+
+    result: dict[tuple[int, str, int], list[int]] = {}
+    for mat_id, country, period_str, hs_id in rows:
+        try:
+            year = int(period_str)
+        except (TypeError, ValueError):
+            continue
+        key = (mat_id, country, year)
+        result.setdefault(key, []).append(hs_id)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -302,6 +362,12 @@ def build_trade_signals(
 
     annual_totals = _get_annual_totals(db, import_export_flag="export")
     annual_import_totals = _get_annual_totals(db, import_export_flag="import")
+
+    # Stage attribution: (material_id, country, year) → [hs_mapping_id, ...]
+    # Populated for trade flows ingested after Phase 1.5 (hs_mapping_id column).
+    # Empty for historical rows — those events still write risk_event_materials.
+    hs_ids_by_export_signal = _get_hs_mapping_ids_by_signal(db, import_export_flag="export")
+    hs_ids_by_import_signal = _get_hs_mapping_ids_by_signal(db, import_export_flag="import")
 
     if not annual_totals and not annual_import_totals:
         log.warning("trade_signal_builder.no_trade_flows")
@@ -379,7 +445,10 @@ def build_trade_signals(
                 skipped_existing += 1
                 continue
 
-            _link_material(db, event_id, mat_id)
+            _link_material(
+                db, event_id, mat_id,
+                hs_mapping_ids=hs_ids_by_export_signal.get((mat_id, country, year)),
+            )
             linked = _link_companies(db, event_id, mat_id, country)
             company_links += linked
             concentration_events += 1
@@ -439,7 +508,10 @@ def build_trade_signals(
                 skipped_existing += 1
                 continue
 
-            _link_material(db, event_id, mat_id)
+            _link_material(
+                db, event_id, mat_id,
+                hs_mapping_ids=hs_ids_by_export_signal.get((mat_id, country, year)),
+            )
             linked = _link_companies(db, event_id, mat_id, country)
             company_links += linked
             export_drop_events += 1
@@ -506,7 +578,10 @@ def build_trade_signals(
                 skipped_existing += 1
                 continue
 
-            _link_material(db, event_id, mat_id)
+            _link_material(
+                db, event_id, mat_id,
+                hs_mapping_ids=hs_ids_by_import_signal.get((mat_id, country, year)),
+            )
             # For import signals, the reporter is the consuming country —
             # link companies that source this material from any geography
             # (not just the consuming country itself).

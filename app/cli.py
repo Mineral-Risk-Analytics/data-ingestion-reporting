@@ -126,7 +126,7 @@ def ingest_usgs_cmd(
 ) -> None:
     """Ingest USGS Mineral Commodity Summaries data from the official CSV.
 
-    Derives primary_producing_countries (ranked by mine production) and
+    Derives material_production_shares (ranked by mine production) and
     criticality_score (normalised HHI) directly from USGS data.
     No synthetic values. Re-run annually when USGS publishes a new MCS.
 
@@ -174,6 +174,7 @@ def ingest_usgs_cmd(
             production_yoy_pct = m.pop("_production_yoy_pct", None)
             capacity_utilization = m.pop("_capacity_utilization", None)
             production_shares = m.pop("_production_shares", [])
+            m.pop("primary_producing_countries", None)  # column dropped in migration 023
 
             row = s.scalar(select(Material).where(Material.canonical_name == m["canonical_name"]))
             if row is None:
@@ -395,6 +396,56 @@ def rescore_chemistry_cmd(
         s.close()
 
 
+@app.command("rescore-hs-nodes")
+def rescore_hs_nodes_cmd(
+    as_of: Optional[str] = typer.Option(
+        None,
+        "--as-of",
+        help="Point-in-time date for scoring (YYYY-MM-DD). Default: today.",
+    ),
+    market_scope: str = typer.Option(
+        "global",
+        "--market-scope",
+        help="'global' (default) or 'us'. Must match the scope of the production share data.",
+    ),
+) -> None:
+    """Compute and persist Level-0 HS node geography scores.
+
+    Scores every (hs_mapping_id × country) pair that has production share data
+    in hs_code_production_shares.  Results feed into the stage-weighted Material
+    Concentration rollup in rescore-market.
+
+    Run this BEFORE rescore-market to ensure Level-0 rows are available.
+
+    \b
+    Examples:
+      bdi-ingest rescore-hs-nodes
+      bdi-ingest rescore-hs-nodes --as-of 2025-01-01
+      bdi-ingest rescore-hs-nodes --market-scope us
+
+    Pipeline order:
+      bdi-ingest rescore-hs-nodes    ← Level 0 (this command)
+      bdi-ingest rescore-market      ← Level 1
+      bdi-ingest rescore-chemistry   ← Level 3
+    """
+    import datetime
+
+    from app.services.scoring.hs_node_scorer import score_all_hs_nodes
+
+    as_of_date = datetime.date.fromisoformat(as_of) if as_of else datetime.date.today()
+    s = _session()
+    try:
+        typer.echo(f"Scoring HS nodes as of {as_of_date} (market_scope={market_scope}) ...")
+        result = score_all_hs_nodes(s, as_of_date, market_scope=market_scope)
+        typer.echo(
+            f"Done. pairs_scored={result['pairs_scored']}, "
+            f"pairs_skipped={result['pairs_skipped']}, "
+            f"nodes_processed={result['nodes_processed']}"
+        )
+    finally:
+        s.close()
+
+
 @app.command("rescore-market")
 def rescore_market_cmd(
     as_of: Optional[str] = typer.Option(
@@ -416,7 +467,7 @@ def rescore_market_cmd(
         "--geographies",
         help=(
             "Comma-separated ISO2 country codes to score against (e.g. 'CN,CL,AU'). "
-            "Default: derived from each material's primary_producing_countries plus "
+            "Default: derived from each material's material_production_shares plus "
             "any country with linked risk events."
         ),
     ),
@@ -448,7 +499,7 @@ def rescore_market_cmd(
     import uuid
 
     from app.models.regulatory import RiskEventGeography, RiskEventMaterial
-    from app.models.supply import Material
+    from app.models.supply import Material, MaterialProductionShare
     from app.services.scoring.market_aggregator import (
         score_all_active_materials,
         score_material_geography,
@@ -480,9 +531,17 @@ def rescore_market_cmd(
             if geo_filter is not None:
                 geos: list[str] = list(geo_filter)
             else:
-                geos = []
-                if mat.primary_producing_countries:
-                    geos.extend(g.upper() for g in mat.primary_producing_countries)
+                # primary_producing_countries removed in migration 023; query
+                # material_production_shares as the authoritative geo seed.
+                prod_share_geos = list(s.scalars(
+                    select(MaterialProductionShare.country_code)
+                    .where(
+                        MaterialProductionShare.material_id == mat.id,
+                        MaterialProductionShare.production_share > 0,
+                    )
+                    .distinct()
+                ).all())
+                geos = [g.upper() for g in prod_share_geos]
                 event_geo_rows = s.execute(
                     select(RiskEventGeography.country_code)
                     .join(
@@ -1605,7 +1664,7 @@ def backfill_fr_links_cmd(
     all historical FR events and fills in the missing junction rows.
 
     Idempotent: re-runs skip pairs that already exist. Use --force to re-scan
-    fully-tagged events after updating _MATERIAL_ALIASES or _GEO_PATTERNS.
+    fully-tagged events after updating hs_code_material_mappings.keywords or _GEO_PATTERNS.
 
     \b
     Examples:
@@ -2288,7 +2347,27 @@ def setup_all_cmd(
     mcs_year: int = typer.Option(
         2025,
         "--mcs-year",
-        help="MCS publication year (forwarded to ingest-usgs).",
+        help="MCS publication year (forwarded to ingest-usgs and ingest-mcs-pdf).",
+    ),
+    mcs_pdf_file: Optional[str] = typer.Option(
+        None,
+        "--mcs-pdf-file",
+        help=(
+            "Path to the USGS Mineral Commodity Summaries PDF (e.g. mcs2025.pdf). "
+            "Populates hs_code_production_shares (global + US) and appends salient "
+            "notes to material_criticality_signals.  Must run after seed-hs-mappings. "
+            "If omitted, the PDF step is skipped and must be run separately with: "
+            "bdi-ingest ingest-mcs-pdf <path> --year <year>"
+        ),
+    ),
+    mrds_file: str = typer.Option(
+        "/data/facilities/mrds.csv",
+        "--mrds-file",
+        help=(
+            "Path to the local MRDS CSV file for facility ingestion. "
+            "Defaults to /data/facilities/mrds.csv. "
+            "Override with a different path or pass --skip-mrds to skip entirely."
+        ),
     ),
     skip_gleif: bool = typer.Option(
         False,
@@ -2298,7 +2377,7 @@ def setup_all_cmd(
     skip_mrds: bool = typer.Option(
         False,
         "--skip-mrds",
-        help="Skip USGS MRDS ingest (downloads ~300 MB; skip if offline).",
+        help="Skip MRDS facility ingest.",
     ),
 ) -> None:
     """One-shot first-time environment bootstrap.
@@ -2310,26 +2389,38 @@ def setup_all_cmd(
     Execution order:
       1.  seed-countries          ISO country reference table (Comtrade codes, name aliases)
       2.  seed                    sources, reference aliases
-      3.  ingest-usgs             USGS MCS world data  (requires --usgs-file)
+      3.  ingest-usgs             USGS MCS world data CSV  (requires --usgs-file)
       4.  seed-materials          non-USGS minerals + battery chemistry junctions
       5.  seed-hs-mappings        HS code → material lookup table
-      6.  seed-companies          curated supply-chain company list
-      7.  seed-facilities         known physical facilities per company
-      8.  ingest-mrds             USGS MRDS mine/processing facility data
+      6.  ingest-mcs-pdf          HS-stage production shares + US import shares (requires --mcs-pdf-file)
+      7.  seed-companies          curated supply-chain company list
+      8.  ingest-mrds             mine/processing facilities from local MRDS CSV
       9.  seed-supply-relationships  upstream/downstream supplier graph
       10. seed-material-exposures    company × material exposure weights
       11. seed-regulations        curated regulatory seed rows
       12. ingest-gleif            LEI enrichment for company entities
 
     \b
+    Step 6 (ingest-mcs-pdf) must run after seed-hs-mappings (step 5) because it
+    writes hs_code_production_shares rows that FK to hs_code_material_mappings.
+    It also requires ingest-usgs (step 3) to have run so material_criticality_signals
+    rows exist for the salient-notes append.
+
+    Step 8 (ingest-mrds) reads from /data/facilities/mrds.csv by default.
+    Override with --mrds-file.  Facility type → supply_chain_stage is mapped
+    automatically (mine→ore, refinery→intermediate).  hs_mapping_id is set NULL
+    and requires manual confirmation post-ingest.
+
+    \b
     After setup-all, run the periodic ingestion commands (ingest-comtrade,
-    ingest-worldbank, etc.) and then full-score to compute scores.
+    ingest-federal-register, etc.) and then full-score to compute scores.
 
     \b
     Examples:
-      bdi-ingest setup-all --usgs-file ~/Downloads/MCS2025_World_Data.csv
-      bdi-ingest setup-all --usgs-file path/to/MCS2025.csv --skip-gleif
-      bdi-ingest setup-all --skip-mrds   # if no USGS file yet — run ingest-usgs manually first
+      bdi-ingest setup-all --usgs-file ~/Downloads/MCS2025_World_Data.csv --mcs-pdf-file ~/Downloads/mcs2025.pdf
+      bdi-ingest setup-all --usgs-file path/to/MCS2025.csv --mcs-pdf-file path/to/mcs2025.pdf --skip-gleif
+      bdi-ingest setup-all --usgs-file path/to/MCS2025.csv --mrds-file /custom/path/mrds.csv
+      bdi-ingest setup-all --skip-mrds   # skip facility ingest entirely
     """
     import sys
     import subprocess
@@ -2349,11 +2440,13 @@ def setup_all_cmd(
             )
             raise typer.Exit(code=result.returncode)
 
+    # Steps 1–2: reference tables
     _run("seed-countries", ["seed-countries"])
     _run("seed", ["seed"])
 
+    # Step 3: USGS MCS CSV → materials + material_production_shares + criticality_signals
     if usgs_file:
-        _run("ingest-usgs", ["ingest-usgs", usgs_file, "--mcs-year", str(mcs_year)])
+        _run("ingest-usgs", ["ingest-usgs", usgs_file, "--mcs-year", str(mcs_year), "--force"])
     else:
         typer.echo(
             "\n⚠  Skipping ingest-usgs (no --usgs-file provided). "
@@ -2361,20 +2454,49 @@ def setup_all_cmd(
             err=True,
         )
 
+    # Steps 4–5: material + HS mapping seeds (depend on materials existing)
     _run("seed-materials", ["seed-materials"])
     _run("seed-hs-mappings", ["seed-hs-mappings"])
+
+    # Step 6: MCS PDF → hs_code_production_shares (global + US) + criticality notes
+    # Must follow seed-hs-mappings so hs_mapping_id FKs resolve.
+    if mcs_pdf_file:
+        _run(
+            "ingest-mcs-pdf",
+            ["ingest-mcs-pdf", mcs_pdf_file, "--year", str(mcs_year), "--force"],
+        )
+    else:
+        typer.echo(
+            "\n⚠  Skipping ingest-mcs-pdf (no --mcs-pdf-file provided). "
+            "Run 'bdi-ingest ingest-mcs-pdf <path> --year <year>' manually. "
+            "Without this, Level-0 HS node scoring falls back to equal-weighting.",
+            err=True,
+        )
+
+    # Step 6b: re-run seed-hs-mappings with --force so that any 6-digit rows
+    # written by ingest-mcs-pdf (which creates mapping stubs for codes it
+    # encounters) get their stage, keywords, and hhi_* fields backfilled from
+    # _MAPPINGS.  The first run (step 5) pre-populates known codes; this pass
+    # ensures any new rows are also covered.
+    _run("seed-hs-mappings (backfill)", ["seed-hs-mappings", "--force"])
+
+    # Steps 7–8: company + facility data
     _run("seed-companies", ["seed-companies"])
-    _run("seed-facilities", ["seed-facilities"])
 
     if not skip_mrds:
-        _run("ingest-mrds", ["ingest-mrds"])
+        _run(
+            "ingest-mrds",
+            ["ingest-mrds", "--local-file", mrds_file],
+        )
     else:
         typer.echo("\n⚠  Skipping ingest-mrds (--skip-mrds set).")
 
+    # Steps 9–11: relationship and regulatory seeds
     _run("seed-supply-relationships", ["seed-supply-relationships"])
     _run("seed-material-exposures", ["seed-material-exposures"])
     _run("seed-regulations", ["seed-regulations"])
 
+    # Step 12: LEI enrichment
     if not skip_gleif:
         _run("ingest-gleif", ["ingest-gleif"])
     else:
@@ -2383,12 +2505,114 @@ def setup_all_cmd(
     typer.echo("\n✓  setup-all complete.")
     typer.echo(
         "\nNext steps:\n"
-        "  bdi-ingest ingest-comtrade --years <years>\n"
-        "  bdi-ingest ingest-comtrade --flow-code M --years <years>\n"
-        "  bdi-ingest ingest-worldbank\n"
+        "  bdi-ingest ingest-comtrade --years <years>           # export flows (runs daily via Inngest)\n"
+        "  bdi-ingest ingest-comtrade --flow-code M --years <years>  # import flows\n"
         "  bdi-ingest ingest-federal-register\n"
+        "  bdi-ingest ingest-gta\n"
+        "  bdi-ingest ingest-opensanctions\n"
+        "  bdi-ingest ingest-eurlex\n"
+        "  bdi-ingest ingest-iea-policy-tracker\n"
+        "  bdi-ingest ingest-iea-reports\n"
         "  bdi-ingest full-score\n"
     )
+
+
+@app.command("ingest-mcs-pdf")
+def ingest_mcs_pdf_cmd(
+    path: str = typer.Argument(
+        ...,
+        help="Path to the USGS Mineral Commodity Summaries PDF (e.g. mcs2026.pdf).",
+    ),
+    year: int = typer.Option(
+        ...,
+        "--year",
+        help=(
+            "MCS publication year (e.g. 2026).  Used as the reference_year for "
+            "production share rows where an explicit year cannot be parsed from the PDF. "
+            "Actual data years in the production tables are typically year-1."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Parse the PDF and log what would be inserted, without writing to the DB.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Suppress the confirmation prompt and proceed immediately.",
+    ),
+) -> None:
+    """Seed hs_code_material_mappings and hs_code_production_shares from a USGS MCS PDF.
+
+    Parses the annual USGS Mineral Commodity Summaries PDF using pdfplumber and:
+
+    \b
+      1. Inserts 10-digit US HTS rows into hs_code_material_mappings (market_scope='us')
+      2. Derives and inserts 6-digit global rows (market_scope='global', ON CONFLICT DO NOTHING)
+      3. Inserts world production shares into hs_code_production_shares (market_scope='global')
+      4. Inserts US import source shares into hs_code_production_shares (market_scope='us')
+      5. Appends salient notes to MaterialCriticalitySignal.metadata_json
+
+    All inserts are idempotent: re-running with the same PDF updates production share values
+    without duplicating mapping rows.
+
+    Prerequisites:
+
+    \b
+      - alembic upgrade head  (migrations 022–028 must be applied)
+      - bdi-ingest seed-countries  (country ISO-2 codes must exist for name resolution)
+      - bdi-ingest seed  (materials must exist for FK linkage)
+
+    \b
+    Examples:
+      bdi-ingest ingest-mcs-pdf mcs2026.pdf --year 2026
+      bdi-ingest ingest-mcs-pdf mcs2026.pdf --year 2026 --dry-run
+    """
+    from pathlib import Path as _Path
+    from app.services.ingestion.mcs_pdf_parser import MCSPdfParser
+
+    pdf_path = _Path(path)
+    if not pdf_path.exists():
+        typer.echo(f"File not found: {path}", err=True)
+        raise typer.Exit(code=1)
+
+    if not dry_run and not force:
+        typer.confirm(
+            f"This will seed hs_code_material_mappings and hs_code_production_shares "
+            f"from {pdf_path.name} (year={year}).  Continue?",
+            abort=True,
+        )
+
+    parser = MCSPdfParser(pdf_path, reference_year=year)
+
+    s = _session()
+    try:
+        stats = parser.seed_to_db(s, dry_run=dry_run)
+        if not dry_run:
+            s.commit()
+
+        total_us = sum(v["us_rows_inserted"] for v in stats.values())
+        total_global = sum(v["global_rows_inserted"] for v in stats.values())
+        total_prod = sum(v["production_shares_inserted"] for v in stats.values())
+        total_imp = sum(v["import_source_shares_inserted"] for v in stats.values())
+
+        typer.echo(json.dumps({
+            "ok": True,
+            "dry_run": dry_run,
+            "commodities_processed": len(stats),
+            "us_mapping_rows": total_us,
+            "global_mapping_rows": total_global,
+            "production_share_rows": total_prod,
+            "import_source_rows": total_imp,
+            "by_commodity": stats,
+        }, indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
 
 
 @app.command("full-score")

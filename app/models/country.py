@@ -87,6 +87,19 @@ class Country(Base):
                 "this country (e.g. [\"China\", \"People's Republic of China\", \"PRC\"]). "
                 "Used for name→ISO2 resolution in ingesters that receive full country names.",
     )
+    detection_patterns: Mapped[Optional[Any]] = mapped_column(
+        JSONB, nullable=True,
+        comment="Array of {pattern, context} objects for free-text country detection. "
+                "context is 'primary' (direct reference, relevance 0.9) or "
+                "'mentioned' (adjectival/contextual, relevance 0.6). "
+                "Used by GeographyCache in normalizers/geography_resolver.py.",
+    )
+    is_sanctions_risk: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="True when this country has a high concentration of sanctioned entities "
+                "in OpenSanctions. Replaces the hardcoded _DEFAULT_HIGH_CONCENTRATION_GEOS "
+                "list in opensanctions.py.",
+    )
     is_major_producer: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False,
         comment="True if this country is a primary producer of battery materials — "

@@ -65,6 +65,7 @@ from app.services.scoring.evidence_query import (
     get_events_for_material,
     get_events_for_materials,
     get_events_for_regulations,
+    get_hs_nodes_for_material,
 )
 from app.services.scoring.supplier_risk import SCORING_VERSION
 
@@ -86,6 +87,29 @@ MARKET_PILLAR_WEIGHTS: dict[str, float] = {
     "operational":   0.10 / 0.85,   # ≈ 0.118
     "financial":     0.10 / 0.85,   # ≈ 0.118
 }
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Stage-weighted rollup for Material Concentration pillar
+# ---------------------------------------------------------------------------
+# Weights map supply_chain_stage → contribution fraction.  Stages closer to
+# battery-grade have higher weights because disruptions there propagate fastest
+# into cell manufacturing.  Weights need not sum to 1 — the rollup normalises
+# by the sum of weights of stages that actually have Level-0 scores.
+# Source: docs/hs-code-redesign.md § "Rollup weighting at Level 0 → Level 1"
+# ---------------------------------------------------------------------------
+STAGE_ROLLUP_WEIGHTS: dict[str, float] = {
+    "ore":           0.10,
+    "concentrate":   0.15,
+    "intermediate":  0.20,
+    "refined":       0.25,
+    "battery_grade": 0.30,
+    # fabricated and scrap not used in Material Concentration rollup
+}
+
+# Minimum number of Level-0 stage nodes required to use the stage-weighted
+# rollup path.  Below this threshold we fall back to the legacy
+# material_risk.score_material_exposure() path.
+_STAGE_ROLLUP_MIN_NODES = 2
 
 # Commodity price volatility thresholds for market financial pressure inputs.
 # CV (coefficient of variation = std/mean) mapped to base_filing_signal (0-40).
@@ -1143,7 +1167,36 @@ def score_material_geography(
     )
 
     # --- STEP 4: Score each pillar ---
-    mat_score = material_risk.score_material_exposure(crit, conc, trade_vol)
+
+    # Material Concentration — use stage-weighted Level-0 rollup when ≥2
+    # HsCodeGeographyRiskScore nodes exist for this (material × geography).
+    # Falls back to the legacy material_risk path when Level-0 data is absent.
+    hs_nodes = get_hs_nodes_for_material(
+        db, material_id, geography_code, as_of_date
+    )
+    eligible_nodes = [
+        n for n in hs_nodes
+        if n.composite_node_score is not None
+        and n.hs_mapping.supply_chain_stage in STAGE_ROLLUP_WEIGHTS
+    ]
+    if len(eligible_nodes) >= _STAGE_ROLLUP_MIN_NODES:
+        # Normalised weighted average of composite_node_scores across stages
+        weighted_sum = sum(
+            n.composite_node_score * STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
+            for n in eligible_nodes
+        )
+        weight_total = sum(
+            STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
+            for n in eligible_nodes
+        )
+        mat_score = weighted_sum / weight_total if weight_total > 0 else 0.0
+        stage_rollup_method = "stage_weighted"
+        stage_rollup_count = len(eligible_nodes)
+    else:
+        mat_score = material_risk.score_material_exposure(crit, conc, trade_vol)
+        stage_rollup_method = "material_fallback"
+        stage_rollup_count = len(eligible_nodes)  # 0 or 1
+
     geo_score = geopolitical_risk.score_geopolitical_trade(ctry_conc, exp_rest, tariff)
     reg_score = regulatory_risk.score_regulatory_profile(
         top_reg_impacts, scope_obligations, prox_adj
@@ -1174,7 +1227,13 @@ def score_material_geography(
             ),
         },
         "sub_inputs": {
-            "material": {"criticality": crit, "concentration": conc, "trade_volatility": trade_vol},
+            "material": {
+                "criticality": crit,
+                "concentration": conc,
+                "trade_volatility": trade_vol,
+                "stage_rollup_method": stage_rollup_method,
+                "stage_rollup_count": stage_rollup_count,
+            },
             "geopolitical": {
                 "country_concentration": ctry_conc,
                 "export_restriction_exposure": exp_rest,
@@ -1240,6 +1299,8 @@ def score_material_geography(
         event_count=total_event_count,
         rationale_json=rationale,
         scoring_version=SCORING_VERSION,
+        stage_rollup_count=stage_rollup_count,
+        stage_rollup_method=stage_rollup_method,
     )
 
     if persist:
@@ -1259,6 +1320,8 @@ def score_material_geography(
             "event_count":                    total_event_count,
             "rationale_json":                 rationale,
             "scoring_version":                SCORING_VERSION,
+            "stage_rollup_count":             stage_rollup_count,
+            "stage_rollup_method":            stage_rollup_method,
         }
         stmt = (
             pg_insert(MaterialGeographyRiskScore)
@@ -1275,6 +1338,8 @@ def score_material_geography(
                     "event_count":                  total_event_count,
                     "rationale_json":               rationale,
                     "scoring_version":              SCORING_VERSION,
+                    "stage_rollup_count":           stage_rollup_count,
+                    "stage_rollup_method":          stage_rollup_method,
                 },
             )
             .returning(MaterialGeographyRiskScore.id)
@@ -1305,7 +1370,7 @@ def score_all_active_materials(
     Batch-score every active material against each supplied geography.
 
     If ``geography_codes`` is None, derives the geography list from the union of:
-      - primary_producing_countries on active materials
+      - country codes in material_production_shares for this material
       - country codes in risk_event_geographies for recent events
 
     This is the function a scheduled job (Inngest / Modal cron) should call.
@@ -1346,10 +1411,17 @@ def score_all_active_materials(
         if geography_codes is not None:
             geos = [g.upper() for g in geography_codes]
         else:
-            # Derive from material's primary_producing_countries seed data
-            geos: list[str] = []
-            if material.primary_producing_countries:
-                geos = [g.upper() for g in material.primary_producing_countries]
+            # Derive from material_production_shares (replaces removed
+            # primary_producing_countries column dropped in migration 023)
+            prod_share_geos = list(db.scalars(
+                select(MaterialProductionShare.country_code)
+                .where(
+                    MaterialProductionShare.material_id == material.id,
+                    MaterialProductionShare.production_share > 0,
+                )
+                .distinct()
+            ).all())
+            geos: list[str] = [g.upper() for g in prod_share_geos]
 
             # Supplement with any geography that has events for this material
             from app.models.regulatory import RiskEventGeography, RiskEventMaterial
@@ -1403,6 +1475,7 @@ def score_all_active_materials(
 
 __all__ = [
     "MARKET_PILLAR_WEIGHTS",
+    "STAGE_ROLLUP_WEIGHTS",
     "score_material_geography",
     "score_all_active_materials",
 ]

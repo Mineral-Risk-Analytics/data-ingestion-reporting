@@ -59,13 +59,15 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.models.country import Country
 from app.models.documents import SourceDocument
 from app.models.regulatory import (
     RiskEvent,
     RiskEventGeography,
+    RiskEventHsMapping,
     RiskEventMaterial,
 )
-from app.models.supply import Material
+from app.services.ingestion.normalizers.material_resolver import MaterialCache, MaterialResolver
 
 log = structlog.get_logger(__name__)
 
@@ -113,93 +115,53 @@ _CATEGORY_MAP: dict[str, str] = {
 _DEFAULT_CATEGORY = "regulatory_compliance"
 
 # ---------------------------------------------------------------------------
-# ISO-3 → ISO-2 country code map
-# IEA PAMS uses ISO3 codes in the countries JSON array.
-# Full list derived from the actual CSV export (96 codes + name fallbacks).
-# IEA uses "EUR" for the European Union bloc (not a standard ISO3 code).
+# ISO-3 → ISO-2 country code map (DB-backed)
 # ---------------------------------------------------------------------------
 
-_ISO3_TO_ISO2: dict[str, str] = {
-    # Africa
-    "AGO": "AO", "BFA": "BF", "CAF": "CF", "CIV": "CI", "CMR": "CM",
-    "COD": "CD", "COG": "CG", "ETH": "ET", "GAB": "GA", "GHA": "GH",
-    "GIN": "GN", "KEN": "KE", "LBR": "LR", "MDG": "MG", "MLI": "ML",
-    "MOZ": "MZ", "MRT": "MR", "MWI": "MW", "NAM": "NA", "NER": "NE",
-    "NGA": "NG", "RWA": "RW", "SEN": "SN", "SLE": "SL", "STP": "ST",
-    "SUR": "SR", "SYC": "SC", "TCD": "TD", "TGO": "TG", "TZA": "TZ",
-    "UGA": "UG", "ZAF": "ZA", "ZMB": "ZM", "ZWE": "ZW", "MAR": "MA",
-    "EGY": "EG", "AGO": "AO",
-    # Americas
-    "ARG": "AR", "BOL": "BO", "BRA": "BR", "CAN": "CA", "CHL": "CL",
-    "COL": "CO", "DOM": "DO", "ECU": "EC", "GTM": "GT", "GUY": "GY",
-    "HND": "HN", "MEX": "MX", "PAN": "PA", "PER": "PE", "SUR": "SR",
-    "TTO": "TT", "USA": "US",
-    # Asia-Pacific
-    "AFG": "AF", "ARM": "AM", "AUS": "AU", "GRL": "GL", "IDN": "ID",
-    "IND": "IN", "IRQ": "IQ", "JPN": "JP", "KAZ": "KZ", "KGZ": "KG",
-    "KHM": "KH", "KOR": "KR", "MNG": "MN", "MMR": "MM", "MYS": "MY",
-    "NCL": "NC", "NZL": "NZ", "PAK": "PK", "PHL": "PH", "PNG": "PG",
-    "QAT": "QA", "SAU": "SA", "THA": "TH", "TJK": "TJ", "TLS": "TL",
-    "TUR": "TR", "UKR": "UA", "VNM": "VN",
-    # Europe
-    "ALB": "AL", "AUT": "AT", "BEL": "BE", "CHE": "CH", "DEU": "DE",
-    "DNK": "DK", "ESP": "ES", "EST": "EE", "EUR": "EU",  # IEA bloc code
-    "FIN": "FI", "FRA": "FR", "GBR": "GB", "IRL": "IE", "ITA": "IT",
-    "NLD": "NL", "NOR": "NO", "POL": "PL", "PRT": "PT", "ROU": "RO",
-    "RUS": "RU", "SWE": "SE",
-    # Fallback name-based entries for XLSX compat (lowercased)
-    "european union": "EU", "eu": "EU",
-    "australia": "AU", "brazil": "BR", "canada": "CA", "chile": "CL",
-    "china": "CN", "people's republic of china": "CN",
-    "democratic republic of the congo": "CD", "drc": "CD",
-    "finland": "FI", "france": "FR", "germany": "DE", "india": "IN",
-    "indonesia": "ID", "italy": "IT", "japan": "JP", "korea": "KR",
-    "republic of korea": "KR", "south korea": "KR", "mexico": "MX",
-    "namibia": "NA", "norway": "NO", "peru": "PE", "philippines": "PH",
-    "poland": "PL", "russia": "RU", "russian federation": "RU",
-    "south africa": "ZA", "spain": "ES", "sweden": "SE",
-    "united kingdom": "GB", "uk": "GB", "united states": "US",
-    "usa": "US", "united states of america": "US", "zambia": "ZM",
-    "zimbabwe": "ZW",
-    # CHN is not in the CSV but include for robustness
-    "CHN": "CN",
-}
+def _build_iso3_map(session: Session) -> dict[str, str]:
+    """
+    Build iso3→iso2 and common_name→iso2 lookup from the ``countries`` table.
+
+    Replaces the former module-level ``_ISO3_TO_ISO2`` static dict.
+
+    Keys:
+      - iso3.upper()         — standard ISO 3166-1 alpha-3 codes (e.g. "COD"→"CD")
+      - name.lower()         — each entry in Country.common_names (e.g. "drc"→"CD")
+
+    Special case: IEA uses "EUR" as a non-standard bloc code for the European
+    Union; we add it explicitly if an EU entry exists in the countries table.
+    """
+    rows = session.execute(
+        select(Country.iso2, Country.iso3, Country.common_names)
+    ).all()
+
+    result: dict[str, str] = {}
+    has_eu = False
+
+    for iso2, iso3, common_names in rows:
+        if iso2 == "EU":
+            has_eu = True
+        if iso3:
+            result[iso3.upper()] = iso2
+        if common_names and isinstance(common_names, list):
+            for name in common_names:
+                if isinstance(name, str) and name.strip():
+                    result[name.lower()] = iso2
+
+    # IEA uses "EUR" for the European Union bloc (not a real ISO3 code).
+    if has_eu:
+        result.setdefault("EUR", "EU")
+
+    return result
 
 # ---------------------------------------------------------------------------
-# Mineral keyword map
-# Keys are lowercased substrings to search in technology/tag text.
+# Mineral keyword map — REMOVED (Phase 2)
 # ---------------------------------------------------------------------------
-
-_MINERAL_CANONICAL: dict[str, str] = {
-    "lithium":          "Lithium",
-    "cobalt":           "Cobalt",
-    "nickel":           "Nickel",
-    "graphite":         "Natural Graphite",
-    "natural graphite": "Natural Graphite",
-    "manganese":        "Manganese",
-    "copper":           "Copper",
-    "rare earth":       "Rare Earth Elements",
-    "ree":              "Rare Earth Elements",
-    "aluminium":        "Aluminum",
-    "aluminum":         "Aluminum",
-    "silicon":          "Silicon (Anode Grade)",
-    "phosphate":        "Phosphate (Battery Grade)",
-    "vanadium":         "Vanadium",
-    "gallium":          "Gallium",
-    "germanium":        "Germanium",
-    "chromium":         "Chromium",
-    "molybdenum":       "Molybdenum",
-    "niobium":          "Niobium",
-    "tantalum":         "Tantalum",
-    "tellurium":        "Tellurium",
-    "titanium":         "Titanium",
-    "zinc":             "Zinc",
-    "tin":              "Tin",
-    "tungsten":         "Tungsten",
-    "platinum":         "Platinum-Group Metals",
-    "pgm":              "Platinum-Group Metals",
-    "magnesium":        "Magnesium",
-}
+# _MINERAL_CANONICAL was a hardcoded keyword→canonical_name dict used in
+# _extract_minerals_from_tech_and_text() (strategy 2).
+# It has been replaced by MaterialCache.detect() in ingest_policy_tracker(),
+# which loads keywords from hs_code_material_mappings.keywords (DB-backed).
+# To add or update mineral keywords, update that table via seed_hs_mappings.py.
 
 # Flush every N inserts to keep the SQLAlchemy unit-of-work compact.
 _FLUSH_EVERY = 50
@@ -223,14 +185,19 @@ def _parse_json_col(raw: str | None) -> Any:
         return []
 
 
-def _extract_iso2_codes(countries_raw: str | None) -> list[str]:
+def _extract_iso2_codes(
+    countries_raw: str | None,
+    iso3_map: dict[str, str],
+) -> list[str]:
     """
     Parse the IEA 'countries' JSON array and return ISO2 codes.
 
     Input:  '[{"iso3": "EUR", "name": "European Union"}, {"iso3": "USA", ...}]'
     Output: ["EU", "US"]
 
-    Falls back to name-based lookup if iso3 is absent or unrecognised.
+    ``iso3_map`` is the DB-backed lookup built by ``_build_iso3_map()``.
+    Falls back to name-based lookup (lowercased) if iso3 is absent or
+    unrecognised.
     """
     items = _parse_json_col(countries_raw)
     if not isinstance(items, list):
@@ -242,11 +209,11 @@ def _extract_iso2_codes(countries_raw: str | None) -> list[str]:
             continue
         # Prefer iso3 lookup
         iso3 = (item.get("iso3") or "").strip().upper()
-        iso2 = _ISO3_TO_ISO2.get(iso3)
+        iso2 = iso3_map.get(iso3)
         if iso2 is None:
-            # Fallback to name
+            # Fallback to name (common_names entries are stored lowercased in map)
             name = (item.get("name") or "").strip().lower()
-            iso2 = _ISO3_TO_ISO2.get(name)
+            iso2 = iso3_map.get(name)
         if iso2 and iso2 not in codes:
             codes.append(iso2)
         elif not iso2:
@@ -282,55 +249,48 @@ _TECH_MINERAL_BASKETS: dict[str, list[str]] = {
 }
 
 
-def _extract_minerals_from_tech_and_text(
-    technologies_raw: str | None,
-    title: str,
-    description: str,
-) -> list[str]:
+def _extract_tech_basket_minerals(technologies_raw: str | None) -> list[str]:
     """
-    Derive canonical mineral names using two complementary strategies:
+    Derive canonical mineral names from IEA technology category strings using
+    ``_TECH_MINERAL_BASKETS``.  This is strategy 1 of the original two-strategy
+    approach; strategy 2 (keyword scanning of title/description) has been moved
+    to ``ingest_policy_tracker()`` and is now handled by ``MaterialCache.detect()``.
 
-    1. Technology basket lookup — IEA's abstract tech categories (e.g.
-       "Battery technologies") are mapped to the minerals they imply.
-    2. Keyword scanning — title and plain-text description are searched for
-       explicit mineral names (catches policies that name minerals directly).
+    Returns a deduplicated list of canonical mineral names implied by the
+    policy's technology categories.  Returns [] when ``technologies_raw`` is
+    absent or does not match any basket key.
 
-    The `tags` column is not used: in the current CSV export it is always
-    empty (all entries return no tag names).
-
-    Returns a deduplicated list of canonical mineral names.
+    Note: the ``tags`` column is not used — in the current CSV export it is
+    always empty.
     """
     found: list[str] = []
-
-    # Strategy 1: technology basket
     tech_list = _parse_json_col(technologies_raw)
-    if isinstance(tech_list, list):
-        for tech in tech_list:
-            tech_lower = str(tech).lower().strip()
-            # Exact match first
-            basket = _TECH_MINERAL_BASKETS.get(tech_lower)
-            if basket is None:
-                # Substring match (handles minor naming variations)
-                basket = next(
-                    (v for k, v in _TECH_MINERAL_BASKETS.items() if k in tech_lower),
-                    None,
-                )
-            if basket:
-                for mineral in basket:
-                    if mineral not in found:
-                        found.append(mineral)
-
-    # Strategy 2: word-boundary keyword scan of title + description.
-    # Word boundaries prevent "tin" matching "containing", "ree" matching
-    # "green", etc.  We compile per-call since the function isn't hot.
-    search_text = f"{title} {description}".lower()
-    for keyword, canonical in _MINERAL_CANONICAL.items():
-        if canonical not in found:
-            pattern = rf"\b{re.escape(keyword)}\b"
-            if re.search(pattern, search_text):
-                found.append(canonical)
-
+    if not isinstance(tech_list, list):
+        return found
+    for tech in tech_list:
+        tech_lower = str(tech).lower().strip()
+        # Exact match first, then substring fallback for minor naming variations
+        basket = _TECH_MINERAL_BASKETS.get(tech_lower)
+        if basket is None:
+            basket = next(
+                (v for k, v in _TECH_MINERAL_BASKETS.items() if k in tech_lower),
+                None,
+            )
+        if basket:
+            for mineral in basket:
+                if mineral not in found:
+                    found.append(mineral)
     return found
+
+
+# Keep old name as an alias so any external callers don't immediately break.
+# Remove in Phase 3.
+def _extract_minerals_from_tech_and_text(
+    technologies_raw: str | None,
+    title: str = "",
+    description: str = "",
+) -> list[str]:  # pragma: no cover
+    return _extract_tech_basket_minerals(technologies_raw)
 
 
 def _extract_policy_type_names(policy_type_raw: str | None) -> list[str]:
@@ -362,12 +322,20 @@ def _strip_html(html: str | None) -> str:
 # CSV parsing
 # ---------------------------------------------------------------------------
 
-def _parse_csv_rows(rows_iter: Any) -> list[dict[str, Any]]:
+def _parse_csv_rows(
+    rows_iter: Any,
+    iso3_map: dict[str, str],
+) -> list[dict[str, Any]]:
     """
     Parse rows from a csv.DictReader using the known IEA PAMS column names.
 
     Required columns: title, countries
     Optional but used: description, status, year, technologies, tags, policyType
+
+    ``iso3_map`` is passed to ``_extract_iso2_codes()`` for country resolution.
+    Mineral detection now covers only the technology-basket path; keyword
+    scanning of title/description is handled later by ``MaterialCache.detect()``
+    in ``ingest_policy_tracker()``.
     """
     records: list[dict[str, Any]] = []
 
@@ -378,35 +346,34 @@ def _parse_csv_rows(rows_iter: Any) -> list[dict[str, Any]]:
         if not title or not countries_raw:
             continue
 
-        iso2_codes = _extract_iso2_codes(countries_raw)
-        # Skip rows with no resolvable country (international org-only entries
-        # are still included with empty iso2_codes — logged at ingest time)
+        iso2_codes = _extract_iso2_codes(countries_raw, iso3_map)
+        # Rows with no resolvable country are still included (logged at ingest time)
 
         description_clean = _strip_html(row.get("description"))
-        minerals = _extract_minerals_from_tech_and_text(
-            row.get("technologies"),
-            title,
-            description_clean,
-        )
+        # Tech-basket minerals only; keyword scan happens at ingest time.
+        tech_basket_minerals = _extract_tech_basket_minerals(row.get("technologies"))
 
         policy_type_names = _extract_policy_type_names(row.get("policyType"))
 
         records.append({
-            "title":             title,
-            "description":       description_clean,
-            "status":            (row.get("status") or "").strip(),
-            "year":              (row.get("year") or "").strip(),
-            "jurisdiction":      (row.get("jurisdiction") or "").strip(),
-            "iso2_codes":        iso2_codes,          # list[str]
-            "minerals":          minerals,             # list[str] canonical names
-            "policy_type_names": policy_type_names,   # list[str] e.g. ["Financing"]
-            "countries_raw":     countries_raw,        # kept for content hash / metadata
+            "title":              title,
+            "description":        description_clean,
+            "status":             (row.get("status") or "").strip(),
+            "year":               (row.get("year") or "").strip(),
+            "jurisdiction":       (row.get("jurisdiction") or "").strip(),
+            "iso2_codes":         iso2_codes,           # list[str]
+            "tech_basket_minerals": tech_basket_minerals,  # list[str] canonical names (basket only)
+            "policy_type_names":  policy_type_names,    # list[str] e.g. ["Financing"]
+            "countries_raw":      countries_raw,         # kept for content hash / metadata
         })
 
     return records
 
 
-def parse_policy_tracker_file(path: str | Path) -> list[dict[str, Any]]:
+def parse_policy_tracker_file(
+    path: str | Path,
+    iso3_map: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """
     Parse the IEA Policy Tracker export (CSV or XLSX) and return normalised
     row dicts.
@@ -414,9 +381,17 @@ def parse_policy_tracker_file(path: str | Path) -> list[dict[str, Any]]:
     Format is auto-detected from the file extension (.csv → csv module,
     .xlsx / .xls → openpyxl).  IEA currently exports as CSV.
 
+    ``iso3_map`` is the DB-backed iso3→iso2 lookup from ``_build_iso3_map()``.
+    When called standalone (outside of ``ingest_policy_tracker``), pass a
+    manually-built dict or an empty dict — country resolution will fall back
+    to logging unknowns.
+
     Raises FileNotFoundError if the path does not exist.
     """
     import csv as csv_module
+
+    if iso3_map is None:
+        iso3_map = {}
 
     path = Path(path)
     if not path.exists():
@@ -434,7 +409,7 @@ def parse_policy_tracker_file(path: str | Path) -> list[dict[str, Any]]:
             reader = csv_module.DictReader(f)
             if reader.fieldnames is None:
                 raise ValueError(f"Empty or unreadable CSV: {path}")
-            records = _parse_csv_rows(reader)
+            records = _parse_csv_rows(reader, iso3_map)
         log.info("iea_policy_tracker.parsed_csv", path=str(path), row_count=len(records))
         return records
 
@@ -477,7 +452,7 @@ def parse_policy_tracker_file(path: str | Path) -> list[dict[str, Any]]:
                 cells.append("")
             yield dict(zip(headers, cells[:len(headers)]))
 
-    records = _parse_csv_rows(_seq_rows_as_dicts())
+    records = _parse_csv_rows(_seq_rows_as_dicts(), iso3_map)
     log.info("iea_policy_tracker.parsed_xlsx", path=str(path), row_count=len(records))
     return records
 
@@ -489,24 +464,6 @@ parse_policy_tracker_xlsx = parse_policy_tracker_file
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
-
-def _build_material_name_map(session: Session) -> dict[str, int]:
-    """Return {canonical_name.lower(): material_id} for all materials."""
-    rows = session.execute(select(Material.id, Material.canonical_name)).all()
-    return {name.lower(): mid for mid, name in rows}
-
-
-def _resolve_material_ids(
-    canonical_names: list[str],
-    name_map: dict[str, int],
-) -> list[int]:
-    """Map canonical mineral names → material IDs, skipping unknowns."""
-    ids: list[int] = []
-    for name in canonical_names:
-        mid = name_map.get(name.lower())
-        if mid and mid not in ids:
-            ids.append(mid)
-    return ids
 
 
 def _derive_event_type(policy_type_names: list[str]) -> str:
@@ -552,13 +509,26 @@ def ingest_policy_tracker(
         run_id:    Optional identifier for this ingestion run.
 
     Returns:
-        Dict with inserted, skipped (duplicate), and failed counts.
+        Dict with inserted, skipped (duplicate), and failed counts plus
+        material_links and hs_mapping_links counters.
+
+    Material attribution (two complementary paths):
+      1. Tech basket  — ``_extract_tech_basket_minerals()`` maps IEA technology
+                        categories to canonical mineral names.  Writes
+                        ``RiskEventMaterial`` only (no HS stage attribution).
+      2. Keyword scan — ``MaterialCache.detect()`` scans title + description
+                        against DB-backed keywords from hs_code_material_mappings.
+                        Writes ``RiskEventMaterial`` AND ``RiskEventHsMapping``
+                        when hs_mapping_id is known (stage attribution).
     """
     if xls_path is None:
         xls_path = DEFAULT_FILE_PATH
 
-    records = parse_policy_tracker_file(xls_path)
-    material_map = _build_material_name_map(session)
+    # Build DB-backed lookups once per run.
+    iso3_map = _build_iso3_map(session)
+    material_cache = MaterialCache.build(session)
+
+    records = parse_policy_tracker_file(xls_path, iso3_map=iso3_map)
 
     # Ensure source document exists
     source_doc = session.scalar(
@@ -575,9 +545,13 @@ def ingest_policy_tracker(
         session.add(source_doc)
         session.flush()
 
+    mat_resolver = MaterialResolver(session)
+
     inserted = 0
     skipped = 0
     failed = 0
+    material_links = 0
+    hs_mapping_links = 0
 
     for rec in records:
         try:
@@ -608,10 +582,14 @@ def ingest_policy_tracker(
             except (ValueError, TypeError):
                 pass
 
-            # Title format: first country name + policy title, truncated
+            # Title: first country ISO2 + policy title, truncated
             country_label = rec["iso2_codes"][0] if rec["iso2_codes"] else rec["jurisdiction"] or "INTL"
             title = f"{country_label} — {rec['title']}"[:1024]
             summary = rec["description"][:500] if rec["description"] else None
+
+            # Keyword scan — combines title + description for MaterialCache
+            search_text = f"{rec['title']} {rec['description']}"
+            keyword_hits = material_cache.detect(search_text)
 
             event = RiskEvent(
                 source_document_id=source_doc.id,
@@ -633,7 +611,7 @@ def ingest_policy_tracker(
                     "policy_type": policy_type_names,
                     "status": rec["status"],
                     "jurisdiction": rec["jurisdiction"],
-                    "minerals_resolved": rec["minerals"],
+                    "tech_basket_minerals": rec["tech_basket_minerals"],
                     "countries_raw": rec["countries_raw"],
                     "run_id": run_id,
                     "positive_policy": True,
@@ -646,7 +624,7 @@ def ingest_policy_tracker(
             session.add(event)
             session.flush()
 
-            # Geography junction — one row per country
+            # ── Geography junction — one row per country ──────────────────────
             for iso2 in rec["iso2_codes"]:
                 session.add(RiskEventGeography(
                     risk_event_id=event.id,
@@ -662,15 +640,67 @@ def ingest_policy_tracker(
                     countries_raw=rec["countries_raw"],
                 )
 
-            # Material junctions (best-effort, derived from technologies + tags)
-            material_ids = _resolve_material_ids(rec["minerals"], material_map)
-            for mid in material_ids:
-                session.add(RiskEventMaterial(
-                    risk_event_id=event.id,
-                    material_id=mid,
-                    relevance_score=0.85,
-                    match_reason="technology_tag_keyword",
-                ))
+            # ── Material junctions ────────────────────────────────────────────
+            # Track which material IDs have been written to avoid duplicate rows.
+            seen_material_ids: set[int] = set()
+
+            # Path 1: tech basket — RiskEventMaterial only (no HS attribution)
+            for canonical_name in rec["tech_basket_minerals"]:
+                mat = mat_resolver.resolve_by_canonical_name(canonical_name)
+                if mat is None or mat.id in seen_material_ids:
+                    continue
+                existing_mat = session.scalar(
+                    select(RiskEventMaterial).where(
+                        RiskEventMaterial.risk_event_id == event.id,
+                        RiskEventMaterial.material_id == mat.id,
+                    ).limit(1)
+                )
+                if existing_mat is None:
+                    session.add(RiskEventMaterial(
+                        risk_event_id=event.id,
+                        material_id=mat.id,
+                        relevance_score=0.85,
+                        match_reason="technology_basket",
+                    ))
+                    material_links += 1
+                seen_material_ids.add(mat.id)
+
+            # Path 2: keyword scan — RiskEventMaterial + RiskEventHsMapping
+            seen_hs_mapping_ids: set[int] = set()
+            for mat_id, relevance, matched_kw, hs_mapping_id in keyword_hits:
+                if mat_id not in seen_material_ids:
+                    existing_mat = session.scalar(
+                        select(RiskEventMaterial).where(
+                            RiskEventMaterial.risk_event_id == event.id,
+                            RiskEventMaterial.material_id == mat_id,
+                        ).limit(1)
+                    )
+                    if existing_mat is None:
+                        session.add(RiskEventMaterial(
+                            risk_event_id=event.id,
+                            material_id=mat_id,
+                            relevance_score=relevance,
+                            match_reason=f"keyword_scan:{matched_kw[:48]}",
+                        ))
+                        material_links += 1
+                    seen_material_ids.add(mat_id)
+
+                if hs_mapping_id is not None and hs_mapping_id not in seen_hs_mapping_ids:
+                    existing_hs = session.scalar(
+                        select(RiskEventHsMapping).where(
+                            RiskEventHsMapping.risk_event_id == event.id,
+                            RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
+                        ).limit(1)
+                    )
+                    if existing_hs is None:
+                        session.add(RiskEventHsMapping(
+                            risk_event_id=event.id,
+                            hs_mapping_id=hs_mapping_id,
+                            relevance_score=relevance,
+                            match_reason=f"keyword_scan:{matched_kw[:48]}",
+                        ))
+                        hs_mapping_links += 1
+                    seen_hs_mapping_ids.add(hs_mapping_id)
 
             inserted += 1
 
@@ -696,6 +726,8 @@ def ingest_policy_tracker(
         "inserted": inserted,
         "skipped_duplicate": skipped,
         "failed": failed,
+        "material_links": material_links,
+        "hs_mapping_links": hs_mapping_links,
     }
     log.info("iea_policy_tracker.done", **result)
     return result

@@ -260,7 +260,7 @@ class IngestionPipeline:
             max_val = 0.0
             for row in rows:
                 partner_iso = geo.partner_country_iso2(row.partner_code) or row.partner_code
-                mid = materials.resolve_by_hs_code(row.hs_code)
+                mid, hs_mapping_id = materials.resolve_by_hs_code(row.hs_code)
                 tf = TradeFlow(
                     source_document_id=doc.id,
                     period=row.period or period,
@@ -269,6 +269,7 @@ class IngestionPipeline:
                     hs_code=row.hs_code,
                     hs_description=row.hs_description,
                     material_id=mid,
+                    hs_mapping_id=hs_mapping_id,
                     import_export_flag=row.import_export,
                     quantity=row.quantity,
                     quantity_unit=row.quantity_unit,
