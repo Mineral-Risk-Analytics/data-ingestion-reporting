@@ -271,6 +271,8 @@ def get_active_compliance_obligations(
         "partial":       0.40,
     }
 
+    # ``verified=True`` filter: only seeded regulations contribute uplift.
+    # See ``get_events_for_regulations`` below for the same rule.
     stmt = (
         select(Regulation.regulation_key, CompanyRegulationExposure.compliance_status)
         .join(
@@ -282,6 +284,7 @@ def get_active_compliance_obligations(
             CompanyRegulationExposure.compliance_status.in_(
                 ["non_compliant", "partial", "unknown"]
             ),
+            Regulation.verified.is_(True),
         )
     )
     if scope.regulation_keys is not None:
@@ -297,10 +300,14 @@ def get_active_compliance_obligations(
             key=lambda t: t[0],
         )
 
+    # Hardcoded fallback for companies with zero company_regulation_exposure
+    # rows — text-scans event titles for known regulation keywords.  Mapped
+    # values must match canonical regulation_key values in seed_regulations.py
+    # (post 2026-05-05: EU_BATTERY_REG → EU_BATTERY_REG_2023).
     known_obligations: dict[str, str] = {
         "uflpa":          "UFLPA",
-        "eu battery":     "EU_BATTERY_REG",
-        "eu_battery":     "EU_BATTERY_REG",
+        "eu battery":     "EU_BATTERY_REG_2023",
+        "eu_battery":     "EU_BATTERY_REG_2023",
         "ira domestic":   "IRA_DOMESTIC",
         "ira_domestic":   "IRA_DOMESTIC",
     }
@@ -788,7 +795,10 @@ def get_regulations_scoping_company(
                 RegulationMaterialScope,
                 RegulationMaterialScope.regulation_id == Regulation.id,
             )
-            .where(RegulationMaterialScope.material_id.in_(material_ids))
+            .where(
+                RegulationMaterialScope.material_id.in_(material_ids),
+                Regulation.verified.is_(True),
+            )
         )
         if scope.regulation_keys is not None:
             stmt = stmt.where(Regulation.regulation_key.in_(scope.regulation_keys))
@@ -804,7 +814,10 @@ def get_regulations_scoping_company(
                 RegulationGeographyScope,
                 RegulationGeographyScope.regulation_id == Regulation.id,
             )
-            .where(RegulationGeographyScope.country_code.in_(country_codes))
+            .where(
+                RegulationGeographyScope.country_code.in_(country_codes),
+                Regulation.verified.is_(True),
+            )
         )
         if scope.regulation_keys is not None:
             stmt = stmt.where(Regulation.regulation_key.in_(scope.regulation_keys))
@@ -830,6 +843,11 @@ def get_events_for_regulations(
     cutoff = _category_window_cutoff(
         RiskCategory.REGULATORY_COMPLIANCE, as_of_date
     )
+    # Filter to verified regulations only.  ``verified=True`` is set
+    # exclusively by ``seed_regulations.py`` (the curated source of truth);
+    # rows that other ingesters might create with ``verified=False``
+    # (legacy / partial) are excluded from scoring evidence to keep the
+    # regulatory pillar grounded in partner-reviewed instruments.
     stmt = (
         select(RiskEvent, RiskEventRegulation.relevance_score)
         .join(
@@ -842,6 +860,7 @@ def get_events_for_regulations(
         )
         .where(
             Regulation.regulation_key.in_(regulation_keys),
+            Regulation.verified.is_(True),
             RiskEvent.risk_categories_json.contains(
                 [RiskCategory.REGULATORY_COMPLIANCE.value]
             ),

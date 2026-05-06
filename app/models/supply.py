@@ -105,6 +105,67 @@ class Material(Base):
     production_shares: Mapped[list["MaterialProductionShare"]] = relationship(
         back_populates="material", cascade="all, delete-orphan"
     )
+    source_aliases: Mapped[list["MaterialSourceAlias"]] = relationship(
+        back_populates="canonical_material", cascade="all, delete-orphan"
+    )
+
+
+class MaterialSourceAlias(Base):
+    """
+    Reference table mapping external-source commodity names to canonical materials.
+
+    Each row says: when source_system X uses source_name Y, it means
+    canonical_material_id Z (or, if is_skipped=True, the row was deliberately
+    not ingested — preserving the audit trail of considered-and-rejected names).
+
+    Replaces four Python dicts that previously lived next to each parser
+    (_CHAPTER_TO_MATERIAL, _PRICE_NAME_TO_MATERIAL, _MCS_COMMODITY_MAP,
+    _COMMODITY_CONFIG).  Future ingestion sources (T4 export controls, T6
+    end-use, Comtrade, etc.) add rows instead of new dicts.
+
+    Lookup pattern: (source_system, lower(btrim(source_name))) is unique
+    per the partial expression index in migration 036.  The
+    `material_resolver` helper handles the normalization.
+
+    See migration 036 for column comments.
+    """
+
+    __tablename__ = "material_source_aliases"
+    __table_args__ = (
+        # Unique constraint enforced by the expression index in the migration;
+        # we don't redeclare it here because SQLAlchemy can't model the
+        # lower(btrim(...)) expression cleanly.  Insertions go through
+        # PG ON CONFLICT DO UPDATE on that index.
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_system: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    canonical_material_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("materials.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    is_skipped: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    skip_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Default true preserves existing single-chapter aliases.  When false,
+    # the CLI writes only per-HS-prefix shares for this alias and skips
+    # material-level signal upserts.  Used for upstream-stage chapters
+    # that share a canonical with a sibling chapter (e.g. BAUXITE AND
+    # ALUMINA → Aluminum, where ALUMINUM is the primary).
+    writes_material_signals: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true",
+    )
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+    canonical_material: Mapped[Optional["Material"]] = relationship(
+        back_populates="source_aliases"
+    )
 
 
 class MaterialProductionShare(Base):

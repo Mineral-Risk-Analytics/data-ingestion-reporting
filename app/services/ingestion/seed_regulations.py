@@ -1,4 +1,4 @@
-"""Curated seed data for the regulations schema group.
+"""Single source of truth for the regulations schema group.
 
 Populates four tables in dependency order:
   1. regulations              — the regulatory instrument records
@@ -6,17 +6,33 @@ Populates four tables in dependency order:
   3. regulation_geography_scope — which geographies each regulation applies to
   4. company_regulation_exposure — each company's exposure and compliance status
 
+This file is the single authoritative place for regulation reference data.
+Ingesters (eurlex.py, federal_register, etc.) MUST NOT define their own
+regulations — they look up regulation_id via ``regulation_aliases`` and
+update only mutable fields (summary, latest URL, etc.).  See
+``seed_regulation_aliases.py`` for the external-ID → regulation_key map.
+
 Why this matters for scoring
 -----------------------------
-The regulatory pillar (20% of company risk score) currently falls back to a
-text-scan of recent risk_event titles while company_regulation_exposure is empty.
-Once this seed is applied, get_active_compliance_obligations() in evidence_query.py
-returns structured obligation keys which map directly to hard-coded uplift points
-in regulatory_risk.py:
+The regulatory pillar (20% of company risk score) reads these tables.  When
+``company_regulation_exposure`` is populated, ``get_active_compliance_obligations()``
+in ``evidence_query.py`` returns structured obligation keys which map to
+hard-coded uplift points in ``regulatory_risk.py``:
 
-    UFLPA          → 25 pts   (Xinjiang forced labor supply chain exposure)
-    EU_BATTERY_REG → 20 pts   (EU market participants lacking compliance docs)
-    IRA_DOMESTIC   → 15 pts   (FEOC materials disqualifying US tax credits)
+    UFLPA              → 25 pts   (Xinjiang forced labor supply chain exposure)
+    EU_BATTERY_REG_2023 → 20 pts   (EU market participants lacking compliance docs)
+    IRA_DOMESTIC       → 15 pts   (FEOC materials disqualifying US tax credits)
+
+Other seeded regulations (CRMA_2024, EU_CBAM, EU_CSDDD, EU_CONFLICT_MINERALS,
+EU_REACH_COBALT, SEC_CLIMATE_2024) are tracked for evidence and reporting but
+generate no uplift until ``COMPLIANCE_OBLIGATIONS`` is extended.
+
+Trust model — verified flag
+---------------------------
+Every row this file inserts is marked ``verified=True``.  Scoring code
+filters on this flag so events attributed to auto-created or partner-
+unreviewed regulations don't influence scores.  Only this seed (and
+``seed_regulation_aliases``) is allowed to write ``verified=True`` rows.
 
 compliance_status logic
 -----------------------
@@ -28,14 +44,11 @@ inserted but produce no score effect — they document confirmed compliance.
     unknown        In scope but compliance status not publicly verifiable
     compliant      Confirmed compliance — no uplift, no active regulatory burden
 
-CRMA_2024 and EU_CBAM are seeded as informational regulations. They have no
-corresponding entry in regulatory_risk.COMPLIANCE_OBLIGATIONS yet, so they
-generate no uplift until that dict is extended.
-
 Run order:
-    bdi-ingest seed-companies       # companies must exist
-    bdi-ingest ingest-usgs ...      # materials must exist
-    bdi-ingest seed-regulations     # this script
+    bdi-ingest seed-companies          # companies must exist
+    bdi-ingest seed-materials          # materials must exist
+    bdi-ingest seed-regulations        # this script
+    bdi-ingest seed-regulation-aliases # CELEX / FR doc → regulation_key
 """
 
 from __future__ import annotations
@@ -59,6 +72,15 @@ from app.models.supply import Material
 log = structlog.get_logger(__name__)
 
 _ASSESSED_AT = date(2025, 1, 1)
+
+# ---------------------------------------------------------------------------
+# Seed version
+# ---------------------------------------------------------------------------
+# Bumped whenever the curated regulation roster, material scopes, or geography
+# scopes change in a way partner-side reviewers should re-validate.  Stamped
+# into ``regulations.metadata_json.seed_version`` for every seeded row so the
+# DB carries provenance.  Format: YYYY-MM-DD of the change.
+_SEED_VERSION = "2026-05-05"
 
 # ---------------------------------------------------------------------------
 # 1. Regulation definitions
@@ -193,6 +215,106 @@ _REGULATIONS: list[dict] = [
             "legal_status": "stayed_pending_court_review",
         },
     },
+
+    # ── EU regulations (moved from eurlex.py manifest 2026-05-05) ────────────
+    # eurlex.py is now an ingester only — fetches summaries / latest URL for
+    # the regulations defined below via CELEX → regulation_key alias lookup.
+
+    {
+        "regulation_key": "EU_BATTERY_REG_2023",
+        "title": "EU Battery Regulation (EU) 2023/1542 — batteries and waste batteries",
+        "issuing_body": "European Parliament and Council",
+        "geography": "EU",
+        "policy_theme": "battery_lifecycle_compliance",
+        "status": "effective",
+        "publication_date": date(2023, 7, 28),
+        "effective_date": date(2024, 8, 18),
+        "summary": (
+            "EU regulation establishing a comprehensive framework for batteries placed on the "
+            "EU market: due-diligence obligations on cobalt, lithium, nickel, and natural "
+            "graphite (Article 47); recycled-content minima rising through 2031–2036; battery "
+            "passport for industrial / EV batteries from 2027; producer-responsibility scheme "
+            "expansion. Non-compliance = EU market exclusion."
+        ),
+        "metadata_json": {
+            "celex": "32023R1542",
+            "due_diligence_effective": "2025-08-18",
+            "recycled_content_lithium_2031_pct": 6,
+            "recycled_content_cobalt_2031_pct": 16,
+            "recycled_content_nickel_2031_pct": 6,
+            "battery_passport_effective": "2027-02-18",
+        },
+    },
+    {
+        "regulation_key": "EU_CSDDD",
+        "title": "Corporate Sustainability Due Diligence Directive (EU) 2024/1760",
+        "issuing_body": "European Parliament and Council",
+        "geography": "EU",
+        "policy_theme": "supply_chain_due_diligence",
+        "status": "enacted",
+        "publication_date": date(2024, 7, 5),
+        "effective_date": date(2027, 7, 26),
+        "summary": (
+            "EU directive requiring large companies operating in the EU to identify, prevent, "
+            "and address adverse human-rights and environmental impacts across their full value "
+            "chain. Phased application 2027–2029 by company size. Civil liability for damages "
+            "linked to due-diligence failures."
+        ),
+        "metadata_json": {
+            "celex": "32024L1760",
+            "first_phase_effective": "2027-07-26",
+            "covers_value_chain": True,
+            "civil_liability": True,
+        },
+    },
+    {
+        "regulation_key": "EU_CONFLICT_MINERALS",
+        "title": "EU Conflict Minerals Regulation (EU) 2017/821",
+        "issuing_body": "European Parliament and Council",
+        "geography": "EU",
+        "policy_theme": "responsible_sourcing",
+        "status": "effective",
+        "publication_date": date(2017, 5, 17),
+        "effective_date": date(2021, 1, 1),
+        "summary": (
+            "EU regulation requiring importers of tin, tantalum, tungsten, and gold to perform "
+            "supply-chain due diligence consistent with the OECD framework. Battery relevance is "
+            "indirect (cobalt is not in scope) but the regulation establishes the OECD-based "
+            "due-diligence baseline that downstream regulations (CSDDD, Battery Reg) reference."
+        ),
+        "metadata_json": {
+            "celex": "32017R0821",
+            "covered_minerals": ["tin", "tantalum", "tungsten", "gold"],
+            "due_diligence_framework": "OECD_5_step",
+        },
+    },
+    {
+        "regulation_key": "EU_REACH_COBALT",
+        "title": "REACH Regulation (EC) 1907/2006 — Cobalt SVHC restrictions",
+        "issuing_body": "European Parliament and Council",
+        "geography": "EU",
+        "policy_theme": "chemicals_regulatory",
+        "status": "effective",
+        "publication_date": date(2006, 12, 18),
+        "effective_date": date(2009, 6, 1),
+        "summary": (
+            "REACH regulation governs registration, evaluation, authorisation, and restriction "
+            "of chemicals in the EU. Several cobalt compounds (cobalt sulfate, dichloride, "
+            "nitrate, carbonate, acetate) are listed as Substances of Very High Concern (SVHC) "
+            "under Annex XIV — requiring authorisation for use. Direct relevance to cobalt "
+            "salts used in cathode-precursor manufacture."
+        ),
+        "metadata_json": {
+            "celex": "32006R1907",
+            "svhc_compounds": [
+                "cobalt sulfate",
+                "cobalt dichloride",
+                "cobalt dinitrate",
+                "cobalt carbonate",
+                "cobalt diacetate",
+            ],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -213,22 +335,69 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Manganese", "scope_type": "covered", "notes": "Critical mineral under FEOC rules."},
         {"material": "Natural Graphite", "scope_type": "covered", "notes": "Battery component input — FEOC restrictions apply."},
     ],
-    "EU_BATTERY_REG": [
-        {"material": "Cobalt", "scope_type": "disclosure_required", "notes": "Mandatory due diligence from 2025. Recycled content target 16% by 2031."},
-        {"material": "Natural Graphite", "scope_type": "disclosure_required", "notes": "Mandatory due diligence from 2025."},
-        {"material": "Lithium", "scope_type": "disclosure_required", "notes": "Mandatory due diligence from 2025. Recycled content target 6% by 2031."},
-        {"material": "Nickel", "scope_type": "disclosure_required", "notes": "Mandatory due diligence from 2025. Recycled content target 6% by 2031."},
-    ],
+    # NOTE: ``EU_BATTERY_REG_2023`` material scopes are defined further down
+    # in this dict (after CRMA / CBAM) so the strategic-raw-material context
+    # is grouped with the other EU regulations.  The old ``EU_BATTERY_REG``
+    # key (without year suffix) was deprecated 2026-05-05 — use
+    # ``EU_BATTERY_REG_2023`` to match COMPLIANCE_OBLIGATIONS in
+    # regulatory_risk.py.
     "CRMA_2024": [
-        {"material": "Lithium", "scope_type": "covered"},
-        {"material": "Cobalt", "scope_type": "covered"},
-        {"material": "Nickel", "scope_type": "covered"},
-        {"material": "Manganese", "scope_type": "covered"},
-        {"material": "Natural Graphite", "scope_type": "covered"},
-        {"material": "Copper", "scope_type": "covered"},
+        # CRMA Annex II: Strategic Raw Materials.  "Strategic" is a higher
+        # designation than "critical" (Annex I); EU member states face binding
+        # 2030 benchmarks against this list (≥10% domestic extraction, ≥40%
+        # processing, ≥15% recycling).  scope_type "strategic_raw_material"
+        # is upweighted in evidence_query._SCOPE_TYPE_WEIGHT.
+        # Battery / EV drivetrain
+        {"material": "Lithium",                "scope_type": "strategic_raw_material"},
+        {"material": "Cobalt",                 "scope_type": "strategic_raw_material"},
+        {"material": "Nickel",                 "scope_type": "strategic_raw_material"},
+        {"material": "Manganese",              "scope_type": "strategic_raw_material"},
+        {"material": "Natural Graphite",       "scope_type": "strategic_raw_material"},
+        {"material": "Copper",                 "scope_type": "strategic_raw_material"},
+        # Industrial / electronics
+        {"material": "Boron",                  "scope_type": "strategic_raw_material"},
+        {"material": "Gallium",                "scope_type": "strategic_raw_material"},
+        {"material": "Germanium",              "scope_type": "strategic_raw_material"},
+        {"material": "Magnesium",              "scope_type": "strategic_raw_material"},
+        {"material": "Silicon (Anode Grade)",  "scope_type": "strategic_raw_material"},
+        {"material": "Titanium",               "scope_type": "strategic_raw_material"},
+        {"material": "Tungsten",               "scope_type": "strategic_raw_material"},
+        {"material": "Niobium",                "scope_type": "strategic_raw_material"},
+        {"material": "Bismuth",                "scope_type": "strategic_raw_material"},
+        # Platinum-group metals (fuel cell catalysts, sensors)
+        {"material": "Platinum-Group Metals",  "scope_type": "strategic_raw_material"},
+        # Magnet rare-earth elements (EV traction motors)
+        {"material": "Neodymium",              "scope_type": "strategic_raw_material"},
+        {"material": "Praseodymium",           "scope_type": "strategic_raw_material"},
+        {"material": "Dysprosium",             "scope_type": "strategic_raw_material"},
+        {"material": "Terbium",                "scope_type": "strategic_raw_material"},
     ],
     "EU_CBAM": [
-        {"material": "Copper", "scope_type": "covered", "notes": "Copper included under aluminium sector extension from 2026."},
+        # CBAM coverage (see metadata_json.covered_sectors): cement,
+        # iron/steel, aluminium, fertilisers, electricity, hydrogen, plus
+        # copper from 2026 under the aluminium-sector expansion.  We seed
+        # the battery-relevant materials only.
+        {"material": "Aluminum", "scope_type": "covered"},
+        {"material": "Nickel",   "scope_type": "covered"},
+        {"material": "Copper",   "scope_type": "covered", "notes": "Copper included under aluminium sector extension from 2026."},
+    ],
+    "EU_BATTERY_REG_2023": [
+        {"material": "Lithium",          "scope_type": "disclosure_required", "notes": "Battery passport + due diligence from 2025. Recycled-content target 6% by 2031."},
+        {"material": "Cobalt",           "scope_type": "disclosure_required", "notes": "Battery passport + due diligence from 2025. Recycled-content target 16% by 2031."},
+        {"material": "Nickel",           "scope_type": "disclosure_required", "notes": "Battery passport + due diligence from 2025. Recycled-content target 6% by 2031."},
+        {"material": "Manganese",        "scope_type": "disclosure_required", "notes": "Battery passport + due diligence from 2025."},
+        {"material": "Natural Graphite", "scope_type": "disclosure_required", "notes": "Battery passport + due diligence from 2025."},
+    ],
+    "EU_CSDDD": [
+        {"material": "Cobalt",           "scope_type": "disclosure_required", "notes": "Mandatory human-rights / environmental due diligence across supply chain."},
+        {"material": "Lithium",          "scope_type": "disclosure_required"},
+        {"material": "Natural Graphite", "scope_type": "disclosure_required"},
+    ],
+    "EU_CONFLICT_MINERALS": [
+        {"material": "Cobalt", "scope_type": "disclosure_required", "notes": "Indirect: cobalt commonly co-mined with conflict-affected supply chains; due diligence required for EU importers."},
+    ],
+    "EU_REACH_COBALT": [
+        {"material": "Cobalt", "scope_type": "restricted", "notes": "Several cobalt compounds classified as Substances of Very High Concern (SVHC) under REACH Annex XIV."},
     ],
 }
 
@@ -249,7 +418,7 @@ _GEOGRAPHY_SCOPES: dict[str, list[dict]] = {
         {"country_code": "KP", "scope_type": "targeted_country"},
         {"country_code": "IR", "scope_type": "targeted_country"},
     ],
-    "EU_BATTERY_REG": [
+    "EU_BATTERY_REG_2023": [
         {"country_code": "EU", "scope_type": "jurisdiction"},
     ],
     "CRMA_2024": [
@@ -257,6 +426,20 @@ _GEOGRAPHY_SCOPES: dict[str, list[dict]] = {
         {"country_code": "CN", "scope_type": "targeted_country"},
     ],
     "EU_CBAM": [
+        {"country_code": "EU", "scope_type": "jurisdiction"},
+        {"country_code": "CN", "scope_type": "targeted_country"},
+        {"country_code": "RU", "scope_type": "targeted_country"},
+    ],
+    "EU_CSDDD": [
+        {"country_code": "EU", "scope_type": "jurisdiction"},
+        {"country_code": "CD", "scope_type": "targeted_country"},  # DRC — cobalt
+        {"country_code": "CN", "scope_type": "targeted_country"},  # supply-chain visibility focus
+    ],
+    "EU_CONFLICT_MINERALS": [
+        {"country_code": "EU", "scope_type": "jurisdiction"},
+        {"country_code": "CD", "scope_type": "targeted_country"},  # DRC — original 3TG focus area
+    ],
+    "EU_REACH_COBALT": [
         {"country_code": "EU", "scope_type": "jurisdiction"},
     ],
     "SEC_CLIMATE_2024": [
@@ -271,7 +454,7 @@ _GEOGRAPHY_SCOPES: dict[str, list[dict]] = {
 #
 # Key scoring logic (regulatory_risk.py):
 #   UFLPA:          25 pt uplift if non_compliant / partial / unknown
-#   EU_BATTERY_REG: 20 pt uplift if non_compliant / partial / unknown
+#   EU_BATTERY_REG_2023: 20 pt uplift if non_compliant / partial / unknown
 #   IRA_DOMESTIC:   15 pt uplift if non_compliant / partial / unknown
 #
 # Only rows with status ≠ "compliant" generate uplift. Compliant rows are
@@ -482,87 +665,87 @@ _COMPANY_EXPOSURES: list[dict] = [
     {"company": "Ecopro BM",               "regulation": "IRA_DOMESTIC", "status": "partial",
      "reason": "Korean cathode active materials producer. Supplies Samsung SDI and SK On for US-market vehicles. Upstream CN mineral sourcing (lithium, nickel precursors) creates IRA critical mineral rule exposure from 2025."},
 
-    # ─── EU_BATTERY_REG ─────────────────────────────────────────────────────
+    # ─── EU_BATTERY_REG_2023 ────────────────────────────────────────────────
     # All EU market participants are in scope. Requirements phase in 2024–2031.
     # Most companies are "partial" — the regulatory timeline is still unfolding
     # and full compliance documentation is not yet required for all provisions.
     # Northvolt and Chinese companies have elevated exposure given specific issues.
 
-    {"company": "Northvolt",               "regulation": "EU_BATTERY_REG", "status": "non_compliant",
+    {"company": "Northvolt",               "regulation": "EU_BATTERY_REG_2023", "status": "non_compliant",
      "reason": "Bankruptcy filing (November 2024) jeopardizes ability to meet EU Battery Reg compliance documentation requirements. Supply chain transparency commitments made pre-bankruptcy may not survive restructuring."},
 
-    {"company": "CATL",                    "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "CATL",                    "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "Sells into EU market. Subject to due diligence requirements for cobalt, graphite, lithium, nickel from 2025. Battery passport implementation underway but not complete. CN sourcing structure increases scrutiny."},
 
-    {"company": "Gotion High-tech",        "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Gotion High-tech",        "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU market participant (Valencia gigafactory planned). Due diligence requirements for CN-sourced materials create compliance challenge given existing US regulatory scrutiny."},
 
-    {"company": "Envision AESC",           "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Envision AESC",           "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "Operates UK (Sunderland) and France gigafactories for EU/UK market. In scope for full EU Battery Reg requirements. Due diligence implementation underway."},
 
-    {"company": "LG Energy Solution",      "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "LG Energy Solution",      "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "Major EU cell supplier (Poland gigafactory). Subject to full EU Battery Reg compliance including due diligence, carbon footprint declaration, and battery passport. Working toward compliance."},
 
-    {"company": "Samsung SDI",             "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Samsung SDI",             "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU cell supplier (Hungary factory). Full compliance timeline in progress. Due diligence for CN-sourced materials is primary challenge."},
 
-    {"company": "SK On",                   "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "SK On",                   "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU cell supplier (SKBA JV with VW in Germany). Battery Reg compliance programme underway alongside financial restructuring."},
 
-    {"company": "Umicore",                 "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Umicore",                 "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "Belgian CAM producer — EU-based, in scope. Positioned as EU Battery Reg-compliant supplier but full documentation for all provisions not yet complete."},
 
-    {"company": "BASF",                    "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "BASF",                    "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU-based CAM producer. In scope for supplier due diligence obligations. RU nickel supply chain exposure creates Norilsk-related disclosure complexity."},
 
     # EU OEMs
-    {"company": "Volkswagen Group",        "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Volkswagen Group",        "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU OEM selling into EU market. Battery passport and due diligence requirements in scope. PowerCo SE designed partly to create EU Battery Reg-compliant domestic supply chain."},
 
-    {"company": "BMW Group",               "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "BMW Group",               "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU OEM. One of the more advanced OEMs on cobalt responsible sourcing (direct smelter MOUs). Full EU Battery Reg compliance documentation still in progress."},
 
-    {"company": "Mercedes-Benz Group",     "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Mercedes-Benz Group",     "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU OEM. Due diligence requirements and battery passport implementation underway. CATL supply chain creates CN-sourcing transparency challenges."},
 
-    {"company": "Stellantis",              "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Stellantis",              "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU OEM (NL HQ, multi-country manufacturing). Full EU Battery Reg compliance programme in progress."},
 
-    {"company": "Volvo Car Group",         "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Volvo Car Group",         "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU OEM (Sweden). Selling into EU market. CATL supply chain requires due diligence documentation. Battery passport programme underway."},
 
-    {"company": "Polestar Automotive",     "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Polestar Automotive",     "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU-HQ OEM. High-sustainability brand positioning means elevated scrutiny of compliance documentation. CATL CN manufacturing creates due diligence challenge."},
 
     # Non-EU OEMs selling into EU
-    {"company": "Toyota Motor Corporation","regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Toyota Motor Corporation","regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "Sells into EU market. PPES supply chain requires EU Battery Reg due diligence documentation. Compliance programme underway."},
 
-    {"company": "Honda Motor Company",     "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Honda Motor Company",     "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU market participant. Battery Reg compliance documentation in progress."},
 
-    {"company": "Hyundai Motor Company",   "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Hyundai Motor Company",   "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU market participant. Czech Republic assembly plant. Battery Reg compliance programme underway."},
 
-    {"company": "Kia Corporation",         "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Kia Corporation",         "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU market participant. Slovak assembly plant. Battery Reg compliance programme underway."},
 
-    {"company": "Nissan Motor Company",    "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Nissan Motor Company",    "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "EU market participant. UK Sunderland factory (AESC cells). Battery Reg compliance underway."},
 
     # Norilsk — Russian entity creates specific disclosure challenges
-    {"company": "Norilsk Nickel",          "regulation": "EU_BATTERY_REG", "status": "non_compliant",
+    {"company": "Norilsk Nickel",          "regulation": "EU_BATTERY_REG_2023", "status": "non_compliant",
      "reason": "Russian entity subject to EU sanctions monitoring. Nickel from Norilsk cannot be sourced without triggering EU Battery Reg supply chain due diligence flags. Effectively excluded from compliant EU supply chains."},
 
     # Chinese cell makers with EU presence
-    {"company": "BYD",                     "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "BYD",                     "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "Selling into EU vehicle market. Hungarian factory under construction. Due diligence requirements for CN-sourced battery materials in scope. Battery passport implementation will be required."},
 
     # Korean cathode/anode material producers supplying EU-market batteries
-    {"company": "Ecopro BM",               "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "Ecopro BM",               "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "Cathode active materials producer supplying Samsung SDI (Hungary) and SK On (Germany JV) for EU-market batteries. In scope for supply chain due diligence provisions from 2025. Due diligence programme in development."},
 
-    {"company": "POSCO Future M",          "regulation": "EU_BATTERY_REG", "status": "partial",
+    {"company": "POSCO Future M",          "regulation": "EU_BATTERY_REG_2023", "status": "partial",
      "reason": "Cathode and anode materials producer. Supplies EU-market cell production. Subject to supply chain due diligence for cobalt, lithium, nickel, graphite sourcing from 2025."},
 
     # ─── CRMA_2024 (informational, no scoring weight yet) ───────────────────
@@ -633,24 +816,41 @@ def seed_regulations(session: Session) -> dict[str, int]:
     exposures_inserted = exposures_updated = exposures_skipped = 0
 
     # ── Pass 1: Regulations ──────────────────────────────────────────────────
+    # Every row produced by this seed is stamped ``verified=True`` and carries
+    # ``metadata_json.seed_version`` so the DB has provenance for which seed
+    # revision the row came from.  Scoring filters on ``verified=True`` —
+    # only rows we curated here (or in seed_regulation_aliases) feed the
+    # regulatory pillar.
     for reg_data in _REGULATIONS:
         key = reg_data["regulation_key"]
+        # Defensive copy so we don't mutate the module-level dict.
+        payload = dict(reg_data)
+        # Merge seed_version into metadata_json (preserve other fields).
+        meta = dict(payload.get("metadata_json") or {})
+        meta["seed_version"] = _SEED_VERSION
+        payload["metadata_json"] = meta
+        payload["verified"] = True
+
         existing = session.scalar(
             select(Regulation).where(Regulation.regulation_key == key)
         )
         if existing is None:
-            reg = Regulation(**{k: v for k, v in reg_data.items()})
+            reg = Regulation(**payload)
             session.add(reg)
             session.flush()
             reg_ids[key] = reg.id
-            log.info("seed_regulations.inserted", regulation_key=key)
+            log.info("seed_regulations.inserted", regulation_key=key,
+                     seed_version=_SEED_VERSION)
             regs_inserted += 1
         else:
             reg_ids[key] = existing.id
-            # Update mutable fields
-            for field in ("title", "summary", "status", "effective_date", "metadata_json"):
-                if getattr(existing, field) != reg_data.get(field):
-                    setattr(existing, field, reg_data.get(field))
+            # Update mutable fields (including verified + metadata_json so
+            # rows pre-dating the verified-flag rollout get upgraded on
+            # re-seed).
+            for field in ("title", "summary", "status", "effective_date",
+                          "metadata_json", "verified"):
+                if getattr(existing, field) != payload.get(field):
+                    setattr(existing, field, payload.get(field))
             regs_updated += 1
             log.debug("seed_regulations.regulation_exists", regulation_key=key)
 

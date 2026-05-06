@@ -1,6 +1,6 @@
 # Scoring (v3.0) — market → rollups → company
 
-> **Last updated: May 2026**
+> **Last updated: May 2026** (post material-source-aliases refactor)
 
 This page is the canonical explanation of **how scores are computed**, at every level:
 
@@ -100,6 +100,8 @@ event_impact = severity × effective_confidence × recency_multiplier × relevan
 ## Pillar math (sub-weights, caps, floors)
 
 These are the pillar-level scoring formulas. Each returns a score on `[0, 100]` unless noted.
+
+> **Note on signal coverage (May 2026):** The MCS 2026 main-CSV ingest now writes six signal columns onto `material_criticality_signals` per (material, source='usgs_mcs', reference_year): `criticality_score`, `hhi_score`, `reserve_hhi_score`, `reserve_life_index`, `production_yoy_pct`, `capacity_utilization`. Five are consumed by `market_aggregator.py`; `capacity_utilization` is always NULL because the 2026 CSV doesn't include it. Two further columns (`price_yoy_pct`, `price_cagr_5yr_pct`) and one metadata field (`metadata_json[us_net_import_reliance]`) are written by `ingest-mcs-prices` and `ingest-usgs` but **not yet read by any scorer** — see `docs/data-sources.md` "Stored but unconsumed" for the wiring backlog.
 
 ### Material Concentration
 

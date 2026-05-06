@@ -111,154 +111,656 @@ def ingest_cmd(
 def ingest_usgs_cmd(
     filepath: str = typer.Argument(
         ...,
-        help="Path to MCS2025_World_Data.csv downloaded from https://pubs.usgs.gov/publication/mcs2025",
+        help=(
+            "Path to MCS world data CSV. Either MCS2025_World_Data.csv (wide "
+            "format, country×year columns) or MCS2026_Commodities_Data.csv "
+            "(long format, one row per chapter×country×stat×year). Format "
+            "is auto-detected from headers unless --csv-format is set."
+        ),
     ),
     force: bool = typer.Option(
         False,
         "--force",
         help="Upsert: update existing materials even if they already exist.",
     ),
-    mcs_year: int = typer.Option(
-        2025,
+    mcs_year: Optional[int] = typer.Option(
+        None,
         "--mcs-year",
-        help="Publication year of the MCS file (used as reference_year in material_criticality_signals).",
+        help=(
+            "Publication year of the MCS file (used as reference_year in "
+            "material_criticality_signals).  Defaults to 2025 for the wide "
+            "format and 2026 for the long format."
+        ),
+    ),
+    csv_format: str = typer.Option(
+        "auto",
+        "--csv-format",
+        help="CSV format: auto | 2025 | 2026.  Auto-detects from column headers.",
     ),
 ) -> None:
     """Ingest USGS Mineral Commodity Summaries data from the official CSV.
 
-    Derives material_production_shares (ranked by mine production) and
-    criticality_score (normalised HHI) directly from USGS data.
-    No synthetic values. Re-run annually when USGS publishes a new MCS.
+    Phase B refactor (May 2026): canonical-name resolution now goes
+    through ``material_source_aliases``.  Materials must already exist
+    in the ``materials`` table (run ``seed-materials`` first); this
+    command writes signals only — it does NOT create materials.
 
-    Also writes source=usgs_mcs rows into material_criticality_signals and
-    syncs the denormalized materials.patent_occurrence_trend cache.
+    Skipped chapters (e.g. ABRASIVES, ARSENIC) are silently dropped per
+    the alias table's ``is_skipped=true`` rows.  Unknown chapters log a
+    warning so partner can decide whether to add an alias or a skip row.
+
+    For the 2026 long-format CSV: additionally writes per-HS-node
+    production shares for sub-typed materials (Silicon ferrosilicon vs
+    metal, Copper mine vs refinery) AND US import-source shares (with
+    market_scope='us') from the 'Import Sources' section.
     """
-    import sqlalchemy as sa
     from pathlib import Path
     from app.models.criticality_signal import MaterialCriticalitySignal
-    from app.models.supply import Material
     from app.services.ingestion.seeds.usgs_mcs_parser import parse_usgs_csv
+    from app.services.ingestion.seeds.mcs2026_parser import parse_mcs2026_csv
+    from app.services.ingestion.material_resolver import MaterialAliasResolver
 
     path = Path(filepath)
     if not path.exists():
         typer.echo(f"File not found: {filepath}", err=True)
         raise typer.Exit(code=1)
 
-    materials = parse_usgs_csv(path)
-    if not materials:
-        typer.echo("No materials parsed — check the file format.", err=True)
+    # ── Format detection ──────────────────────────────────────────────────
+    # 2026 long format: header includes "MCS chapter" as the first column.
+    # 2025 wide format: header has "Commodity" + per-year columns like
+    # "World mine production 2024".  We sniff the first line in cp1252
+    # (handles em-dashes that appear in 2026; harmless for 2025).
+    detected = csv_format
+    if csv_format == "auto":
+        with open(path, encoding="cp1252", errors="replace") as f:
+            first_line = f.readline()
+        if "MCS chapter" in first_line:
+            detected = "2026"
+        else:
+            detected = "2025"
+        typer.echo(f"  [info] auto-detected MCS CSV format: {detected}", err=True)
+    elif csv_format not in ("2025", "2026"):
+        typer.echo(
+            f"Invalid --csv-format {csv_format!r}; must be auto|2025|2026.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Default mcs_year per format if the user didn't pass --mcs-year.
+    if mcs_year is None:
+        mcs_year = 2026 if detected == "2026" else 2025
+
+    if detected == "2026":
+        records = parse_mcs2026_csv(path)
+    else:
+        records = parse_usgs_csv(path)
+    if not records:
+        typer.echo("No records parsed — check the file format.", err=True)
         raise typer.Exit(code=1)
 
     s = _session()
     try:
-        existing_count = s.scalar(
-            select(sa.func.count()).select_from(Material)
-        ) or 0
+        from app.models.supply import (
+            HsCodeMaterialMapping,
+            HsCodeProductionShare,
+            MaterialProductionShare,
+        )
 
-        if existing_count > 0 and not force:
-            typer.echo(json.dumps({
-                "ok": False,
-                "reason": f"materials table already has {existing_count} rows. Use --force to upsert.",
-            }, indent=2))
-            raise typer.Exit(code=1)
-
-        from app.models.supply import MaterialProductionShare
-
-        inserted = updated = signals_written = 0
+        resolver = MaterialAliasResolver(s)
+        signals_written = 0
         shares_written = 0
-        for m in materials:
-            # Strip internal keys before creating ORM objects.
-            hhi_score = m.pop("_hhi_score", None)
-            reserve_hhi_score = m.pop("_reserve_hhi_score", None)
-            reserve_life_index = m.pop("_reserve_life_index", None)
-            production_yoy_pct = m.pop("_production_yoy_pct", None)
-            capacity_utilization = m.pop("_capacity_utilization", None)
-            production_shares = m.pop("_production_shares", [])
-            m.pop("primary_producing_countries", None)  # column dropped in migration 023
+        hs_shares_written = 0
+        hs_shares_skipped_no_mapping = 0
+        us_import_shares_written = 0
+        us_import_shares_skipped_no_mapping = 0
+        resolved_canonicals: list[str] = []
+        skipped_aliases: list[str] = []
+        unknown_aliases: list[str] = []
 
-            row = s.scalar(select(Material).where(Material.canonical_name == m["canonical_name"]))
-            if row is None:
-                row = Material(**m)
-                s.add(row)
-                s.flush()
-                inserted += 1
-            elif force:
-                for k, v in m.items():
-                    if k != "canonical_name":
-                        setattr(row, k, v)
-                s.flush()
-                updated += 1
+        for rec in records:
+            source_system = rec.pop("source_system", None)
+            source_name = rec.pop("source_name", None)
+            if not (source_system and source_name):
+                continue
 
-            # Write / upsert a material_criticality_signals row for this material.
-            # Idempotent: if the row exists, update criticality_score and hhi_score.
-            existing_signal = s.scalar(
-                select(MaterialCriticalitySignal).where(
-                    MaterialCriticalitySignal.material_id == row.id,
-                    MaterialCriticalitySignal.source == "usgs_mcs",
-                    MaterialCriticalitySignal.reference_year == mcs_year,
+            result = resolver.resolve(source_system, source_name)
+            if result.status == "skipped":
+                skipped_aliases.append(source_name)
+                continue
+            if result.status == "unknown":
+                unknown_aliases.append(source_name)
+                typer.echo(
+                    f"  [unknown] no alias for ({source_system!r}, "
+                    f"{source_name!r}) — add a row to "
+                    f"seed_material_source_aliases.py and re-run "
+                    f"`seed-material-aliases --force-update`.",
+                    err=True,
                 )
-            )
-            trend = m.get("patent_occurrence_trend")
-            if existing_signal is None:
-                s.add(MaterialCriticalitySignal(
-                    material_id=row.id,
-                    source="usgs_mcs",
-                    reference_year=mcs_year,
-                    criticality_score=row.criticality_score,
-                    trend_direction=trend,
-                    hhi_score=hhi_score,
-                    reserve_hhi_score=reserve_hhi_score,
-                    reserve_life_index=reserve_life_index,
-                    production_yoy_pct=production_yoy_pct,
-                    capacity_utilization=capacity_utilization,
-                    metadata_json={"mcs_publication_year": mcs_year},
-                ))
-                signals_written += 1
-            elif force:
-                existing_signal.criticality_score = row.criticality_score
-                existing_signal.hhi_score = hhi_score
-                existing_signal.reserve_hhi_score = reserve_hhi_score
-                existing_signal.reserve_life_index = reserve_life_index
-                existing_signal.production_yoy_pct = production_yoy_pct
-                existing_signal.capacity_utilization = capacity_utilization
-                existing_signal.trend_direction = trend
-                signals_written += 1
+                continue
+            material = result.material
+            assert material is not None  # status == "ok"
+            # Secondary chapters (e.g. BAUXITE AND ALUMINA → Aluminum)
+            # share a canonical with a primary chapter; only the primary
+            # writes material-level signals.  Secondary still contributes
+            # per-HS-prefix shares so its country distributions land in
+            # hs_code_production_shares.
+            writes_material_signals = result.writes_material_signals
+            if writes_material_signals:
+                resolved_canonicals.append(material.canonical_name)
+            else:
+                resolved_canonicals.append(
+                    f"{material.canonical_name} (secondary: {source_name!r})"
+                )
 
-            # Upsert production share rows for each producing country.
-            for share in production_shares:
-                existing_share = s.scalar(
-                    select(MaterialProductionShare).where(
-                        MaterialProductionShare.material_id == row.id,
-                        MaterialProductionShare.country_code == share["country_code"],
-                        MaterialProductionShare.reference_year == mcs_year,
+            # ── Pull signal fields out of the record ──────────────────────
+            criticality_score = rec.get("criticality_score")
+            hhi_score = rec.get("hhi_score")
+            reserve_hhi_score = rec.get("reserve_hhi_score")
+            reserve_life_index = rec.get("reserve_life_index")
+            production_yoy_pct = rec.get("production_yoy_pct")
+            capacity_utilization = rec.get("capacity_utilization")
+            production_shares = rec.get("production_shares") or []
+            hs_production_shares = rec.get("hs_production_shares") or []
+            us_import_sources = rec.get("us_import_sources") or []
+            us_net_import_reliance = rec.get("us_net_import_reliance")
+            apparent_consumption = rec.get("apparent_consumption")
+            price_unit_usgs = rec.get("price_unit_usgs")
+
+            # ── Material-level writes: skip for secondary chapters ────────
+            # Secondary chapters share a canonical with a primary sibling
+            # (e.g. BAUXITE AND ALUMINA → Aluminum, where ALUMINUM is the
+            # primary).  Writing material-level signals from the secondary
+            # would overwrite the primary's values via the unique key
+            # (material_id, source, reference_year).  Per-HS-prefix shares
+            # below are still written because they route to distinct HS
+            # prefixes (bauxite to 2606, aluminum to 7601 — no collision).
+            if writes_material_signals:
+                # USGS-derived price_unit: only write when material.price_unit
+                # is currently NULL.  Protects partner-set values (e.g. Sodium
+                # "per_mt", REE "per_kg") from being overwritten.
+                if price_unit_usgs is not None and material.price_unit is None:
+                    material.price_unit = price_unit_usgs
+
+                # Back-sync the materials.criticality_score cache.
+                if criticality_score is not None:
+                    material.criticality_score = criticality_score
+
+                # ── material_criticality_signals upsert ───────────────────
+                existing_signal = s.scalar(
+                    select(MaterialCriticalitySignal).where(
+                        MaterialCriticalitySignal.material_id == material.id,
+                        MaterialCriticalitySignal.source == "usgs_mcs",
+                        MaterialCriticalitySignal.reference_year == mcs_year,
                     )
                 )
-                if existing_share is None:
-                    s.add(MaterialProductionShare(
-                        material_id=row.id,
-                        country_code=share["country_code"],
+                # us_net_import_reliance / apparent_consumption now live in
+                # typed columns (migration 038) — write directly there.
+                # metadata_json keeps lighter-weight extras only
+                # (mcs_publication_year, fig10_source_rows etc.).
+                signal_meta: dict = {"mcs_publication_year": mcs_year}
+
+                if existing_signal is None:
+                    s.add(MaterialCriticalitySignal(
+                        material_id=material.id,
+                        source="usgs_mcs",
                         reference_year=mcs_year,
-                        production_volume=share["production_volume"],
-                        production_share=share["production_share"],
-                        unit_of_measure=share.get("unit_of_measure"),
-                        data_source="usgs_mcs",
+                        criticality_score=criticality_score,
+                        hhi_score=hhi_score,
+                        reserve_hhi_score=reserve_hhi_score,
+                        reserve_life_index=reserve_life_index,
+                        production_yoy_pct=production_yoy_pct,
+                        capacity_utilization=capacity_utilization,
+                        us_net_import_reliance_pct=us_net_import_reliance,
+                        us_apparent_consumption=apparent_consumption,
+                        metadata_json=signal_meta,
                     ))
-                    shares_written += 1
+                    signals_written += 1
                 elif force:
-                    existing_share.production_volume = share["production_volume"]
-                    existing_share.production_share = share["production_share"]
-                    existing_share.unit_of_measure = share.get("unit_of_measure")
-                    shares_written += 1
+                    existing_signal.criticality_score = criticality_score
+                    existing_signal.hhi_score = hhi_score
+                    existing_signal.reserve_hhi_score = reserve_hhi_score
+                    existing_signal.reserve_life_index = reserve_life_index
+                    existing_signal.production_yoy_pct = production_yoy_pct
+                    existing_signal.capacity_utilization = capacity_utilization
+                    existing_signal.us_net_import_reliance_pct = us_net_import_reliance
+                    existing_signal.us_apparent_consumption = apparent_consumption
+                    merged = dict(existing_signal.metadata_json or {})
+                    merged.update(signal_meta)
+                    existing_signal.metadata_json = merged
+                    signals_written += 1
+
+                # ── material_production_shares upsert ─────────────────────
+                for share in production_shares:
+                    existing_share = s.scalar(
+                        select(MaterialProductionShare).where(
+                            MaterialProductionShare.material_id == material.id,
+                            MaterialProductionShare.country_code == share["country_code"],
+                            MaterialProductionShare.reference_year == mcs_year,
+                        )
+                    )
+                    if existing_share is None:
+                        s.add(MaterialProductionShare(
+                            material_id=material.id,
+                            country_code=share["country_code"],
+                            reference_year=mcs_year,
+                            production_volume=share["production_volume"],
+                            production_share=share["production_share"],
+                            unit_of_measure=share.get("unit_of_measure"),
+                            data_source="usgs_mcs",
+                        ))
+                        shares_written += 1
+                    elif force:
+                        existing_share.production_volume = share["production_volume"]
+                        existing_share.production_share = share["production_share"]
+                        existing_share.unit_of_measure = share.get("unit_of_measure")
+                        shares_written += 1
+
+            # ── Per-HS-node global production shares ─────────────────────
+            # Sub-type splits (Silicon ferrosilicon vs metal, Copper mine vs
+            # refinery).  Looks up hs_mapping_id via (material_id, prefix,
+            # scope='global') and upserts into hs_code_production_shares.
+            for hs_share in hs_production_shares:
+                hs_prefix = hs_share["hs_code_prefix"]
+                hs_mapping = s.scalar(
+                    select(HsCodeMaterialMapping).where(
+                        HsCodeMaterialMapping.material_id == material.id,
+                        HsCodeMaterialMapping.hs_code_prefix == hs_prefix,
+                        HsCodeMaterialMapping.market_scope == "global",
+                    )
+                )
+                if hs_mapping is None:
+                    hs_shares_skipped_no_mapping += 1
+                    typer.echo(
+                        f"  [skip] no hs_code_material_mappings row for "
+                        f"({material.canonical_name!r}, {hs_prefix!r}, global) — "
+                        f"run seed-hs-mappings first",
+                        err=True,
+                    )
+                    continue
+                existing_hs_share = s.scalar(
+                    select(HsCodeProductionShare).where(
+                        HsCodeProductionShare.hs_mapping_id == hs_mapping.id,
+                        HsCodeProductionShare.country_code == hs_share["country_code"],
+                        HsCodeProductionShare.reference_year == mcs_year,
+                        HsCodeProductionShare.market_scope == "global",
+                        HsCodeProductionShare.source == "usgs_mcs",
+                    )
+                )
+                if existing_hs_share is None:
+                    s.add(HsCodeProductionShare(
+                        hs_mapping_id=hs_mapping.id,
+                        country_code=hs_share["country_code"],
+                        reference_year=mcs_year,
+                        production_share=hs_share["production_share"],
+                        production_volume=hs_share["production_volume"],
+                        market_scope="global",
+                        source="usgs_mcs",
+                        notes=(
+                            f"CSV sub-type: {hs_share['type_substring']!r} — "
+                            f"derived from MCS {mcs_year} World Data CSV"
+                        ),
+                    ))
+                    hs_shares_written += 1
+                elif force:
+                    existing_hs_share.production_share = hs_share["production_share"]
+                    existing_hs_share.production_volume = hs_share["production_volume"]
+                    hs_shares_written += 1
+
+            # ── US import-source rows (market_scope='us', 2026 only) ──────
+            # Each Import Sources row tells us what fraction of US imports
+            # of a given sub-type came from a given country.  Stored with
+            # market_scope='us' so global HHI computations aren't
+            # contaminated.
+            #
+            # Sub-type → HS-prefix resolution happens in three layers
+            # (May 2026):
+            #   1. Parser-internal _DETAIL_TO_HS_PREFIX  (Silicon ferrosilicon
+            #      vs metal, Copper mine vs refinery — explicit per-chapter rules)
+            #   2. Keyword-based DB lookup  — match the sub-type substring
+            #      against partner-curated keywords on this material's HS
+            #      mappings (e.g. "oxide" → 282580 for Antimony).  Covers
+            #      ~55 of the 60 collision cases observed in MCS 2026.
+            #   3. Fall back to material.hs_codes[0]  — last-resort default.
+            # The dedup pass below handles any remaining collisions.
+            material_primary_prefix = ""
+            if material.hs_codes:
+                material_primary_prefix = material.hs_codes[0].replace(".", "")
+
+            # Build keyword lookup once per material: list of
+            # (hs_prefix, [lowercase_keywords]).  Used by the keyword-
+            # resolution step below.
+            kw_rows = s.execute(
+                select(
+                    HsCodeMaterialMapping.hs_code_prefix,
+                    HsCodeMaterialMapping.keywords,
+                ).where(
+                    HsCodeMaterialMapping.material_id == material.id,
+                    HsCodeMaterialMapping.market_scope == "global",
+                    HsCodeMaterialMapping.keywords.is_not(None),
+                )
+            ).all()
+            kw_lookup: list[tuple[str, list[str]]] = []
+            for prefix, kws in kw_rows:
+                if not kws:
+                    continue
+                kw_lookup.append((prefix, [str(k).lower() for k in kws]))
+
+            def _resolve_via_keywords(detail: str) -> Optional[str]:
+                """Match an MCS sub-type against partner-curated keywords.
+
+                Substring match in either direction (keyword in detail OR
+                detail in keyword).  When multiple HS prefixes match, the
+                LONGEST keyword wins — encodes specificity ("ferrochromium,
+                low-carbon" > "ferrochromium" > "metal").
+                """
+                sub_low = (detail or "").lower().strip()
+                if not sub_low:
+                    return None
+                matches: list[tuple[int, str]] = []
+                for prefix, kws in kw_lookup:
+                    for kw in kws:
+                        if kw in sub_low or sub_low in kw:
+                            matches.append((len(kw), prefix))
+                            break  # one match per prefix is enough
+                if not matches:
+                    return None
+                matches.sort(reverse=True)
+                return matches[0][1]
+
+            # Many MCS chapters publish multiple Import Sources sub-types
+            # (e.g. Antimony: 'oxide' / 'unwrought metal' / 'total metal
+            # and oxide').  After keyword resolution, sub-types that
+            # didn't match a keyword fall back to material.hs_codes[0]
+            # and may collide on the unique key.  The dedup pass keeps
+            # one row per (prefix, country), preferring the row whose
+            # sub-type label contains 'total' / 'all forms' / etc.; ties
+            # broken by largest share.  All collapsed sub-types are
+            # recorded in the notes field so the audit trail survives.
+            _TOTAL_SUBSTRINGS = ("total", "all forms", "all imports", "all countries")
+
+            def _is_total_subtype(s: str) -> bool:
+                low = (s or "").lower()
+                return any(t in low for t in _TOTAL_SUBSTRINGS)
+
+            deduped: dict[tuple[str, str], dict] = {}
+            for src in us_import_sources:
+                # Resolve hs_code_prefix in priority order:
+                # parser-routed → keyword-resolved → primary-fallback
+                hs_prefix = src.get("hs_code_prefix")
+                if not hs_prefix:
+                    hs_prefix = _resolve_via_keywords(src.get("type_substring", ""))
+                if not hs_prefix:
+                    hs_prefix = material_primary_prefix
+                if not hs_prefix:
+                    us_import_shares_skipped_no_mapping += 1
+                    continue
+                key = (hs_prefix, src["country_code"])
+                cand_total = _is_total_subtype(src.get("type_substring", ""))
+                if key not in deduped:
+                    deduped[key] = {
+                        "src": src,
+                        "is_total": cand_total,
+                        "subtypes": [src.get("type_substring", "") or "(unspecified)"],
+                        "hs_prefix": hs_prefix,
+                    }
+                    continue
+                existing = deduped[key]
+                existing["subtypes"].append(
+                    src.get("type_substring", "") or "(unspecified)",
+                )
+                # Decide whether to swap.  Keep existing unless the
+                # candidate strictly outranks it.
+                if cand_total and not existing["is_total"]:
+                    existing["src"] = src
+                    existing["is_total"] = True
+                elif cand_total == existing["is_total"]:
+                    if src.get("production_share", 0) > existing["src"].get("production_share", 0):
+                        existing["src"] = src
+                # else: existing wins (it's a 'total' row, candidate isn't)
+
+            for (hs_prefix, country_code), entry in deduped.items():
+                src = entry["src"]
+                subtypes = entry["subtypes"]
+                hs_mapping = s.scalar(
+                    select(HsCodeMaterialMapping).where(
+                        HsCodeMaterialMapping.material_id == material.id,
+                        HsCodeMaterialMapping.hs_code_prefix == hs_prefix,
+                        HsCodeMaterialMapping.market_scope == "global",
+                    )
+                )
+                if hs_mapping is None:
+                    us_import_shares_skipped_no_mapping += 1
+                    typer.echo(
+                        f"  [skip-us] no hs_code_material_mappings row for "
+                        f"({material.canonical_name!r}, {hs_prefix!r}, global) — "
+                        f"run seed-hs-mappings first",
+                        err=True,
+                    )
+                    continue
+                # Build the notes — flag when multiple sub-types collapsed.
+                if len(subtypes) == 1:
+                    notes_text = (
+                        f"US import source: {subtypes[0]!r} "
+                        f"({src.get('reference_year_range', '')}) — "
+                        f"derived from MCS {mcs_year} Import Sources section"
+                    )
+                else:
+                    chosen = src.get("type_substring", "") or "(unspecified)"
+                    notes_text = (
+                        f"US import source: {chosen!r} chosen from "
+                        f"{len(subtypes)} sub-types {subtypes} "
+                        f"({src.get('reference_year_range', '')}) — "
+                        f"derived from MCS {mcs_year} Import Sources section. "
+                        f"Multi-sub-type collapse — see hs_code_production_shares "
+                        f"notes for the chosen-row provenance."
+                    )
+
+                existing_us_share = s.scalar(
+                    select(HsCodeProductionShare).where(
+                        HsCodeProductionShare.hs_mapping_id == hs_mapping.id,
+                        HsCodeProductionShare.country_code == country_code,
+                        HsCodeProductionShare.reference_year == mcs_year,
+                        HsCodeProductionShare.market_scope == "us",
+                        HsCodeProductionShare.source == "usgs_mcs",
+                    )
+                )
+                if existing_us_share is None:
+                    s.add(HsCodeProductionShare(
+                        hs_mapping_id=hs_mapping.id,
+                        country_code=country_code,
+                        reference_year=mcs_year,
+                        production_share=src["production_share"],
+                        production_volume=None,
+                        market_scope="us",
+                        source="usgs_mcs",
+                        notes=notes_text,
+                    ))
+                    us_import_shares_written += 1
+                elif force:
+                    existing_us_share.production_share = src["production_share"]
+                    existing_us_share.notes = notes_text
+                    us_import_shares_written += 1
 
         s.commit()
         typer.echo(json.dumps({
             "ok": True,
             "source": f"USGS Mineral Commodity Summaries {mcs_year}",
-            "inserted": inserted,
-            "updated": updated,
+            "csv_format": detected,
+            "records_resolved": len(resolved_canonicals),
+            "records_skipped_via_alias": len(skipped_aliases),
+            "records_unknown": len(unknown_aliases),
             "signals_written": signals_written,
             "shares_written": shares_written,
-            "materials": [m["canonical_name"] for m in materials],
+            "hs_shares_written": hs_shares_written,
+            "hs_shares_skipped_no_mapping": hs_shares_skipped_no_mapping,
+            "us_import_shares_written": us_import_shares_written,
+            "us_import_shares_skipped_no_mapping": us_import_shares_skipped_no_mapping,
+            "materials": sorted(set(resolved_canonicals)),
+            "skipped_via_alias": sorted(set(skipped_aliases)),
+            "unknown_source_names": sorted(set(unknown_aliases)),
+        }, indent=2))
+    finally:
+        s.close()
+
+
+@app.command("ingest-mcs-prices")
+def ingest_mcs_prices_cmd(
+    filepath: str = typer.Argument(
+        ...,
+        help=(
+            "Path to MCS Fig 10 price growth CSV (e.g. "
+            "data/usgs/2026/MCS2026_Fig10_Price_Growth_Rates.csv)."
+        ),
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Update price columns even if already populated for this material+year.",
+    ),
+    mcs_year: int = typer.Option(
+        2026,
+        "--mcs-year",
+        help=(
+            "Publication year of the MCS file (joins to the same "
+            "material_criticality_signals row written by ingest-usgs)."
+        ),
+    ),
+) -> None:
+    """Ingest USGS MCS Fig 10 price-growth rates into material_criticality_signals.
+
+    Reads the supplementary Fig 10 CSV and writes price_yoy_pct and
+    price_cagr_5yr_pct onto the existing usgs_mcs signal row for each
+    material (creating the row if it doesn't exist yet — useful for
+    materials in seed_materials but not in the main MCS chapter map,
+    e.g. individual REEs).
+
+    Run after ingest-usgs so the signal row already exists; otherwise
+    this command will create skeleton rows with only price metrics
+    populated.
+
+    Idempotent without --force: skips rows where price_yoy_pct is
+    already non-null.  --force overwrites.
+    """
+    from collections import defaultdict
+    from pathlib import Path
+    from app.models.criticality_signal import MaterialCriticalitySignal
+    from app.services.ingestion.seeds.mcs2026_fig10_parser import (
+        parse_mcs2026_fig10_csv,
+    )
+    from app.services.ingestion.material_resolver import MaterialAliasResolver
+
+    path = Path(filepath)
+    if not path.exists():
+        typer.echo(f"File not found: {filepath}", err=True)
+        raise typer.Exit(code=1)
+
+    raw_rows = parse_mcs2026_fig10_csv(path)
+    if not raw_rows:
+        typer.echo("No price rows parsed — check the file format.", err=True)
+        raise typer.Exit(code=1)
+
+    s = _session()
+    try:
+        resolver = MaterialAliasResolver(s)
+
+        # ── Resolve each raw row, then aggregate by canonical material ────
+        # Multiple Fig 10 rows can map to the same canonical (e.g. both
+        # Fluorspar grades → "Fluorspar"; 10 individual REE oxides →
+        # "Rare Earth Elements"); we average the metrics across them.
+        # arithmetic mean is the simplest defensible aggregation given
+        # Fig 10 carries no volume weights.
+        bucket: dict[int, dict] = defaultdict(
+            lambda: {"yoy": [], "cagr": [], "sources": [], "material": None}
+        )
+        skipped_aliases: list[str] = []
+        unknown_aliases: list[str] = []
+
+        for r in raw_rows:
+            result = resolver.resolve(r["source_system"], r["source_name"])
+            material, status = result.material, result.status
+            if status == "skipped":
+                skipped_aliases.append(r["source_name"])
+                continue
+            if status == "unknown":
+                unknown_aliases.append(r["source_name"])
+                typer.echo(
+                    f"  [unknown] no alias for ('fig10_prices', "
+                    f"{r['source_name']!r}) — add a row to "
+                    f"seed_material_source_aliases.py.",
+                    err=True,
+                )
+                continue
+            assert material is not None
+            b = bucket[material.id]
+            b["material"] = material
+            if r["price_yoy_pct"] is not None:
+                b["yoy"].append(r["price_yoy_pct"])
+            if r["price_cagr_5yr_pct"] is not None:
+                b["cagr"].append(r["price_cagr_5yr_pct"])
+            b["sources"].append(r["source_name"])
+
+        rows_inserted = 0
+        rows_updated = 0
+        rows_skipped_existing = 0
+
+        for mat_id, b in bucket.items():
+            material = b["material"]
+            avg_yoy = (
+                round(sum(b["yoy"]) / len(b["yoy"]), 4) if b["yoy"] else None
+            )
+            avg_cagr = (
+                round(sum(b["cagr"]) / len(b["cagr"]), 4) if b["cagr"] else None
+            )
+            sources = b["sources"]
+
+            signal = s.scalar(
+                select(MaterialCriticalitySignal).where(
+                    MaterialCriticalitySignal.material_id == mat_id,
+                    MaterialCriticalitySignal.source == "usgs_mcs",
+                    MaterialCriticalitySignal.reference_year == mcs_year,
+                )
+            )
+            if signal is None:
+                # Create a skeleton signal row.  Other supply metrics
+                # (HHI, production_yoy_pct etc.) stay NULL until
+                # ingest-usgs runs for this material.
+                signal = MaterialCriticalitySignal(
+                    material_id=mat_id,
+                    source="usgs_mcs",
+                    reference_year=mcs_year,
+                    price_yoy_pct=avg_yoy,
+                    price_cagr_5yr_pct=avg_cagr,
+                    metadata_json={
+                        "mcs_publication_year": mcs_year,
+                        "fig10_source_rows": sources,
+                    },
+                )
+                s.add(signal)
+                rows_inserted += 1
+                continue
+
+            if signal.price_yoy_pct is not None and not force:
+                rows_skipped_existing += 1
+                continue
+
+            signal.price_yoy_pct = avg_yoy
+            signal.price_cagr_5yr_pct = avg_cagr
+            meta = dict(signal.metadata_json or {})
+            meta["fig10_source_rows"] = sources
+            signal.metadata_json = meta
+            rows_updated += 1
+
+        s.commit()
+        typer.echo(json.dumps({
+            "ok": True,
+            "source": f"USGS MCS {mcs_year} Fig 10 — Price Growth Rates",
+            "rows_in_csv": len(raw_rows),
+            "materials_resolved": len(bucket),
+            "rows_inserted": rows_inserted,
+            "rows_updated": rows_updated,
+            "rows_skipped_existing_use_force": rows_skipped_existing,
+            "skipped_via_alias": sorted(set(skipped_aliases)),
+            "unknown_source_names": sorted(set(unknown_aliases)),
         }, indent=2))
     finally:
         s.close()
@@ -287,38 +789,127 @@ def seed_materials_cmd() -> None:
         s.close()
 
 
+@app.command("seed-material-aliases")
+def seed_material_aliases_cmd(
+    force_update: bool = typer.Option(
+        False,
+        "--force-update",
+        help=(
+            "Update existing alias rows (canonical mapping, is_skipped, "
+            "skip_reason) when re-seeding.  Use after editing the alias "
+            "lists in seed_material_source_aliases.py."
+        ),
+    ),
+) -> None:
+    """Seed the material_source_aliases reference table.
+
+    Translates external commodity names (USGS MCS chapters, Fig 10
+    commodity rows, MCS PDF headings, etc.) to canonical material rows.
+    Replaces the four legacy Python dicts (``_CHAPTER_TO_MATERIAL``,
+    ``_PRICE_NAME_TO_MATERIAL``, ``_MCS_COMMODITY_MAP``,
+    ``_COMMODITY_CONFIG``) with one DB-backed register.
+
+    Run AFTER ``seed-materials`` (alias rows FK-reference materials.id).
+
+    Idempotent without --force-update: skips existing alias rows so a
+    re-seed is a no-op.  With --force-update: rewrites the canonical
+    mapping / skip flag / skip reason so partner edits propagate.
+    """
+    from app.services.ingestion.seed_material_source_aliases import run_seed
+
+    s = _session()
+    try:
+        result = run_seed(s, force_update=force_update)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("seed-regulation-aliases")
+def seed_regulation_aliases_cmd(
+    force_update: bool = typer.Option(
+        False,
+        "--force-update",
+        help=(
+            "Update existing alias rows (regulation_id mapping, is_skipped, "
+            "skip_reason) when re-seeding.  Use after editing the alias "
+            "lists in seed_regulation_aliases.py."
+        ),
+    ),
+) -> None:
+    """Seed the regulation_aliases reference table.
+
+    Translates external regulation identifiers (EUR-Lex CELEX numbers,
+    Federal Register document IDs, US Code citations, etc.) to canonical
+    regulation rows.  Mirrors seed-material-aliases for the regulations
+    schema.
+
+    Run AFTER ``seed-regulations`` (alias rows FK-reference regulations.id).
+
+    Idempotent without --force-update: skips existing alias rows so a
+    re-seed is a no-op.  With --force-update: rewrites the canonical
+    mapping / skip flag / skip reason so partner edits propagate.
+    """
+    from app.services.ingestion.seed_regulation_aliases import run_seed
+
+    s = _session()
+    try:
+        result = run_seed(s, force_update=force_update)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("seed-hs-mappings")
 def seed_hs_mappings_cmd(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Drop and re-seed all HS mappings (use after HS nomenclature update).",
+        help=(
+            "Update curated fields (description, confidence, supply_chain_stage, "
+            "stage_sequence, digit_count, keywords) on existing rows.  "
+            "Non-destructive — does NOT delete rows added by ingest-mcs-pdf "
+            "or other ingesters; preserves auto-created 6-digit stubs and "
+            "10-digit HTS rows.  Use after editing _MAPPINGS or "
+            "_HS_KEYWORDS_BY_MAPPING."
+        ),
     ),
 ) -> None:
-    """Seed the hs_code_material_mappings table from the curated reference list.
+    """Seed hs_code_material_mappings from the curated _MAPPINGS table.
 
-    Idempotent without --force: skips existing (hs_code_prefix, material_id) pairs.
-    With --force: deletes all existing rows and re-inserts from scratch.
+    Idempotent without --force: skips existing (hs_code_prefix, material_id)
+    pairs.  Inserts rows from _MAPPINGS that don't yet exist.
+
+    With --force: in-place UPDATE of curated fields on existing rows.  Does
+    NOT delete any rows — auto-added rows from ingest-mcs-pdf (6-digit stubs
+    and 10-digit HTS codes) and any partner-curated entries are preserved.
+    Pass-through to ``upsert_hs_mappings(force=True)``; also overwrites
+    keywords on rows whose ``keywords`` array is already populated.
 
     Re-run when:
-    - New materials are added to the materials table
-    - WCO updates the HS nomenclature (every 5 years)
-    - A material's HS code classification changes
+      * New materials are added to the materials table
+      * A material's HS code classification changes in _MAPPINGS
+      * Stage assignments or confidence values are corrected
+      * Keyword definitions in _HS_KEYWORDS_BY_MAPPING change
 
-    Note: materials must be seeded first (run seed-materials or ingest-usgs).
+    Note: materials must be seeded first (run seed-materials).
+
+    For a true rebuild from scratch (e.g. WCO HS nomenclature update), do
+    that as a targeted SQL migration — blanket-deleting this table
+    cascade-deletes hs_code_production_shares and SET NULLs
+    risk_events.hs_mapping_id, which is rarely what you want.
     """
-    import sqlalchemy as sa
     from app.services.ingestion.seed_hs_mappings import upsert_hs_mappings
-    from app.models.supply import HsCodeMaterialMapping
 
     s = _session()
     try:
-        if force:
-            s.execute(sa.delete(HsCodeMaterialMapping))
-            s.commit()
-            typer.echo("Cleared existing HS mappings.")
-
-        result = upsert_hs_mappings(s)
+        result = upsert_hs_mappings(s, force=force)
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
@@ -991,7 +1582,7 @@ def seed_regulations_cmd() -> None:
     regulation_geography_scope, and company_regulation_exposure.
 
     This unblocks the regulatory pillar (20% of company score). The three scored
-    obligations are UFLPA (25 pts), EU_BATTERY_REG (20 pts), IRA_DOMESTIC (15 pts).
+    obligations are UFLPA (25 pts), EU_BATTERY_REG_2023 (20 pts), IRA_DOMESTIC (15 pts).
     Only non_compliant / partial / unknown rows generate scoring uplift.
 
     Idempotent: safe to re-run after updating compliance statuses in the seed file.
@@ -1022,19 +1613,31 @@ def ingest_eurlex_cmd(
         help="Skip fetching summary text from EUR-Lex (faster, no network required).",
     ),
 ) -> None:
-    """Upsert EU battery supply chain regulations from the EUR-Lex manifest.
+    """Refresh EUR-Lex regulation summaries and create regulatory risk events.
 
-    Seeds the regulations table with the EU Battery Regulation (2023/1542),
-    CRMA (2024/1252), CBAM, CSDDD, Conflict Minerals Regulation, and REACH
-    cobalt restrictions — along with their material and geography scope records.
+    Iterates every active CELEX number in ``regulation_aliases``
+    (source_system='eurlex_celex') and:
+      * Backfills ``Regulation.summary`` from EUR-Lex HTML when NULL.
+      * Bumps ``metadata_json.last_seen`` for freshness tracking.
+      * Attaches ``source_document_id`` if not yet set.
+      * Creates one ``RiskEvent`` + ``RiskEventRegulation`` junction
+        per regulation (idempotent).
 
-    Idempotent: re-running will not duplicate rows. Fetches plain-text summaries
-    from EUR-Lex HTML unless --no-fetch is passed.
+    Does NOT create regulations.  CELEX numbers without an alias row
+    are surfaced as warnings — to track a new EU regulation, add it to
+    ``seed_regulations.py:_REGULATIONS`` and ``seed_regulation_aliases.py:_EURLEX_CELEX``,
+    then re-run ``seed-regulations`` and ``seed-regulation-aliases``.
 
-    Run this after seed-materials so material_id lookups resolve correctly:
+    Idempotent: re-runs only refresh mutable fields and never duplicate
+    risk events.  Pass ``--no-fetch`` to skip the HTTP fetch entirely
+    (faster, no network required).
+
+    Run order on a fresh DB:
 
     \b
       bdi-ingest seed-materials
+      bdi-ingest seed-regulations
+      bdi-ingest seed-regulation-aliases
       bdi-ingest ingest-eurlex
     """
     from app.services.ingestion.eurlex import ingest_eurlex
@@ -2338,8 +2941,9 @@ def setup_all_cmd(
         None,
         "--usgs-file",
         help=(
-            "Path to MCS world data CSV (e.g. MCS2025_World_Data.csv). "
-            "Download from https://pubs.usgs.gov/publication/mcs2025. "
+            "Path to MCS world data CSV (e.g. MCS2025_World_Data.csv or "
+            "MCS2026_Commodities_Data.csv). "
+            "Download from https://pubs.usgs.gov/publication/mcs<year>. "
             "If omitted, the USGS step is skipped and must be run separately "
             "with: bdi-ingest ingest-usgs <path>"
         ),
@@ -2347,7 +2951,7 @@ def setup_all_cmd(
     mcs_year: int = typer.Option(
         2025,
         "--mcs-year",
-        help="MCS publication year (forwarded to ingest-usgs and ingest-mcs-pdf).",
+        help="MCS publication year (forwarded to ingest-usgs / ingest-mcs-pdf / ingest-mcs-prices).",
     ),
     mcs_pdf_file: Optional[str] = typer.Option(
         None,
@@ -2358,6 +2962,18 @@ def setup_all_cmd(
             "notes to material_criticality_signals.  Must run after seed-hs-mappings. "
             "If omitted, the PDF step is skipped and must be run separately with: "
             "bdi-ingest ingest-mcs-pdf <path> --year <year>"
+        ),
+    ),
+    mcs_prices_file: Optional[str] = typer.Option(
+        None,
+        "--mcs-prices-file",
+        help=(
+            "Path to the USGS MCS Fig 10 Price Growth Rates CSV "
+            "(e.g. MCS2026_Fig10_Price_Growth_Rates.csv).  Writes "
+            "price_yoy_pct and price_cagr_5yr_pct onto the same "
+            "material_criticality_signals row written by ingest-usgs.  "
+            "If omitted, the Fig 10 step is skipped and must be run "
+            "separately with: bdi-ingest ingest-mcs-prices <path>"
         ),
     ),
     mrds_file: str = typer.Option(
@@ -2382,34 +2998,50 @@ def setup_all_cmd(
 ) -> None:
     """One-shot first-time environment bootstrap.
 
-    Runs every seed and reference-data ingest command in dependency order so you
-    don't have to remember the sequence.  Safe to re-run — all steps are idempotent.
+    Runs every seed and reference-data ingest command in dependency order so
+    you don't have to remember the sequence.  Safe to re-run — all steps are
+    idempotent.
 
     \b
-    Execution order:
-      1.  seed-countries          ISO country reference table (Comtrade codes, name aliases)
-      2.  seed                    sources, reference aliases
-      3.  ingest-usgs             USGS MCS world data CSV  (requires --usgs-file)
-      4.  seed-materials          non-USGS minerals + battery chemistry junctions
-      5.  seed-hs-mappings        HS code → material lookup table
-      6.  ingest-mcs-pdf          HS-stage production shares + US import shares (requires --mcs-pdf-file)
-      7.  seed-companies          curated supply-chain company list
-      8.  ingest-mrds             mine/processing facilities from local MRDS CSV
-      9.  seed-supply-relationships  upstream/downstream supplier graph
-      10. seed-material-exposures    company × material exposure weights
-      11. seed-regulations        curated regulatory seed rows
-      12. ingest-gleif            LEI enrichment for company entities
+    Execution order (Phase B / May 2026 — alias-resolver based):
+      1.  seed-countries           ISO country reference table (Comtrade codes, name aliases)
+      2.  seed                     sources, reference aliases
+      3.  seed-materials           39 canonical materials + battery chemistry junctions
+      4.  seed-material-aliases    external commodity name → canonical material lookup
+      5.  ingest-usgs              USGS MCS world data CSV  (requires --usgs-file)
+      6.  seed-hs-mappings         curated HS code → material lookup table
+      7.  ingest-mcs-pdf           HS-stage production shares + US import shares (requires --mcs-pdf-file)
+      8.  seed-hs-mappings --force backfill curated fields onto rows added by ingest-mcs-pdf
+      9.  ingest-mcs-prices        Fig 10 price-growth rates → criticality signals (requires --mcs-prices-file)
+      10. seed-companies           curated supply-chain company list
+      11. ingest-mrds              mine/processing facilities from local MRDS CSV
+      12. seed-supply-relationships  upstream/downstream supplier graph
+      13. seed-material-exposures    company × material exposure weights
+      14. seed-regulations         curated regulatory seed rows
+      15. ingest-gleif             LEI enrichment for company entities
 
     \b
-    Step 6 (ingest-mcs-pdf) must run after seed-hs-mappings (step 5) because it
-    writes hs_code_production_shares rows that FK to hs_code_material_mappings.
-    It also requires ingest-usgs (step 3) to have run so material_criticality_signals
-    rows exist for the salient-notes append.
+    Dependency notes:
+      * ingest-usgs / ingest-mcs-pdf / ingest-mcs-prices all use the
+        MaterialAliasResolver, so seed-materials AND seed-material-aliases
+        must run first (steps 3–4).  Without aliases, every chapter
+        resolves to "unknown" and is silently skipped.
+      * ingest-mcs-pdf (step 7) writes hs_code_production_shares rows that
+        FK to hs_code_material_mappings, so seed-hs-mappings (step 6) must
+        run first.
+      * The seed-hs-mappings --force pass at step 8 is non-destructive: it
+        UPDATEs curated fields (description, confidence, stage, keywords)
+        onto rows added by ingest-mcs-pdf (6-digit stubs, 10-digit HTS).
+        It does NOT delete any rows.
+      * ingest-mcs-prices (step 9) joins to the same material_criticality_signals
+        row that ingest-usgs created at step 5; running it without ingest-usgs
+        leaves the supply-side metric columns NULL.
 
-    Step 8 (ingest-mrds) reads from /data/facilities/mrds.csv by default.
+    \b
+    Step 11 (ingest-mrds) reads from /data/facilities/mrds.csv by default.
     Override with --mrds-file.  Facility type → supply_chain_stage is mapped
-    automatically (mine→ore, refinery→intermediate).  hs_mapping_id is set NULL
-    and requires manual confirmation post-ingest.
+    automatically (mine→ore, refinery→intermediate).  hs_mapping_id is set
+    NULL and requires manual confirmation post-ingest.
 
     \b
     After setup-all, run the periodic ingestion commands (ingest-comtrade,
@@ -2417,9 +3049,11 @@ def setup_all_cmd(
 
     \b
     Examples:
-      bdi-ingest setup-all --usgs-file ~/Downloads/MCS2025_World_Data.csv --mcs-pdf-file ~/Downloads/mcs2025.pdf
-      bdi-ingest setup-all --usgs-file path/to/MCS2025.csv --mcs-pdf-file path/to/mcs2025.pdf --skip-gleif
-      bdi-ingest setup-all --usgs-file path/to/MCS2025.csv --mrds-file /custom/path/mrds.csv
+      bdi-ingest setup-all --usgs-file ~/Downloads/MCS2026_Commodities_Data.csv \\
+                           --mcs-pdf-file ~/Downloads/mcs2026.pdf \\
+                           --mcs-prices-file ~/Downloads/MCS2026_Fig10_Price_Growth_Rates.csv \\
+                           --mcs-year 2026
+      bdi-ingest setup-all --usgs-file path/to/MCS.csv --mcs-pdf-file path/to/mcs.pdf --skip-gleif
       bdi-ingest setup-all --skip-mrds   # skip facility ingest entirely
     """
     import sys
@@ -2444,7 +3078,14 @@ def setup_all_cmd(
     _run("seed-countries", ["seed-countries"])
     _run("seed", ["seed"])
 
-    # Step 3: USGS MCS CSV → materials + material_production_shares + criticality_signals
+    # Steps 3–4: materials + alias resolver inputs.  MUST run before any
+    # ingester that uses MaterialAliasResolver (ingest-usgs, ingest-mcs-pdf,
+    # ingest-mcs-prices).  Without these, every external chapter / commodity
+    # name resolves to "unknown" and gets dropped.
+    _run("seed-materials", ["seed-materials"])
+    _run("seed-material-aliases", ["seed-material-aliases"])
+
+    # Step 5: USGS MCS CSV → material_criticality_signals + production_shares
     if usgs_file:
         _run("ingest-usgs", ["ingest-usgs", usgs_file, "--mcs-year", str(mcs_year), "--force"])
     else:
@@ -2454,12 +3095,12 @@ def setup_all_cmd(
             err=True,
         )
 
-    # Steps 4–5: material + HS mapping seeds (depend on materials existing)
-    _run("seed-materials", ["seed-materials"])
+    # Step 6: curated HS code → material mappings (depends on seed-materials)
     _run("seed-hs-mappings", ["seed-hs-mappings"])
 
-    # Step 6: MCS PDF → hs_code_production_shares (global + US) + criticality notes
-    # Must follow seed-hs-mappings so hs_mapping_id FKs resolve.
+    # Step 7: MCS PDF → hs_code_production_shares (global + US) + 6-digit
+    # stubs + 10-digit HTS rows.  Must follow seed-hs-mappings so curated
+    # parents exist for the FK to land on.
     if mcs_pdf_file:
         _run(
             "ingest-mcs-pdf",
@@ -2473,14 +3114,30 @@ def setup_all_cmd(
             err=True,
         )
 
-    # Step 6b: re-run seed-hs-mappings with --force so that any 6-digit rows
-    # written by ingest-mcs-pdf (which creates mapping stubs for codes it
-    # encounters) get their stage, keywords, and hhi_* fields backfilled from
-    # _MAPPINGS.  The first run (step 5) pre-populates known codes; this pass
-    # ensures any new rows are also covered.
+    # Step 8: non-destructive backfill.  --force here UPDATEs curated fields
+    # (description / confidence / stage / stage_sequence / digit_count /
+    # keywords) on rows added by ingest-mcs-pdf at step 7.  It does NOT
+    # delete any rows — auto-added 6-digit stubs and 10-digit HTS rows are
+    # preserved.
     _run("seed-hs-mappings (backfill)", ["seed-hs-mappings", "--force"])
 
-    # Steps 7–8: company + facility data
+    # Step 9: USGS MCS Fig 10 prices → price_yoy_pct + price_cagr_5yr_pct
+    # on the same material_criticality_signals row written at step 5.
+    if mcs_prices_file:
+        _run(
+            "ingest-mcs-prices",
+            ["ingest-mcs-prices", mcs_prices_file, "--mcs-year", str(mcs_year), "--force"],
+        )
+    else:
+        typer.echo(
+            "\n⚠  Skipping ingest-mcs-prices (no --mcs-prices-file provided). "
+            "Run 'bdi-ingest ingest-mcs-prices <path> --mcs-year <year>' manually. "
+            "Without this, Financial Pressure Tier 1.5 (price-growth) signals "
+            "are absent and scoring falls back to Pink Sheet alone.",
+            err=True,
+        )
+
+    # Steps 10–11: company + facility data
     _run("seed-companies", ["seed-companies"])
 
     if not skip_mrds:
@@ -2491,12 +3148,17 @@ def setup_all_cmd(
     else:
         typer.echo("\n⚠  Skipping ingest-mrds (--skip-mrds set).")
 
-    # Steps 9–11: relationship and regulatory seeds
+    # Steps 12–14: relationship and regulatory seeds
     _run("seed-supply-relationships", ["seed-supply-relationships"])
     _run("seed-material-exposures", ["seed-material-exposures"])
     _run("seed-regulations", ["seed-regulations"])
+    # External regulation IDs (CELEX, FR doc number, etc.) → regulation_key.
+    # MUST run after seed-regulations (FK references regulations.id) and
+    # BEFORE eurlex.py / federal-register / any future regulation-attaching
+    # ingester so they can resolve external IDs through the alias table.
+    _run("seed-regulation-aliases", ["seed-regulation-aliases"])
 
-    # Step 12: LEI enrichment
+    # Step 15: LEI enrichment
     if not skip_gleif:
         _run("ingest-gleif", ["ingest-gleif"])
     else:
@@ -2542,6 +3204,18 @@ def ingest_mcs_pdf_cmd(
         "--force",
         help="Suppress the confirmation prompt and proceed immediately.",
     ),
+    use_llm_sections: bool = typer.Option(
+        True,
+        "--use-llm-sections/--no-llm-sections",
+        help=(
+            "When True (default), use the Anthropic LLM locator to identify "
+            "commodity chapter bounds.  More robust to MCS layout variants "
+            "(footnoted headings, multi-page chapters).  Requires "
+            "ANTHROPIC_API_KEY and the `anthropic` package; result is cached "
+            "at data/mcs<year>_locator_result.json so re-runs skip the LLM "
+            "call.  When False, falls back to regex heading detection."
+        ),
+    ),
 ) -> None:
     """Seed hs_code_material_mappings and hs_code_production_shares from a USGS MCS PDF.
 
@@ -2584,11 +3258,19 @@ def ingest_mcs_pdf_cmd(
             abort=True,
         )
 
-    parser = MCSPdfParser(pdf_path, reference_year=year)
-
     s = _session()
     try:
-        stats = parser.seed_to_db(s, dry_run=dry_run)
+        # Construct the parser with a resolver so the regex fallback path
+        # can translate PDF headings via the alias table.  The LLM path
+        # doesn't need it (canonical names come from the materials list
+        # passed into ``seed_to_db``).
+        from app.services.ingestion.material_resolver import MaterialAliasResolver
+        resolver = MaterialAliasResolver(s)
+        parser = MCSPdfParser(pdf_path, reference_year=year, resolver=resolver)
+
+        stats = parser.seed_to_db(
+            s, dry_run=dry_run, use_llm_sections=use_llm_sections,
+        )
         if not dry_run:
             s.commit()
 

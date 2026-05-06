@@ -162,444 +162,117 @@ _EXCLUDE_COUNTRIES = {
 # Per-commodity static config: fields not derivable from the CSV.
 # hs_codes: WCO HS 2022 chapter.heading format.
 # ---------------------------------------------------------------------------
-_COMMODITY_CONFIG: dict[str, dict] = {
-    "Lithium ": {  # trailing space in CSV
-        "canonical_name": "Lithium",
-        "category": "cathode_active",
-        "symbol_or_code": "Li",
-        "hs_codes": ["2825.20", "2836.91"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "stable",
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Cobalt": {
-        "canonical_name": "Cobalt",
-        "category": "cathode_active",
-        "symbol_or_code": "Co",
-        "hs_codes": ["2836.20", "2605.00"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "declining",  # LFP shift reducing cobalt use
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Nickel": {
-        "canonical_name": "Nickel",
-        "category": "cathode_active",
-        "symbol_or_code": "Ni",
-        "hs_codes": ["2604.00", "7502.10"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "declining",  # LFP shift; NMC 811 partially offsets
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Graphite": {
-        "canonical_name": "Natural Graphite",
-        "category": "anode",
-        "symbol_or_code": "C",
-        "hs_codes": ["3801.10", "3801.20"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "stable",
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Manganese": {
-        "canonical_name": "Manganese",
-        "category": "cathode_active",
-        "symbol_or_code": "Mn",
-        "hs_codes": ["2602.00", "2820.10"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "stable",  # peaked per paper
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Copper ": {  # trailing space in CSV
-        "canonical_name": "Copper",
-        "category": "structural",
-        "symbol_or_code": "Cu",
-        "hs_codes": ["7401.00", "7408.11"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": False,
-        "patent_occurrence_trend": "stable",
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Aluminum": {
-        "canonical_name": "Aluminum",
-        "category": "structural",
-        "symbol_or_code": "Al",
-        "hs_codes": ["7601.10", "7601.20"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": False,
-        "patent_occurrence_trend": "stable",
-        "data_availability": "commercial",
-        "mine_type_keyword": "smelter production",  # MCS reports smelter, not mine
-    },
-    "Rare earths": {
-        "canonical_name": "Rare Earth Elements",
-        "category": "component",
-        "symbol_or_code": "REE",
-        "hs_codes": ["2846.10", "2846.90"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": None,  # aggregate row; individual REEs tracked separately
-        "data_availability": "limited",
-        "mine_type_keyword": "mine production",
-    },
-    "Vanadium": {
-        "canonical_name": "Vanadium",
-        "category": "cathode_active",
-        "symbol_or_code": "V",
-        "hs_codes": ["2615.20"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": False,
-        "patent_occurrence_trend": None,
-        "data_availability": "limited",
-        "mine_type_keyword": "mine production",
-    },
-    "Silicon": {
-        "canonical_name": "Silicon (Anode Grade)",
-        "category": "anode",
-        "symbol_or_code": "Si",
-        "hs_codes": ["2804.61", "2804.69"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": False,
-        "is_eu_crma_critical": False,
-        "patent_occurrence_trend": "rising",
-        "data_availability": "limited",
-        "mine_type_keyword": "silicon metal",  # prefer metal over ferrosilicon
-    },
-    "Phosphate rock ": {  # trailing space in CSV
-        "canonical_name": "Phosphate (Battery Grade)",
-        "category": "cathode_active",
-        "symbol_or_code": "P",
-        "hs_codes": ["2835.26", "2835.29"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": False,
-        "is_eu_crma_critical": False,
-        "patent_occurrence_trend": "rising",
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
+# ---------------------------------------------------------------------------
+# Per-commodity routing keywords (parser-level, Category C)
+# ---------------------------------------------------------------------------
+# Tells the parser which row to filter to within a multi-type commodity
+# (e.g. for SILICON, the file has both ferrosilicon and silicon-metal rows;
+# we want the world mine production rollup keyed by `mine_type_keyword`).
+#
+# Static metadata (canonical_name, category, hs_codes, IRA/CRMA flags) is
+# no longer carried here — it now lives in ``seed_materials.py``.  The
+# CSV-name → canonical mapping is in ``material_source_aliases``
+# (source_system='mcs_2025_csv').  This dict is parser-internal only.
+_COMMODITY_TYPE_KEYWORD: dict[str, str] = {
+    'Lithium '                                        : 'mine production',
+    'Cobalt'                                          : 'mine production',
+    'Nickel'                                          : 'mine production',
+    'Graphite'                                        : 'mine production',
+    'Manganese'                                       : 'mine production',
+    'Copper '                                         : 'mine production',
+    'Aluminum'                                        : 'smelter production',
+    'Rare earths'                                     : 'mine production',
+    'Vanadium'                                        : 'mine production',
+    'Silicon'                                         : 'silicon metal',
+    'Phosphate rock '                                 : 'mine production',
+    'Gallium '                                        : 'primary production',
+    'Gemanium'                                        : 'primary and secondary refinery production',
+    'Chromium'                                        : 'mine production',
+    'Molybdenum '                                     : 'mine production',
+    'Niobium'                                         : 'mine production',
+    'Tantalum'                                        : 'mine production',
+    'Tellurium'                                       : 'refinery production, tellurium content',
+    'Titanium Mineral Concentrates'                   : 'mine production',
+    'Zirconium and Hafnium'                           : 'mine production',
+    'Iron Ore  '                                      : 'mine production',
+    'Magnesium Compounds'                             : 'mine production',
+    'Platinum-Group metals'                           : 'mine production',
+    'Tungsten '                                       : 'mine production',
+    'Indium'                                          : 'refinery production',
+    'Tin'                                             : 'mine production',
+    'Silver'                                          : 'mine production',
+    'Fluorspar'                                       : 'mine production',
+    'Boron '                                          : 'boron all types',
+    'Selenium'                                        : 'refinery production, selenium content',
+    'Bismuth'                                         : 'refinery production',
+    'Antimony'                                        : 'mine production',
+    'Zinc'                                            : 'mine production',
+    'Rhenium'                                         : 'mine production',
+}
 
-    # -----------------------------------------------------------------------
-    # Expansion set — minerals added from MCS2025_World_Data.csv beyond the
-    # original 11. All are present in the CSV with production data that yields
-    # HHI-derived criticality scores. Static config below; production/HHI
-    # values are derived by the parser at ingest time.
-    #
-    # patent_occurrence_trend: rising/declining/stable sourced from the
-    #   EPO PATSTAT analysis in "Critical Minerals for EV Batteries" paper
-    #   (Natalia et al., 2024). None = no PATSTAT coverage yet.
-    # data_availability: commercial = active LME/spot price benchmarks;
-    #   limited = sporadic or opaque pricing; no_benchmark = no public price.
-    # EU CRM Act 2024 (EU Regulation 2024/1252 Annex II strategic list):
-    #   Gallium, Germanium, Titanium, Niobium, Tantalum, Tellurium,
-    #   Chromium, Molybdenum, Zirconium, Magnesium, Boron, Bismuth, Selenium,
-    #   Rhenium, Tungsten, Indium, Fluorspar are all listed.
-    # IRA critical minerals list (U.S. Federal Register Vol. 88 No. 214, 2023):
-    #   Gallium, Germanium, Titanium, Niobium, Tantalum, Tellurium,
-    #   Chromium, Molybdenum, Zirconium, Tin, Zinc, Bismuth, Selenium,
-    #   Rhenium, Tungsten, Indium, Antimony, Silver listed.
-    # -----------------------------------------------------------------------
 
-    "Gallium ": {  # trailing space in CSV
-        "canonical_name": "Gallium",
-        "category": "component",
-        "symbol_or_code": "Ga",
-        "hs_codes": ["2805.19"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "rising",
-        "data_availability": "no_benchmark",  # ~94% CN-sourced; no established exchange
-        "mine_type_keyword": "primary production",  # CSV TYPE = "Primary production"
-    },
-    "Gemanium": {  # NOTE: CSV contains a typo ("Gemanium" not "Germanium")
-        "canonical_name": "Germanium",
-        "category": "component",
-        "symbol_or_code": "Ge",
-        "hs_codes": ["2804.90"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "rising",
-        "data_availability": "no_benchmark",  # no exchange price; spot market opaque
-        "mine_type_keyword": "primary and secondary refinery production",  # CSV TYPE exact match
-    },
-    "Chromium": {
-        "canonical_name": "Chromium",
-        "category": "cathode_active",
-        "symbol_or_code": "Cr",
-        "hs_codes": ["2610.00", "7202.41"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": False,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "rising",
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Molybdenum ": {  # trailing space in CSV
-        "canonical_name": "Molybdenum",
-        "category": "component",
-        "symbol_or_code": "Mo",
-        "hs_codes": ["2613.10", "2613.90"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": False,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "rising",
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Niobium": {
-        "canonical_name": "Niobium",
-        "category": "component",
-        "symbol_or_code": "Nb",
-        "hs_codes": ["2615.90", "8112.92"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "rising",
-        "data_availability": "limited",
-        "mine_type_keyword": "mine production",
-    },
-    "Tantalum": {
-        "canonical_name": "Tantalum",
-        "category": "component",
-        "symbol_or_code": "Ta",
-        "hs_codes": ["2615.90", "8103.20"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "rising",
-        "data_availability": "limited",
-        "mine_type_keyword": "mine production",
-    },
-    "Tellurium": {
-        "canonical_name": "Tellurium",
-        "category": "component",
-        "symbol_or_code": "Te",
-        "hs_codes": ["2804.19"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "rising",
-        "data_availability": "no_benchmark",
-        "mine_type_keyword": "refinery production, tellurium content",  # CSV TYPE exact match
-    },
-    "Titanium Mineral Concentrates": {
-        # Prefer "Titanium Mineral Concentrates" over "Titanium & titanium dioxide"
-        # for supply concentration signal (mine-level, not processing-level).
-        "canonical_name": "Titanium",
-        "category": "component",
-        "symbol_or_code": "Ti",
-        "hs_codes": ["2614.00", "8108.20"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "rising",
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Zirconium and Hafnium": {
-        # Hafnium is co-produced with zirconium; tracked under the Zirconium row.
-        "canonical_name": "Zirconium",
-        "category": "component",
-        "symbol_or_code": "Zr",
-        "hs_codes": ["2615.10", "8109.20"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": "rising",
-        "data_availability": "limited",
-        "mine_type_keyword": "mine production",
-    },
-    "Iron Ore  ": {  # two trailing spaces in CSV
-        "canonical_name": "Iron Ore (LFP Grade)",
-        "category": "cathode_active",
-        "symbol_or_code": "Fe",
-        "hs_codes": ["2601.11", "2601.12"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": False,
-        "is_eu_crma_critical": False,
-        "patent_occurrence_trend": "rising",  # LFP cathode shift drives iron demand
-        "data_availability": "commercial",    # actively traded on exchanges
-        "mine_type_keyword": "mine production",
-    },
-    "Magnesium Compounds": {
-        # "Magnesium Compounds" covers mined production (brucite, magnesite).
-        # More useful than "Magnesium metal" (smelter) for supply concentration signal.
-        "canonical_name": "Magnesium",
-        "category": "structural",
-        "symbol_or_code": "Mg",
-        "hs_codes": ["2519.10", "2519.90"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": False,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": None,
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Platinum-Group metals": {
-        # Aggregate only — Pt and Pd are not separable from mine production data
-        # in this CSV. Use this row for overall PGM supply concentration.
-        "canonical_name": "Platinum-Group Metals",
-        "category": "component",
-        "symbol_or_code": "PGM",
-        "hs_codes": ["7110.11", "7110.21", "7110.31"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": None,
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Tungsten ": {  # trailing space in CSV
-        "canonical_name": "Tungsten",
-        "category": "component",
-        "symbol_or_code": "W",
-        "hs_codes": ["2611.00", "8101.10"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": None,
-        "data_availability": "limited",
-        "mine_type_keyword": "mine production",
-    },
-    "Indium": {
-        "canonical_name": "Indium",
-        "category": "component",
-        "symbol_or_code": "In",
-        "hs_codes": ["8112.13", "8112.92"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": None,
-        "data_availability": "limited",
-        "mine_type_keyword": "refinery production",  # CSV TYPE = "Refinery production"
-    },
-    "Tin": {
-        "canonical_name": "Tin",
-        "category": "structural",
-        "symbol_or_code": "Sn",
-        "hs_codes": ["2609.00", "8001.10"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": False,
-        "patent_occurrence_trend": "declining",
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Silver": {
-        "canonical_name": "Silver",
-        "category": "structural",
-        "symbol_or_code": "Ag",
-        "hs_codes": ["2616.10", "7106.10"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": False,
-        "patent_occurrence_trend": "stable",
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Fluorspar": {
-        "canonical_name": "Fluorspar",
-        "category": "electrolyte",  # used in LFP electrolyte and fluoride solid electrolytes
-        "symbol_or_code": "CaF2",
-        "hs_codes": ["2529.21", "2529.22"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": False,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": None,
-        "data_availability": "limited",
-        "mine_type_keyword": "mine production",
-    },
-    "Boron ": {  # trailing space in CSV
-        "canonical_name": "Boron",
-        "category": "electrolyte",
-        "symbol_or_code": "B",
-        "hs_codes": ["2528.00"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": False,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": None,
-        "data_availability": "commercial",
-        "mine_type_keyword": "boron all types",  # CSV TYPE = "Boron all types"
-    },
-    "Selenium": {
-        "canonical_name": "Selenium",
-        "category": "component",
-        "symbol_or_code": "Se",
-        "hs_codes": ["2804.19"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": None,
-        "data_availability": "limited",
-        "mine_type_keyword": "refinery production, selenium content",  # CSV TYPE exact match
-    },
-    "Bismuth": {
-        "canonical_name": "Bismuth",
-        "category": "component",
-        "symbol_or_code": "Bi",
-        "hs_codes": ["2616.90", "8106.00"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": False,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": None,
-        "data_availability": "limited",
-        "mine_type_keyword": "refinery production",  # CSV TYPE = "Refinery production"
-    },
-    "Antimony": {
-        "canonical_name": "Antimony",
-        "category": "component",
-        "symbol_or_code": "Sb",
-        "hs_codes": ["2617.10", "8110.10"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": True,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": None,
-        "data_availability": "limited",
-        "mine_type_keyword": "mine production",
-    },
-    "Zinc": {
-        "canonical_name": "Zinc",
-        "category": "current_collector",  # current collector (anode side in some chemistries)
-        "symbol_or_code": "Zn",
-        "hs_codes": ["2608.00", "7901.11"],
-        "price_unit": "per_mt",
-        "is_ira_critical_mineral": False,
-        "is_eu_crma_critical": False,
-        "patent_occurrence_trend": None,
-        "data_availability": "commercial",
-        "mine_type_keyword": "mine production",
-    },
-    "Rhenium": {
-        "canonical_name": "Rhenium",
-        "category": "component",
-        "symbol_or_code": "Re",
-        "hs_codes": ["2804.19", "8112.92"],
-        "price_unit": "per_kg",
-        "is_ira_critical_mineral": False,
-        "is_eu_crma_critical": True,
-        "patent_occurrence_trend": None,
-        "data_availability": "no_benchmark",
-        "mine_type_keyword": "mine production",
-    },
+# ---------------------------------------------------------------------------
+# CSV-derived per-HS-node production shares
+# ---------------------------------------------------------------------------
+# For commodities where USGS splits production into multiple sub-types
+# (e.g. Silicon: Ferosilicon vs silicon metal; Copper: mine vs refinery),
+# this mapping tells the parser which sub-type rows to aggregate into a
+# stage-specific production-share stream and which HS-mapping prefix to
+# attribute them to.  Independent of `_COMMODITY_CONFIG.mine_type_keyword`
+# (which governs the legacy material-level criticality calc).
+#
+# Why it matters: the current material-level `material_production_shares`
+# rows aggregate ALL sub-types into a single per-country share.  For
+# scoring purposes, that conflates ferrosilicon producers (Bhutan, India,
+# Kazakhstan, Malaysia, Poland — none of whom produce silicon metal) with
+# silicon-metal producers (Australia, Germany — neither of whom produce
+# ferrosilicon).  The HHI for combined "Silicon" is fine, but the
+# stage-aware Level-0 scorer wants distinct geographic distributions per
+# HS node — that's what this config enables.
+#
+# Only includes battery-relevant sub-types.  Non-battery sub-types (e.g.
+# titanium dioxide pigments) are intentionally excluded — including them
+# would pollute the supply-chain risk signal for battery scoring.
+#
+# Format:
+#     {csv_commodity_key: [(type_substring_lowercase, hs_prefix), ...]}
+#
+# `type_substring` is matched case-insensitively as a substring of the
+# CSV's TYPE column.  Note that USGS uses the misspelling "Ferosilicon"
+# (one r) in MCS 2025 — match the CSV verbatim, not the standard spelling.
+# ---------------------------------------------------------------------------
+
+# IMPORTANT: keys MUST exactly match the CSV commodity strings used as
+# keys in `_COMMODITY_CONFIG` above.  USGS MCS 2025 has trailing
+# whitespace on several commodities (e.g. 'Copper ' with a trailing
+# space) — match the CSV verbatim or the lookup misses.
+
+_HS_NODE_SHARES_CONFIG: dict[str, list[tuple[str, str]]] = {
+    # Silicon — ferrosilicon (battery_grade per partner) vs silicon metal
+    # (refined).  Different geographic profiles in MCS 2025 — see comment
+    # block above.
+    "Silicon": [
+        ("ferosilicon", "720221"),  # USGS spelling matches "Plant production, Ferosilicon, silicon content"
+        ("silicon metal", "280461"),
+    ],
+    # Copper — mine production (ore) vs refinery production (refined cathode).
+    # Both are battery-relevant; ore covers concentrate exports (DR Congo,
+    # Peru, Chile) while refinery covers cathode-stage producers (China is
+    # heavy on refining despite less mine output).
+    # NOTE: CSV key is 'Copper ' WITH trailing space.
+    "Copper ": [
+        ("mine production", "2603"),
+        ("refinery production", "7403"),
+    ],
+    # Titanium — initially planned to split sponge metal vs pigment capacity
+    # (CSV commodity 'Titanium & titanium dioxide').  But the parser's
+    # _COMMODITY_CONFIG uses the OTHER titanium commodity ('Titanium Mineral
+    # Concentrates'), which only has ore-stage data (ilmenite + rutile, both
+    # mapped to HS 2614).  Splitting ilmenite vs rutile by HS node isn't
+    # meaningful — both are ore.  Sponge-metal split would require reading
+    # an additional CSV commodity key, which is more parser work than is
+    # justified for a single new sub-type.  Skipped for now; revisit if
+    # battery-grade titanium scoring needs the distinction.
 }
 
 
@@ -642,18 +315,18 @@ def parse_usgs_csv(filepath: str | Path) -> list[dict]:
         reader = csv.DictReader(f)
         for row in reader:
             commodity = row["COMMODITY"]
-            if commodity not in _COMMODITY_CONFIG:
+            if commodity not in _COMMODITY_TYPE_KEYWORD:
                 continue
             raw.setdefault(commodity, []).append(row)
 
     results = []
 
-    for csv_commodity, config in _COMMODITY_CONFIG.items():
+    for csv_commodity, mine_keyword in _COMMODITY_TYPE_KEYWORD.items():
         rows = raw.get(csv_commodity, [])
         if not rows:
             continue
 
-        keyword = config["mine_type_keyword"].lower()
+        keyword = mine_keyword.lower()
 
         # Filter to the relevant production type rows.
         production_rows = [
@@ -798,32 +471,90 @@ def parse_usgs_csv(filepath: str | Path) -> list[dict]:
                 f"Top producing countries (ranked): {', '.join(ranked_countries[:5])}."
             )
 
+        # Per-HS-node production shares — for commodities where USGS reports
+        # multiple distinct sub-types (ferrosilicon vs silicon metal, copper
+        # mine vs refinery, etc.) we want stage-specific country distributions
+        # in `hs_code_production_shares` so the Level-0 scorer can compute
+        # per-stage HHI.  See `_HS_NODE_SHARES_CONFIG` for what's mapped.
+        # Empty list when the commodity has no entry in the config.
+        hs_production_shares: list[dict] = []
+        sub_type_specs = _HS_NODE_SHARES_CONFIG.get(csv_commodity, [])
+        for type_substring, hs_prefix in sub_type_specs:
+            # Filter ALL rows for this commodity (not just `production_rows`,
+            # which was already narrowed by the legacy `mine_type_keyword`).
+            sub_rows = [r for r in rows if type_substring in r["TYPE"].lower()]
+            if not sub_rows:
+                continue
+
+            sub_world_total_row = next(
+                (r for r in sub_rows
+                 if r["COUNTRY"].strip().lower().startswith("world total")),
+                None,
+            )
+            sub_country_rows = [
+                r for r in sub_rows
+                if r["COUNTRY"].strip().lower() not in _EXCLUDE_COUNTRIES
+            ]
+
+            sub_country_prod: dict[str, float] = {}
+            sub_volumes_raw: dict[str, float] = {}
+            for r in sub_country_rows:
+                vol = (
+                    _parse_number(r["PROD_2023"])
+                    or _parse_number(r["PROD_EST_ 2024"])
+                )
+                if vol is None:
+                    continue
+                country_name = r["COUNTRY"].strip()
+                iso2 = _COUNTRY_ISO2.get(country_name)
+                if iso2 is None:
+                    continue
+                sub_country_prod[iso2] = sub_country_prod.get(iso2, 0.0) + vol
+                sub_volumes_raw[iso2] = vol
+
+            sub_world_prod = (
+                _parse_number(sub_world_total_row["PROD_2023"])
+                if sub_world_total_row else None
+            ) or (
+                _parse_number(sub_world_total_row["PROD_EST_ 2024"])
+                if sub_world_total_row else None
+            )
+            # Fallback: derive world total by summing country values when the
+            # world-total row is missing or unparseable.
+            if not sub_world_prod and sub_country_prod:
+                sub_world_prod = sum(sub_country_prod.values())
+
+            sub_unit = (
+                sub_world_total_row["UNIT_MEAS"].strip()
+                if sub_world_total_row else ""
+            )
+
+            if sub_country_prod and sub_world_prod and sub_world_prod > 0:
+                for iso2, vol in sub_country_prod.items():
+                    hs_production_shares.append({
+                        "hs_code_prefix": hs_prefix,
+                        "country_code": iso2,
+                        "production_volume": vol,
+                        "production_share": round(vol / sub_world_prod, 6),
+                        "unit_of_measure": sub_unit or None,
+                        "type_substring": type_substring,  # provenance for logs
+                    })
+
         material = {
-            "canonical_name": config["canonical_name"],
-            "category": config["category"],
-            "symbol_or_code": config["symbol_or_code"],
-            "hs_codes": config["hs_codes"],
-            "criticality_score": criticality,
-            "primary_producing_countries": ranked_countries,
-            "price_unit": config["price_unit"],
-            "is_ira_critical_mineral": config["is_ira_critical_mineral"],
-            "is_eu_crma_critical": config["is_eu_crma_critical"],
-            # New fields from migration 002 — optional in config, default None.
-            "patent_occurrence_trend": config.get("patent_occurrence_trend"),
-            "data_availability": config.get("data_availability"),
-            # hhi_score is same as criticality_score (both are normalised HHI 0–1)
-            # but named separately for clarity when writing material_criticality_signals.
-            "_hhi_score": criticality,
-            # Supply metric signals — stripped before ORM Material creation,
-            # written to material_criticality_signals by ingest-usgs.
-            "_reserve_hhi_score": reserve_hhi,
-            "_reserve_life_index": reserve_life_index,
-            "_production_yoy_pct": production_yoy_pct,
-            "_capacity_utilization": capacity_utilization,
-            # Production shares stripped before creating Material ORM objects;
-            # persisted separately by ingest-usgs into material_production_shares.
-            "_production_shares": production_shares,
-            "notes": " ".join(notes_parts),
+            "source_system":           "mcs_2025_csv",
+            "source_name":             csv_commodity,
+            "criticality_score":       criticality,
+            "hhi_score":               criticality,
+            "reserve_hhi_score":       reserve_hhi,
+            "reserve_life_index":      reserve_life_index,
+            "production_yoy_pct":      production_yoy_pct,
+            "capacity_utilization":    capacity_utilization,
+            "production_shares":       production_shares,
+            "hs_production_shares":    hs_production_shares,
+            "ranked_countries":        ranked_countries,
+            "world_total":             world_prod,
+            "world_unit":              unit or None,
+            "notes":                   " ".join(notes_parts),
         }
         results.append(material)
 

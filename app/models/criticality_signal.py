@@ -108,6 +108,37 @@ class MaterialCriticalitySignal(Base):
             "High = tight market with little buffer."
         ),
     )
+    # ── Price-trend metrics from USGS MCS 2026 Fig 10 (migration 036) ─────────
+    price_yoy_pct: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "YoY price change as signed fraction (e.g. 1.44 = +144%). "
+            "Positive = supply-side stress; negative = market easing. "
+            "Sourced from USGS MCS Fig 10 Price Growth Rates."
+        ),
+    )
+    price_cagr_5yr_pct: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "5-year compound annual growth rate of price as signed fraction "
+            "(e.g. 0.47 = +47% CAGR). Smoother trend signal than yoy."
+        ),
+    )
+    # ── US-dependency metrics promoted from metadata_json (migration 038) ─────
+    us_net_import_reliance_pct: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "USGS Net Import Reliance percentage (0–100). Bounded "
+            "estimates ('<50', '>50') stored as midpoint values."
+        ),
+    )
+    us_apparent_consumption: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "US apparent consumption volume (latest year, source unit). "
+            "Sourced from MCS Salient Statistics."
+        ),
+    )
     metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

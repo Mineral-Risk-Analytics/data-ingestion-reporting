@@ -830,6 +830,7 @@ def _insert_risk_event(
     ev = RiskEvent(
         source_document_id=doc.id,
         event_type="federal_register_notice",
+        event_subtype=query.event_subtype,  # typed col (migration 040)
         event_date=event_date,
         title=title[:1024],
         summary=summary,
@@ -839,6 +840,8 @@ def _insert_risk_event(
         geography_json={"primary": geo_primary, "scope": "federal"},
         content_hash=content_hash,
         metadata_json={
+            # event_subtype kept in metadata_json for one release cycle to
+            # support backwards-compat readers; drop later.
             "event_subtype": query.event_subtype,
             "query_name": query.name,
             "agencies": agencies[:8],

@@ -1,10 +1,20 @@
 # Data Sources → Scoring Inputs (EV battery domain)
 
-> **Last updated: April 2026**
+> **Last updated: May 2026**
 
 This page is the canonical map of **(data source → tables/fields → scoring inputs → pillars → scoring layers)**.
 
 If you only remember one thing: **data sources do not “feed a pillar” directly** — they feed *specific* scoring inputs that are combined by pillar math in [`app/services/scoring/`](/Users/nicolebush/dev/battery-data-intelligence-engine/app/services/scoring/).
+
+## Materials register & alias resolution (May 2026 refactor)
+
+Canonical material names are now seeded register data, not parser-derived. All ingest parsers emit raw `source_name` records and the CLI resolves them to canonical materials via the `material_source_aliases` table. Three concepts that follow from this:
+
+- **Material register** is the 39-row list in `seed_materials.py` populated into the `materials` table by `seed-materials`. Static facts live here (canonical_name, category, symbol_or_code, hs_codes, IRA/CRMA flags). Dynamic signals (criticality_score, HHI, price trends) are written by ingest, not seeded.
+- **Source aliases** in `material_source_aliases` translate external commodity names to canonical materials per source (`mcs_2026_csv`, `mcs_2025_csv`, `mcs_pdf`, `fig10_prices`). 215 rows seeded by `seed-material-aliases`. Includes explicit `is_skipped=True` rows for non-battery commodities (LEAD, ASBESTOS, individual PGM prices) so partner sees an audit trail of considered-and-rejected names.
+- **Secondary chapters** (`writes_material_signals=False`) are aliases that share a canonical with a sibling primary chapter — currently only `BAUXITE AND ALUMINA → Aluminum`. The CLI writes their per-HS-prefix country shares (bauxite ore at HS 2606) but skips material-level upserts that would collide with the primary `ALUMINUM` chapter's signals.
+
+Run order on a fresh DB: `alembic upgrade head` → `seed-materials` → `seed-material-aliases` → `seed-hs-mappings` → `ingest-usgs` → `ingest-mcs-prices` → `ingest-mcs-pdf`.
 
 ---
 
@@ -69,6 +79,10 @@ The pure scorer is `score_material_exposure(criticality, concentration, trade_vo
 | `criticality` | intrinsic supply risk of the material | `material_criticality_signals.criticality_score` (preferred) else `materials.criticality_score` fallback | USGS MCS (live), EU CRMA (planned), IEA (planned), manual seeds |
 | `concentration` | concentration of supply across countries/suppliers | market: derived from HCG + criticality signal; company: derived from `company_material_exposures` (+ chemistry reweight) | USGS MCS (live), seeded exposures (live) |
 | `trade_volatility` | volatility proxy from prices and/or trade/event evidence | market: price volatility + events; company: evidence aggregator + trade signals | World Bank Pink Sheet (live), Census trade (live), Comtrade (live), GTA (live) |
+| `reserve_hhi_score` | forward-looking concentration over country reserves (15% of stage rollup) | `material_criticality_signals.reserve_hhi_score` | USGS MCS (live, 2026 main) |
+| `reserve_life_index` | scarcity proxy = world reserves / world annual production (years; 30% of scarcity sub-score) | `material_criticality_signals.reserve_life_index` | USGS MCS (live, 2026 main) |
+| `production_yoy_pct` | supply contraction signal (YoY change in world production) | `material_criticality_signals.production_yoy_pct` | USGS MCS (live, 2026 main) |
+| `capacity_utilization` | tight-market signal (production / capacity, 10% of stage rollup) | `material_criticality_signals.capacity_utilization` | USGS MCS Salient table; **not published in 2026 CSV — currently always NULL**, USGS may add later |
 
 ### Geopolitical / Trade pillar inputs
 
@@ -174,7 +188,9 @@ This appendix lists each source once. Detailed “how it scores” lives in the 
 
 | Source | How you run it | Primary tables written | Primary scoring role |
 |---|---|---|---|
-| USGS Mineral Commodity Summaries (MCS) | `bdi-ingest ingest-usgs <file>` | `materials`, `material_criticality_signals`, `material_production_shares` | baseline criticality + production shares for rollups |
+| USGS MCS — main CSV (2025 wide / 2026 long) | `bdi-ingest ingest-usgs <file>` | `material_criticality_signals` (criticality, HHI, reserve_hhi_score, reserve_life_index, production_yoy_pct, capacity_utilization, metadata_json[us_net_import_reliance, us_apparent_consumption]); `material_production_shares`; `hs_code_production_shares` (`market_scope='global'` for sub-type splits + secondary chapters; `market_scope='us'` for 2026 Import Sources); `materials.criticality_score`+`price_unit` cache back-sync | baseline criticality + production shares + reserve metrics + capacity utilization for rollups; tariff-adjacent HHI inputs for HS-node scoring |
+| USGS MCS — Fig 10 prices CSV (2026 only) | `bdi-ingest ingest-mcs-prices <file>` | `material_criticality_signals.price_yoy_pct`, `price_cagr_5yr_pct`, `metadata_json[fig10_source_rows]` | financial-pressure (NOT YET CONSUMED — see "Stored but unconsumed" below) |
+| USGS MCS — annual PDF (tariff schedules) | `bdi-ingest ingest-mcs-pdf <file>` | `hs_code_material_mappings` (10-digit US HTS + derived 6-digit global); `hs_code_production_shares` (global production leaders + US import sources) | source-of-truth for granular HS codes (only the PDF carries 6/8/10-digit codes) and per-HS-node country shares feeding HS-node scorer |
 | World Bank Pink Sheet | `bdi-ingest ingest-worldbank` | `commodity_prices` | market financial-pressure (price volatility), contributes to trade volatility signals |
 | UN Comtrade | `bdi-ingest ingest-comtrade` | `trade_flows`, `source_documents` | rollup weights (trade value), geo concentration inputs |
 | U.S. Census Trade | `bdi-ingest ingest census-trade` | `trade_flows`, `risk_events`, `source_documents` | geopolitical + material trade-event evidence; supplements trade coverage |
@@ -183,9 +199,22 @@ This appendix lists each source once. Detailed “how it scores” lives in the 
 | Federal Register | `bdi-ingest ingest federal-register` | `regulations`, `risk_events`, `source_documents`, `document_chunks` | U.S. regulatory evidence + events (company linking gated) |
 | SEC EDGAR | `bdi-ingest ingest sec-edgar` | `risk_events`, `source_documents` | financial-pressure and operational evidence |
 | OpenSanctions | `bdi-ingest ingest-opensanctions` | `companies`, `company_aliases`, `source_documents` | entity/alias enrichment (scoring contribution is indirect) |
-| Manual seed — materials | `bdi-ingest seed-materials` | `materials`, `battery_chemistry_materials` | chemistry composition foundation |
-| Manual seed — HS mappings | `bdi-ingest seed-hs-mappings` | `hs_code_material_mappings` | bridges HS codes → materials for trade/event attribution |
+| Manual seed — materials register | `bdi-ingest seed-materials` | `materials` (39 rows), `battery_chemistry_materials` | canonical material register; chemistry composition foundation |
+| Manual seed — material source aliases | `bdi-ingest seed-material-aliases` | `material_source_aliases` (215 rows) | translates parser source_name strings to canonical materials at ingest time |
+| Manual seed — HS mappings | `bdi-ingest seed-hs-mappings` | `hs_code_material_mappings` (286 rows with `supply_chain_stage`) | bridges HS codes → materials AND supplies stage assignments for HS-node scoring |
 | News (stub) | `bdi-ingest ingest news` | `risk_events`, `source_documents`, `document_chunks` | operational evidence placeholder |
+
+### Stored but unconsumed (May 2026)
+
+Three signal categories the parsers now write but no scorer reads yet. Closing these gaps is the next scoring-engine work item:
+
+| Signal | Where it's written | Who should consume it | Effort |
+|---|---|---|---|
+| `price_yoy_pct`, `price_cagr_5yr_pct` (Fig 10) | `material_criticality_signals` | `score_financial_pressure` market layer — currently uses Pink Sheet `commodity_prices` only | Wire as a secondary input alongside Pink Sheet CV; partner-decide how to combine |
+| `hs_code_production_shares` rows with `market_scope='us'` (2026 Import Sources) | `hs_code_production_shares` | An IRA-domestic-content / US-trade-dependency scorer that doesn't exist yet — distinct from global HHI | Greenfield; defer until partner specs the US-scope view |
+| `metadata_json[us_net_import_reliance]`, `[us_apparent_consumption]` (2026 Salient) | `material_criticality_signals.metadata_json` | Could feed a "US dependency" sub-score in Material Concentration or as a separate IRA pillar | Decide where it belongs before wiring |
+
+The scoring documentation **must not** describe these as live scoring inputs — they're stored data awaiting consumer code.
 
 ### Planned sources (not yet ingested)
 

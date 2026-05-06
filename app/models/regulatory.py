@@ -80,6 +80,9 @@ class Regulation(Base):
     geography_scopes: Mapped[list["RegulationGeographyScope"]] = relationship(
         back_populates="regulation", cascade="all, delete-orphan"
     )
+    source_aliases: Mapped[list["RegulationSourceAlias"]] = relationship(
+        back_populates="regulation", cascade="all, delete-orphan"
+    )
     company_exposures: Mapped[list["CompanyRegulationExposure"]] = relationship(
         back_populates="regulation", cascade="all, delete-orphan"
     )
@@ -131,6 +134,58 @@ class RegulationGeographyScope(Base):
     )
 
     regulation: Mapped["Regulation"] = relationship(back_populates="geography_scopes")
+
+
+class RegulationSourceAlias(Base):
+    """
+    Reference table mapping external source identifiers to canonical regulations.
+
+    Each row says: when source_system X publishes source_key Y, it means
+    regulation_id Z (or, if is_skipped=True, the row was deliberately not
+    ingested — preserving the audit trail of considered-and-rejected
+    external IDs).
+
+    Mirrors ``MaterialSourceAlias`` so that the alias-resolver pattern is
+    uniform across reference data.  Each ingester translates its own
+    external IDs (CELEX, Federal Register doc number, US Code citation,
+    OFAC SDN entity ID, GTA case ID, etc.) to ``regulation_id`` via this
+    table — no auto-creation of regulations from arbitrary inputs.
+
+    Lookup pattern: ``(source_system, lower(btrim(source_key)))`` is unique
+    per the partial expression index in migration 039.  The
+    ``RegulationAliasResolver`` helper handles the normalisation.
+
+    See migration 039 for column comments.
+    """
+
+    __tablename__ = "regulation_aliases"
+    __table_args__ = (
+        # Unique constraint enforced by the expression index in the
+        # migration; SQLAlchemy can't model the lower(btrim(...)) expression
+        # cleanly here.  Insertions go through PG ON CONFLICT DO UPDATE on
+        # that index.
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_system: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    regulation_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("regulations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    is_skipped: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    skip_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+    regulation: Mapped[Optional["Regulation"]] = relationship(
+        back_populates="source_aliases"
+    )
 
 
 class CompanyRegulationExposure(Base):
@@ -196,6 +251,20 @@ class RiskEvent(Base):
         ForeignKey("source_documents.id", ondelete="SET NULL"), index=True
     )
     event_type: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    # Precise event classification, distinct from the ingester-specific
+    # ``event_type``.  Read by ``hs_node_scorer`` (tariff_exposure /
+    # export_restriction sub-scores) and the geopolitical / regulatory
+    # aggregators.  Canonical values (May 2026 — extend in
+    # alembic/versions/040 docstring before adding new ones):
+    #     TARIFF                — duties / tariff increases / threats
+    #     EXPORT_RESTRICTION    — export bans, quotas, licensing, taxes
+    #     IMPORT_DISRUPTION     — import tariffs / quotas / bans (demand-side)
+    #     TRADE_CONCENTRATION   — derived from trade flow concentration
+    #     REGULATORY_COMPLIANCE — compliance / due-diligence regulations
+    #     TRADE_POLICY          — general trade policy without a specific measure
+    event_subtype: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True,
+    )
     event_date: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), index=True
     )

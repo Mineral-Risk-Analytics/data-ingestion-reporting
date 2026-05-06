@@ -35,10 +35,17 @@ log = structlog.get_logger(__name__)
 
 # Confidence penalty per material. Score backed solely by no_benchmark materials
 # floors at 0.3 (product of penalties across all materials in the chemistry).
+#
+# "unknown" is the explicit sentinel for materials where data_availability
+# has not been partner-reviewed yet.  Conservative penalty (0.70) so the
+# resulting score_confidence visibly drops rather than silently inflating
+# under the prior ``or "commercial"`` fallback.  When PATSTAT or partner
+# review fills these in, the penalty disappears.
 DATA_AVAILABILITY_CONFIDENCE: dict[str, float] = {
     "commercial":    1.00,
     "limited":       0.85,
     "no_benchmark":  0.65,
+    "unknown":       0.70,
 }
 
 METHODOLOGY_VERSION_ROLLUP = "2.0"
@@ -169,6 +176,12 @@ def score_chemistry_from_rollup(
     material_scores_used: dict[str, dict] = {}
     materials_missing_global: list[str] = []
     no_benchmark_materials: list[str] = []
+    # Materials whose data_availability column is NULL — partner has
+    # not yet classified them as commercial / limited / no_benchmark.
+    # Currently treated with a conservative confidence penalty (0.70)
+    # via the ``or "unknown"`` fallback below; surfaced in the rationale
+    # so the partner can see exactly which rows need review.
+    materials_unknown_availability: list[str] = []
 
     for junc in active_rows:
         material = materials_by_id.get(junc.material_id)
@@ -196,11 +209,19 @@ def score_chemistry_from_rollup(
 
         total_intensity += intensity
 
-        avail = material.data_availability or "commercial"
-        conf_factor = DATA_AVAILABILITY_CONFIDENCE.get(avail, 1.00)
+        # Default-to-"unknown" rather than "commercial" — surfacing
+        # missing data via the rationale instead of silently treating
+        # NULL rows as fully reliable.  See May 2026 audit: 35 of 39
+        # USGS-tracked materials had hardcoded data_availability values
+        # with no provenance and have been stripped to NULL pending
+        # partner review.
+        avail = material.data_availability or "unknown"
+        conf_factor = DATA_AVAILABILITY_CONFIDENCE.get(avail, 0.70)
         confidence_product *= conf_factor
         if avail == "no_benchmark":
             no_benchmark_materials.append(name)
+        elif avail == "unknown":
+            materials_unknown_availability.append(name)
 
         material_scores_used[name] = {
             "material_id": junc.material_id,
@@ -237,6 +258,10 @@ def score_chemistry_from_rollup(
         "materials_scored": list(material_scores_used.keys()),
         "materials_missing_global_score": materials_missing_global,
         "no_benchmark_materials": no_benchmark_materials,
+        # Materials with data_availability=NULL are penalised by the
+        # "unknown" confidence factor (0.70) and listed here so the
+        # rationale shows exactly which rows still need partner review.
+        "materials_unknown_availability": materials_unknown_availability,
         "score_confidence": score_confidence,
         "pillar_weights_used": MARKET_PILLAR_WEIGHTS,
         "material_detail": material_scores_used,

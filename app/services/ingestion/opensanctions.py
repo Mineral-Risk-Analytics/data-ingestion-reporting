@@ -13,6 +13,29 @@ Downloads the free daily bulk CSV export from OpenSanctions
    recording how many sanctioned company/organisation records are linked to that
    country in the OpenSanctions dataset.
 
+Material attribution (May 2026 — N2 fix)
+----------------------------------------
+Sanctions list entries describe ENTITIES, not materials, so keyword-matching
+the entity name would produce noise (a company called "Lithium Mining Corp"
+doesn't necessarily make this event a Lithium-relevant signal — it makes the
+COMPANY relevant; whether the material is depends on what they actually
+trade).  We use structured data instead:
+
+* For ``sanctions_listing`` events: pull rows from ``company_material_exposures``
+  for the matched company.  Each non-zero exposure becomes a ``RiskEventMaterial``
+  with ``relevance_score = exposure_score`` and ``match_reason = 'company_material_exposure'``.
+  Norilsk Nickel sanctioned → Nickel + Cobalt + PGM events all attributed to
+  the relevant materials at the partner-curated exposure weight.
+
+* For ``geography_sanctions_exposure`` events: pull the latest
+  ``material_production_shares`` rows for the country.  Each material where
+  the country has ``production_share ≥ min_share`` (default 5%) becomes a
+  ``RiskEventMaterial`` with ``relevance_score = production_share`` and
+  ``match_reason = 'country_production_concentration'``.  Materials the
+  country dominates (CN graphite at 70%) get high relevance; materials it
+  produces marginally get low.  This is what propagates the country-aggregate
+  signal into the material × geography rollup that scoring reads.
+
 Matching strategy
 -----------------
 **Primary — LEI**: The ``identifiers`` column of the simple CSV contains
@@ -60,9 +83,15 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models.company import Company, CompanyAlias
+from app.models.company import Company, CompanyAlias, CompanyMaterialExposure
 from app.models.country import Country
-from app.models.regulatory import RiskEvent, RiskEventCompany, RiskEventGeography
+from app.models.regulatory import (
+    RiskEvent,
+    RiskEventCompany,
+    RiskEventGeography,
+    RiskEventMaterial,
+)
+from app.models.supply import MaterialProductionShare
 from app.services.ingestion import feature_flags
 
 log = structlog.get_logger(__name__)
@@ -357,6 +386,134 @@ def match_companies(
 
 
 # ---------------------------------------------------------------------------
+# Material attribution helpers
+# ---------------------------------------------------------------------------
+# Sanctions events attach to materials via STRUCTURED data, not keyword
+# matching.  See module docstring "Material attribution" section for the
+# rationale.
+
+# Default floor for country-aggregate event attribution: a material has to be
+# at least this share of world production for the country before we propagate
+# the geography signal to it.  5% is permissive (admits Iron Ore CN, Aluminum
+# RU, etc.) without flooding the junction table with hundredths-of-a-percent
+# noise.
+_DEFAULT_GEO_MIN_SHARE = 0.05
+
+
+def _attribute_company_event_to_materials(
+    session: Session,
+    *,
+    risk_event_id: int,
+    company: Company,
+) -> int:
+    """Add ``RiskEventMaterial`` rows for a ``sanctions_listing`` event.
+
+    For each material the company has non-zero ``exposure_score`` against
+    in ``company_material_exposures`` (across any supply-chain stage —
+    aggregated by ``MAX``), insert a junction row tagged with
+    ``match_reason='company_material_exposure'``.
+
+    A company with multi-stage exposure to the same material (e.g. mining
+    AND refining cobalt) gets ONE junction row at the highest stage's
+    exposure score — duplicate stages would violate the
+    ``(risk_event_id, material_id)`` unique constraint and the highest
+    stage represents the ceiling of supply-chain exposure anyway.
+
+    Returns the count of rows inserted.
+    """
+    rows = session.execute(
+        select(
+            CompanyMaterialExposure.material_id,
+            func.max(CompanyMaterialExposure.exposure_score).label("score"),
+        )
+        .where(CompanyMaterialExposure.company_id == company.id)
+        .group_by(CompanyMaterialExposure.material_id)
+    ).all()
+
+    inserted = 0
+    for material_id, score in rows:
+        if score is None or float(score) <= 0:
+            continue
+        session.add(
+            RiskEventMaterial(
+                risk_event_id=risk_event_id,
+                material_id=material_id,
+                relevance_score=float(score),
+                match_reason="company_material_exposure",
+            )
+        )
+        inserted += 1
+    return inserted
+
+
+def _attribute_geo_event_to_materials(
+    session: Session,
+    *,
+    risk_event_id: int,
+    country_code: str,
+    min_share: float = _DEFAULT_GEO_MIN_SHARE,
+) -> int:
+    """Add ``RiskEventMaterial`` rows for a ``geography_sanctions_exposure``
+    event.
+
+    Pulls the LATEST ``material_production_shares`` row per material for
+    the given country (the table is annual; only the most recent year is
+    relevant for current-state risk).  Materials where the country has
+    ``production_share < min_share`` are skipped.
+
+    The relevance_score on the junction equals the country's share of
+    world production for that material — so a CN sanctions exposure event
+    propagates to graphite at ~0.70 and to cobalt at ~0.04 (cobalt
+    production is DRC-dominated, not CN), which is what we want.
+
+    Returns the count of rows inserted.
+    """
+    # Latest reference_year per material for this country.  Pulled in a
+    # single round-trip via a self-join on the max(year) subquery.
+    latest_subq = (
+        select(
+            MaterialProductionShare.material_id,
+            func.max(MaterialProductionShare.reference_year).label("max_year"),
+        )
+        .where(MaterialProductionShare.country_code == country_code)
+        .group_by(MaterialProductionShare.material_id)
+        .subquery()
+    )
+
+    rows = session.execute(
+        select(
+            MaterialProductionShare.material_id,
+            MaterialProductionShare.production_share,
+        )
+        .join(
+            latest_subq,
+            (MaterialProductionShare.material_id == latest_subq.c.material_id)
+            & (MaterialProductionShare.reference_year == latest_subq.c.max_year),
+        )
+        .where(
+            MaterialProductionShare.country_code == country_code,
+            MaterialProductionShare.production_share.is_not(None),
+            MaterialProductionShare.production_share >= min_share,
+        )
+    ).all()
+
+    inserted = 0
+    for material_id, prod_share in rows:
+        if prod_share is None:
+            continue
+        session.add(
+            RiskEventMaterial(
+                risk_event_id=risk_event_id,
+                material_id=material_id,
+                relevance_score=float(prod_share),
+                match_reason="country_production_concentration",
+            )
+        )
+        inserted += 1
+    return inserted
+
+
+# ---------------------------------------------------------------------------
 # Content hash
 # ---------------------------------------------------------------------------
 
@@ -441,6 +598,8 @@ def ingest_opensanctions(
                 "company_events_inserted": 0,
                 "company_events_skipped_existing": 0,
                 "geography_events_inserted": 0,
+                "company_material_links": 0,
+                "geo_material_links": 0,
                 "companies_matched": 0,
                 "total_entities_parsed": 0,
                 "skipped_too_recent": True,
@@ -466,6 +625,8 @@ def ingest_opensanctions(
     company_events_inserted = 0
     company_events_skipped = 0
     geography_events_inserted = 0
+    company_material_links = 0
+    geo_material_links = 0
     batch_count = 0
 
     # --- Step 2: company match events ----------------------------------------
@@ -536,6 +697,31 @@ def ingest_opensanctions(
                 event_id=str(event.id),
                 company=company.canonical_name,
                 reason="LINK_EVENTS_TO_COMPANIES feature flag is disabled",
+            )
+
+        # ── Material attribution via company_material_exposures ─────────
+        # Independent of the company-link feature flag: this writes the
+        # event-to-material edge that scoring's material × geography
+        # rollup reads, regardless of whether the company-link layer is
+        # materialised at ingest time.
+        material_link_count = _attribute_company_event_to_materials(
+            session,
+            risk_event_id=event.id,
+            company=company,
+        )
+        company_material_links += material_link_count
+        if material_link_count == 0:
+            log.warning(
+                "opensanctions.company_event.no_material_attribution",
+                company=company.canonical_name,
+                event_id=str(event.id),
+                hint=(
+                    "company_material_exposures has no rows for this "
+                    "company; sanctions event won't propagate to material "
+                    "scoring.  Add exposure rows via "
+                    "seed_material_exposures.py for the materials this "
+                    "company actually trades."
+                ),
             )
 
         # One RiskEventGeography per unique country across all matched entities
@@ -618,11 +804,37 @@ def ingest_opensanctions(
             )
         )
 
+        # ── Material attribution via material_production_shares ─────────
+        # Each material the country produces above the threshold gets a
+        # junction row weighted by the country's share.  This is what
+        # turns a "CN — N sanctioned entities" event into a material-
+        # level signal that propagates through the geography rollup.
+        geo_link_count = _attribute_geo_event_to_materials(
+            session,
+            risk_event_id=geo_event.id,
+            country_code=country,
+        )
+        geo_material_links += geo_link_count
+        if geo_link_count == 0:
+            log.warning(
+                "opensanctions.geo_event.no_material_attribution",
+                country=country,
+                event_id=str(geo_event.id),
+                hint=(
+                    "material_production_shares has no rows above the "
+                    "min_share threshold for this country.  Either the "
+                    "country doesn't produce any tracked material above "
+                    "5%, or USGS data hasn't been ingested — run "
+                    "`bdi-ingest ingest-usgs <CSV>`."
+                ),
+            )
+
         log.info(
             "opensanctions.geo_event.inserted",
             country=country,
             sanctioned_count=count,
             severity=min(1.0, count / 500),
+            material_links=geo_link_count,
         )
         geography_events_inserted += 1
         batch_count += 1
@@ -637,6 +849,8 @@ def ingest_opensanctions(
         company_events_inserted=company_events_inserted,
         company_events_skipped_existing=company_events_skipped,
         geography_events_inserted=geography_events_inserted,
+        company_material_links=company_material_links,
+        geo_material_links=geo_material_links,
         companies_matched=len(matches),
         total_entities_parsed=len(entities),
     )
@@ -644,6 +858,8 @@ def ingest_opensanctions(
         "company_events_inserted": company_events_inserted,
         "company_events_skipped_existing": company_events_skipped,
         "geography_events_inserted": geography_events_inserted,
+        "company_material_links": company_material_links,
+        "geo_material_links": geo_material_links,
         "companies_matched": len(matches),
         "total_entities_parsed": len(entities),
         "skipped_too_recent": False,

@@ -330,13 +330,15 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Compounds of rare earth metals — terbium compounds",
      0.7, "battery_grade", 4, "global"),
 
-    # ── Sodium (Na-ion) ───────────────────────────────────────────────────
+    # ── Sodium (Na-ion battery scope) ───────────────────────────────────
+    # Reverted from "Sodium Carbonate (Battery Grade)" (May 2026).  Partner's
+    # HS code review showed Na-ion battery supply chain spans multiple
+    # sodium chemistries — see additional 4-digit entries in the May 2026
+    # coverage block below.  HS 2827 (sodium chloride / salt) intentionally
+    # NOT included — partner says NaCl isn't a battery feedstock.
     ("2836", "Sodium",
-     "Carbonates — sodium carbonate (soda ash) at 2836.20; primary Na-ion cathode precursor",
+     "Carbonates — sodium carbonate (soda ash) at 283620; primary Na-ion cathode precursor",
      0.8, "battery_grade", 4, "global"),
-    ("2827", "Sodium",
-     "Chlorides and chloride oxides — sodium chloride at 2827.10",
-     0.7, "intermediate", 4, "global"),
 
     # =========================================================================
     # 6-DIGIT GLOBAL ROWS (stage-specific; derived from MCS 2026 tariff tables)
@@ -667,9 +669,14 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     # ── Silicon — Anode Grade (6-digit) ───────────────────────────────────
     # MCS 2026 has no tariff section for silicon (US net exporter).
     # Codes sourced from WCO HS 2022 nomenclature.
+    # Stage downgraded from battery_grade → refined (May 2026, partner
+    # decision).  280461 covers high-purity silicon metal generally;
+    # bulk trade flows on this prefix go to semiconductor / solar, not
+    # battery anode specifically.  Sub-segment battery-grade silicon
+    # would need its own 8/10-digit code if/when one exists.
     ("280461", "Silicon (Anode Grade)",
      "Silicon, containing ≥99.99% silicon by weight (solar/semiconductor/anode grade)",
-     1.0, "battery_grade", 6, "global"),
+     1.0, "refined", 6, "global"),
     ("280469", "Silicon (Anode Grade)",
      "Silicon, other (metallurgical grade, <99.99%)", 0.9, "refined", 6, "global"),
 
@@ -765,20 +772,292 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("281000", "Boron",
      "Oxides of boron; boric acids (B2O3, H3BO3) — processed boron intermediate",
      0.9, "intermediate", 6, "global"),
+    # Refined borates upgraded from 'refined' → 'battery_grade' (May 2026)
+    # per partner annotation: "Battery materials (established – electrolytes)"
     ("284011", "Boron",
-     "Disodium tetraborate (refined borax, anhydrous)", 0.9, "refined", 6, "global"),
+     "Disodium tetraborate (refined borax, anhydrous) — battery electrolyte chemical",
+     0.9, "battery_grade", 6, "global"),
     ("284019", "Boron",
-     "Other borates (sodium perborate, other refined borates)", 0.8, "refined", 6, "global"),
+     "Other borates (sodium perborate, other refined borates) — battery electrolyte chemicals",
+     0.8, "battery_grade", 6, "global"),
 
     # ── Zinc (6-digit) ────────────────────────────────────────────────────
     ("260800", "Zinc",
      "Zinc ores and concentrates", 1.0, "ore", 6, "global"),
     ("281700", "Zinc",
-     "Zinc oxide; zinc peroxide (ZnO — intermediate chemical form)",
-     1.0, "intermediate", 6, "global"),
+     "Zinc oxide; zinc peroxide (ZnO) — Zn-air battery active material",
+     1.0, "battery_grade", 6, "global"),
     ("283329", "Zinc",
-     "Zinc sulfate (ZnSO4); shares 6-digit with cobalt and other sulfates",
+     "Zinc sulfate (ZnSO4) — Zn-ion electrolyte / aqueous battery; shares 6-digit with cobalt sulfate",
+     0.7, "battery_grade", 6, "global"),
+
+    # =========================================================================
+    # COVERAGE ADDITIONS — May 2026 (partner CSV review)
+    # =========================================================================
+    # Added based on partner's "Comprehensive HS_HTS codes" review.  Closes 60
+    # 4-digit prefix gaps from her curated CSV:
+    #   - 14 P0 (direct battery materials): cobalt salts, MnO2, V2O5, ZnO,
+    #     fluorides for electrolyte, MgCl2, TiO2 (LTO), boron borax, etc.
+    #   - 7 P1 (structural EV / scrap streams): ferroalloys, recycling
+    #   - Sodium expansion: NaOH (2815), Na phosphate (2835), peroxometallates (2841)
+    #   - Bismuth + Rhenium minimal coverage
+    # P2 (R&D / niche) and P3 (non-battery) deferred per partner annotation.
+    # =========================================================================
+
+    # ── P0 — Cobalt cathode precursors (multi-material 4-digit, mid confidence) ─
+    ("2822", "Cobalt",
+     "Cobalt oxides and hydroxides — Co(OH)2 cathode precursor at 282200",
+     1.0, "battery_grade", 4, "global"),
+    ("2833", "Cobalt",
+     "Sulphates — cobalt sulfate (CoSO4) at 283329; cathode precursor (multi-material 4-digit)",
+     0.4, "battery_grade", 4, "global"),
+    ("2836", "Cobalt",
+     "Carbonates — cobalt carbonate at 283699; cathode precursor (multi-material 4-digit)",
+     0.4, "battery_grade", 4, "global"),
+
+    # ── P0 — Manganese dioxide (cathode active form) ──────────────────────
+    ("2820", "Manganese",
+     "Manganese oxides — MnO2 cathode active material",
+     1.0, "battery_grade", 4, "global"),
+
+    # ── P0 — Vanadium pentoxide (VRFB active material) ───────────────────
+    ("2825", "Vanadium",
+     "Hydrazine and metal oxides — vanadium pentoxide (V2O5) at 282530; VRFB active material (multi-material 4-digit)",
+     0.4, "battery_grade", 4, "global"),
+
+    # ── P0 — Zinc battery materials ───────────────────────────────────────
+    ("2817", "Zinc",
+     "Zinc oxide; zinc peroxide — Zn-air battery active material",
+     1.0, "battery_grade", 4, "global"),
+
+    # ── P0 — Titanium dioxide (LTO anode) ────────────────────────────────
+    ("2823", "Titanium",
+     "Titanium oxides — TiO2 used in lithium-titanate (LTO) anodes; mostly pigments by volume",
+     0.8, "battery_grade", 4, "global"),
+
+    # ── P0 — Boron refined borates (electrolyte) ─────────────────────────
+    ("2840", "Boron",
+     "Refined borates and borax — battery electrolyte chemicals",
+     0.8, "battery_grade", 4, "global"),
+
+    # ── P0 — Fluorspar derivatives (electrolyte chemicals) ───────────────
+    ("2811", "Fluorspar",
+     "Hydrofluoric acid (HF) — battery electrolyte precursor at 281111",
+     0.7, "intermediate", 4, "global"),
+    ("2826", "Fluorspar",
+     "Fluorides — AlF3 (282612), synthetic cryolite (282630) for battery electrolytes",
+     0.7, "intermediate", 4, "global"),
+    ("2530", "Fluorspar",
+     "Mineral substances NEC — natural cryolite at 253090 (multi-material 4-digit)",
+     0.4, "ore", 4, "global"),
+
+    # ── P0 — Magnesium chloride (battery electrolyte) ────────────────────
+    ("2827", "Magnesium",
+     "Chlorides — magnesium chloride (MgCl2) electrolyte at 282731 (multi-material 4-digit)",
+     0.4, "intermediate", 4, "global"),
+
+    # ── P0 — Nickel scrap (recycling) ────────────────────────────────────
+    ("7503", "Nickel",
+     "Nickel waste and scrap — recycling stream",
+     1.0, "scrap", 4, "global"),
+
+    # ── P1 — Aluminum scrap (structural EV / battery pack recycling) ──────
+    ("7602", "Aluminum",
+     "Aluminum waste and scrap — recycling stream",
+     1.0, "scrap", 4, "global"),
+
+    # ── P1 — Copper scrap and wire (battery wiring / current collectors) ─
+    ("7404", "Copper",
+     "Copper waste and scrap — recycling stream",
+     1.0, "scrap", 4, "global"),
+    ("7408", "Copper",
+     "Copper wire — fabricated form for battery wiring and current collectors",
+     1.0, "fabricated", 4, "global"),
+
+    # ── P1 — Steel-related ferroalloys (structural EV) ───────────────────
+    # 7202 is the multi-material ferroalloys chapter; existing seed already
+    # has Titanium, Vanadium, Molybdenum entries.  These complete coverage
+    # for the structural EV chassis material chain.
+    ("7202", "Chromium",
+     "Ferroalloys — ferrochromium for stainless steel; structural EV chassis",
+     0.7, "intermediate", 4, "global"),
+    ("7204", "Chromium",
+     "Iron and steel scrap — stainless component recovers chromium",
+     0.5, "scrap", 4, "global"),
+    ("7202", "Manganese",
+     "Ferroalloys — ferromanganese (720211/720219), silicomanganese (720230)",
+     0.7, "intermediate", 4, "global"),
+    ("7202", "Niobium",
+     "Ferroalloys — ferroniobium (720293) for high-strength steel",
+     0.7, "intermediate", 4, "global"),
+    ("7202", "Nickel",
+     "Ferroalloys — ferronickel (720260) for stainless steel",
+     0.6, "intermediate", 4, "global"),
+    ("7202", "Silicon (Anode Grade)",
+     "Ferroalloys — ferrosilicon (720221 >55% Si, 720229 ≤55% Si); a cost-effective alternative to graphite anodes that enables up to ~10x silicon energy storage while alleviating volume expansion, enhancing battery capacity and faster charging in advanced Li-ion cells (also serves as metallurgical precursor to higher-purity silicon)",
+     0.6, "battery_grade", 4, "global"),
+
+    # ── P1 — Zinc scrap ──────────────────────────────────────────────────
+    ("7902", "Zinc",
+     "Zinc waste and scrap — recycling",
+     1.0, "scrap", 4, "global"),
+
+    # ── Sodium expansion (Option B — single material, multi-prefix scope) ─
+    # Existing 2836 entry above is kept as the primary battery-grade
+    # precursor.  Below add NaOH precursor, Na phosphate (NIB cathode), and
+    # peroxometallates per partner's CSV annotations.  HS 2827 (sodium
+    # chloride / salt), 2805 (sodium metal), and 2833 (Na2SO4) are
+    # intentionally excluded — partner tagged each as not battery-relevant.
+    ("2815", "Sodium",
+     "Sodium hydroxide (caustic soda) at 281511 — chemical precursor for Na-ion cathode synthesis",
+     0.7, "intermediate", 4, "global"),
+    ("2835", "Sodium",
+     "Phosphates — trisodium phosphate (Na3PO4) at 283526; polyanionic NIB cathode precursor (multi-material 4-digit)",
+     0.5, "battery_grade", 4, "global"),
+    ("2841", "Sodium",
+     "Salts of peroxometallic acids — sodium-containing TM oxide precursors at 284169 (multi-material 4-digit)",
+     0.4, "battery_grade", 4, "global"),
+
+    # ── Bismuth (battery R&D — minimal coverage) ──────────────────────────
+    # Partner tags as "Battery R&D / future (electrolytes)".  Single-material
+    # 4-digit means high confidence on attribution.
+    ("8106", "Bismuth",
+     "Bismuth and articles thereof — battery R&D (electrolyte additives)",
+     1.0, "refined", 4, "global"),
+
+    # ── Rhenium (non-battery — minimal coverage so material has any HS path) ─
+    # Partner does not tag rhenium as battery-relevant; entries kept minimal
+    # so the material isn't an orphan in materials table without any HS
+    # mapping at all.  Both prefixes are multi-material — low confidence.
+    ("2841", "Rhenium",
+     "Salts of peroxometallic acids — ammonium perrhenate at 284190 (multi-material 4-digit)",
+     0.4, "intermediate", 4, "global"),
+    ("8112", "Rhenium",
+     "Beryllium / chromium / minor metals chapter — rhenium unwrought at 811241 (multi-material 4-digit)",
+     0.4, "refined", 4, "global"),
+
+    # ── 6-digit additions for the prefixes above ─────────────────────────
+    # Only entries NOT already present in the existing 6-digit blocks above.
+    # Confirmed via post-edit duplicate check (2026-05).  720421 (stainless
+    # scrap) is the only new ferro-/scrap 6-digit entry needed; the other
+    # ferroalloy 6-digit codes (720211/19/41/49/60/93, 740400, 740811,
+    # 750300, 760200, 790200) already existed under their respective
+    # material sections.  Same logic for fluoride / titanium / vanadium /
+    # magnesium 6-digit codes.
+    ("720421", "Chromium",
+     "Stainless steel scrap — chromium recovery stream",
+     1.0, "scrap", 6, "global"),
+    ("790200", "Zinc",
+     "Zinc waste and scrap — recycling",
+     1.0, "scrap", 6, "global"),
+    ("720221", "Silicon (Anode Grade)",
+     "Ferrosilicon, >55% Si by weight — graphite-alternative anode material for advanced Li-ion cells; enables ~10x silicon energy storage while alleviating volume expansion (faster charging, higher capacity)",
+     1.0, "battery_grade", 6, "global"),
+    ("720229", "Silicon (Anode Grade)",
+     "Ferrosilicon, ≤55% Si by weight — graphite-alternative anode material for advanced Li-ion cells; enables ~10x silicon energy storage while alleviating volume expansion (faster charging, higher capacity)",
+     1.0, "battery_grade", 6, "global"),
+
+    # Sodium 6-digit (NaOH, Na phosphate, soda ash, peroxometallates)
+    ("281511", "Sodium",
+     "Sodium hydroxide (caustic soda), solid — chemical precursor",
+     1.0, "intermediate", 6, "global"),
+    ("281512", "Sodium",
+     "Sodium hydroxide (caustic soda), aqueous — chemical precursor",
+     1.0, "intermediate", 6, "global"),
+    ("283526", "Sodium",
+     "Trisodium phosphate (Na3PO4) — polyanionic NIB cathode precursor",
+     1.0, "battery_grade", 6, "global"),
+    ("283620", "Sodium",
+     "Disodium carbonate (Na2CO3 / soda ash) — Na-ion cathode precursor",
+     1.0, "battery_grade", 6, "global"),
+    ("284169", "Sodium",
+     "Sodium peroxometallates — Na-containing TM oxide precursors",
+     0.7, "battery_grade", 6, "global"),
+
+    # Bismuth 6-digit
+    ("810610", "Bismuth",
+     "Bismuth ≥99.99% (high purity) — battery R&D",
+     1.0, "refined", 6, "global"),
+    ("810690", "Bismuth",
+     "Bismuth, other forms — battery R&D",
+     0.8, "refined", 6, "global"),
+
+    # Rhenium 6-digit
+    ("811241", "Rhenium",
+     "Rhenium unwrought (incl. powders) — partner non-battery; minimal coverage",
+     1.0, "refined", 6, "global"),
+    ("284190", "Rhenium",
+     "Ammonium perrhenate — Re precursor",
+     0.5, "intermediate", 6, "global"),
+
+    # ── Migrated from mcs_pdf_parser._HS_6DIGIT_STAGE_OVERRIDE (May 2026) ──
+    # 20 entries that the PDF parser carried as overrides but were
+    # missing from this seed.  Migrating them here lets us delete the
+    # override dict and have a single source of truth for stage
+    # assignments.
+    ("260600", "Aluminum",
+     "Aluminium ores and concentrates — bauxite (sub-prefix of 2606)",
+     1.0, "ore", 6, "global"),
+    ("281820", "Aluminum",
+     "Aluminium oxide (alumina) — refined intermediate from bauxite",
+     1.0, "intermediate", 6, "global"),
+    # 260111 and 260112 (Iron Ore non/agglomerated) are ALREADY seeded
+    # earlier in this list — entries 92/93.  Removed redundant duplicates
+    # added during the May 2026 PDF-override migration pass.
+    ("261500", "Vanadium",
+     "Vanadium ores and concentrates (shared 6-digit with Niobium / Tantalum / Zirconium)",
+     1.0, "ore", 6, "global"),
+    ("261500", "Niobium",
+     "Niobium ores and concentrates (shared 6-digit, mixed-material)",
+     1.0, "ore", 6, "global"),
+    ("261500", "Tantalum",
+     "Tantalum ores and concentrates (shared 6-digit, mixed-material)",
+     1.0, "ore", 6, "global"),
+    ("261500", "Zirconium",
+     "Zirconium ores and concentrates (shared 6-digit, mixed-material)",
+     1.0, "ore", 6, "global"),
+    ("261790", "Rare Earth Elements",
+     "Rare-earth ores and concentrates (other) — bastnäsite / monazite mixed",
+     0.7, "ore", 6, "global"),
+    ("283324", "Nickel",
+     "Nickel sulphate (NiSO4) — primary battery-grade precursor for cathode active material",
+     1.0, "battery_grade", 6, "global"),
+    ("283329", "Manganese",
+     "Manganese sulphate (MnSO4) — battery-grade cathode precursor",
+     1.0, "battery_grade", 6, "global"),
+    ("740311", "Copper",
+     "Copper cathodes (refined) — battery current collector input",
+     1.0, "refined", 6, "global"),
+    ("740319", "Copper",
+     "Refined copper, other unwrought forms",
+     1.0, "refined", 6, "global"),
+    ("750100", "Nickel",
+     "Nickel mattes / sinters / oxide sinters — intermediate from sulfide flow",
+     1.0, "intermediate", 6, "global"),
+    ("750220", "Nickel",
+     "Nickel alloys, unwrought — refined product, partial battery use",
+     0.6, "refined", 6, "global"),
+    ("810194", "Tungsten",
+     "Tungsten powders / unwrought — intermediate metallurgical form",
      0.7, "intermediate", 6, "global"),
+    ("810199", "Tungsten",
+     "Tungsten, other (refined / wrought)",
+     0.7, "refined", 6, "global"),
+    ("810292", "Molybdenum",
+     "Molybdenum, other (intermediate forms — Mo trioxide, etc.)",
+     0.7, "intermediate", 6, "global"),
+    ("252810", "Boron",
+     "Natural sodium borates and concentrates — boron ore stage",
+     1.0, "ore", 6, "global"),
+    ("252890", "Boron",
+     "Other natural borates and concentrates",
+     1.0, "ore", 6, "global"),
+    ("282739", "Lithium",
+     "Other chlorides — includes lithium chloride (LiCl) intermediate",
+     0.6, "intermediate", 6, "global"),
+    ("280512", "Lithium",
+     "Calcium / strontium / barium — shared 6-digit; lithium-adjacent for some refining inputs",
+     0.4, "refined", 6, "global"),
 ]
 
 
@@ -1070,7 +1349,391 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
     ("280469", "Silicon (Anode Grade)"): [
         "silicon, other",
     ],
+    # Ferrosilicon — graphite-alternative anode material for advanced Li-ion
+    # cells (per partner input).  USGS uses the misspelling "Ferosilicon" in
+    # the MCS CSV; included here so free-text matching catches both forms
+    # plus the FeSi shorthand commonly used in trade reporting.
+    ("7202", "Silicon (Anode Grade)"): [
+        "ferrosilicon",
+        "FeSi",
+        "Ferosilicon",   # USGS misspelling (one r) — matches MCS CSV TYPE strings
+    ],
+
+    # ════════════════════════════════════════════════════════════════════════
+    # MCS 2026 Import Sources sub-type aliases (May 2026 batch)
+    # ════════════════════════════════════════════════════════════════════════
+    # Below this line: keywords derived directly from the MCS 2026
+    # Import Sources Statistics_detail values, so the parser's sub-type
+    # resolution can route each sub-type to its specific HS prefix
+    # instead of collapsing all sub-types onto material.hs_codes[0].
+    #
+    # Coverage rationale: each chapter publishes 2-7 distinct sub-types
+    # (e.g. ANTIMONY: oxide / unwrought metal and powder / ore and
+    # concentrates / total).  Without these keywords, the CLI dedup
+    # pass keeps one row and discards the rest.  WITH these keywords,
+    # each sub-type lands on its own HS prefix and partner sees per-
+    # stage country distributions.
+    #
+    # "Total"-style sub-types (e.g. "Combined total", "Total imports",
+    # "Total metal and oxide") are intentionally NOT keyworded — the
+    # CLI dedup pass already prefers them when keywords don't resolve,
+    # so they fall through correctly without explicit aliases.
+
+    # ── Antimony ─────────────────────────────────────────────────────────
+    ("261710", "Antimony"): [
+        "ore and concentrates",
+        "antimony ore",
+        "antimony concentrate",
+    ],
+    ("282580", "Antimony"): [
+        "oxide",
+        "antimony oxide",
+        "Sb2O3",
+    ],
+    ("811010", "Antimony"): [
+        "unwrought metal and powder",
+        "unwrought antimony",
+        "antimony metal",
+        "antimony powder",
+        "metal and powder",
+    ],
+
+    # ── Aluminum (BAUXITE AND ALUMINA chapter sub-types) ─────────────────
+    # 'Bauxite' keyword already lives on (2606, Aluminum).  Add 6-digit
+    # form + alumina alias on the intermediate prefix.
+    ("260600", "Aluminum"): [
+        "bauxite",
+        "aluminium ore",
+        "aluminum ore",
+    ],
+    ("281820", "Aluminum"): [
+        "alumina",
+        "aluminium oxide",
+        "aluminum oxide",
+        "Al2O3",
+    ],
+
+    # ── Chromium ─────────────────────────────────────────────────────────
+    # 'Chromium-containing chemicals' and 'Stainless steel' sub-types
+    # have no precise HS code in seed today — left unmapped, fall through
+    # to dedup. Partner can revisit once chemical-specific HS rows are added.
+    ("261000", "Chromium"): [
+        "chromite",
+        "chromite (ores and concentrates)",
+        "chromium ore",
+        "chromium concentrate",
+    ],
+    ("720241", "Chromium"): [
+        "ferrochromium",                          # default (high-C is dominant trade form)
+        "ferrochromium, high-carbon",
+        "high-carbon ferrochromium",
+        "charge ferrochromium",
+    ],
+    ("720249", "Chromium"): [
+        "ferrochromium, low-carbon",
+        "low-carbon ferrochromium",
+    ],
+    ("811221", "Chromium"): [
+        "chromium metal",
+        "unwrought chromium",
+    ],
+    ("720421", "Chromium"): [
+        "chromium-containing scrap",
+        "stainless steel scrap",
+    ],
+
+    # ── Copper ───────────────────────────────────────────────────────────
+    ("740200", "Copper"): [
+        "copper content of blister and anodes",
+        "blister copper",
+        "copper anodes",
+        "copper anode",
+        "anode copper",
+        "unrefined copper",
+        "copper content of matte, ash, and precipitate",
+        "copper matte",
+        "matte, ash, and precipitate",
+    ],
+    ("740311", "Copper"): [
+        "refined copper",
+        "copper cathodes",
+        "copper cathode",
+        "cathode copper",
+    ],
+    ("740400", "Copper"): [
+        "copper content of scrap",
+        "copper scrap",
+        "copper waste and scrap",
+    ],
+    # 260300 already has 'copper ores', 'copper concentrate' — extend with
+    # the MCS-specific phrasing.  Note: this overrides the existing entry,
+    # so we re-list the prior keywords too.
+    ("260300", "Copper"): [
+        "copper ores",
+        "copper concentrate",
+        "copper content of ore and concentrate",
+        "copper ore and concentrate",
+    ],
+
+    # ── Germanium ────────────────────────────────────────────────────────
+    ("282560", "Germanium"): [
+        "germanium dioxide",
+        "germanium dioxide (Ge content)",
+        "GeO2",
+        "germanium oxide",
+    ],
+    ("811292", "Germanium"): [
+        "germanium metal",
+        "unwrought germanium",
+    ],
+
+    # ── Magnesium (METAL chapter) ────────────────────────────────────────
+    ("810411", "Magnesium"): [
+        "magnesium metal",
+        "magnesium metal (99.8% purity)",
+        "unwrought magnesium",
+        "pure magnesium",
+    ],
+    ("810419", "Magnesium"): [
+        "magnesium alloys",
+        "magnesium alloy",
+        "magnesium alloys (magnesium content)",
+    ],
+    ("810420", "Magnesium"): [
+        "scrap",
+        "magnesium scrap",
+        "magnesium waste and scrap",
+    ],
+    ("810430", "Magnesium"): [
+        "magnesium powders",
+        "magnesium powder",
+    ],
+    ("810490", "Magnesium"): [
+        "sheet, powder, and other",
+        "magnesium sheet",
+        "wrought magnesium",
+        "magnesium articles",
+    ],
+
+    # ── Manganese ────────────────────────────────────────────────────────
+    ("720211", "Manganese"): [
+        "ferromanganese",                           # default to high-C as dominant
+        "ferromanganese, high-carbon",
+    ],
+    ("720219", "Manganese"): [
+        "ferromanganese, low-carbon",
+        "ferromanganese, medium-carbon",
+    ],
+    ("720230", "Manganese"): [
+        "silicomanganese",
+        "ferrosilicon manganese",
+        "silicon manganese",
+    ],
+
+    # ── Molybdenum ───────────────────────────────────────────────────────
+    ("261310", "Molybdenum"): [
+        "molybdenum ore and concentrates, roasted",
+        "molybdic oxide calcine",
+    ],
+    ("261390", "Molybdenum"): [
+        "molybdenum ore",
+        "molybdenum concentrate",
+        "molybdenum ore and concentrates",     # default (unroasted is dominant)
+    ],
+    ("720270", "Molybdenum"): [
+        "ferromolybdenum",
+    ],
+
+    # ── Nickel ───────────────────────────────────────────────────────────
+    # 750210 already has keywords; extend with 'primary nickel' MCS phrasing.
+    ("750210", "Nickel"): [
+        "unwrought nickel, not alloyed",
+        "class 1 nickel",
+        "Ni briquette",
+        "primary nickel",
+    ],
+    ("750300", "Nickel"): [
+        "nickel-containing scrap",
+        "nickel scrap",
+        "nickel-containing scrap, including nickel content of stainless-steel scrap",
+        "stainless steel scrap (nickel content)",
+    ],
+
+    # ── Niobium ──────────────────────────────────────────────────────────
+    ("261590", "Niobium"): [
+        "niobium and tantalum ores and concentrates",
+        "columbite-tantalite",
+        "columbite",
+        "niobium ore",
+        "niobium concentrate",
+    ],
+    ("282590", "Niobium"): [
+        "niobium oxide",
+        "Nb2O5",
+        "columbium oxide",
+    ],
+    ("720293", "Niobium"): [
+        "ferroniobium",
+        "ferroniobium and niobium metal",     # combined sub-type → routes to dominant ferro form
+        "ferro-columbium",
+    ],
+
+    # ── Rhenium ──────────────────────────────────────────────────────────
+    ("284190", "Rhenium"): [
+        "ammonium perrhenate",
+    ],
+    ("811241", "Rhenium"): [
+        "rhenium metal",
+        "unwrought rhenium",
+    ],
+
+    # ── Tantalum ─────────────────────────────────────────────────────────
+    # 261590 also serves Tantalum (mixed-material 6-digit prefix).
+    ("261590", "Tantalum"): [
+        "tantalum ores and concentrates",
+        "tantalite",
+        "tantalum ore",
+        "tantalum concentrate",
+    ],
+    ("810320", "Tantalum"): [
+        "tantalum metal and powder",
+        "tantalum metal",
+        "tantalum powder",
+        "unwrought tantalum",
+    ],
+    ("810391", "Tantalum"): [
+        "tantalum waste and scrap",
+        "tantalum scrap",
+    ],
+
+    # ── Tin ──────────────────────────────────────────────────────────────
+    ("800110", "Tin"): [
+        "refined tin",
+        "unwrought tin",
+        "pure tin",
+        "tin, not alloyed",
+    ],
+    ("800200", "Tin"): [
+        "waste and scrap",
+        "tin waste and scrap",
+        "tin scrap",
+    ],
+
+    # ── Titanium ─────────────────────────────────────────────────────────
+    ("320611", "Titanium"): [
+        "TiO2 pigment",
+        "titanium dioxide pigment",
+        "TiO2 ≥80%",
+    ],
+    # 810820 already has 'unwrought titanium', 'titanium sponge'; extend
+    # with the MCS phrasing variant.
+    ("810820", "Titanium"): [
+        "unwrought titanium",
+        "titanium sponge",
+        "titanium sponge metal",
+        "titanium metal",
+    ],
+
+    # ── Vanadium ─────────────────────────────────────────────────────────
+    ("282530", "Vanadium"): [
+        "vanadium pentoxide",
+        "V2O5",
+        "vanadium oxide",
+    ],
+    ("720292", "Vanadium"): [
+        "ferrovanadium",
+    ],
+
+    # ── Zinc ─────────────────────────────────────────────────────────────
+    ("260800", "Zinc"): [
+        "ores and concentrates",
+        "zinc ore",
+        "zinc concentrate",
+        "zinc ores and concentrates",
+    ],
+    # 7901 (4-digit) is the only "refined zinc" prefix in seed today.
+    # Routing 'refined metal' here lets the parser resolve at the 4-digit
+    # level until partner adds 6-digit zinc refined entries.
+    ("7901", "Zinc"): [
+        "refined metal",
+        "refined zinc",
+        "unwrought zinc",
+        "zinc metal",
+    ],
+    ("790200", "Zinc"): [
+        "waste and scrap",
+        "zinc waste and scrap",
+        "zinc scrap",
+        "waste and scrap (gross weight)",
+    ],
+
+    # ── Zirconium (and Hafnium sub-types) ────────────────────────────────
+    # MCS publishes Hafnium sub-types under the same chapter but seed has
+    # no Hf-specific HS rows (Hf shares 6-digit prefixes with Zr).  Hf
+    # sub-types fall through to dedup until partner adds Hf entries.
+    ("261510", "Zirconium"): [
+        "zirconium ores and concentrates",
+        "zircon",
+        "zircon sand",
+        "zircon sands",
+    ],
+    ("282560", "Zirconium"): [
+        "zirconium, compounds",
+        "zirconium oxide",
+        "zirconium dioxide",
+        "ZrO2",
+        "baddeleyite",
+    ],
+    ("810929", "Zirconium"): [
+        "zirconium, unwrought",
+        "unwrought zirconium",
+        "zirconium powder",
+    ],
+    ("810999", "Zirconium"): [
+        "zirconium, wrought",
+        "wrought zirconium",
+        "zirconium articles",
+    ],
 }
+
+
+def _merged_keywords_for(
+    hs_prefix: str, canonical_name: str
+) -> list[str]:
+    """Return the merged keyword list for a (prefix, canonical) pair.
+
+    Two sources, merged with curated-first ordering so the partner-
+    curated keywords win on lookup priority:
+
+      Tier 1  ``_HS_KEYWORDS_BY_MAPPING``      hand-curated, in this file
+      Tiers 2-4 ``_HS_KEYWORDS_AUTO``           auto-derived from canonical
+                                                name + symbol + stage +
+                                                partner CSV descriptions
+                                                (see ``seed_hs_keywords_auto.py``)
+
+    Dedup is case-insensitive; first-seen wins.  Returns lowercased
+    keywords ready for ``hs_code_material_mappings.keywords`` (a JSONB
+    array — case is preserved at the storage layer but the resolver
+    lowercases for matching).
+    """
+    from app.services.ingestion.seed_hs_keywords_auto import _HS_KEYWORDS_AUTO
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for src in (_HS_KEYWORDS_BY_MAPPING, _HS_KEYWORDS_AUTO):
+        for k in src.get((hs_prefix, canonical_name), []) or []:
+            kl = (k or "").strip().lower()
+            if kl and kl not in seen:
+                seen.add(kl)
+                out.append(kl)
+    return out
+
+
+def _all_keyword_keys() -> set[tuple[str, str]]:
+    """Union of (prefix, canonical) keys present in either keyword source."""
+    from app.services.ingestion.seed_hs_keywords_auto import _HS_KEYWORDS_AUTO
+
+    return set(_HS_KEYWORDS_BY_MAPPING.keys()) | set(_HS_KEYWORDS_AUTO.keys())
 
 
 def _upsert_keywords_for_mappings(
@@ -1079,15 +1742,19 @@ def _upsert_keywords_for_mappings(
     mat_map: dict[str, int],
     force: bool,
 ) -> dict[str, int]:
-    """Apply ``_HS_KEYWORDS_BY_MAPPING`` to ``hs_code_material_mappings.keywords``.
+    """Apply merged curated+auto keywords to ``hs_code_material_mappings.keywords``.
 
     Called from ``upsert_hs_mappings`` after mapping rows are inserted/updated.
     Resolves each ``(prefix, canonical_name)`` key to a specific row scoped to
-    ``market_scope='global'`` and writes the keyword list when:
+    ``market_scope='global'`` and writes the merged keyword list when:
 
       * ``force=True``                          → always overwrite
       * the existing ``keywords`` column is NULL or empty → set fresh
       * existing keywords already populated AND ``force=False`` → skip
+
+    Source merge order (see ``_merged_keywords_for``):
+      1. ``_HS_KEYWORDS_BY_MAPPING``  — hand-curated (highest priority)
+      2. ``_HS_KEYWORDS_AUTO``        — derived from canonical/symbol/stage/CSV
 
     Args:
         session:  Active SQLAlchemy session.  Caller owns the commit.
@@ -1104,7 +1771,8 @@ def _upsert_keywords_for_mappings(
     skipped_existing = 0
     skipped_no_row = 0
 
-    for (hs_prefix, canonical_name), keywords in _HS_KEYWORDS_BY_MAPPING.items():
+    for (hs_prefix, canonical_name) in _all_keyword_keys():
+        keywords = _merged_keywords_for(hs_prefix, canonical_name)
         if not keywords:
             continue
 

@@ -67,8 +67,17 @@ _EXPORT_WEIGHT = 0.25
 # Sub-score helpers (pure functions)
 # ---------------------------------------------------------------------------
 
-_TARIFF_SUBTYPES = frozenset({"tariff_increase", "tariff_threat", "tariff"})
-_EXPORT_SUBTYPES = frozenset({"export_restriction", "export_ban", "export_quota"})
+# ── event_subtype classifications consumed by Tariff / Export sub-scores ──
+# These match the canonical taxonomy emitted by ingesters (see migration 040
+# docstring + ``RiskEvent.event_subtype`` column comment).  Pre-2026-05-05
+# these constants were lowercase (``"tariff"``, ``"export_restriction"``…)
+# matching against ``RiskEvent.event_type``, but no ingester ever wrote those
+# values — see ``docs/scoring-audit-2026-05-addendum.md`` G3 for the
+# diagnosis.  Migration 040 promoted ``event_subtype`` to a typed column
+# and aligned both sides on the uppercase form ingesters had been using
+# all along.
+_TARIFF_SUBTYPES = frozenset({"TARIFF"})
+_EXPORT_SUBTYPES = frozenset({"EXPORT_RESTRICTION"})
 
 
 def _compute_hhi(shares: list[float]) -> float:
@@ -180,12 +189,14 @@ def score_hs_node_geography(
     hhi_at_stage = _compute_hhi(share_values)
 
     # ── 5. Tariff events scoped to this HS code ──────────────────────────────
+    # Filter on typed ``event_subtype`` column (migration 040), not the
+    # ingester-specific ``event_type`` — see _TARIFF_SUBTYPES comment above.
     tariff_rows = db.execute(
         select(RiskEvent.severity_score, RiskEvent.confidence_score, RiskEvent.event_date)
         .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
         .where(
             RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
-            RiskEvent.event_type.in_(_TARIFF_SUBTYPES),
+            RiskEvent.event_subtype.in_(_TARIFF_SUBTYPES),
         )
     ).all()
 
@@ -198,12 +209,13 @@ def score_hs_node_geography(
     )
 
     # ── 6. Export restriction events scoped to this HS code ─────────────────
+    # Same as tariff filter: typed ``event_subtype`` column (migration 040).
     export_rows = db.execute(
         select(RiskEvent.severity_score, RiskEvent.confidence_score, RiskEvent.event_date)
         .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
         .where(
             RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
-            RiskEvent.event_type.in_(_EXPORT_SUBTYPES),
+            RiskEvent.event_subtype.in_(_EXPORT_SUBTYPES),
         )
     ).all()
 

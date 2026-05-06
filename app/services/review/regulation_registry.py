@@ -74,7 +74,7 @@ REGULATION_REVIEW_CONFIG: dict[str, RegulationReviewConfig] = {
             "Department of Energy",
         ],
     },
-    "EU_BATTERY_REG": {
+    "EU_BATTERY_REG_2023": {
         "fr_query_names": ["critical_minerals", "lithium_battery"],
         "keywords": [
             "EU Battery Regulation",

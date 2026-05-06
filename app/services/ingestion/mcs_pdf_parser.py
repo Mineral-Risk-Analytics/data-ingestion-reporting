@@ -27,7 +27,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import structlog
 from sqlalchemy import select
@@ -37,11 +37,19 @@ from sqlalchemy.orm import Session
 from app.models.supply import HsCodeMaterialMapping, HsCodeProductionShare, Material
 from app.models.criticality_signal import MaterialCriticalitySignal
 
+if TYPE_CHECKING:
+    from app.services.ingestion.material_resolver import MaterialAliasResolver
+
 log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Commodity name normalisation — PDF all-caps headings → materials.canonical_name
 # ---------------------------------------------------------------------------
+# This dict is now DEPRECATED — the same mappings live in
+# ``material_source_aliases`` (source_system='mcs_pdf').  The regex
+# fallback path uses ``MaterialAliasResolver``; this dict is retained
+# only as a build-time fallback for callers that haven't been updated
+# yet.  Will be removed once all callers pass a resolver.
 
 _MCS_COMMODITY_MAP: dict[str, str] = {
     "COBALT":                   "Cobalt",
@@ -73,195 +81,70 @@ _MCS_COMMODITY_MAP: dict[str, str] = {
     "INDIUM":                   "Indium",
     "ANTIMONY":                 "Antimony",
     "ZIRCONIUM AND HAFNIUM":    "Zirconium",
+    # Sodium-ion battery cathode precursor — MCS publishes Na2CO3 production
+    # under the SODA ASH chapter.  After the May 2026 partner-CSV review the
+    # canonical material was kept as "Sodium" with multiple HS prefixes
+    # (NaOH, Na phosphate, Na2CO3, peroxometallates) rather than narrowed
+    # to just sodium carbonate.
+    "SODA ASH":                 "Sodium",
     # Add entries as new commodities are covered by MCS
 }
 
 # ---------------------------------------------------------------------------
 # Stage preference for world mine production share linkage.
-# Maps canonical material name → preferred supply_chain_stage for the
-# hs_code_production_shares row that represents world mine production.
-# 'ore' is correct for most mining commodities.  A few processed materials
-# are reported at the 'refined' or 'battery_grade' stage instead.
 # ---------------------------------------------------------------------------
+# Maps canonical material name → preferred supply_chain_stage for the
+# hs_code_production_shares row that anchors world production shares from
+# the MCS PDF.  Used by ``_pick_production_hs_id``.
+#
+# Default for any material NOT listed here: "ore" — most MCS commodities
+# report mine production tonnages at the ore stage.  The dict carries
+# ONLY the exceptions where USGS reports production at a different stage.
+# Trimmed in May 2026 from 30 entries to 5; redundant defaults removed.
+#
+# When adding a new material that doesn't have an ore-stage HS prefix
+# (e.g. a co-product like Gallium that's only recovered during refining),
+# add an entry here.  Otherwise leave it out and the default takes over.
+
+_MCS_PRODUCTION_STAGE_PREFERENCE_DEFAULT = "ore"
 
 _MCS_PRODUCTION_STAGE_PREFERENCE: dict[str, str] = {
-    "Cobalt": "ore",
-    "Lithium": "ore",           # spodumene / brine extraction
-    "Nickel": "ore",
-    "Manganese": "ore",
-    "Natural Graphite": "ore",
-    "Rare Earth Elements": "ore",
-    "Platinum-Group Metals": "ore",
-    "Aluminum": "ore",          # bauxite
-    "Copper": "ore",
-    "Silicon (Anode Grade)": "refined",
-    "Titanium": "ore",
-    "Chromium": "ore",
-    "Tungsten": "ore",
-    "Molybdenum": "ore",
-    "Vanadium": "ore",
-    "Niobium": "ore",
-    "Tantalum": "ore",
-    "Tin": "ore",
-    "Zinc": "ore",
-    "Boron": "ore",
-    "Fluorspar": "ore",
-    "Magnesium": "ore",
-    "Iron Ore (LFP Grade)": "ore",
-    "Silver": "ore",
-    "Gallium": "refined",
+    # Co-products of zinc/copper refining — no standalone "ore" stage.
+    # First appearance in the supply chain is as a refined metal
+    # recovered during smelter operations.
+    "Gallium":   "refined",
     "Germanium": "refined",
-    "Indium": "refined",
-    "Antimony": "ore",
-    "Zirconium": "ore",
+    "Indium":    "refined",
+    # USGS reports silicon-metal world production at the refined stage
+    # (HS 280461 — silicon-metal ≥99.99%).  Quartz mining is upstream of
+    # MCS's silicon chapter, not reported there.
+    "Silicon (Anode Grade)": "refined",
+    # USGS reports under the SODA ASH chapter; soda ash (Na2CO3) is the
+    # battery-grade input for Na-ion cathode synthesis (Na2CO3 → cathode
+    # active material).  Without this override the function's lowest-
+    # stage-sequence fallback would land production data on caustic-soda
+    # intermediate (281511), which is the wrong stage for our scoring.
+    "Sodium":    "battery_grade",
 }
 
 # ---------------------------------------------------------------------------
 # Stage assignment for parser-derived 6-digit and 10-digit rows
 # ---------------------------------------------------------------------------
-# Resolution order at insert time:
-#   1. Look up (hs_code_prefix, canonical_material_name) in _HS_6DIGIT_STAGE_OVERRIDE.
-#      For 10-digit prefixes the truncated 6-digit form is also tried.
-#   2. Fall back to the 4-digit parent's stage in hs_code_material_mappings
+# Resolution order at insert time (refactored May 2026 — single source of
+# truth is now ``seed_hs_mappings._MAPPINGS`` populated into
+# ``hs_code_material_mappings``):
+#
+#   1. Look up (hs_code_prefix, material_id) in hs_code_material_mappings.
+#      The seed supplies stages for both 4-digit and 6-digit codes.
+#   2. For 10-digit codes, also try the truncated 6-digit form.
+#   3. Fall back to the 4-digit parent's stage in hs_code_material_mappings
 #      filtered by the same material_id.
-#   3. If neither resolves, the row is written with stage=NULL and a structured
-#      log line is emitted so coverage gaps are visible.
+#   4. If neither resolves, write stage=NULL and emit a structured log.
 #
-# Override scope rule: only declare an entry when the 6-digit (or 10-digit) form
-# resolves to a more specific stage than its 4-digit parent in `_MAPPINGS`,
-# OR when the 4-digit parent does not exist in `_MAPPINGS` for this material.
-# Otherwise leave it to inheritance — fewer entries to maintain, less drift risk.
-#
-# Confidence buckets:
-#   ▶ "high"          — major battery materials, supply chain stage well established
-#   ▶ "needs_review"  — listed for completeness; partner should confirm before
-#                       this is the authoritative stage on a persisted row
-# Marking is informal — both buckets get applied; the comment is a flag for
-# downstream review, not a runtime branch.
-# ---------------------------------------------------------------------------
+# Removed: the previous ``_HS_6DIGIT_STAGE_OVERRIDE`` dict (84 entries)
+# that duplicated seed_hs_mappings.  All entries were either consistent
+# (78), or the 6 partner-resolved conflicts where the seed value wins.
 
-_HS_6DIGIT_STAGE_OVERRIDE: dict[tuple[str, str], tuple[str, int]] = {
-    # ── Lithium ─────────────────────────────────────────── (high confidence)
-    # 282520 = lithium hydroxide. Parent 2825 already battery_grade in seed,
-    # so this is a no-op-but-explicit entry to make the intent obvious to readers.
-    ("282520", "Lithium"): ("battery_grade", 5),
-    # 283691 = lithium carbonate. Parent 2836 (carbonates) is mixed across
-    # materials; explicit override needed.
-    ("283691", "Lithium"): ("battery_grade", 5),
-    # 282739 = lithium chloride. Parent 2827 (chlorides) is mixed.
-    ("282739", "Lithium"): ("intermediate", 3),
-    # 280512 = lithium metal. Parent 2805 in seed at refined; explicit for clarity.
-    ("280512", "Lithium"): ("refined", 4),
-
-    # ── Cobalt ──────────────────────────────────────────── (high confidence)
-    # 282200 = cobalt oxides and hydroxides. Parent 2822 not in 4-digit seed
-    # for Cobalt → must override.
-    ("282200", "Cobalt"): ("battery_grade", 5),
-    # 283329 = cobalt sulfate. Parent 2833 (sulfates) is mixed across materials.
-    ("283329", "Cobalt"): ("battery_grade", 5),
-    # 810520 = cobalt mattes / unwrought. Parent 8105 in seed at intermediate.
-    ("810520", "Cobalt"): ("intermediate", 3),
-    # 260500 = cobalt ores. Parent 2605 in seed at ore.
-    ("260500", "Cobalt"): ("ore", 1),
-
-    # ── Nickel ──────────────────────────────────────────── (high confidence)
-    # 283324 = nickel sulfate. Parent 2833 (sulfates) mixed → override.
-    ("283324", "Nickel"): ("battery_grade", 5),
-    # 750100 = nickel mattes / oxide sinters. Parent 7501 in seed at intermediate.
-    ("750100", "Nickel"): ("intermediate", 3),
-    # 750210 / 750220 = unwrought nickel. Parent 7502 in seed at refined.
-    ("750210", "Nickel"): ("refined", 4),
-    ("750220", "Nickel"): ("refined", 4),
-    # 260400 = nickel ores. Parent 2604 in seed at ore.
-    ("260400", "Nickel"): ("ore", 1),
-
-    # ── Manganese ───────────────────────────────────────── (high confidence)
-    # 283329 = manganese sulfate. Note: same prefix as Cobalt sulfate; this
-    # works because the override key is (prefix, canonical_name).
-    ("283329", "Manganese"): ("battery_grade", 5),
-    # 260200 = manganese ores.
-    ("260200", "Manganese"): ("ore", 1),
-
-    # ── Copper ──────────────────────────────────────────── (high confidence)
-    ("260300", "Copper"): ("ore", 1),
-    ("740200", "Copper"): ("intermediate", 3),
-    ("740311", "Copper"): ("refined", 4),  # cathode
-    ("740319", "Copper"): ("refined", 4),
-
-    # ── Aluminum ────────────────────────────────────────── (high confidence)
-    ("260600", "Aluminum"): ("ore", 1),    # bauxite
-    ("281820", "Aluminum"): ("intermediate", 3),  # alumina (Al2O3)
-    ("760110", "Aluminum"): ("refined", 4),       # primary unwrought
-    ("760120", "Aluminum"): ("refined", 4),       # alloyed unwrought
-
-    # ── Iron Ore (LFP Grade) ────────────────────────────── (high confidence)
-    ("260111", "Iron Ore (LFP Grade)"): ("ore", 1),
-    ("260112", "Iron Ore (LFP Grade)"): ("ore", 1),
-
-    # ── Natural Graphite ────────────────────────────────── (high confidence)
-    ("250410", "Natural Graphite"): ("ore", 1),
-    ("250490", "Natural Graphite"): ("ore", 1),
-
-    # ── Rare Earth Elements ─────────────────────────────── (high confidence)
-    ("280530", "Rare Earth Elements"): ("refined", 4),       # REE metals unwrought
-    ("284690", "Rare Earth Elements"): ("battery_grade", 5),  # REE compounds
-    ("261790", "Rare Earth Elements"): ("ore", 1),           # other ores
-
-    # ── Titanium ────────────────────────────────────────── (high confidence)
-    ("261400", "Titanium"): ("ore", 1),
-    ("810820", "Titanium"): ("refined", 4),
-    ("720291", "Titanium"): ("intermediate", 3),  # ferrotitanium
-
-    # ── Tungsten ────────────────────────────────────────── (high confidence)
-    ("261100", "Tungsten"): ("ore", 1),
-    ("810194", "Tungsten"): ("intermediate", 3),  # APT
-    ("810199", "Tungsten"): ("refined", 4),
-
-    # ── Silicon (Anode Grade) ───────────────────────────── (needs_review)
-    # MCS does not cleanly separate metallurgical Si vs polysilicon vs
-    # battery-grade Si at the 6-digit level. 280461 covers metallurgical Si.
-    # Real battery-grade Si is a small slice of refined production. Partner
-    # should confirm whether stage=refined is appropriate or if it should be
-    # battery_grade in the battery context.
-    ("280461", "Silicon (Anode Grade)"): ("refined", 4),     # needs_review
-    ("280469", "Silicon (Anode Grade)"): ("refined", 4),     # needs_review
-
-    # ── Vanadium / Niobium / Tantalum / Zirconium ───────── (high confidence)
-    # All four share 4-digit ore prefix 2615 (in seed at ore for each).
-    # 6-digit subdivisions break out by material — each is still ore at this stage.
-    ("261500", "Vanadium"): ("ore", 1),
-    ("261500", "Niobium"): ("ore", 1),
-    ("261500", "Tantalum"): ("ore", 1),
-    ("261500", "Zirconium"): ("ore", 1),
-    # Refined / intermediate forms
-    ("810292", "Molybdenum"): ("intermediate", 3),  # ferromolybdenum
-    ("720270", "Molybdenum"): ("intermediate", 3),
-    ("720292", "Vanadium"): ("intermediate", 3),    # ferrovanadium
-    ("720241", "Chromium"): ("intermediate", 3),    # ferrochromium
-    ("720249", "Chromium"): ("intermediate", 3),
-
-    # ── Boron ─────────────────────────────────────────── (needs_review)
-    # 252810 / 252890 are natural borate concentrates (ore).
-    # 281000 oxides of boron / boric acid is processed = intermediate.
-    # Battery-grade boron compounds (LiBOB precursors) are niche; not seeded.
-    # Partner should confirm whether processed borates should ever be marked
-    # battery_grade in the battery scoring context.
-    ("252810", "Boron"): ("ore", 1),                # natural borate
-    ("252890", "Boron"): ("ore", 1),
-    ("281000", "Boron"): ("intermediate", 3),       # processed boric oxide
-
-    # ── PGMs / Silver / Antimony / Tin / Zinc / Mg / Fluorspar ─
-    # These materials' 6-digit subdivisions inherit cleanly from their
-    # 4-digit parent's seed assignment in `_MAPPINGS`. No overrides needed.
-    # Add entries here if the parser produces 6-digit codes whose stage is
-    # genuinely different from the 4-digit parent for the same material.
-
-    # ── Gallium / Germanium / Indium / Tellurium / Selenium ─ (needs_review)
-    # All trade through chapter 8112 (minor metals, refined) or 2804 (non-metals).
-    # 6-digit subdivisions like 811292 (gallium unwrought) inherit refined from
-    # 8112 in seed. Add explicit entries only if the parser produces sub-prefixes
-    # the seed doesn't cover. Partner should confirm 6-digit Ga/Ge/In codes.
-}
 
 # ---------------------------------------------------------------------------
 # Regex patterns
@@ -370,20 +253,81 @@ class MCSPdfParser:
     For DB seeding, call :meth:`seed_to_db` directly.
     """
 
-    def __init__(self, path: Path, reference_year: int) -> None:
+    def __init__(
+        self,
+        path: Path,
+        reference_year: int,
+        resolver: Optional["MaterialAliasResolver"] = None,
+    ) -> None:
+        """``resolver``: ``MaterialAliasResolver`` instance the regex
+        fallback path uses to translate PDF headings to canonical
+        material names.  Optional only because the LLM path doesn't
+        need it (canonical names come from the partner-curated
+        materials list passed into ``parse``); the regex fallback path
+        will raise if invoked without a resolver.
+        """
         self._path = path
         self._reference_year = reference_year
+        self._resolver = resolver
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def parse(self) -> list[CommoditySection]:
+    def parse(
+        self,
+        *,
+        canonical_materials: Optional[list[str]] = None,
+        use_llm_sections: bool = True,
+    ) -> list[CommoditySection]:
         """
         Parse all commodity sections from the PDF.
 
-        Returns one :class:`CommoditySection` per recognised commodity heading.
-        Headings not in ``_MCS_COMMODITY_MAP`` are silently skipped.
+        Two code paths share the same downstream extractors
+        (``_parse_tariff_table``, ``_parse_production_leaders``,
+        ``_parse_import_sources``, ``_extract_salient_notes``) — they only
+        differ in how the per-commodity text bounds are determined.
+
+        Path A — LLM-driven section detection (preferred):
+            ``use_llm_sections=True`` (default) AND ``canonical_materials``
+            is provided.  Calls ``locate_commodity_chapters()`` to get
+            chapter bounds for each canonical material, slices the joined
+            PDF text using those bounds, and runs the extractors on each
+            slice.  Robust to MCS layout variants — handles footnoted
+            headings, multi-chapter materials, and out-of-scope commodities
+            without regex maintenance.  Result is cached at
+            ``data/mcs<year>_locator_result.json``; subsequent calls within
+            the cache window skip the LLM entirely.
+
+        Path B — Regex-driven section detection (fallback):
+            ``use_llm_sections=False`` OR ``canonical_materials`` not
+            provided.  Walks the joined PDF text looking for all-caps
+            headings via ``_split_into_commodity_sections()``.  Susceptible
+            to layout edge cases (the issues we found in MCS 2026 with
+            footnoted ALUMINUM¹, IRON ORE¹, etc.) but works without an
+            LLM dependency.
+
+        Args:
+            canonical_materials:
+                ``materials.canonical_name`` values from the DB.  Required
+                for Path A.  When omitted, falls back to Path B.
+            use_llm_sections:
+                When True (default), prefer Path A.  When False, force
+                Path B even if ``canonical_materials`` is provided —
+                useful for testing the regex baseline.
+
+        Returns one :class:`CommoditySection` per recognised commodity.
+        """
+        if use_llm_sections and canonical_materials:
+            return self._parse_via_llm_locator(canonical_materials)
+        return self._parse_via_regex()
+
+    def _read_pdf_text(self) -> str:
+        """Read the PDF and return joined text using the canonical convention.
+
+        Pages are joined with ``"\\n\\n--- PAGE BREAK ---\\n\\n"``.  Both
+        the regex path and the LLM locator depend on this exact format
+        (the locator uses the page-break markers to build the page index).
         """
         try:
             import pdfplumber  # noqa: PLC0415 — optional heavy dep
@@ -393,18 +337,99 @@ class MCSPdfParser:
                 "Install with: pip install pdfplumber"
             ) from exc
 
-        sections: list[CommoditySection] = []
         full_text_pages: list[str] = []
-
         with pdfplumber.open(str(self._path)) as pdf:
             for page in pdf.pages:
                 full_text_pages.append(page.extract_text() or "")
+        return "\n\n--- PAGE BREAK ---\n\n".join(full_text_pages)
 
-        combined = "\n\n--- PAGE BREAK ---\n\n".join(full_text_pages)
+    def _parse_via_llm_locator(
+        self,
+        canonical_materials: list[str],
+    ) -> list[CommoditySection]:
+        """LLM-driven Path A: get chapter bounds from the locator, then run
+        the existing extractors on each chapter's bounded text.
+
+        Disk cache lives at ``data/mcs<year>_locator_result.json``.  When
+        present, the locator loads from disk without calling Anthropic.
+        Check the file into git to make CI deterministic.
+        """
+        # Lazy import so the regex path doesn't pay the import cost
+        from app.services.ingestion.mcs_pdf_llm_locator import (  # noqa: PLC0415
+            locate_commodity_chapters,
+        )
+
+        full_text = self._read_pdf_text()
+        cache_path = Path("data") / f"mcs{self._reference_year}_locator_result.json"
+
+        log.info(
+            "mcs_pdf_parser.llm_locator.starting",
+            cache_path=str(cache_path),
+            canonical_materials=len(canonical_materials),
+            reference_year=self._reference_year,
+        )
+
+        result = locate_commodity_chapters(
+            pdf_text=full_text,
+            canonical_material_names=canonical_materials,
+            cache_path=cache_path,
+        )
+
+        log.info(
+            "mcs_pdf_parser.llm_locator.complete",
+            chapters=len(result.chapters),
+            skipped=len(result.skipped),
+        )
+
+        sections: list[CommoditySection] = []
+        lines = full_text.splitlines()
+        for chapter in result.chapters:
+            chapter_text = "\n".join(lines[chapter.start_line:chapter.end_line])
+            section = CommoditySection(
+                heading=chapter.pdf_heading,
+                canonical_name=chapter.canonical_material,
+            )
+            section.tariff_entries = self._parse_tariff_table(chapter_text)
+            section.production_leaders = self._parse_production_leaders(chapter_text)
+            section.import_sources = self._parse_import_sources(chapter_text)
+            section.salient_notes = self._extract_salient_notes(chapter_text)
+
+            if not section.tariff_entries and not section.production_leaders:
+                log.warning(
+                    "mcs_pdf_parser.empty_section",
+                    canonical_name=chapter.canonical_material,
+                    heading=chapter.pdf_heading,
+                    note="LLM-located chapter produced no tariff or production rows; "
+                         "verify the chapter bounds in the cache file are correct.",
+                )
+
+            sections.append(section)
+            log.info(
+                "mcs_pdf_parser.section_parsed",
+                commodity=chapter.canonical_material,
+                source="llm_locator",
+                tariff_entries=len(section.tariff_entries),
+                production_leaders=len(section.production_leaders),
+                import_sources=len(section.import_sources),
+            )
+
+        return sections
+
+    def _parse_via_regex(self) -> list[CommoditySection]:
+        """Fallback Path B: regex-based heading detection on the joined PDF text.
+
+        Used when ``use_llm_sections=False`` or when the caller cannot
+        provide a canonical-materials list.  Susceptible to MCS layout
+        edge cases (footnoted headings, multi-occurrence headings) — see
+        ``docs/scoring-audit-2026-05.md`` § G3 for the failure modes that
+        motivated the LLM path.
+        """
+        sections: list[CommoditySection] = []
+        combined = self._read_pdf_text()
         raw_sections = self._split_into_commodity_sections(combined)
 
         for heading, body in raw_sections.items():
-            canonical = _MCS_COMMODITY_MAP.get(heading.strip())
+            canonical = self._resolve_pdf_heading(heading.strip())
             if canonical is None:
                 log.debug("mcs_pdf_parser.unknown_heading", heading=heading)
                 continue
@@ -426,6 +451,7 @@ class MCSPdfParser:
             log.info(
                 "mcs_pdf_parser.section_parsed",
                 commodity=canonical,
+                source="regex",
                 tariff_entries=len(section.tariff_entries),
                 production_leaders=len(section.production_leaders),
                 import_sources=len(section.import_sources),
@@ -433,7 +459,13 @@ class MCSPdfParser:
 
         return sections
 
-    def seed_to_db(self, session: Session, *, dry_run: bool = False) -> dict[str, Any]:
+    def seed_to_db(
+        self,
+        session: Session,
+        *,
+        dry_run: bool = False,
+        use_llm_sections: bool = True,
+    ) -> dict[str, Any]:
         """
         Parse the PDF and seed the extracted data into the database.
 
@@ -449,9 +481,14 @@ class MCSPdfParser:
 
         Returns a summary dict with counts per commodity.
         """
-        sections = self.parse()
         country_map = self._build_country_map(session)
         material_map = self._build_material_map(session)
+        # Pass the materials list to parse() so the LLM locator can filter
+        # the PDF to chapters that map to a canonical material we score.
+        sections = self.parse(
+            canonical_materials=list(material_map.keys()),
+            use_llm_sections=use_llm_sections,
+        )
 
         # Cached 4-digit-parent stage lookups, shared across all materials in
         # this seed run.  Populated lazily by `_assign_stage`.
@@ -602,25 +639,44 @@ class MCSPdfParser:
                     # `hs_code_production_shares` and persisted on
                     # `hs_code_geography_risk_scores.hhi_at_stage`.
 
-            # --- Step 4b: US import sources → linked to all 10-digit US rows ---
+            # --- Step 4b: US import sources — DISABLED May 2026 ---
+            # The previous implementation fan-out each PDF sub-type's
+            # country share across EVERY 10-digit US HTS row in the
+            # chapter (e.g. "Chromite ores: South Africa 96%" was
+            # written to ferrochromium and chromium-metal codes too —
+            # incorrect attribution).
+            #
+            # Per-country US import shares now come exclusively from
+            # ``ingest-usgs`` (MCS 2026 long-format CSV) using the
+            # keyword-based sub-type resolver against
+            # ``hs_code_material_mappings.keywords``.  That path
+            # attributes each sub-type to its specific 6-digit prefix
+            # (e.g. "Chromite (ores and concentrates)" → 261000) instead
+            # of fan-outing to all chapter codes.
+            #
+            # Trade-offs:
+            #   * 10-digit codes get no per-country share data attached
+            #     — 10-digit nodes are still useful for tariff lookups
+            #     (their primary purpose) but won't have a population
+            #     of ``hs_code_production_shares`` rows.  If partner
+            #     ever needs per-country attribution at 10-digit
+            #     granularity, see the next-step plan: a sub-type →
+            #     10-digit code-group keyword mapping that mirrors the
+            #     6-digit one we already have for the CSV path.
+            #   * ``section.import_sources`` is still parsed for
+            #     diagnostics and forward compatibility; just not
+            #     written.
             if section.import_sources and us_id_map:
-                for imp in section.import_sources:
-                    iso2 = self._resolve_country(imp.country_name, country_map)
-                    if iso2 is None:
-                        continue
-                    for hs_id in us_id_map.values():
-                        written = self._upsert_production_share(
-                            session,
-                            hs_mapping_id=hs_id,
-                            country_code=iso2,
-                            production_share=imp.share,
-                            production_volume=None,
-                            reference_year=imp.reference_year,
-                            market_scope="us",
-                            source="usgs_mcs",
-                            dry_run=dry_run,
-                        )
-                        s["import_source_shares_inserted"] += written
+                log.debug(
+                    "mcs_pdf_parser.import_sources_skipped",
+                    canonical=section.canonical_name,
+                    count=len(section.import_sources),
+                    note=(
+                        "Per-country US import shares are now sourced "
+                        "from ingest-usgs (CSV path) only.  PDF write "
+                        "path disabled May 2026."
+                    ),
+                )
 
             # --- Salient notes → append to MaterialCriticalitySignal ---
             if section.salient_notes and not dry_run:
@@ -672,7 +728,18 @@ class MCSPdfParser:
         Returns ``{heading: section_body_text}`` keyed by uppercase heading.
         Only headings present in ``_MCS_COMMODITY_MAP`` appear in the result.
         """
-        known_headings = set(_MCS_COMMODITY_MAP.keys())
+        # "Known headings" come from the alias table now — the resolver
+        # tells us which PDF headings have a partner-curated mapping
+        # under source_system='mcs_pdf'.  When no resolver is wired in
+        # (legacy callers), fall back to the deprecated dict.
+        if self._resolver is not None:
+            from app.models.supply import MaterialSourceAlias as _MSA  # local import
+            known_rows = self._resolver._session.scalars(  # type: ignore[attr-defined]
+                select(_MSA).where(_MSA.source_system == "mcs_pdf")
+            ).all()
+            known_headings = {r.source_name.strip().upper() for r in known_rows}
+        else:
+            known_headings = set(_MCS_COMMODITY_MAP.keys())
         lines = full_text.splitlines()
 
         # Step 1: locate every plausible heading line (known + unknown).
@@ -720,6 +787,23 @@ class MCSPdfParser:
             )
 
         return sections
+
+    def _resolve_pdf_heading(self, heading: str) -> Optional[str]:
+        """Resolve a PDF heading to a canonical material name.
+
+        Uses ``MaterialAliasResolver`` (source_system='mcs_pdf') when
+        the parser was constructed with a resolver, falls back to the
+        deprecated ``_MCS_COMMODITY_MAP`` dict otherwise.  Returns the
+        canonical name on success; returns None when the heading is
+        skipped (alias is_skipped=True) or unknown (no alias row).
+        """
+        if self._resolver is None:
+            return _MCS_COMMODITY_MAP.get(heading)
+        result = self._resolver.resolve("mcs_pdf", heading)
+        if result.status == "ok":
+            assert result.material is not None
+            return result.material.canonical_name
+        return None
 
     @staticmethod
     def _commodity_heading_text(line: str) -> Optional[str]:
@@ -829,16 +913,26 @@ class MCSPdfParser:
 
     def _parse_production_leaders(self, section_text: str) -> list[ProductionShare]:
         """
-        Extract world mine production country data.
+        Extract world production country data from the chapter's production table.
 
-        Scans the "World Mine Production and Reserves" table.
+        MCS uses several variant headers depending on the commodity:
+            "World Mine Production and Reserves"          (most ores: Co, Ni, Cu, …)
+            "World Smelter Production and Capacity"       (Aluminum)
+            "World Refinery Production and Reserves"      (some refined products)
+            "World Mine Production"                       (some)
+            "World Refinery Production"                   (some)
+        The regex below matches any "World <Mine|Smelter|Refinery> Production"
+        prefix.  Without this broadening, Aluminum (and other non-Mine
+        production headers) silently produced zero rows because the previous
+        anchor required the literal "Mine" word.
+
         Derives production shares from raw tonnages (normalised against world total).
         Skips "World total" and "Other" rows — these are meta-rows, not countries.
         """
         leaders: list[ProductionShare] = []
 
         header_match = re.search(
-            r'World\s+Mine\s+Production\s+and\s+Reserves',
+            r'World\s+(?:Mine|Smelter|Refinery)\s+Production',
             section_text,
             re.IGNORECASE,
         )
@@ -1001,48 +1095,38 @@ class MCSPdfParser:
         """
         Resolve ``(supply_chain_stage, stage_sequence)`` for a parser-derived row.
 
-        Resolution order:
-          1. ``_HS_6DIGIT_STAGE_OVERRIDE`` keyed by (prefix, canonical_name).
-             For 10-digit prefixes, also try the 6-digit truncation.
-          2. The 4-digit parent's stage in ``hs_code_material_mappings`` for
-             this material_id (cached across calls in ``parent_stage_cache``).
+        Resolution order (refactored May 2026 — single source of truth is now
+        ``hs_code_material_mappings``, populated from
+        ``seed_hs_mappings._MAPPINGS``):
+
+          1. Exact-prefix lookup in ``hs_code_material_mappings`` for this
+             material_id.  For a 10-digit prefix, also try the 6-digit
+             truncation.
+          2. 4-digit parent inheritance from ``hs_code_material_mappings``
+             for this material_id (cached across calls).
           3. ``(None, None)`` with a structured warning so coverage gaps surface.
 
         ``parent_stage_cache``:
-            Caller-supplied dict to avoid hitting the DB once per 6-digit child.
-            Keyed by ``(prefix4, material_id)``; populated lazily.
+            Caller-supplied dict keyed by ``(prefix, material_id)`` so the
+            same prefix isn't queried twice across the loop.
 
         Returns:
-            ``(stage, stage_sequence)`` — both Optional[]; both populated or
+            ``(stage, stage_sequence)`` — both Optional; both populated or
             both ``None``.
         """
-        # ── Step 1: explicit override (high-confidence map at top of file) ──
-        # Try the prefix as-given first
-        override = _HS_6DIGIT_STAGE_OVERRIDE.get((hs_code_prefix, canonical_name))
-        if override is not None:
-            return override
-
-        # For a 10-digit prefix, try its 6-digit truncation
-        if digit_count == 10 and len(hs_code_prefix) >= 6:
-            six = hs_code_prefix[:6]
-            override = _HS_6DIGIT_STAGE_OVERRIDE.get((six, canonical_name))
-            if override is not None:
-                return override
-
-        # ── Step 2: 4-digit parent inheritance from `_MAPPINGS` (DB) ────────
-        if len(hs_code_prefix) >= 4:
-            prefix4 = hs_code_prefix[:4]
-            cache_key = (prefix4, material_id)
+        # Helper: look up stage for a (prefix, material_id) from the DB,
+        # caching the result.
+        def _lookup(prefix: str) -> tuple[Optional[str], Optional[int]]:
+            cache_key = (prefix, material_id)
             if cache_key not in parent_stage_cache:
                 row = session.execute(
                     select(
                         HsCodeMaterialMapping.supply_chain_stage,
                         HsCodeMaterialMapping.stage_sequence,
                     ).where(
-                        HsCodeMaterialMapping.hs_code_prefix == prefix4,
+                        HsCodeMaterialMapping.hs_code_prefix == prefix,
                         HsCodeMaterialMapping.material_id == material_id,
                         HsCodeMaterialMapping.market_scope == "global",
-                        HsCodeMaterialMapping.digit_count == 4,
                         HsCodeMaterialMapping.supply_chain_stage.is_not(None),
                     )
                 ).first()
@@ -1050,20 +1134,36 @@ class MCSPdfParser:
                     parent_stage_cache[cache_key] = (row[0], row[1])
                 else:
                     parent_stage_cache[cache_key] = (None, None)
-            stage, seq = parent_stage_cache[cache_key]
+            return parent_stage_cache[cache_key]
+
+        # ── Step 1: exact-prefix lookup ────────────────────────────────────
+        stage, seq = _lookup(hs_code_prefix)
+        if stage is not None:
+            return stage, seq
+
+        # 10-digit codes also try the 6-digit truncation.
+        if digit_count == 10 and len(hs_code_prefix) >= 6:
+            stage, seq = _lookup(hs_code_prefix[:6])
             if stage is not None:
                 return stage, seq
 
-        # ── Step 3: unresolved — log and return NULL ────────────────────────
+        # ── Step 2: 4-digit parent inheritance ─────────────────────────────
+        if len(hs_code_prefix) >= 4:
+            stage, seq = _lookup(hs_code_prefix[:4])
+            if stage is not None:
+                return stage, seq
+
+        # ── Step 3: unresolved — log and return NULL ───────────────────────
         log.warning(
             "mcs_pdf_parser.stage_unresolved",
             hs_code_prefix=hs_code_prefix,
             digit_count=digit_count,
             material=canonical_name,
             note=(
-                "No override entry and no 4-digit parent stage — row will be "
-                "written with stage=NULL.  Add an override in "
-                "_HS_6DIGIT_STAGE_OVERRIDE or seed the 4-digit parent row."
+                "No exact-prefix, 6-digit truncation, or 4-digit parent "
+                "stage in hs_code_material_mappings — row will be written "
+                "with stage=NULL.  Add an entry to seed_hs_mappings._MAPPINGS "
+                "and re-run seed-hs-mappings."
             ),
         )
         return (None, None)
@@ -1235,7 +1335,9 @@ class MCSPdfParser:
         if not global_id_map:
             return None
 
-        preferred_stage = _MCS_PRODUCTION_STAGE_PREFERENCE.get(canonical_name, "ore")
+        preferred_stage = _MCS_PRODUCTION_STAGE_PREFERENCE.get(
+            canonical_name, _MCS_PRODUCTION_STAGE_PREFERENCE_DEFAULT,
+        )
 
         # Try: find a global row for this material with the preferred stage
         existing = session.execute(

@@ -278,7 +278,7 @@ def derive_geopolitical_inputs(
     tariff_events: list[EventWithRelevance] = []
 
     for ew in all_geo:
-        subtype = (ew.event.metadata_json or {}).get("event_subtype", "")
+        subtype = ew.event.event_subtype or ""  # typed col (migration 040)
         text = (ew.event.title or "").lower()
 
         if subtype == "EXPORT_RESTRICTION" or (
@@ -389,7 +389,7 @@ def derive_operational_inputs(
     """
     struct_events: list[EventWithRelevance] = []
     for ew in operational_events:
-        subtype = (ew.event.metadata_json or {}).get("event_subtype", "")
+        subtype = ew.event.event_subtype or ""  # typed col (migration 040)
         text = (ew.event.title or "").lower()
         if subtype in ("SINGLE_SOURCE", "CAPACITY_CONSTRAINT") or (
             "single source" in text
@@ -443,7 +443,7 @@ def derive_financial_inputs(
 
     leverage_sum = 0.0
     for ew in filing_events:
-        subtype = (ew.event.metadata_json or {}).get("event_subtype", "")
+        subtype = ew.event.event_subtype or ""  # typed col (migration 040)
         text = (ew.event.title or "").lower()
         if subtype in ("LEVERAGE_WARNING", "COVENANT_STRESS") or (
             "leverage" in text or "covenant" in text or "debt" in text
@@ -453,7 +453,7 @@ def derive_financial_inputs(
 
     liquidity_sum = 0.0
     for ew in filing_events:
-        subtype = (ew.event.metadata_json or {}).get("event_subtype", "")
+        subtype = ew.event.event_subtype or ""  # typed col (migration 040)
         text = (ew.event.title or "").lower()
         if subtype in ("GOING_CONCERN", "CASH_RUNWAY", "CAPEX_CUT") or (
             "going concern" in text

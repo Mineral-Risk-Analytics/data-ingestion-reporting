@@ -136,6 +136,7 @@ def _insert_event(
 
     event = RiskEvent(
         event_type="GEOPOLITICAL_TRADE",
+        event_subtype=event_subtype,  # typed col (migration 040)
         event_date=event_date,
         title=title,
         summary=summary,
@@ -145,6 +146,10 @@ def _insert_event(
         geography_json={"primary": reporter_country},
         content_hash=ch,
         metadata_json={
+            # event_subtype kept in metadata_json for one release cycle —
+            # downstream readers migrated to the typed column 2026-05-05;
+            # JSON copy retained for backwards compatibility while we
+            # confirm nothing else reads it.  Drop after one production cycle.
             "event_subtype": event_subtype,
             "reporter_country": reporter_country,
             "material_id": material_id,

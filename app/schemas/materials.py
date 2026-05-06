@@ -13,6 +13,11 @@ class HsMappingRead(BaseModel):
 
     Column names are aliased to match the spec's preferred API names so the
     frontend types stay stable even if internal column names drift.
+
+    Stage / scope / digit_count / keywords (added May 2026) come straight from
+    seed_hs_mappings — no aliasing needed.  Used by the frontend HS Codes &
+    Stages tab to group rows by stage and to surface the partner-curated
+    keyword aliases used for trade-event attribution.
     """
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
@@ -23,6 +28,13 @@ class HsMappingRead(BaseModel):
     hs_description: Optional[str] = Field(None, alias="description")
     mapping_confidence: float = Field(alias="confidence")
     created_at: datetime
+
+    # Stage + scope metadata from seed_hs_mappings.
+    supply_chain_stage: Optional[str] = None
+    stage_sequence: Optional[int] = None
+    digit_count: int = 4
+    market_scope: str = "global"
+    keywords: Optional[List[str]] = None
 
     # Computed mismatch flags — populated by the route handler, not from ORM.
     is_low_confidence: bool = False
@@ -50,6 +62,17 @@ class MappingHealth(BaseModel):
 
 
 class CriticalitySignalRead(BaseModel):
+    """Serializes a row from ``material_criticality_signals``.
+
+    All eight signal columns are exposed (May 2026) so the Overview tab
+    can render the supply-side and price-trend stats the parsers
+    populate.  ``metadata_json`` carries source-specific extras such as
+    ``us_net_import_reliance_pct`` (from MCS Salient stats),
+    ``us_apparent_consumption`` (same), ``mcs_publication_year``, and
+    ``fig10_source_rows`` (the verbatim Fig 10 commodity strings that
+    were averaged into this material's price values).
+    """
+
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -58,6 +81,20 @@ class CriticalitySignalRead(BaseModel):
     criticality_score: Optional[float] = None
     trend_direction: Optional[str] = None
     hhi_score: Optional[float] = None
+    # ── Supply metrics added migration 019 ────────────────────────────────
+    reserve_hhi_score: Optional[float] = None
+    reserve_life_index: Optional[float] = None
+    production_yoy_pct: Optional[float] = None
+    capacity_utilization: Optional[float] = None
+    # ── Price-trend metrics added migration 036 ──────────────────────────
+    price_yoy_pct: Optional[float] = None
+    price_cagr_5yr_pct: Optional[float] = None
+    # ── US-dependency metrics promoted from metadata_json (migration 038) ─
+    us_net_import_reliance_pct: Optional[float] = None
+    us_apparent_consumption: Optional[float] = None
+    # ── Source-specific extras ────────────────────────────────────────────
+    metadata_json: Optional[Dict[str, Any]] = None
+    created_at: datetime
 
 
 class ChemistryUseRead(BaseModel):

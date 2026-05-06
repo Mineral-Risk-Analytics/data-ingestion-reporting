@@ -111,14 +111,30 @@ STAGE_ROLLUP_WEIGHTS: dict[str, float] = {
 # material_risk.score_material_exposure() path.
 _STAGE_ROLLUP_MIN_NODES = 2
 
-# Commodity price volatility thresholds for market financial pressure inputs.
-# CV (coefficient of variation = std/mean) mapped to base_filing_signal (0-40).
+# ── Pink Sheet (commodity_prices) thresholds — short-window ─────────────
+# CV (coefficient of variation = std/mean) over the look-back window
+# scaled into base_filing_signal (0-40).
 _PRICE_CV_MAX = 0.50   # CV >= 0.50 → full signal (40)
-# Price change threshold for directional stress signals.
+# Directional price-change thresholds for stress signals.
 _PRICE_SPIKE_PCT  = 0.20   # +20% in window → buyer leverage stress
 _PRICE_CRASH_PCT  = 0.20   # -20% in window → producer liquidity stress
-# Look-back window for price trend signals (days).
+# Look-back window for the Pink Sheet trend signals (days).
 _PRICE_WINDOW_DAYS = 180
+
+# ── Fig 10 (USGS MCS price growth rates) thresholds — annual / 5-yr ────
+# Fig 10 ships single-number annual % change + 5-yr CAGR per material.
+# Both values are signed fractions (e.g. 1.44 = +144%).  Mapped to the
+# same three sub-signals as Pink Sheet, then combined via max() so:
+#   * materials with no Pink Sheet coverage (most of them) still get a
+#     financial-pressure signal from Fig 10;
+#   * materials with Pink Sheet coverage get whichever signal is
+#     stronger (no false dampening from the lower of two estimates).
+# Thresholds chosen to match observed MCS 2026 magnitudes (Antimony
+# +144%, Bismuth +270%, Germanium +106%): a YoY swing of 50% or
+# 5-yr CAGR of 30% is "extreme" and saturates the contribution.
+_FIG10_YOY_SPIKE_PCT  = 0.50   # +50% YoY → max leverage_warning_bonus contribution
+_FIG10_YOY_CRASH_PCT  = 0.50   # -50% YoY → max liquidity_stress_bonus contribution
+_FIG10_CAGR_VOL_MAX   = 0.30   # |CAGR| >= 30% → full base_filing_signal contribution
 
 _MAX_EVENT_IMPACT = 1.56
 
@@ -203,7 +219,7 @@ def _classify_geo_events(
     export_events: list[EventWithRelevance] = []
     tariff_events: list[EventWithRelevance] = []
     for ew in events:
-        subtype = (ew.event.metadata_json or {}).get("event_subtype", "")
+        subtype = ew.event.event_subtype or ""  # typed col (migration 040)
         text = (ew.event.title or "").lower()
         if subtype == "EXPORT_RESTRICTION" or (
             "export" in text and ("restrict" in text or "ban" in text or "control" in text)
@@ -678,7 +694,7 @@ def _derive_market_operational_inputs(
     if struct_dep is None:
         struct_events = [
             ew for ew in operational_events
-            if (ew.event.metadata_json or {}).get("event_subtype", "") in (
+            if (ew.event.event_subtype or "") in (  # typed col (migration 040)
                 "SINGLE_SOURCE", "CAPACITY_CONSTRAINT"
             ) or any(
                 kw in (ew.event.title or "").lower()
@@ -908,9 +924,9 @@ def _derive_market_financial_inputs(
     ``fp_module.score_financial_pressure()``, which still takes the first four
     values unchanged.
 
-    Signal sources (three tiers, all additive):
+    Signal sources (four tiers — Tier 1.5 added May 2026):
     ─────────────────────────────────────────────────────────────────────
-    Tier 1 — Commodity price series (primary market signal):
+    Tier 1 — Commodity price series (Pink Sheet, daily):
 
     base_filing_signal (0-40)   ← price VOLATILITY
         CV = std(prices) / mean(prices) over _PRICE_WINDOW_DAYS.
@@ -922,6 +938,17 @@ def _derive_market_financial_inputs(
 
     liquidity_stress_bonus (0-30) ← price CRASH
         If price fell > _PRICE_CRASH_PCT, producers face margin pressure.
+
+    Tier 1.5 — USGS MCS Fig 10 price growth rates (annual + 5-yr CAGR):
+        Reads ``material_criticality_signals.{price_yoy_pct, price_cagr_5yr_pct}``
+        for the material.  Combined with Tier 1 via ``max()`` so:
+          * materials without daily Pink Sheet coverage (most of them)
+            still produce a non-zero financial pressure score, and
+          * materials with Pink Sheet coverage take the stronger signal.
+        |CAGR| augments base_filing_signal (volatility proxy);
+        signed YoY augments leverage_warning_bonus (positive) or
+        liquidity_stress_bonus (negative).  Detail in ``fig10_signal``
+        block of the rationale meta dict.
 
     Tier 2 — FINANCIAL_PRESSURE events tagged to this material:
         "price_surge" / "market_squeeze" → adds to leverage_warning_bonus
@@ -987,12 +1014,77 @@ def _derive_market_financial_inputs(
             # Price crash → producer liquidity stress
             liquidity_stress_bonus = min(1.0, abs(pct_change) / _PRICE_CRASH_PCT) * 30.0
 
+    # ── Tier 1.5 — USGS MCS Fig 10 price growth rates (annual + 5-yr) ──
+    # Materials with no Pink Sheet coverage still get a financial-pressure
+    # signal here; materials with Pink Sheet coverage take the max of the
+    # two so the stronger source wins.  Reads the latest usgs_mcs signal
+    # row (the row ingest-mcs-prices wrote price_yoy_pct / price_cagr
+    # onto).  Returns None gracefully when the signal row doesn't exist
+    # for this material — the contribution is then 0.
+    fig10_signal_row = db.execute(
+        select(
+            MaterialCriticalitySignal.price_yoy_pct,
+            MaterialCriticalitySignal.price_cagr_5yr_pct,
+            MaterialCriticalitySignal.reference_year,
+        ).where(
+            MaterialCriticalitySignal.material_id == material_id,
+            MaterialCriticalitySignal.source == "usgs_mcs",
+            MaterialCriticalitySignal.price_yoy_pct.is_not(None),
+        )
+        .order_by(MaterialCriticalitySignal.reference_year.desc())
+        .limit(1)
+    ).first()
+
+    fig10_meta: dict = {}
+    if fig10_signal_row is not None:
+        f_yoy = (
+            float(fig10_signal_row.price_yoy_pct)
+            if fig10_signal_row.price_yoy_pct is not None
+            else None
+        )
+        f_cagr = (
+            float(fig10_signal_row.price_cagr_5yr_pct)
+            if fig10_signal_row.price_cagr_5yr_pct is not None
+            else None
+        )
+
+        # CAGR magnitude → base_filing_signal proxy.  Long-run CAGR is not
+        # the same as short-window CV (Pink Sheet's volatility metric)
+        # but high |CAGR| reliably indicates the material's price has
+        # been moving — directionally if not chaotically — over the
+        # 5-yr window.  Cap at _FIG10_CAGR_VOL_MAX = 30%.
+        if f_cagr is not None:
+            cagr_signal = min(1.0, abs(f_cagr) / _FIG10_CAGR_VOL_MAX) * 40.0
+            base_filing_signal = max(base_filing_signal, cagr_signal)
+            fig10_meta["cagr_contribution_to_base_filing_signal"] = round(cagr_signal, 2)
+
+        # YoY signed → spike (positive) or crash (negative).
+        if f_yoy is not None and f_yoy > 0:
+            spike_signal = min(1.0, f_yoy / _FIG10_YOY_SPIKE_PCT) * 30.0
+            leverage_warning_bonus = max(leverage_warning_bonus, spike_signal)
+            fig10_meta["yoy_contribution_to_leverage_warning"] = round(spike_signal, 2)
+        elif f_yoy is not None and f_yoy < 0:
+            crash_signal = min(1.0, abs(f_yoy) / _FIG10_YOY_CRASH_PCT) * 30.0
+            liquidity_stress_bonus = max(liquidity_stress_bonus, crash_signal)
+            fig10_meta["yoy_contribution_to_liquidity_stress"] = round(crash_signal, 2)
+
+        fig10_meta.update({
+            "yoy_pct": round(f_yoy, 4) if f_yoy is not None else None,
+            "cagr_5yr_pct": round(f_cagr, 4) if f_cagr is not None else None,
+            "reference_year": fig10_signal_row.reference_year,
+        })
+        # Fig 10 contributes evidence regardless of whether Pink Sheet
+        # had data — count it toward the sparse-evidence threshold so the
+        # filing-count cap reflects the augmented signal.
+        if filing_count == 0:
+            filing_count = 1
+
     # Supplement with FINANCIAL_PRESSURE events tagged to this material
     fin_events = get_events_for_material(
         db, material_id, RiskCategory.FINANCIAL_PRESSURE, as_of_date
     )
     for ew in fin_events:
-        subtype = (ew.event.metadata_json or {}).get("event_subtype", "")
+        subtype = ew.event.event_subtype or ""  # typed col (migration 040)
         text = (ew.event.title or "").lower()
         severity = float(ew.event.severity_score or 0.5)
 
@@ -1031,10 +1123,14 @@ def _derive_market_financial_inputs(
         "contribution_to_base_signal": round(company_contribution, 2),
         "max_possible_contribution": _COMPANY_SIGNAL_MAX_CONTRIBUTION,
         "companies": company_details,
+        "fig10_signal": fig10_meta or None,
         "note": (
             "SEC EDGAR company financial pressure scores weighted by production share. "
             "Coverage is strong for Li, Co, Cu, Ni; partial for REE, Mn; "
-            "effectively zero for Ga, Ge, Te, In — coverage_weight reflects this."
+            "effectively zero for Ga, Ge, Te, In — coverage_weight reflects this. "
+            "Fig 10 (USGS MCS price growth) signals are merged via max() against "
+            "Pink Sheet so materials without daily-price coverage still produce a "
+            "non-zero financial pressure score — see fig10_signal block."
         ),
     }
 

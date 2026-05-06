@@ -52,10 +52,43 @@ re-run after the first.
 
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+
+def _ensure_anthropic_key_in_env() -> None:
+    """Best-effort load of ANTHROPIC_API_KEY from a project-root ``.env`` file
+    when it's not already in the environment.
+
+    Why: the locator can be invoked from multiple call sites — the standalone
+    ``scripts/run_mcs_locator.py`` (which calls ``load_dotenv()`` itself), the
+    CLI (``bdi-ingest ingest-mcs-pdf``), Inngest jobs, and ad-hoc REPL use.
+    Some of those load ``.env`` automatically; some don't.  Putting the
+    fallback here makes the locator self-sufficient — if the key is in
+    ``.env`` and ``python-dotenv`` is installed, it works regardless of
+    caller.
+
+    No-op when the key is already set, when python-dotenv isn't installed,
+    or when no ``.env`` file is found.  Never raises.
+    """
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except ImportError:
+        return
+    # `load_dotenv()` with no argument walks up from cwd looking for `.env`.
+    # Falls back to walking up from this file's location.
+    if not load_dotenv():
+        here = Path(__file__).resolve()
+        for parent in here.parents:
+            env_path = parent / ".env"
+            if env_path.exists():
+                load_dotenv(env_path, override=False)
+                break
 
 import structlog
 from pydantic import BaseModel, Field, ValidationError
@@ -905,6 +938,9 @@ def locate_commodity_chapters(
 
     # Lazy import so the rest of the codebase doesn't require anthropic
     if client is None:
+        # Best-effort load of ANTHROPIC_API_KEY from .env when missing.
+        # Idempotent — no-op if already set or if dotenv isn't installed.
+        _ensure_anthropic_key_in_env()
         try:
             import anthropic  # type: ignore
         except ImportError as exc:

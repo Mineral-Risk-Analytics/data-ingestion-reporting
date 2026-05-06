@@ -41,7 +41,7 @@ dev = [
 bdi-ingest = "app.cli:main"
 
 [tool.hatch.envs.default.scripts]
-ingest-usgs = "bdi-ingest ingest-usgs ./data/mineral-commodities/MCS2025_World_Data.csv"
+ingest-usgs = "bdi-ingest ingest-usgs ./data/usgs/2026/MCS2026_Commodities_Data.csv"
 ingest-usgs-force = "bdi-ingest ingest-usgs ./data/mineral-commodities/MCS2025_World_Data.csv --force"
 ingest-worldbank = "bdi-ingest ingest-worldbank"
 ingest-worldbank-full = "bdi-ingest ingest-worldbank --since-year 1960"

@@ -217,6 +217,12 @@ class IngestionPipeline:
                 effective_date=parsed.effective_date,
                 summary=parsed.abstract_text,
                 extra_meta={"source_api": "federal_register"},
+                # ``reg_key`` here is a Federal Register document number
+                # (e.g. "2024-12345"), not a canonical regulation_key.  The
+                # resolver looks it up under source_system='federal_register'
+                # in regulation_aliases.  Unknown FR doc numbers are skipped
+                # with warning rather than auto-creating a regulation row.
+                source_system="federal_register",
             )
             self._add_risk_event(
                 doc, build_regulatory_risk_event(parsed), company_cache
@@ -436,40 +442,99 @@ class IngestionPipeline:
         effective_date: Any,
         summary: str | None,
         extra_meta: dict | None,
+        source_system: str | None = None,
     ) -> None:
-        stmt = select(Regulation).where(
-            Regulation.source_document_id == doc.id,
-            Regulation.regulation_key == regulation_key,
+        """Refresh mutable fields on an existing curated regulation.
+
+        Locked-down semantics (May 2026 refactor): this method NEVER
+        creates new regulation rows.  Pipeline ingesters (Federal Register,
+        SEC EDGAR, news, Census trade) surface arbitrary external IDs that
+        often don't correspond to tracked regulations — silently auto-
+        creating a row for every such ID poisoned the regulations table
+        with partial / mis-classified records.
+
+        Resolution order:
+          1. If ``source_system`` is provided, try
+             ``RegulationAliasResolver.resolve(source_system, regulation_key)``.
+             This handles the "regulation_key is actually an external ID"
+             case (e.g. Federal Register doc number → canonical key).
+          2. Else, try a direct lookup on ``Regulation.regulation_key``.
+          3. If neither resolves: log a warning and SKIP.  The caller's
+             ``RiskEvent`` row still gets written but without a
+             ``RiskEventRegulation`` junction, which is correct — events
+             whose regulatory context we can't verify shouldn't influence
+             scoring against fabricated regulation rows.
+
+        On a successful resolve, this method updates only the *mutable*
+        side of the regulation:
+          * ``summary`` if the existing one is NULL (never overwrites
+            curated text)
+          * ``metadata_json.last_seen`` (freshness signal)
+          * ``source_document_id`` if not yet set
+        Curated fields (title, geography, policy_theme, status,
+        publication_date, effective_date) are NOT touched — those come
+        from ``seed_regulations.py``.
+        """
+        from datetime import datetime, timezone
+        from app.services.ingestion.regulation_resolver import (
+            RegulationAliasResolver,
         )
-        existing = self._db.execute(stmt).scalar_one_or_none()
-        meta = dict(extra_meta or {})
-        if existing:
-            existing.title = title
-            existing.issuing_body = issuing_body
-            existing.geography = geography
-            existing.policy_theme = policy_theme
-            existing.status = status
-            existing.publication_date = publication_date
-            existing.effective_date = effective_date
-            existing.summary = summary
-            existing.metadata_json = meta
-            self._db.add(existing)
-            return
-        self._db.add(
-            Regulation(
-                source_document_id=doc.id,
-                regulation_key=regulation_key,
-                title=title,
-                issuing_body=issuing_body,
-                geography=geography,
-                policy_theme=policy_theme,
-                status=status,
-                publication_date=publication_date,
-                effective_date=effective_date,
-                summary=summary,
-                metadata_json=meta,
+
+        regulation: Regulation | None = None
+
+        # Step 1 — alias resolver (when caller provided source context).
+        if source_system:
+            resolver = RegulationAliasResolver(self._db)
+            result = resolver.resolve(source_system, regulation_key)
+            if result.status == "skipped":
+                # Partner-curated decision not to track — skip silently.
+                return
+            if result.status == "ok":
+                regulation = result.regulation
+
+        # Step 2 — direct lookup (caller passed a canonical regulation_key).
+        if regulation is None:
+            regulation = self._db.scalar(
+                select(Regulation).where(
+                    Regulation.regulation_key == regulation_key
+                )
             )
-        )
+
+        # Step 3 — skip with warning when nothing matches.
+        if regulation is None:
+            log.warning(
+                "pipeline.unknown_regulation",
+                regulation_key=regulation_key,
+                source_system=source_system,
+                hint=(
+                    "external regulation ID not in regulation_aliases. "
+                    "Add it to seed_regulation_aliases.py (and the "
+                    "regulation itself to seed_regulations.py if it's "
+                    "battery-supply-chain-relevant), then re-run "
+                    "seed-regulations + seed-regulation-aliases. "
+                    "Event will still be written but without a "
+                    "RiskEventRegulation junction."
+                ),
+            )
+            return
+
+        # ── Mutable-field refresh on the resolved regulation ───────────
+        # Backfill summary only when missing (don't overwrite curated text).
+        if summary and not regulation.summary:
+            regulation.summary = summary
+
+        # Attach SourceDocument if not yet linked (helps trace provenance).
+        if regulation.source_document_id is None:
+            regulation.source_document_id = doc.id
+
+        # Bump last_seen + merge any extra metadata the caller provided.
+        meta = dict(regulation.metadata_json or {})
+        meta["last_seen"] = datetime.now(timezone.utc).isoformat()
+        if extra_meta:
+            for k, v in extra_meta.items():
+                # Don't overwrite curated keys (e.g. celex, seed_version).
+                meta.setdefault(k, v)
+        regulation.metadata_json = meta
 
     def _add_risk_event(
         self,

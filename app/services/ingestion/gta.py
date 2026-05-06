@@ -941,6 +941,7 @@ def ingest_gta(
         event = RiskEvent(
             source_document_id=source_document_id,
             event_type=intervention_type or "trade_intervention",
+            event_subtype=event_subtype,  # typed col (migration 040); None when no subtype maps
             event_date=event_date,
             title=title,
             summary=summary,
@@ -955,6 +956,8 @@ def ingest_gta(
                 "raw_intervention_type": intervention["intervention_type"],
                 "in_force": in_force,
                 "source_url": url,
+                # event_subtype kept in metadata_json for one release cycle
+                # to support backwards-compat readers; drop later.
                 **({"event_subtype": event_subtype} if event_subtype else {}),
             },
             verified=False,
