@@ -218,12 +218,30 @@ def _get_or_create_source_document(
 # ---------------------------------------------------------------------------
 
 # Severity by regulation status.  See module docstring for calibration.
-_SEVERITY_BY_STATUS: dict[str, float] = {
+# Public aliases below — exported so the API layer (RegulationRead schema)
+# can return the per-regulation severity weight without importing this
+# ingestion module.  Underscore-prefixed names retained for backwards
+# compatibility with existing internal callers.
+SEVERITY_BY_STATUS: dict[str, float] = {
     "effective": 0.55,
     "enacted":   0.40,
     "proposed":  0.25,
 }
-_DEFAULT_REGULATION_SEVERITY = 0.35
+DEFAULT_REGULATION_SEVERITY = 0.35
+
+# Backwards-compatible internal aliases — keep until existing callers migrate.
+_SEVERITY_BY_STATUS = SEVERITY_BY_STATUS
+_DEFAULT_REGULATION_SEVERITY = DEFAULT_REGULATION_SEVERITY
+
+
+def status_severity_weight(status: str | None) -> float:
+    """Return the severity weight a RiskEvent should carry given the
+    regulation's status.  Public helper so the API can serialize the
+    same value the ingester writes.
+    """
+    if not status:
+        return DEFAULT_REGULATION_SEVERITY
+    return SEVERITY_BY_STATUS.get(status, DEFAULT_REGULATION_SEVERITY)
 
 
 def _build_regulation_event(

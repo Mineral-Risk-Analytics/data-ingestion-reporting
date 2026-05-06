@@ -83,7 +83,12 @@ HIGH_CONCENTRATION_GEOS = frozenset({"CN", "CD", "RU"})
 # Weight applied to scope-only regulation hits (no CompanyRegulationExposure row)
 # keyed by RegulationMaterialScope.scope_type.
 #
-# Rationale for each tier:
+# Rationale for each tier (descending severity):
+#   banned                  0.70  Outright import / use prohibition — the strongest scope_type a
+#                                 material can carry.  Added 2026-05-06 to close a latent gap where
+#                                 ``banned`` rows fell through to the 0.50 default and scored LOWER
+#                                 than ``restricted`` (0.60).  No current seed entry uses this value;
+#                                 the weight is here so a future banned-material seed scores correctly.
 #   strategic_raw_material  0.65  CRMA Annex II: binding 2030 extraction/processing/recycling
 #                                 benchmarks; stronger enforcement obligation than disclosure alone.
 #   restricted              0.60  Active restrictions (e.g. REACH SVHC authorisation); enforcement
@@ -97,6 +102,7 @@ HIGH_CONCENTRATION_GEOS = frozenset({"CN", "CD", "RU"})
 #
 # Unknown scope_type values fall back to 0.50 (same as disclosure_required).
 _SCOPE_TYPE_WEIGHT: dict[str, float] = {
+    "banned":                 0.70,
     "strategic_raw_material": 0.65,
     "restricted":             0.60,
     "disclosure_required":    0.50,

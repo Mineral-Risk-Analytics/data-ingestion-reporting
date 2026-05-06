@@ -353,24 +353,53 @@ def _derive_market_geopolitical_inputs(
     geography_code: str,
     geo_trade_events: list[EventWithRelevance],
     as_of_date: date,
-) -> tuple[float, float, float]:
+    *,
+    eligible_nodes: Optional[list["HsCodeGeographyRiskScore"]] = None,
+) -> tuple[float, float, float, str]:
     """
-    Returns (country_concentration, export_restriction_exposure, tariff_exposure)
-    each on [0, 1.0].
+    Returns (country_concentration, export_restriction_exposure, tariff_exposure,
+             geopolitical_method) where the floats are on [0, 1.0] and
+    geopolitical_method is one of:
+
+        "event_classification"  — only the legacy geography-anchored event
+                                  path fired (HS nodes absent or below the
+                                  ``_STAGE_ROLLUP_MIN_NODES`` threshold).
+        "max_with_hs_nodes"     — both paths fired; we kept the higher of
+                                  (HS-aggregated, event-classified) for each
+                                  sub-score to avoid losing signal from
+                                  geography-only events that aren't
+                                  HS-attributed.
 
     country_concentration:
         The geography's share of global production for this material from
         MaterialProductionShare (most recent reference year).  Uses the
         fraction directly — e.g. China ≈ 0.70 for Graphite, Chile ≈ 0.30 for
-        Lithium, Australia ≈ 0.50 for Lithium — so scores differentiate
-        meaningfully across geographies and materials.
-
-        Falls back to the legacy HCG binary flag (1.0 for CN/CD/RU, 0.0
-        otherwise) when no production share data exists for this pair,
-        logging a debug message so coverage gaps are visible.
+        Lithium — so scores differentiate meaningfully across geographies
+        and materials.  Falls back to the legacy HCG binary flag for
+        well-known concentrated geographies (CN, CD, RU) when no production
+        share data exists.
 
     export_restriction_exposure / tariff_exposure:
-        Average normalised event_impact for events classified by subtype/keyword.
+        Two complementary signal paths combined via max():
+
+        1. Event classification path: scans ``geo_trade_events`` (events
+           tagged to this geography for the GEOPOLITICAL_TRADE category)
+           and classifies via ``event_subtype`` (typed col, migration 040)
+           or title keywords.  Geography-anchored — captures events that
+           reach this country regardless of HS attribution.
+
+        2. HS-node aggregate path (May 2026 — G2 fix): when
+           ``eligible_nodes`` >= ``_STAGE_ROLLUP_MIN_NODES``, computes a
+           stage-weighted average of ``node.tariff_exposure`` and
+           ``node.export_restriction`` across HS stages using
+           ``STAGE_ROLLUP_WEIGHTS`` (the same weights Material Concentration
+           uses).  Material × stage scoped — more precise than the
+           geography-anchored event path.
+
+        Combination via ``max()`` is intentional: the HS-node path is more
+        precise where it has signal, but events tagged only to the
+        geography (no HS code attribution) appear in path 1 and not 2.
+        Taking max() ensures neither contribution is silently dropped.
     """
     # Primary: production share from MaterialProductionShare
     share_row = db.scalar(
@@ -396,15 +425,55 @@ def _derive_market_geopolitical_inputs(
             fallback_value=country_concentration,
         )
 
+    # ── Path 1: event classification (geography-anchored) ──────────────────
     export_events, tariff_events = _classify_geo_events(geo_trade_events)
-    export_exposure = _avg_impact_normalised(
+    event_export = _avg_impact_normalised(
         export_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
     )
-    tariff_exposure = _avg_impact_normalised(
+    event_tariff = _avg_impact_normalised(
         tariff_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
     )
 
-    return country_concentration, export_exposure, tariff_exposure
+    # ── Path 2: HS-node aggregate (material × stage scoped) — G2 fix ───────
+    # Skip when no nodes were passed (caller hasn't fetched them) or when
+    # there are too few to be representative.  Falls through to event-only.
+    method = "event_classification"
+    if eligible_nodes is not None and len(eligible_nodes) >= _STAGE_ROLLUP_MIN_NODES:
+        # Stage-weighted average of HS-node sub-scores, normalised by the
+        # sum of weights for stages actually present.  Same shape as
+        # Material Concentration's stage rollup (lines 1278–1290).
+        weight_total = sum(
+            STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
+            for n in eligible_nodes
+        )
+        if weight_total > 0:
+            hs_tariff = sum(
+                (n.tariff_exposure or 0.0)
+                * STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
+                for n in eligible_nodes
+            ) / weight_total
+            hs_export = sum(
+                (n.export_restriction or 0.0)
+                * STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
+                for n in eligible_nodes
+            ) / weight_total
+            # Combine via max — see docstring rationale.
+            export_exposure = max(event_export, hs_export)
+            tariff_exposure = max(event_tariff, hs_tariff)
+            method = "max_with_hs_nodes"
+            log.debug(
+                "market_aggregator.geo.hs_node_aggregate",
+                material_id=material_id,
+                geography_code=geography_code,
+                node_count=len(eligible_nodes),
+                event_tariff=event_tariff,
+                hs_tariff=hs_tariff,
+                event_export=event_export,
+                hs_export=hs_export,
+            )
+            return country_concentration, export_exposure, tariff_exposure, method
+
+    return country_concentration, event_export, event_tariff, method
 
 
 def _resolve_compliance_weight(
@@ -1251,22 +1320,10 @@ def score_material_geography(
         for ew in lst
     })
 
-    # --- STEP 3: Derive sub-inputs ---
-    crit, conc, trade_vol = _derive_market_material_inputs(
-        criticality_signal, geography_code, all_trade_events, as_of_date
-    )
-    ctry_conc, exp_rest, tariff = _derive_market_geopolitical_inputs(
-        db, material_id, geography_code, geo_trade_events, as_of_date
-    )
-    struct_dep, op_impacts, dep_source = _derive_market_operational_inputs(
-        db, material_id, geography_code, all_op_events, as_of_date
-    )
-
-    # --- STEP 4: Score each pillar ---
-
-    # Material Concentration — use stage-weighted Level-0 rollup when ≥2
-    # HsCodeGeographyRiskScore nodes exist for this (material × geography).
-    # Falls back to the legacy material_risk path when Level-0 data is absent.
+    # --- STEP 3: Fetch HS nodes early so both the Material Concentration
+    # pillar (stage-weighted composite_node_score rollup) and the
+    # Geopolitical pillar (G2 fix — HS-node tariff/export aggregates) can
+    # share a single query.
     hs_nodes = get_hs_nodes_for_material(
         db, material_id, geography_code, as_of_date
     )
@@ -1275,6 +1332,25 @@ def score_material_geography(
         if n.composite_node_score is not None
         and n.hs_mapping.supply_chain_stage in STAGE_ROLLUP_WEIGHTS
     ]
+
+    # --- STEP 4: Derive sub-inputs ---
+    crit, conc, trade_vol = _derive_market_material_inputs(
+        criticality_signal, geography_code, all_trade_events, as_of_date
+    )
+    ctry_conc, exp_rest, tariff, geo_method = _derive_market_geopolitical_inputs(
+        db, material_id, geography_code, geo_trade_events, as_of_date,
+        eligible_nodes=eligible_nodes,
+    )
+    struct_dep, op_impacts, dep_source = _derive_market_operational_inputs(
+        db, material_id, geography_code, all_op_events, as_of_date
+    )
+
+    # --- STEP 5: Score each pillar ---
+
+    # Material Concentration — use stage-weighted Level-0 rollup when ≥2
+    # HsCodeGeographyRiskScore nodes exist.  Falls back to the legacy
+    # material_risk path when Level-0 data is absent (eligible_nodes already
+    # computed above so Geopolitical and Material pillars share the query).
     if len(eligible_nodes) >= _STAGE_ROLLUP_MIN_NODES:
         # Normalised weighted average of composite_node_scores across stages
         weighted_sum = sum(
@@ -1300,7 +1376,7 @@ def score_material_geography(
     op_score = _score_operational_market(struct_dep, op_impacts)
     fin_score = fp_module.score_financial_pressure(base_sig, lev_bon, liq_bon, fin_count)
 
-    # --- STEP 5: Aggregate ---
+    # --- STEP 6: Aggregate ---
     overall = _aggregate_market_score(mat_score, geo_score, reg_score, op_score, fin_score)
 
     # --- Build rationale ---
@@ -1334,6 +1410,12 @@ def score_material_geography(
                 "country_concentration": ctry_conc,
                 "export_restriction_exposure": exp_rest,
                 "tariff_exposure": tariff,
+                # G2 fix (May 2026): records whether export/tariff sub-inputs
+                # came from the legacy event-classification path only or
+                # were combined via max() with the HS-node stage-weighted
+                # aggregate.  See _derive_market_geopolitical_inputs docstring.
+                "method": geo_method,
+                "hs_node_count": len(eligible_nodes),
             },
             "regulatory": {
                 "top_event_count": len(top_reg_impacts),
