@@ -213,6 +213,19 @@ def seed_regulation_aliases(
         else:
             skipped_existing += 1
 
+    # Flush any pending inserts/updates so the rows pick up FK-resolved IDs
+    # and are visible to subsequent queries within the same transaction.
+    # Caller (run_seed) owns the commit — keeps this function composable
+    # with multi-step seed scripts that batch several seeds into one tx.
+    if inserted or updated:
+        session.flush()
+
+    log.info(
+        "seed_regulation_aliases.done",
+        inserted=inserted, updated=updated,
+        skipped_existing=skipped_existing,
+        skipped_unknown_regulation=skipped_unknown,
+    )
     return {
         "inserted": inserted,
         "updated": updated,
@@ -224,7 +237,19 @@ def seed_regulation_aliases(
 # Backwards-compat alias for callers that import a generic ``run_seed`` name
 # (matches the convention used in ``seed_material_source_aliases``).
 def run_seed(session: Session, *, force_update: bool = False) -> dict[str, int]:
-    return seed_regulation_aliases(session, force_update=force_update)
+    """Run the seed and commit.
+
+    The inner ``seed_regulation_aliases`` flushes pending writes but does
+    not commit so it stays composable inside multi-step seed scripts.
+    The CLI command opens a session, calls this wrapper, and closes — so
+    without the commit here the inserted rows are discarded by the close.
+    Bug fix 2026-05-06: previously this function just returned the inner
+    result without committing, which is why ``seed-regulation-aliases``
+    reported "inserted: N" but left the table empty.
+    """
+    stats = seed_regulation_aliases(session, force_update=force_update)
+    session.commit()
+    return stats
 
 
 __all__ = [

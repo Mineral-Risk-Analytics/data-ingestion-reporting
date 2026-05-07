@@ -271,13 +271,28 @@ DEFAULT_GTA_CATEGORY = "geopolitical_trade"
 # No subtype is set for instruments that don't map cleanly to either bucket
 # (State aid, Investment measure, Procurement) — text matching handles those.
 _INTERVENTION_SUBTYPE_MAP: dict[str, str] = {
-    "Export taxes":                 "EXPORT_RESTRICTION",
-    "Export quotas":                "EXPORT_RESTRICTION",
-    "Export licensing requirements":"EXPORT_RESTRICTION",
-    "Export bans":                  "EXPORT_RESTRICTION",
-    "Import tariff":                "IMPORT_DISRUPTION",
-    "Import quota":                 "IMPORT_DISRUPTION",
-    "Import ban":                   "IMPORT_DISRUPTION",
+    # Export-side interventions (implementing country IS the producer
+    # whose supply just got constrained).
+    # 2026-05-06: GTA's actual data uses singular forms ("Export licensing
+    # requirement", not "requirements") — the prior plural keys here
+    # silently failed to match real GTA rows, leaving event_subtype NULL
+    # and tariff/export sub-scores at zero.  Both forms accepted now.
+    "Export taxes":                  "EXPORT_RESTRICTION",
+    "Export tax":                    "EXPORT_RESTRICTION",
+    "Export quotas":                 "EXPORT_RESTRICTION",
+    "Export quota":                  "EXPORT_RESTRICTION",
+    "Export licensing requirements": "EXPORT_RESTRICTION",
+    "Export licensing requirement":  "EXPORT_RESTRICTION",
+    "Export bans":                   "EXPORT_RESTRICTION",
+    "Export ban":                    "EXPORT_RESTRICTION",
+    # Import-side interventions (affected country IS the producer being
+    # tariffed; see the G11 audit fix in hs_node_scorer.py).
+    "Import tariff":                 "IMPORT_DISRUPTION",
+    "Import tariffs":                "IMPORT_DISRUPTION",
+    "Import quota":                  "IMPORT_DISRUPTION",
+    "Import quotas":                 "IMPORT_DISRUPTION",
+    "Import ban":                    "IMPORT_DISRUPTION",
+    "Import bans":                   "IMPORT_DISRUPTION",
 }
 
 # RiskEvent.event_type is String(128); truncate to fit.
@@ -355,6 +370,31 @@ _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "description": ("description", "summary", "intervention_description"),
     "in_force": ("in_force", "currently_in_force", "is_in_force"),
+    # Added 2026-05-06 (G11/Scope 2):
+    # ``affected_jurisdictions`` — countries whose imports/exports are
+    # constrained by the intervention.  Critical for IMPORT_DISRUPTION
+    # events: the implementing country is the importing country, but the
+    # producer country whose risk should rise is in this column.  GTA
+    # bulk + curated exports both name the column "Affected Jurisdictions".
+    "affected_jurisdictions": (
+        "affected_jurisdictions",
+        "affected_jurisdiction",
+        "target_jurisdiction",
+        "target_jurisdictions",
+    ),
+    # ``implementation_level`` — National | Sub-national | Multilateral.
+    # Severity multiplier applied at ingest.
+    "implementation_level": (
+        "implementation_level",
+        "implementing_level",
+    ),
+    # ``is_horizontal`` — boolean.  When True the intervention applies
+    # broadly across products rather than being targeted; per-HS-code
+    # signal is reduced.
+    "is_horizontal": (
+        "is_horizontal",
+        "horizontal",
+    ),
 }
 
 # Required columns — the parser raises ValueError if any of these can't be
@@ -432,7 +472,16 @@ def _split_hs_codes(raw: str) -> list[str]:
 
     GTA separates codes with semicolons or commas. Codes may arrive as
     integers (``"260400"`` → ``260400``) or with chapter dots
-    (``"26.04.00"``). We strip non-digits and zero-pad to six characters.
+    (``"26.04.00"``).  We strip non-digits and truncate national extensions
+    (HTS-10) to the HS-6 international form.
+
+    **CPC vs HS discrimination.** GTA's "Affected Products" column carries
+    either HS codes or CPC (Central Product Classification) codes depending
+    on the dataset.  CPC tops out at 5 digits; HS is 6+ internationally.
+    Codes shorter than 6 digits are CPC and are dropped — the previous
+    implementation zero-padded them, which masked their identity and
+    relied on accidental non-overlap with battery HS prefixes (which all
+    start with 2/3/7/8) to avoid false positives.  Reject explicitly.
     """
     if not raw:
         return []
@@ -441,9 +490,10 @@ def _split_hs_codes(raw: str) -> list[str]:
     parts = raw.replace(",", ";").split(";")
     for part in parts:
         digits = "".join(ch for ch in part if ch.isdigit())
-        if not digits:
+        if len(digits) < 6:
+            # CPC product code (or malformed) — not an HS code.
             continue
-        out.append(digits.zfill(6)[:6] if len(digits) <= 6 else digits[:6])
+        out.append(digits[:6])
     return out
 
 
@@ -479,6 +529,35 @@ def _resolve_country(raw: str, country_name_map: Optional[dict[str, str]] = None
             return iso2
     # 3. Hardcoded fallback.
     return GTA_COUNTRY_MAP.get(raw)
+
+
+def _resolve_country_list(
+    raw: str,
+    country_name_map: Optional[dict[str, str]] = None,
+) -> list[str]:
+    """Resolve a comma-separated GTA jurisdictions cell to a list of ISO2 codes.
+
+    GTA's "Affected Jurisdictions" column contains comma-separated country
+    names (e.g. ``"Argentina, Seychelles"`` or, for broad multilateral
+    interventions, 100+ entries).  Each name is resolved through the same
+    pipeline as ``_resolve_country``.  Unresolvable names are dropped
+    silently — caller can compare ``len(out)`` to the expected count if it
+    needs to flag unknowns.
+
+    Returned list is deduplicated, preserving first-occurrence order so
+    the primary affected jurisdiction (when present at the head of the
+    list) stays at index 0.
+    """
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for piece in raw.split(","):
+        iso2 = _resolve_country(piece.strip(), country_name_map)
+        if iso2 and iso2 not in seen:
+            out.append(iso2)
+            seen.add(iso2)
+    return out
 
 
 def _build_country_name_map(session: Session) -> dict[str, str]:
@@ -655,6 +734,36 @@ def parse_gta_csv(
             row.get(col["in_force"]) if "in_force" in col else False
         )
 
+        # ── Scope 2 fields (added 2026-05-06) ──────────────────────────────
+        # Affected jurisdictions — countries whose imports/exports are
+        # constrained.  Resolved here in the parser (rather than at ingest)
+        # so the country_name_map only has to be built once per run and the
+        # parsing/resolution failure modes are visible in parse stats.
+        affected_iso2_list: list[str] = []
+        if "affected_jurisdictions" in col:
+            affected_raw = row.get(col["affected_jurisdictions"]) or ""
+            affected_iso2_list = _resolve_country_list(
+                affected_raw, country_name_map=country_name_map
+            )
+
+        # Implementation level — defaults to "National" when the column is
+        # absent (older GTA exports) since the bulk of GTA data is national.
+        implementation_level: Optional[str] = None
+        if "implementation_level" in col:
+            implementation_level = (
+                row.get(col["implementation_level"]) or ""
+            ).strip() or None
+
+        # Is horizontal — boolean flag.  False when absent / unparseable.
+        is_horizontal = False
+        if "is_horizontal" in col:
+            is_horizontal = _to_bool(row.get(col["is_horizontal"]))
+
+        # Date announced — already parsed above for the event_date fallback.
+        # Re-parse here so the policy_proximity_adjustment can use it as a
+        # forward-looking effective date when distinct from date_implemented.
+        date_announced = _parse_date(date_announced_str)
+
         results.append(
             {
                 "gta_id": gta_id,
@@ -666,6 +775,11 @@ def parse_gta_csv(
                 "matched_hs_codes": matched,
                 "summary": summary,
                 "in_force": in_force,
+                # Scope 2 additions:
+                "affected_iso2_list":    affected_iso2_list,
+                "implementation_level":  implementation_level,
+                "is_horizontal":         is_horizontal,
+                "date_announced":        date_announced,
                 "raw_row": dict(row),
             }
         )
@@ -813,10 +927,75 @@ def _severity_for(intervention_type: str, in_force: bool) -> float:
     The scoring engine applies recency decay on top of this base value, so
     recent interventions still dominate even when their severity score is
     moderate.
+
+    See ``_apply_severity_modifiers`` for the implementation-level + horizontal
+    multipliers added 2026-05-06 (Scope 2 audit refinements).
     """
     if "ban" in intervention_type.lower() and "export" in intervention_type.lower():
         return 0.9
     return 0.7 if in_force else 0.3
+
+
+# ---------------------------------------------------------------------------
+# Implementation-level severity multipliers (Scope 2 audit, 2026-05-06)
+# ---------------------------------------------------------------------------
+# Source: GTA's "Implementation Level" column.  Distribution observed in the
+# real interventions_batteries.csv (n=1728):
+#   National 1292, Subnational 146, Supranational 69, NFI 258, IFI 48
+#
+# National      — legislative/regulatory action by a sovereign government.  Baseline 1.0×.
+# Subnational   — US state, Indian state, etc.  Less binding; 0.5×.
+# Supranational — EU directives, RCEP, ASEAN-level commitments.  Harder to reverse; 1.1×.
+# NFI           — National Financial Institution (EXIM banks, state development
+#                 banks, sovereign wealth funds).  All NFI rows in the data
+#                 are financial-support instruments: trade finance, state
+#                 loans, loan guarantees, financial grants, state aid, equity
+#                 stakes.  These are subsidy-type events, not tariff or
+#                 export restrictions.  They don't map to TARIFF /
+#                 IMPORT_DISRUPTION / EXPORT_RESTRICTION subtypes, so they
+#                 are excluded from the HS-node tariff/export sub-scores
+#                 regardless of multiplier.  Listed here at 1.0× for
+#                 completeness; if a future "EXPORT_SUBSIDY" subtype is added
+#                 the multiplier may need recalibration.
+# IFI           — International Financial Institution (European Investment
+#                 Bank, World Bank, EBRD, ADB).  Same pattern as NFI: all
+#                 financial-support instruments, not regulatory restrictions.
+#                 Listed at 1.0× for the same reason.
+_IMPLEMENTATION_LEVEL_MULTIPLIER: dict[str, float] = {
+    "national":      1.00,
+    "subnational":   0.50,   # GTA real-data spelling (no hyphen)
+    "sub-national":  0.50,   # alternate spelling tolerated
+    "supranational": 1.10,   # GTA's actual category for multilateral commitments
+    "multilateral":  1.10,   # legacy alias
+    "nfi":           1.00,   # National Financial Institution — financial support
+    "ifi":           1.00,   # International Financial Institution — financial support
+}
+
+# Horizontal interventions apply broadly across many products.  The
+# per-HS-code signal is diluted because the policy isn't materially
+# targeted at any one of them.
+_IS_HORIZONTAL_MULTIPLIER: float = 0.65
+
+
+def _apply_severity_modifiers(
+    base_severity: float,
+    *,
+    implementation_level: Optional[str],
+    is_horizontal: bool,
+) -> float:
+    """Apply Scope-2 severity refinements on top of the base severity.
+
+    Multiplicative.  Result clamped to [0.0, 1.0] since the downstream
+    scorer expects a normalised severity.
+    """
+    sev = base_severity
+    if implementation_level:
+        mult = _IMPLEMENTATION_LEVEL_MULTIPLIER.get(implementation_level.strip().lower())
+        if mult is not None:
+            sev *= mult
+    if is_horizontal:
+        sev *= _IS_HORIZONTAL_MULTIPLIER
+    return max(0.0, min(1.0, sev))
 
 
 # ---------------------------------------------------------------------------
@@ -899,10 +1078,27 @@ def ingest_gta(
     inserted = 0
     skipped_existing = 0
     skipped_unknown_country = 0
+    skipped_no_resolved_material = 0   # added 2026-05-06 (Scope 2)
+    skipped_too_broad = 0              # added 2026-05-06 (Scope 2)
     material_links_created = 0
     hs_mapping_links_created = 0
     geography_links_created = 0
     pending_in_batch = 0
+
+    # Cap on the number of "affected" countries written per event.  Above
+    # this threshold the intervention is effectively non-targeted (e.g.
+    # generic WTO commitments listing 160+ members), so we treat it as
+    # ambient and skip writing affected rows — its tariff_exposure
+    # contribution would be unrealistically high otherwise.
+    #
+    # Calibration (2026-05-06): set to 75 after surveying real GTA data.
+    # The interventions_batteries.csv shows median=26, max=50 affected
+    # countries per event.  An earlier cap of 25 would have skipped affected
+    # rows for ~50% of real interventions, defeating the G11 fix.  75 is
+    # comfortably above the observed max while still pruning truly generic
+    # multilateral commitments (which list 100+ jurisdictions when present).
+    # Revisit if a future GTA bulk export shifts the distribution.
+    _AFFECTED_COUNTRY_CAP = 75
 
     for intervention in interventions:
         title = intervention["title"]
@@ -914,17 +1110,23 @@ def ingest_gta(
         matched_hs_codes = intervention["matched_hs_codes"]
         risk_category = intervention["risk_category"]
         in_force = intervention["in_force"]
+        affected_iso2_list = intervention.get("affected_iso2_list") or []
+        implementation_level = intervention.get("implementation_level")
+        is_horizontal = bool(intervention.get("is_horizontal"))
+        date_announced = intervention.get("date_announced")
 
         ch = _content_hash(title, summary, event_date)
         if _existing_event_id(session, content_hash=ch, gta_id=gta_id) is not None:
             skipped_existing += 1
             continue
 
-        severity = _severity_for(intervention_type, in_force)
+        # ── Strict attribution gates (Scope 2 audit, 2026-05-06) ───────────
+        # Per partner direction (G11), an event with no resolvable producer
+        # country or no resolvable tracked material contributes nothing
+        # actionable to scoring — skip it entirely rather than insert a dead
+        # row.
 
-        geography_json: Optional[dict[str, Any]] = (
-            {"primary": implementing_iso2} if implementing_iso2 else None
-        )
+        # Gate 1: implementing country must resolve to ISO2.
         if implementing_iso2 is None:
             skipped_unknown_country += 1
             log.debug(
@@ -932,11 +1134,91 @@ def ingest_gta(
                 gta_id=gta_id,
                 raw=intervention["raw_row"].get("implementing_jurisdiction"),
             )
+            continue
 
-        # event_subtype enables precise signal routing in the scoring engine
-        # (market_aggregator + evidence_aggregator). Falls back to None for
-        # instrument types without a clean supply/demand-side classification.
+        # Gate 2: at least one matched HS code must resolve to a seeded
+        # hs_code_material_mapping.  Pre-resolve the codes here so the loop
+        # below doesn't re-walk them and so the gate has a definitive answer
+        # before any DB writes.
         event_subtype = _INTERVENTION_SUBTYPE_MAP.get(intervention_type)
+        resolved_codes: list[tuple[int, Optional[int]]] = []
+        for hs_code in matched_hs_codes:
+            mat_id, hs_map_id = _resolve_material_id(hs_code, hs_material_map)
+            if mat_id is not None:
+                resolved_codes.append((mat_id, hs_map_id))
+        if not resolved_codes:
+            skipped_no_resolved_material += 1
+            log.debug(
+                "gta.no_resolved_material",
+                gta_id=gta_id,
+                matched_hs_codes=matched_hs_codes,
+            )
+            continue
+
+        # ── Severity calibration with Scope-2 modifiers ────────────────────
+        base_severity = _severity_for(intervention_type, in_force)
+        severity = _apply_severity_modifiers(
+            base_severity,
+            implementation_level=implementation_level,
+            is_horizontal=is_horizontal,
+        )
+
+        # ── Build metadata_json (Scope-2 fields included) ──────────────────
+        metadata: dict[str, Any] = {
+            "gta_id": gta_id,
+            "gta_hs_codes": matched_hs_codes,
+            "raw_intervention_type": intervention["intervention_type"],
+            "in_force": in_force,
+            "source_url": url,
+            "implementation_level": implementation_level,
+            "is_horizontal": is_horizontal,
+        }
+        if event_subtype:
+            # event_subtype kept in metadata_json for one release cycle
+            # to support backwards-compat readers; drop later.
+            metadata["event_subtype"] = event_subtype
+        if date_announced is not None:
+            # Used by market_aggregator's policy_proximity_adjustment when
+            # date_announced is within 90 days of as_of_date.
+            metadata["effective_date"] = date_announced.date().isoformat()
+        if affected_iso2_list:
+            metadata["affected_iso2_list"] = affected_iso2_list
+
+        # ── Decide whether to write "affected" geography rows ──────────────
+        # Only IMPORT_DISRUPTION events carry meaningful "affected =
+        # producer being tariffed" semantics.  For EXPORT_RESTRICTION events
+        # the implementing country IS the producer; the GTA "Affected
+        # Jurisdictions" list there enumerates *destinations* whose imports
+        # are constrained, which is a different semantic and would mislead
+        # the scorer if tagged "affected".  Skip writing affected rows for
+        # non-import-disruption events.
+        #
+        # Additionally, if the affected list is too broad (e.g. all WTO
+        # members), treat the intervention as non-targeted ambient signal
+        # and skip the affected rows.  The event itself still inserts
+        # because it has value as evidence; it just won't feed
+        # tariff_exposure for any specific country.
+        is_import_disruption = (event_subtype == "IMPORT_DISRUPTION")
+        write_affected_rows = (
+            is_import_disruption
+            and 0 < len(affected_iso2_list) <= _AFFECTED_COUNTRY_CAP
+        )
+        if (
+            is_import_disruption
+            and len(affected_iso2_list) > _AFFECTED_COUNTRY_CAP
+        ):
+            skipped_too_broad += 1
+            log.debug(
+                "gta.affected_list_too_broad",
+                gta_id=gta_id,
+                affected_count=len(affected_iso2_list),
+                cap=_AFFECTED_COUNTRY_CAP,
+            )
+
+        # ── Build geography_json for admin views ───────────────────────────
+        geography_json: dict[str, Any] = {"primary": implementing_iso2}
+        if write_affected_rows:
+            geography_json["affected"] = affected_iso2_list
 
         event = RiskEvent(
             source_document_id=source_document_id,
@@ -950,83 +1232,72 @@ def ingest_gta(
             risk_categories_json=[risk_category],
             geography_json=geography_json,
             content_hash=ch,
-            metadata_json={
-                "gta_id": gta_id,
-                "gta_hs_codes": matched_hs_codes,
-                "raw_intervention_type": intervention["intervention_type"],
-                "in_force": in_force,
-                "source_url": url,
-                # event_subtype kept in metadata_json for one release cycle
-                # to support backwards-compat readers; drop later.
-                **({"event_subtype": event_subtype} if event_subtype else {}),
-            },
+            metadata_json=metadata,
             verified=False,
         )
         session.add(event)
         session.flush()
 
-        if implementing_iso2 is not None:
-            session.add(
-                RiskEventGeography(
-                    risk_event_id=event.id,
-                    country_code=implementing_iso2,
-                    geography_context="primary",
-                    relevance_score=1.0,
-                )
+        # ── Geography rows ─────────────────────────────────────────────────
+        # Primary = implementing country.  Used by ``export_restriction``
+        # sub-score in hs_node_scorer (the implementing country IS the
+        # producer for export-side interventions).
+        session.add(
+            RiskEventGeography(
+                risk_event_id=event.id,
+                country_code=implementing_iso2,
+                geography_context="primary",
+                relevance_score=1.0,
             )
-            geography_links_created += 1
+        )
+        geography_links_created += 1
 
-        # Phase 1.5 fix: _resolve_material_id returns (material_id, hs_mapping_id).
-        # The old code assigned the full tuple to `material_id` without unpacking,
-        # so the None-check never fired and a tuple was passed as an int FK.
+        # Affected = countries whose imports/exports are constrained.  Used
+        # by ``tariff_exposure`` sub-score in hs_node_scorer (the affected
+        # country IS the producer for import-side interventions — the one
+        # whose exports just got tariffed).
+        # Drop the implementing country if it appears in its own affected
+        # list (a known GTA data quirk on multilateral/regional acts).
+        if write_affected_rows:
+            for affected_iso2 in affected_iso2_list:
+                if affected_iso2 == implementing_iso2:
+                    continue
+                session.add(
+                    RiskEventGeography(
+                        risk_event_id=event.id,
+                        country_code=affected_iso2,
+                        geography_context="affected",
+                        relevance_score=1.0,
+                    )
+                )
+                geography_links_created += 1
+
+        # ── Material + HS junction rows ────────────────────────────────────
+        # ``resolved_codes`` was pre-built above as part of Gate 2.
         seen_material_ids: set[int] = set()
         seen_hs_mapping_ids: set[int] = set()
-        for hs_code in matched_hs_codes:
-            material_id, hs_mapping_id = _resolve_material_id(hs_code, hs_material_map)
-            if material_id is None:
-                continue
-
-            # ── material-level junction (always) ─────────────────────────────
+        for material_id, hs_mapping_id in resolved_codes:
             if material_id not in seen_material_ids:
-                # Defensive check: respects (risk_event_id, material_id) UNIQUE.
-                existing_mat = session.scalar(
-                    select(RiskEventMaterial).where(
-                        RiskEventMaterial.risk_event_id == event.id,
-                        RiskEventMaterial.material_id == material_id,
+                session.add(
+                    RiskEventMaterial(
+                        risk_event_id=event.id,
+                        material_id=material_id,
+                        relevance_score=0.9,
+                        match_reason="hs_code",
                     )
                 )
-                if existing_mat is None:
-                    session.add(
-                        RiskEventMaterial(
-                            risk_event_id=event.id,
-                            material_id=material_id,
-                            relevance_score=0.9,
-                            match_reason="hs_code",
-                        )
-                    )
-                    material_links_created += 1
+                material_links_created += 1
                 seen_material_ids.add(material_id)
-
-            # ── stage-level junction (only when hs_mapping_id is known) ──────
-            # GTA provides actual HS codes in its data, so this is the most
-            # precisely attributable source — every matched code gets a stage row.
             if hs_mapping_id is not None and hs_mapping_id not in seen_hs_mapping_ids:
-                existing_hs = session.scalar(
-                    select(RiskEventHsMapping).where(
-                        RiskEventHsMapping.risk_event_id == event.id,
-                        RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
+                session.add(
+                    RiskEventHsMapping(
+                        risk_event_id=event.id,
+                        hs_mapping_id=hs_mapping_id,
+                        relevance_score=0.9,
+                        match_reason="hs_code",
                     )
                 )
-                if existing_hs is None:
-                    session.add(
-                        RiskEventHsMapping(
-                            risk_event_id=event.id,
-                            hs_mapping_id=hs_mapping_id,
-                            relevance_score=0.9,
-                            match_reason="hs_code",
-                        )
-                    )
-                    hs_mapping_links_created += 1
+                hs_mapping_links_created += 1
                 seen_hs_mapping_ids.add(hs_mapping_id)
 
         inserted += 1
@@ -1051,6 +1322,9 @@ def ingest_gta(
         "hs_mapping_links": hs_mapping_links_created,
         "geography_links": geography_links_created,
         "skipped_unknown_country": skipped_unknown_country,
+        # Added 2026-05-06 (Scope 2 audit refinements):
+        "skipped_no_resolved_material": skipped_no_resolved_material,
+        "skipped_too_broad_affected":   skipped_too_broad,
     }
     log.info("gta.ingest.done", **result)
     return result

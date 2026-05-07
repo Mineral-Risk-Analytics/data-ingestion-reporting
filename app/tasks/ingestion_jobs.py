@@ -8,9 +8,39 @@ Weekly jobs (Sunday night UTC, feeds Monday scoring):
 
 Quarterly jobs (1st of Jan / Apr / Jul / Oct):
 
-- ``ingest-comtrade-quarterly``     — 1st of quarter, 00:00 UTC
 - ``ingest-eurlex-quarterly``       — 1st of quarter, 00:30 UTC
 - ``ingest-sec-edgar-quarterly``    — 1st of quarter, 01:00 UTC
+
+Semi-annual auto-download (1st of Jan / Jul):
+
+- ``ingest-mrds-semiannual``        — 1st of Jan/Jul, 09:00 UTC
+                                      Auto-downloads the USGS MRDS bulk CSV.
+
+Reminder-only jobs (manual upload required — no API for these sources):
+
+- ``gta-refresh-reminder-quarterly``       — 1st of quarter, 09:00 UTC
+- ``iea-policy-tracker-reminder-quarterly``— 1st of quarter, 09:30 UTC
+- ``usgs-mcs-refresh-reminder-annual``     — 15 April, 09:00 UTC
+
+These reminder jobs do NOT move data; they emit a structured WARNING log
+prompting the partner to manually export from the source (GTA dashboard,
+iea.org data tool, USGS MCS landing page) and run the corresponding
+``bdi-ingest`` CLI command.  Tracked here so refresh cadence is visible
+in the Inngest dashboard.
+
+Comtrade cadence note:
+    Daily backfill lives in ``scoring_jobs.py::ingest_comtrade_job`` (06:00 UTC
+    daily, year × prefix × flow iteration).  Once that job logs
+    ``comtrade_job.backfill_complete``, swap its cron from ``0 6 * * *`` to
+    ``0 6 * * SUN`` (weekly) — Comtrade publishes annual data with a 4-6 month
+    lag, so weekly is sufficient post-backfill.  No quarterly job here — the
+    earlier ``ingest-comtrade-quarterly`` was deleted 2026-05-06 because it
+    duplicated the daily job.
+
+SEC EDGAR cadence note:
+    10-K (annual) and 10-Q (quarterly) filings make quarterly ingestion the
+    right cadence. Runs with ``max_filings=12`` to capture the most recent
+    filing cycle per company.
 
 All jobs:
   - Open a fresh SQLAlchemy session (never share a session across invocations).
@@ -20,17 +50,6 @@ All jobs:
   - The interval gates in OpenSanctions and Pink Sheet ingesters prevent
     redundant full-file downloads — pass ``min_interval_days=0`` only if you
     need to force a re-run via manual trigger.
-
-Comtrade cadence note:
-    UN Comtrade data lags by 3–6 months. Running quarterly on the 1st of
-    Jan/Apr/Jul/Oct is sufficient — more frequent runs return the same dataset.
-    The ``--years`` flag is not set here so it defaults to the most recent
-    available year(s) as configured in the CLI default.
-
-SEC EDGAR cadence note:
-    10-K (annual) and 10-Q (quarterly) filings make quarterly ingestion the
-    right cadence. Runs with ``max_filings=12`` to capture the most recent
-    filing cycle per company.
 """
 
 from __future__ import annotations
@@ -82,19 +101,6 @@ def _run_ingest_worldbank() -> dict:
         session.close()
 
 
-def _run_ingest_comtrade() -> dict:
-    from app.services.ingestion.comtrade import ingest_comtrade
-
-    session = get_session_factory()()
-    try:
-        # No year filter — ingest_comtrade defaults to the most recent
-        # available year. Idempotent: existing rows are skipped.
-        result = ingest_comtrade(session)
-        return {"source": "comtrade", **result}
-    finally:
-        session.close()
-
-
 def _run_ingest_eurlex() -> dict:
     from app.services.ingestion.eurlex import ingest_eurlex
 
@@ -109,11 +115,12 @@ def _run_ingest_eurlex() -> dict:
 
 
 def _run_ingest_sec_edgar() -> dict:
-    from sqlalchemy import select
-
-    from app.models import Source
-    from app.models.enums import ImplementationPhase, SourceType
-    from app.services.ingestion.pipeline import IngestionPipeline
+    """Inngest entry point — uses the dedicated ingest_sec_edgar module
+    (May 2026 refactor; replaced the generic IngestionPipeline path so
+    filings get MaterialCache material attribution + event_subtype on the
+    typed column).  See app/services/ingestion/ingest_sec_edgar.py.
+    """
+    from app.services.ingestion.ingest_sec_edgar import ingest_sec_edgar
 
     CIK_MAP: dict[str, str] = {
         "Tesla":                 "0001318605",
@@ -130,32 +137,13 @@ def _run_ingest_sec_edgar() -> dict:
         "BHP Group":             "0001306965",
     }
     cik_list = list(CIK_MAP.values())
-    max_filings = 12
 
     session = get_session_factory()()
     try:
-        source = session.scalar(
-            select(Source).where(
-                Source.source_type == SourceType.SEC_EDGAR.value,
-                Source.is_active == True,  # noqa: E712
-            ).limit(1)
+        result = ingest_sec_edgar(
+            session, cik_list=cik_list, max_filings=12
         )
-        if source is None:
-            source = Source(
-                name="SEC EDGAR — battery supply chain filers",
-                source_type=SourceType.SEC_EDGAR.value,
-                phase=ImplementationPhase.PHASE_1.value,
-                is_active=True,
-                config_json={"ciks": cik_list, "max_filings": max_filings},
-            )
-            session.add(source)
-            session.flush()
-
-        run_id = IngestionPipeline(session).run(
-            source.id,
-            params={"ciks": cik_list, "max_filings": max_filings},
-        )
-        return {"source": "sec_edgar", "ingestion_run_id": run_id, "ciks_processed": len(cik_list)}
+        return {"source": "sec_edgar", **result}
     finally:
         session.close()
 
@@ -209,16 +197,12 @@ async def ingest_worldbank_job(ctx: inngest.Context) -> dict:
 # Quarterly ingestion jobs — 1st of Jan / Apr / Jul / Oct
 # ---------------------------------------------------------------------------
 
-@inngest_client.create_function(
-    fn_id="ingest-comtrade-quarterly",
-    trigger=inngest.TriggerCron(cron="0 0 1 1,4,7,10 *"),
-)
-async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
-    """Quarterly Comtrade ingest — 1st of Jan/Apr/Jul/Oct at 00:00 UTC."""
-    ctx.logger.info("ingestion_jobs.comtrade.start")
-    result = await asyncio.to_thread(_run_ingest_comtrade)
-    ctx.logger.info("ingestion_jobs.comtrade.done", extra=result)
-    return result
+# Removed 2026-05-06: ``ingest-comtrade-quarterly`` was a duplicate of the
+# daily ``ingest-comtrade-daily`` job in scoring_jobs.py.  Both registered
+# Inngest functions, both called the same ingest_comtrade() entry point —
+# the quarterly run on Jan/Apr/Jul/Oct 1st would compete with that day's
+# daily run for rate-limit budget without adding new data.  The daily
+# job's DB idempotency check + 429 circuit breaker are sufficient.
 
 
 @inngest_client.create_function(
@@ -246,49 +230,178 @@ async def ingest_sec_edgar_job(ctx: inngest.Context) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# MRDS periodic reminder — fires 15th of Jan / Apr / Jul / Oct at 09:00 UTC.
+# MRDS auto-download — semi-annual real ingest (no manual step needed)
+# ---------------------------------------------------------------------------
+# USGS MRDS publishes the bulk CSV at a stable URL with no auth.  The
+# ingester's local_file=None path streams it directly.  USGS doesn't have a
+# fixed publish cadence, but the dataset is mostly stable (major updates
+# happen 1-2× per year), so semi-annual on Jan + Jul 1st is plenty.  Auto-
+# download is cheap (~30s) and idempotent — most runs will just confirm
+# "no changes" via the ingester's dep_id dedup.
+# ---------------------------------------------------------------------------
+
+def _run_ingest_mrds() -> dict:
+    """Sync wrapper that calls ingest_mrds with auto-download."""
+    from app.services.ingestion.mrds import ingest_mrds
+
+    session = get_session_factory()()
+    try:
+        # local_file=None → streams from MRDS_CSV_ZIP_URL (mrdata.usgs.gov).
+        # Active-only filter (skip Past Producer + Prospect, see N4 fix
+        # 2026-05-06) keeps the run to ~26k rows of the 304k file.
+        result = ingest_mrds(session)
+        return {"source": "mrds", **result}
+    finally:
+        session.close()
+
+
+@inngest_client.create_function(
+    fn_id="ingest-mrds-semiannual",
+    trigger=inngest.TriggerCron(cron="0 9 1 1,7 *"),
+)
+async def ingest_mrds_job(ctx: inngest.Context) -> dict:
+    """Semi-annual USGS MRDS ingest — 1st of Jan/Jul at 09:00 UTC.
+
+    Auto-downloads from ``mrdata.usgs.gov/mrds/mrds-csv.zip``.  Idempotent
+    via dep_id (existing rows update mutable fields; new rows insert).
+    Replaces the prior reminder-only job (2026-05-06) since the ingester
+    actually supports headless download — the reminder pattern was
+    overcautious.
+    """
+    ctx.logger.info("ingestion_jobs.mrds.start")
+    result = await asyncio.to_thread(_run_ingest_mrds)
+    ctx.logger.info("ingestion_jobs.mrds.done", extra=result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Reminder-only jobs — manual upload required
+# ---------------------------------------------------------------------------
+# These three sources don't have public APIs we can hit headlessly:
+#   * GTA  — bulk CSV download requires registration + API key (paid tier)
+#   * IEA Policy Tracker — interactive web tool with manual CSV export
+#   * USGS MCS — annual PDF/CSV release with no stable URL
 #
-# USGS MRDS is available as a bulk CSV download from mrdata.usgs.gov but has
-# no fixed update schedule. This job logs a structured reminder so the ops
-# team knows to re-run the ingester. Alternatively, omit --local-file and let
-# the ingester download directly: `bdi-ingest ingest-mrds`.
+# Reminder jobs log a structured WARNING so the partner has a paper trail
+# of when each refresh was due.  They do NOT move data — partner must
+# manually export and run the corresponding ``bdi-ingest`` command.
 # ---------------------------------------------------------------------------
 
 @inngest_client.create_function(
-    fn_id="mrds-refresh-reminder-quarterly",
-    trigger=inngest.TriggerCron(cron="0 9 15 1,4,7,10 *"),
+    fn_id="gta-refresh-reminder-quarterly",
+    trigger=inngest.TriggerCron(cron="0 9 1 1,4,7,10 *"),
 )
-async def mrds_refresh_reminder_job(ctx: inngest.Context) -> dict:
-    """Quarterly MRDS refresh reminder — 15th of Jan/Apr/Jul/Oct at 09:00 UTC.
+async def gta_refresh_reminder_job(ctx: inngest.Context) -> dict:
+    """Quarterly GTA refresh reminder — 1st of Jan/Apr/Jul/Oct at 09:00 UTC.
 
-    USGS MRDS does not publish on a fixed schedule. This reminder fires quarterly
-    as a prompt to re-run the ingester and pick up any new or updated mine records.
+    Global Trade Alert's bulk download URL (``data_extraction/download``)
+    no longer works without registration.  Partner must manually export
+    a curated CSV from https://globaltradealert.org/data-center
+    (e.g. "Harmful Trade Policy Interventions: Batteries") and run::
 
-    Two options:
-      1. Live download (recommended — no manual step):
-           bdi-ingest ingest-mrds
-      2. Manual download then ingest:
-           # Download from https://mrdata.usgs.gov/mrds/mrds-csv.zip
-           bdi-ingest ingest-mrds --local-file /path/to/mrds.csv
+        bdi-ingest ingest-gta --local-file /path/to/interventions.csv
 
-    After ingesting, run rescore-market to pick up updated facility data in the
-    operational scoring pillar.
+    Quarterly cadence chosen because GTA tracks tariff/export-restriction
+    activity that the geopolitical pillar reads — quarterly is a
+    reasonable balance between staying current and partner workload.
     """
-    import datetime as _dt
-
-    ctx.logger.info(
-        "ingestion_jobs.mrds_reminder.fired",
+    fired_at = _dt.datetime.utcnow().isoformat()
+    ctx.logger.warning(
+        "ingestion_jobs.gta_reminder.fired",
         extra={
-            "action_required": "Re-run USGS MRDS ingester to refresh mine facility data",
-            "download_url": "https://mrdata.usgs.gov/mrds/mrds-csv.zip",
-            "cli_command": "bdi-ingest ingest-mrds",
-            "fired_at": _dt.datetime.utcnow().isoformat(),
+            "action_required": "Manually export GTA CSV + run ingest-gta",
+            "download_page": "https://globaltradealert.org/data-center",
+            "cli_command": "bdi-ingest ingest-gta --local-file /path/to/csv",
+            "fired_at": fired_at,
         },
     )
     return {
-        "reminder": "mrds_refresh",
+        "reminder": "gta_refresh",
         "action_required": True,
-        "download_url": "https://mrdata.usgs.gov/mrds/mrds-csv.zip",
+        "download_page": "https://globaltradealert.org/data-center",
+        "fired_at": fired_at,
+    }
+
+
+@inngest_client.create_function(
+    fn_id="iea-policy-tracker-reminder-quarterly",
+    trigger=inngest.TriggerCron(cron="30 9 1 1,4,7,10 *"),
+)
+async def iea_policy_tracker_reminder_job(ctx: inngest.Context) -> dict:
+    """Quarterly IEA Policy Tracker reminder — 1st of Jan/Apr/Jul/Oct at 09:30 UTC.
+
+    The IEA Critical Minerals Policy Tracker is an interactive web tool
+    with no programmatic download.  Partner exports the CSV from
+    https://www.iea.org/data-and-statistics/data-tools/critical-minerals-policy-tracker
+    and runs::
+
+        bdi-ingest ingest-iea-policy-tracker --file-path /path/to/csv
+
+    Quarterly cadence matches IEA's typical update frequency for the
+    tracker.
+    """
+    fired_at = _dt.datetime.utcnow().isoformat()
+    ctx.logger.warning(
+        "ingestion_jobs.iea_policy_tracker_reminder.fired",
+        extra={
+            "action_required": "Manually export IEA Policy Tracker CSV + run ingest-iea-policy-tracker",
+            "download_page": (
+                "https://www.iea.org/data-and-statistics/data-tools/"
+                "critical-minerals-policy-tracker"
+            ),
+            "cli_command": "bdi-ingest ingest-iea-policy-tracker --file-path /path/to/csv",
+            "fired_at": fired_at,
+        },
+    )
+    return {
+        "reminder": "iea_policy_tracker_refresh",
+        "action_required": True,
+        "fired_at": fired_at,
+    }
+
+
+@inngest_client.create_function(
+    fn_id="usgs-mcs-refresh-reminder-annual",
+    trigger=inngest.TriggerCron(cron="0 9 15 4 *"),
+)
+async def usgs_mcs_refresh_reminder_job(ctx: inngest.Context) -> dict:
+    """Annual USGS MCS refresh reminder — 15 April at 09:00 UTC.
+
+    USGS publishes the Mineral Commodity Summaries (MCS) once per year,
+    typically late January / early February.  The mid-April fire date
+    gives the team a 6–8 week buffer after publication to wait for any
+    corrections, then prompts the manual ingest.
+
+    Three CLI commands cover the MCS family — run all three after the
+    new MCS publishes::
+
+        bdi-ingest ingest-usgs <path-to-MCS<year>_World_Data.csv>
+        bdi-ingest ingest-mcs-pdf <path-to-mcs<year>.pdf> --year <year>
+        bdi-ingest ingest-mcs-prices <path-to-fig10.csv>
+
+    All three are idempotent — re-running on the same files is safe.
+    """
+    fired_at = _dt.datetime.utcnow().isoformat()
+    ctx.logger.warning(
+        "ingestion_jobs.usgs_mcs_reminder.fired",
+        extra={
+            "action_required": (
+                "Manually download new USGS MCS files + run ingest-usgs / "
+                "ingest-mcs-pdf / ingest-mcs-prices"
+            ),
+            "download_page": "https://pubs.usgs.gov/publication/mcs",
+            "cli_commands": [
+                "bdi-ingest ingest-usgs <path>",
+                "bdi-ingest ingest-mcs-pdf <path> --year <year>",
+                "bdi-ingest ingest-mcs-prices <path>",
+            ],
+            "fired_at": fired_at,
+        },
+    )
+    return {
+        "reminder": "usgs_mcs_refresh",
+        "action_required": True,
+        "fired_at": fired_at,
     }
 
 
@@ -297,13 +410,21 @@ async def mrds_refresh_reminder_job(ctx: inngest.Context) -> dict:
 # ---------------------------------------------------------------------------
 
 INGESTION_FUNCTIONS = [
+    # Weekly auto-download
     ingest_opensanctions_job,
     ingest_federal_register_job,
     ingest_worldbank_job,
-    ingest_comtrade_job,
+    # Quarterly auto-download
     ingest_eurlex_job,
     ingest_sec_edgar_job,
-    mrds_refresh_reminder_job,
+    # Semi-annual auto-download
+    ingest_mrds_job,
+    # Reminder-only (manual upload)
+    gta_refresh_reminder_job,
+    iea_policy_tracker_reminder_job,
+    usgs_mcs_refresh_reminder_job,
+    # Removed 2026-05-06: ingest_comtrade_job — duplicated the daily job in
+    # scoring_jobs.py.  See removal note above the deleted decorator.
 ]
 
 __all__ = [
@@ -311,14 +432,16 @@ __all__ = [
     "ingest_opensanctions_job",
     "ingest_federal_register_job",
     "ingest_worldbank_job",
-    "ingest_comtrade_job",
     "ingest_eurlex_job",
     "ingest_sec_edgar_job",
-    "mrds_refresh_reminder_job",
+    "ingest_mrds_job",
+    "gta_refresh_reminder_job",
+    "iea_policy_tracker_reminder_job",
+    "usgs_mcs_refresh_reminder_job",
     "_run_ingest_opensanctions",
     "_run_ingest_federal_register",
     "_run_ingest_worldbank",
-    "_run_ingest_comtrade",
     "_run_ingest_eurlex",
     "_run_ingest_sec_edgar",
+    "_run_ingest_mrds",
 ]

@@ -31,14 +31,18 @@ class MaterialCriticalitySignal(Base):
     """
     One row per (material, source, reference_year). Captures criticality scores
     from multiple independent sources so the chemistry risk scorer can prefer
-    more authoritative signals (eu_crma, iea_report) over baseline USGS data.
+    more authoritative signals (eu_crma) over baseline USGS data.
 
     Source hierarchy used by chemistry_risk.score_chemistry_from_rollup():
         1. eu_crma      — EU Critical Raw Materials Act assessments
-        2. iea_report   — IEA Critical Minerals annual reports
-        3. usgs_mcs     — USGS Mineral Commodity Summaries (default baseline)
-        4. manual       — hand-entered data for materials without other sources
-        5. patstat      — EPO PATSTAT (future phase)
+        2. usgs_mcs     — USGS Mineral Commodity Summaries (default baseline)
+        3. manual       — hand-entered data for materials without other sources
+        4. patstat      — EPO PATSTAT (future phase)
+
+    Removed 2026-05-06: ``iea_report`` source.  The iea_reports.py ingester
+    was deleted because it overlapped with usgs_mcs and used heuristic
+    keyword matching (deficit/surplus/challenge → 0.30/0.65/0.80) that
+    didn't add reliable signal beyond USGS's structured HHI/RLI data.
 
     hhi_score stores the raw Herfindahl-Hirschman Index (Σ share_i²) in 0–1
     range (this codebase uses fractional shares, not percentages). The traditional
@@ -60,7 +64,7 @@ class MaterialCriticalitySignal(Base):
     )
     source: Mapped[str] = mapped_column(
         String(32), nullable=False,
-        comment="usgs_mcs | eu_crma | iea_report | patstat | manual",
+        comment="usgs_mcs | eu_crma | patstat | manual",
     )
     reference_year: Mapped[int] = mapped_column(
         Integer, nullable=False,

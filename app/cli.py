@@ -73,7 +73,7 @@ def seed_countries_cmd() -> None:
 def ingest_cmd(
     source: str = typer.Argument(
         ...,
-        help="federal-register | census-trade | sec-edgar | news",
+        help="federal-register | census-trade | news",
     ),
     extra_json: Optional[str] = typer.Option(
         None,
@@ -81,16 +81,29 @@ def ingest_cmd(
         help='JSON object merged into source config, e.g. \'{"per_page":5}\'',
     ),
 ) -> None:
-    """Run a Phase 1 ingestion pipeline by source alias."""
+    """Run a Phase 1 ingestion pipeline by source alias.
+
+    Note: ``sec-edgar`` was removed from this mapping in the May 2026
+    refactor — use the dedicated ``bdi-ingest ingest-sec-edgar`` command
+    instead, which routes through the new ``ingest_sec_edgar`` module
+    with full material attribution.  ``federal-register`` is also
+    preferentially served by ``bdi-ingest ingest-federal-register`` for
+    the same reason; this generic command is kept as a fallback debugging
+    entry point for the remaining pipeline-served sources (census-trade,
+    news) until they get dedicated modules of their own.
+    """
     mapping = {
         "federal-register": SourceType.FEDERAL_REGISTER.value,
         "census-trade": SourceType.CENSUS_TRADE.value,
-        "sec-edgar": SourceType.SEC_EDGAR.value,
         "news": SourceType.NEWS.value,
     }
     st = mapping.get(source.replace("_", "-"))
     if not st:
-        typer.echo(f"Unknown source {source!r}. Choose from {list(mapping.keys())}", err=True)
+        typer.echo(
+            f"Unknown source {source!r}. Choose from {list(mapping.keys())}.\n"
+            f"For sec-edgar use the dedicated `bdi-ingest ingest-sec-edgar` command.",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
     params = json.loads(extra_json) if extra_json else None
@@ -1288,7 +1301,12 @@ def ingest_comtrade_cmd(
     hs_prefixes: Optional[str] = typer.Option(
         None,
         "--hs-prefixes",
-        help="Comma-separated HS prefixes to query (e.g. '2604,2602'). Default: reads from supply_chain_contexts.",
+        help=(
+            "Comma-separated HS prefixes to query (e.g. '2604,2602'). "
+            "Default: derives from hs_code_material_mappings (run "
+            "`bdi-ingest seed-hs-mappings` first); falls back to "
+            "supply_chain_contexts when the mappings table is empty."
+        ),
     ),
     flow_code: str = typer.Option(
         "X",
@@ -1315,6 +1333,7 @@ def ingest_comtrade_cmd(
     from app.services.ingestion.comtrade import (
         CONSUMER_COUNTRIES,
         REPORTER_COUNTRIES,
+        ComtradeRateLimitExhausted,
         ingest_comtrade,
     )
 
@@ -1345,6 +1364,28 @@ def ingest_comtrade_cmd(
             flow_code=flow,
         )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except ComtradeRateLimitExhausted as exc:
+        # Distinct exit path so the user sees a clear "rate-limited, try
+        # again later" message instead of a stack trace.  Rows fetched
+        # before the breaker tripped are already committed; re-running
+        # will skip them via the source-document dedup.
+        typer.echo(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                    "rate_limited": True,
+                    "hint": (
+                        "Comtrade free tier caps at ~500 calls/day. "
+                        "Re-run after the quota resets — already-ingested "
+                        "(reporter × prefix × year) combinations will be skipped."
+                    ),
+                },
+                indent=2,
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=2)
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
         raise typer.Exit(code=1)
@@ -1819,10 +1860,11 @@ def ingest_sec_edgar_cmd(
         bdi-ingest ingest-sec-edgar --companies "Tesla,General Motors,Ford Motor Company"
         bdi-ingest ingest-sec-edgar --max-filings 20
     """
-    import sqlalchemy as sa
-    from app.models import Source
-    from app.models.enums import ImplementationPhase, SourceType
-    from app.services.ingestion.pipeline import IngestionPipeline
+    # 2026-05-06 refactor: switched from generic IngestionPipeline to a
+    # dedicated ingester module so SEC filings get MaterialCache-driven
+    # material attribution + event_subtype='FINANCIAL_PRESSURE' (typed
+    # column from migration 040).  See app/services/ingestion/ingest_sec_edgar.py.
+    from app.services.ingestion.ingest_sec_edgar import ingest_sec_edgar
 
     # ── CIK map ─────────────────────────────────────────────────────────────
     # Maps canonical_name (must match seed_companies.py) → zero-padded CIK.
@@ -1872,30 +1914,10 @@ def ingest_sec_edgar_cmd(
 
     s = _session()
     try:
-        # Find or create the SEC EDGAR source row.
-        source = s.scalar(
-            select(Source).where(
-                Source.source_type == SourceType.SEC_EDGAR.value,
-                Source.is_active == True,
-            ).limit(1)
+        result = ingest_sec_edgar(
+            s, cik_list=cik_list, max_filings=max_filings
         )
-        if source is None:
-            source = Source(
-                name="SEC EDGAR — battery supply chain filers",
-                source_type=SourceType.SEC_EDGAR.value,
-                phase=ImplementationPhase.PHASE_1.value,
-                is_active=True,
-                config_json={"ciks": cik_list, "max_filings": max_filings},
-            )
-            s.add(source)
-            s.flush()
-            typer.echo("Created new SEC EDGAR source row.")
-
-        run_id = IngestionPipeline(s).run(
-            source.id,
-            params={"ciks": cik_list, "max_filings": max_filings},
-        )
-        typer.echo(json.dumps({"ok": True, "ingestion_run_id": run_id, "ciks_processed": len(cik_list)}, indent=2))
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
         raise typer.Exit(code=1)
@@ -2815,7 +2837,7 @@ def _format_review_markdown(result, *, dry_run: bool) -> str:
 @app.command("ingest-iea-policy-tracker")
 def ingest_iea_policy_tracker_cmd(
     file_path: str = typer.Option(
-        "data/iea_policy_tracker.csv",
+        "data/iea/policy_tracker.csv",
         "--file-path",
         help=(
             "Path to the downloaded IEA Policy Tracker CSV (or XLSX). "
@@ -2854,77 +2876,6 @@ def ingest_iea_policy_tracker_cmd(
     s = _session()
     try:
         result = ingest_policy_tracker(s, xls_path=file_path, run_id=run_id)
-        s.commit()
-        typer.echo(json.dumps({"ok": True, **result}, indent=2))
-    except Exception as exc:
-        s.rollback()
-        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
-        raise typer.Exit(code=1)
-    finally:
-        s.close()
-
-
-@app.command("ingest-iea-reports")
-def ingest_iea_reports_cmd(
-    report_year: Optional[int] = typer.Option(
-        None,
-        "--report-year",
-        help=(
-            "Only ingest reports whose reference_year matches this value. "
-            "Default: all enabled reports in the catalogue."
-        ),
-    ),
-    timeout: int = typer.Option(
-        120,
-        "--timeout",
-        help="HTTP timeout in seconds for each PDF download.",
-    ),
-) -> None:
-    """Download IEA Critical Minerals PDF reports and extract criticality signals.
-
-    Fetches enabled reports from the IEA_REPORTS catalogue (currently the 2024
-    and 2023 Critical Minerals Market Reviews).  Extracts MaterialCriticalitySignal
-    rows using pdfplumber — section text and tables are parsed for supply
-    concentration figures and demand trend keywords per mineral.
-
-    Signals are upserted with source="iea_report", which ranks above "usgs_mcs"
-    in the market_aggregator scoring hierarchy, so these forward-looking IEA
-    signals will override USGS-derived criticality scores where available.
-
-    Idempotent: re-running refreshes signals from the latest parsed data.
-
-    \b
-    Run order:
-      bdi-ingest seed-materials        # material lookups must exist
-      bdi-ingest ingest-iea-reports    # this command (downloads PDFs)
-      bdi-ingest rescore-market        # picks up updated criticality signals
-
-    \b
-    Examples:
-      bdi-ingest ingest-iea-reports
-      bdi-ingest ingest-iea-reports --report-year 2024
-      bdi-ingest ingest-iea-reports --timeout 180
-    """
-    from app.services.ingestion.iea_reports import IEA_REPORTS, ingest_iea_reports
-
-    reports = [r for r in IEA_REPORTS if r.enabled]
-    if report_year is not None:
-        reports = [r for r in reports if r.reference_year == report_year]
-        if not reports:
-            typer.echo(
-                f"No enabled reports found for reference_year={report_year}. "
-                f"Available years: {sorted({r.reference_year for r in IEA_REPORTS if r.enabled})}",
-                err=True,
-            )
-            raise typer.Exit(code=1)
-
-    typer.echo(f"Ingesting {len(reports)} IEA report(s)…")
-    for r in reports:
-        typer.echo(f"  • {r.title}")
-
-    s = _session()
-    try:
-        result = ingest_iea_reports(s, reports=reports, timeout=timeout)
         s.commit()
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
@@ -3174,7 +3125,6 @@ def setup_all_cmd(
         "  bdi-ingest ingest-opensanctions\n"
         "  bdi-ingest ingest-eurlex\n"
         "  bdi-ingest ingest-iea-policy-tracker\n"
-        "  bdi-ingest ingest-iea-reports\n"
         "  bdi-ingest full-score\n"
     )
 

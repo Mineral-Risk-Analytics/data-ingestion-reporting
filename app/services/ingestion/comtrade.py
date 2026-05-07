@@ -151,6 +151,36 @@ _API_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=15.0, pool=15.0)
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 5.0  # seconds; doubles on each retry
 
+# Circuit breaker: stop the ingester when the daily rate limit is clearly
+# exhausted.  Comtrade free tier caps at ~500 calls/day; once we hit it,
+# every remaining call just burns ~35s on doomed in-request retries.
+# When this many CONSECUTIVE rate-limit errors come back from the outer
+# loop, abort the run with a clear message rather than grinding for hours.
+# Threshold of 3 = 3 × 3 in-request retries = 9 actual 429 responses,
+# which is definitive.  Any successful call resets the counter, so
+# transient blips don't trigger it.
+_RATE_LIMIT_BREAKER_THRESHOLD = 3
+
+
+class ComtradeRateLimitExhausted(Exception):
+    """Raised when the outer-loop circuit breaker trips on consecutive 429s.
+
+    Carries enough context so the caller can resume the run later — the
+    per-iteration commit means everything fetched so far is already in
+    ``trade_flows`` and the source-document dedup will skip those on retry.
+    """
+
+    def __init__(self, consecutive_count: int, last_reporter: str, last_year: int) -> None:
+        super().__init__(
+            f"Comtrade rate limit appears exhausted: {consecutive_count} consecutive "
+            f"429-after-retries failures (last attempt: reporter={last_reporter}, "
+            f"year={last_year}).  Re-run later — already-ingested rows will be "
+            f"skipped via the source-document dedup."
+        )
+        self.consecutive_count = consecutive_count
+        self.last_reporter = last_reporter
+        self.last_year = last_year
+
 
 # ---------------------------------------------------------------------------
 # API client
@@ -551,26 +581,66 @@ def ingest_comtrade(
     global _CODE_TO_ISO2  # noqa: PLW0603 — intentional module-level update
     _CODE_TO_ISO2 = {v: k for k, v in {**REPORTER_COUNTRIES, **resolved_reporters}.items()}
 
-    # --- Resolve HS prefixes from supply_chain_contexts if not provided ------
-    if hs_prefixes is None:
-        ctx = session.scalar(
-            select(SupplyChainContext).where(SupplyChainContext.slug == "ev_battery")
-        )
-        if ctx is None or not ctx.relevant_hs_code_prefixes:
-            raise ValueError(
-                "No HS code prefixes found. Ensure supply_chain_contexts has a row "
-                "with slug='ev_battery' and relevant_hs_code_prefixes set, "
-                "or pass hs_prefixes= explicitly."
-            )
-        resolved_prefixes: list[str] = list(ctx.relevant_hs_code_prefixes)
+    # --- Resolve HS prefixes ------------------------------------------------
+    # Resolution order (2026-05-06 — matches the gta.py pattern):
+    #   1. Caller override (``hs_prefixes=`` kwarg).
+    #   2. Derive from ``hs_code_material_mappings`` — the live seeded list.
+    #      Adding a new material + HS mapping automatically expands Comtrade
+    #      coverage without code or migration changes.
+    #   3. Fall back to ``supply_chain_contexts.relevant_hs_code_prefixes``
+    #      when the mappings table is empty (fresh DB, ``seed-hs-mappings``
+    #      not yet run).
+    # The previous version relied solely on (3), which had a 6-prefix static
+    # list locked into migration 001 — well behind the actual seeded coverage.
+    if hs_prefixes is not None:
+        resolved_prefixes: list[str] = list(hs_prefixes)
+        prefix_source = "explicit_kwarg"
     else:
-        resolved_prefixes = list(hs_prefixes)
+        # Pull the live mappings.
+        hs_material_map = _build_hs_material_map(session)
+        if hs_material_map:
+            # Use 4-digit prefixes — Comtrade accepts 4 (chapter+heading) or
+            # 6 (subheading) cmdCode values; 4-digit broadens the API query
+            # to capture all subheadings under each heading and lets the
+            # per-row resolver downstream pick the best match.
+            prefixes_set: set[str] = set()
+            for raw_prefix in hs_material_map.keys():
+                clean = raw_prefix.replace(".", "")
+                if len(clean) >= 4:
+                    prefixes_set.add(clean[:4])
+            resolved_prefixes = sorted(prefixes_set)
+            prefix_source = "hs_code_material_mappings"
+        else:
+            # Fallback: supply_chain_contexts row (legacy path).
+            ctx = session.scalar(
+                select(SupplyChainContext).where(SupplyChainContext.slug == "ev_battery")
+            )
+            if ctx is None or not ctx.relevant_hs_code_prefixes:
+                raise ValueError(
+                    "No HS code prefixes found. Run `bdi-ingest seed-hs-mappings` "
+                    "first (preferred), or ensure supply_chain_contexts has a row "
+                    "with slug='ev_battery' and relevant_hs_code_prefixes set, "
+                    "or pass hs_prefixes= explicitly."
+                )
+            resolved_prefixes = list(ctx.relevant_hs_code_prefixes)
+            prefix_source = "supply_chain_contexts"
+            log.warning(
+                "comtrade.prefix_fallback_to_static_context",
+                hint=(
+                    "hs_code_material_mappings is empty — using the static "
+                    "list from supply_chain_contexts.  Run `bdi-ingest "
+                    "seed-hs-mappings` to enable dynamic prefix derivation."
+                ),
+                static_prefix_count=len(resolved_prefixes),
+            )
 
     log.info(
         "comtrade.ingest.start",
         years=years,
         reporters=list(resolved_reporters.keys()),
         hs_prefixes=resolved_prefixes,
+        hs_prefix_source=prefix_source,
+        hs_prefix_count=len(resolved_prefixes),
     )
 
     # --- One-time setup ------------------------------------------------------
@@ -582,6 +652,8 @@ def ingest_comtrade(
     skipped_empty_response = 0
     api_calls_made = 0
     errors = 0
+    # Circuit-breaker state — reset to 0 on any successful API call.
+    consecutive_rate_limit_errors = 0
 
     # --- Outer loop: year × reporter × hs_prefix ----------------------------
     for year in years:
@@ -640,13 +712,55 @@ def ingest_comtrade(
                         flow_code=flow_code,
                     )
                     api_calls_made += 1
-                except (httpx.HTTPStatusError, httpx.TimeoutException, ValueError) as exc:
+                    # Successful call — reset the rate-limit circuit breaker.
+                    consecutive_rate_limit_errors = 0
+                except httpx.HTTPStatusError as exc:
+                    # Distinguish rate-limit failures from other HTTP errors —
+                    # only the former should trip the circuit breaker.
+                    is_rate_limit = (
+                        exc.response is not None and exc.response.status_code == 429
+                    )
                     log.warning(
                         "comtrade.api_error",
                         reporter=iso2,
                         hs_prefix=hs_prefix,
                         year=year,
                         error=str(exc),
+                        is_rate_limit=is_rate_limit,
+                    )
+                    errors += 1
+                    if is_rate_limit:
+                        consecutive_rate_limit_errors += 1
+                        if consecutive_rate_limit_errors >= _RATE_LIMIT_BREAKER_THRESHOLD:
+                            log.error(
+                                "comtrade.rate_limit_breaker_tripped",
+                                consecutive_failures=consecutive_rate_limit_errors,
+                                threshold=_RATE_LIMIT_BREAKER_THRESHOLD,
+                                api_calls_made=api_calls_made,
+                                inserted=inserted,
+                                hint=(
+                                    "Daily rate limit appears exhausted. "
+                                    "Re-run later — source-document dedup will "
+                                    "skip already-ingested combinations."
+                                ),
+                            )
+                            raise ComtradeRateLimitExhausted(
+                                consecutive_count=consecutive_rate_limit_errors,
+                                last_reporter=iso2,
+                                last_year=year,
+                            ) from exc
+                    continue
+                except (httpx.TimeoutException, ValueError) as exc:
+                    # Non-rate-limit failures: log + continue, but DON'T reset
+                    # the circuit breaker counter.  A timeout in the middle of
+                    # a rate-limit spell shouldn't mask the rate-limit signal.
+                    log.warning(
+                        "comtrade.api_error",
+                        reporter=iso2,
+                        hs_prefix=hs_prefix,
+                        year=year,
+                        error=str(exc),
+                        is_rate_limit=False,
                     )
                     errors += 1
                     continue

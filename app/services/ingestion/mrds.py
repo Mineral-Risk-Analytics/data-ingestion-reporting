@@ -72,6 +72,7 @@ from sqlalchemy.orm import Session
 
 from app.models.facility import Facility, FacilityMaterialLink
 from app.models.supply import Material
+from app.services.ingestion.material_resolver import MaterialAliasResolver
 
 log = structlog.get_logger(__name__)
 
@@ -326,142 +327,172 @@ MRDS_STATUS_MAP: dict[str, str] = {
 # MRDS oper_type → Facility.facility_type
 # ---------------------------------------------------------------------------
 
+# Updated 2026-05-06 against actual MRDS data distribution.  The previous
+# version listed values like "smelter" / "refinery" / "mill" / "concentrator"
+# that NEVER appear in the real ``oper_type`` column — those were dead-code
+# fallbacks.  Real distinct values found in the 304k-row file are:
+#   surface, underground, surface-underground, placer, processing plant,
+#   well, offshore, geothermal, brine operation, leach.
+# ``smelter`` / ``refinery`` / ``concentrator`` now live in ``_NAME_KEYWORDS``
+# below (the name-keyword fallback path) since they only ever appear in
+# ``site_name`` / ``names`` text, not in oper_type.
 MRDS_OPER_TYPE_MAP: dict[str, str] = {
-    "surface":          "mine",
-    "underground":      "mine",
-    "open pit":         "mine",
-    "placer":           "mine",
-    "brine":            "mine",
-    "solution":         "mine",     # solution mining (lithium brine)
-    "in-situ":          "mine",
-    "dredge":           "mine",
-    "alluvial":         "mine",
-    "quarry":           "mine",
-    "mill":             "refinery",
-    "plant":            "refinery",
-    "smelter":          "refinery",
-    "refinery":         "refinery",
-    "processing":       "refinery",
-    "concentrator":     "refinery",
-    "leach":            "refinery",
+    # ── Mining (→ "mine" facility_type) ────────────────────────────────
+    "surface":              "mine",
+    "underground":          "mine",
+    "surface-underground":  "mine",
+    "open pit":             "mine",
+    "placer":               "mine",
+    "brine":                "mine",
+    "brine operation":      "mine",
+    "solution":             "mine",     # solution mining (lithium brine)
+    "in-situ":              "mine",
+    "dredge":               "mine",
+    "alluvial":             "mine",
+    "quarry":               "mine",
+    "well":                 "mine",     # extraction well (Li / B brine, geothermal)
+    "offshore":             "mine",     # offshore extraction
+    "geothermal":           "mine",     # geothermal brine for Li / B
+    # ── Processing — granular facility_types (added 2026-05-06) ────────
+    # These don't appear directly in oper_type but the name-keyword
+    # fallback synthesises them, and the map below routes each to a
+    # distinct facility_type so FACILITY_TYPE_TO_STAGE can hand out
+    # different stages.
+    "concentrator":         "concentrator",   # produces concentrate from ore
+    "flotation":            "concentrator",
+    "mill":                 "concentrator",   # mills typically = concentrators
+    "smelter":              "smelter",        # produces matte / raw metal
+    "smelting":             "smelter",
+    "refinery":             "refinery",       # produces refined metal
+    "refining":             "refinery",
+    "leach":                "leach",          # hydromet — varies, conservative
+    "processing plant":     "processing",     # ambiguous — keep conservative
+    "processing":           "processing",
+    "plant":                "processing",
 }
 
 # ---------------------------------------------------------------------------
 # Facility.facility_type → FacilityMaterialLink.supply_chain_stage
 # ---------------------------------------------------------------------------
-# MRDS collapses all processing facilities into "refinery".  Per the design
-# doc, prefer the *lower* stage (intermediate) when MRDS does not supply
-# enough detail to distinguish intermediate from refined.  This is conservative
-# and avoids attributing full-refinery HHI to smelter/matte facilities.
+# Granularity expansion (2026-05-06): the previous version collapsed every
+# processing facility to ``intermediate`` regardless of type.  Now uses the
+# distinct facility_types from MRDS_OPER_TYPE_MAP / _NAME_KEYWORDS to write
+# a meaningful stage that the Material Concentration pillar's stage-rollup
+# (STAGE_ROLLUP_WEIGHTS in market_aggregator.py) can use.
+#
 # hs_mapping_id is left NULL for all MRDS rows — manual confirmation required.
 
 FACILITY_TYPE_TO_STAGE: dict[str, str] = {
-    "mine":     "ore",
-    "refinery": "intermediate",   # conservative; update manually to "refined" / "battery_grade"
+    "mine":          "ore",
+    "concentrator":  "concentrate",     # mills + concentrators — STAGE_ROLLUP_WEIGHTS 0.15
+    "smelter":       "intermediate",    # produces matte / raw metal
+    "refinery":      "refined",         # produces refined metal — STAGE_ROLLUP_WEIGHTS 0.25
+    "leach":         "intermediate",    # ambiguous; conservative
+    "processing":    "intermediate",    # ambiguous; conservative
 }
+
+# ---------------------------------------------------------------------------
+# Name-keyword fallback for unknown ``oper_type``
+# ---------------------------------------------------------------------------
+# 48% of MRDS rows have oper_type empty or "unknown"; ~31k of the active
+# subset (Producer / Past Producer / Plant) carry classifying keywords in
+# ``site_name`` or ``names``.  This list runs in order — more specific terms
+# first — so e.g. "Quarry and Plant" classifies as a quarry, not a plant.
+#
+# Keywords return values compatible with MRDS_OPER_TYPE_MAP keys above so the
+# fallback feeds the same downstream pipeline.
+#
+# False-positive notes from real data:
+#   * "Smelter Knolls South Borrow Pit" — "Smelter Knolls" is a place name,
+#     not a smelter.  Accepted (single-digit FP volume).
+#   * Bare "leach" hits person-name surnames ("Hanks-Miller-Leach Group") —
+#     restricted here to the qualified forms ("heap leach", "leach plant").
+#   * "Concentrator Mine" — both keywords appear; "concentrator" wins via
+#     ordering.  Real volume is tiny (<20 rows); accepted.
+_NAME_KEYWORDS_ORDERED: list[tuple[str, str]] = [
+    # Refining (highest stage) — small absolute count but real signal
+    ("refinery",            "refinery"),
+    ("refining",            "refinery"),
+    # Smelting
+    ("smelter",             "smelter"),
+    ("smelting",            "smelter"),
+    # Concentrators (specific qualified forms first)
+    ("concentrator",        "concentrator"),
+    ("flotation",           "concentrator"),
+    ("concentrating mill",  "concentrator"),
+    # Leach plant — only qualified forms (bare "leach" hits surnames)
+    ("heap leach",          "leach"),
+    ("leach plant",         "leach"),
+    ("leach pad",           "leach"),
+    # Mining-side keywords — checked BEFORE generic mill/plant so
+    # "Quarry and Plant" classifies as quarry, not plant.
+    ("quarry",              "quarry"),
+    ("open-pit",            "open pit"),
+    ("open pit",            "open pit"),
+    ("strip mine",          "surface"),
+    ("placer",              "placer"),
+    ("dredge",              "dredge"),
+    ("alluvial",            "alluvial"),
+    ("shaft",               "underground"),
+    # Generic processing — checked AFTER mining keywords on purpose
+    ("processing plant",    "processing plant"),
+    ("processing facility", "processing plant"),
+    ("mill",                "mill"),       # mills are usually concentrators
+    ("plant",               "plant"),      # ambiguous; routed to "processing"
+    # Generic mine + pit keywords last (most permissive)
+    ("pit",                 "open pit"),   # 6k hits, mostly real mining pits
+    ("mine",                "surface"),    # default mine type when unclear
+]
+
+
+def _classify_from_name(
+    site_name: Optional[str],
+    names: Optional[str],
+) -> Optional[str]:
+    """Infer an MRDS_OPER_TYPE_MAP-compatible value from facility name text.
+
+    ``site_name`` is the authoritative facility name; ``names`` is the
+    operator/owner — used only as fallback because operator names can
+    contain misleading historical / corporate terms.  Stops at first
+    keyword match (more specific terms come first in
+    ``_NAME_KEYWORDS_ORDERED``).
+
+    Returns None if neither field contains a recognised keyword.
+    """
+    import re as _re
+
+    candidates: list[str] = []
+    if site_name:
+        candidates.append(site_name.lower())
+    if names:
+        candidates.append(names.lower())
+    if not candidates:
+        return None
+
+    # Word-boundary regex per keyword to avoid matching inside other words
+    # ("mine" inside "minerals", "pit" inside "Pittsburgh", etc.).
+    for kw, oper_type in _NAME_KEYWORDS_ORDERED:
+        pattern = _re.compile(r"\b" + _re.escape(kw) + r"\b", _re.IGNORECASE)
+        for text in candidates:
+            if pattern.search(text):
+                return oper_type
+    return None
 
 # ---------------------------------------------------------------------------
 # Country full name → ISO2 (MRDS uses full English names)
 # ---------------------------------------------------------------------------
 
-_COUNTRY_NAME_TO_ISO2: dict[str, str] = {
-    "afghanistan":                      "AF",
-    "argentina":                        "AR",
-    "australia":                        "AU",
-    "austria":                          "AT",
-    "bolivia":                          "BO",
-    "botswana":                         "BW",
-    "brazil":                           "BR",
-    "burundi":                          "BI",
-    "cambodia":                         "KH",
-    "cameroon":                         "CM",
-    "canada":                           "CA",
-    "chile":                            "CL",
-    "china":                            "CN",
-    "colombia":                         "CO",
-    "congo, dem. rep.":                 "CD",
+_MRDS_COUNTRY_OVERRIDES: dict[str, str] = {
+    # MRDS / legacy spellings that may not exist in countries.common_names.
+    "congo, dem. rep.": "CD",
     "congo, democratic republic of the": "CD",
     "democratic republic of the congo": "CD",
-    "drc":                              "CD",
-    "cuba":                             "CU",
-    "czech republic":                   "CZ",
-    "czechia":                          "CZ",
-    "ecuador":                          "EC",
-    "egypt":                            "EG",
-    "eritrea":                          "ER",
-    "ethiopia":                         "ET",
-    "finland":                          "FI",
-    "france":                           "FR",
-    "germany":                          "DE",
-    "ghana":                            "GH",
-    "greece":                           "GR",
-    "greenland":                        "GL",
-    "guinea":                           "GN",
-    "hungary":                          "HU",
-    "india":                            "IN",
-    "indonesia":                        "ID",
-    "iran":                             "IR",
-    "ireland":                          "IE",
-    "italy":                            "IT",
-    "japan":                            "JP",
-    "jordan":                           "JO",
-    "kazakhstan":                       "KZ",
-    "kenya":                            "KE",
-    "kyrgyzstan":                       "KG",
-    "laos":                             "LA",
-    "madagascar":                       "MG",
-    "malawi":                           "MW",
-    "malaysia":                         "MY",
-    "mali":                             "ML",
-    "mauritania":                       "MR",
-    "mexico":                           "MX",
-    "mongolia":                         "MN",
-    "morocco":                          "MA",
-    "mozambique":                       "MZ",
-    "namibia":                          "NA",
-    "nepal":                            "NP",
-    "new caledonia":                    "NC",
-    "new zealand":                      "NZ",
-    "niger":                            "NE",
-    "nigeria":                          "NG",
-    "norway":                           "NO",
-    "pakistan":                         "PK",
-    "papua new guinea":                 "PG",
-    "peru":                             "PE",
-    "philippines":                      "PH",
-    "poland":                           "PL",
-    "portugal":                         "PT",
-    "russia":                           "RU",
-    "russian federation":               "RU",
-    "rwanda":                           "RW",
-    "saudi arabia":                     "SA",
-    "senegal":                          "SN",
-    "serbia":                           "RS",
-    "sierra leone":                     "SL",
-    "south africa":                     "ZA",
-    "south korea":                      "KR",
-    "korea, republic of":               "KR",
-    "spain":                            "ES",
-    "sri lanka":                        "LK",
-    "sudan":                            "SD",
-    "sweden":                           "SE",
-    "switzerland":                      "CH",
-    "tajikistan":                       "TJ",
-    "tanzania":                         "TZ",
-    "thailand":                         "TH",
-    "turkey":                           "TR",
-    "turkiye":                          "TR",
-    "uganda":                           "UG",
-    "ukraine":                          "UA",
-    "united kingdom":                   "GB",
-    "united states":                    "US",
-    "united states of america":         "US",
-    "usa":                              "US",
-    "uzbekistan":                       "UZ",
-    "vietnam":                          "VN",
-    "viet nam":                         "VN",
-    "zambia":                           "ZM",
-    "zimbabwe":                         "ZW",
+    "drc": "CD",
+    "turkiye": "TR",
+    "viet nam": "VN",
+    "korea, republic of": "KR",
+    "united states of america": "US",
+    "usa": "US",
 }
 
 # Battery-critical commodity codes — used to pre-filter the full MRDS dataset
@@ -476,7 +507,35 @@ MRDS_CSV_ZIP_URL = "https://mrdata.usgs.gov/mrds/mrds-csv.zip"
 # Country resolution
 # ---------------------------------------------------------------------------
 
-def _resolve_country(raw: str) -> Optional[str]:
+def _build_country_map(session: Session) -> dict[str, str]:
+    """Build a lowercase name/alias → ISO2 lookup from the countries table.
+
+    Mirrors the pattern used by other ingestors (e.g. the MCS PDF parser) so we
+    don't maintain a giant hardcoded mapping. MRDS-specific edge spellings live
+    in `_MRDS_COUNTRY_OVERRIDES`.
+    """
+    from app.models.country import Country  # noqa: PLC0415
+
+    result: dict[str, str] = {}
+    rows = session.execute(
+        select(Country.iso2, Country.name, Country.common_names)
+    ).all()
+
+    for iso2, canonical, common_names in rows:
+        if isinstance(canonical, str) and canonical:
+            result[canonical.lower()] = iso2
+        if isinstance(iso2, str) and iso2:
+            result[iso2.lower()] = iso2
+        if common_names and isinstance(common_names, list):
+            for alias in common_names:
+                if isinstance(alias, str) and alias:
+                    result[alias.lower()] = iso2
+
+    result.update(_MRDS_COUNTRY_OVERRIDES)
+    return result
+
+
+def _resolve_country(raw: str, country_map: dict[str, str]) -> Optional[str]:
     """Return ISO2 from a MRDS country string.
 
     MRDS uses full English names. Returns None for unresolvable strings
@@ -488,24 +547,48 @@ def _resolve_country(raw: str) -> Optional[str]:
     # Some MRDS rows already use ISO2
     if len(stripped) == 2 and stripped.isalpha():
         return stripped.upper()
-    return _COUNTRY_NAME_TO_ISO2.get(stripped.lower())
+    return country_map.get(stripped.lower())
 
 
 # ---------------------------------------------------------------------------
 # Commodity resolution — handles commod1/2/3 columns
 # ---------------------------------------------------------------------------
 
-def _resolve_commodities(row: dict) -> list[str]:
+def _resolve_commodities(
+    row: dict,
+    *,
+    resolver: MaterialAliasResolver,
+) -> list[str]:
     """Extract canonical material names from MRDS commod1/2/3 columns.
 
+    Primary path: resolve via ``material_source_aliases`` using
+    ``MaterialAliasResolver`` under ``source_system="mrds"`` (consistent with
+    other ingestors).
+
+    Fallback path: legacy ``MRDS_COMMODITY_MAP`` dict for deployments that
+    haven't seeded MRDS aliases yet.
+
     Returns list preserving order: commod1 first (primary), then co-products.
-    Skips unrecognised commodity codes without raising.
+    Skips unrecognised commodity values without raising.
     """
     result: list[str] = []
     for col in ("commod1", "commod2", "commod3"):
-        raw = str(row.get(col, "") or "").strip().lower()
+        raw_original = str(row.get(col, "") or "").strip()
+        raw = raw_original.lower()
         if not raw:
             continue
+
+        # Prefer DB-backed aliases.
+        alias_result = resolver.resolve("mrds", raw_original)
+        if alias_result.status == "ok" and alias_result.material is not None:
+            canonical = alias_result.material.canonical_name
+            if canonical not in result:
+                result.append(canonical)
+            continue
+        if alias_result.status == "skipped":
+            continue
+
+        # Legacy fallback (pre-alias seeding).
         canonical = MRDS_COMMODITY_MAP.get(raw)
         if canonical and canonical not in result:
             result.append(canonical)
@@ -566,16 +649,24 @@ def ingest_mrds(
         ).all()
     }
 
+    # Pre-load country aliases → ISO2 once (MRDS uses full names, not ISO2)
+    country_map = _build_country_map(session)
+
+    # Pre-load material source aliases for MRDS name resolution
+    resolver = MaterialAliasResolver(session)
+
     facilities_inserted  = 0
     facilities_updated   = 0
     links_inserted       = 0
     links_updated        = 0
-    skipped_no_country   = 0
-    skipped_no_commodity = 0
-    skipped_no_coords    = 0
-    skipped_planned      = 0
-    rows_scanned         = 0
-    rows_matched         = 0
+    skipped_no_country         = 0
+    skipped_no_commodity       = 0
+    skipped_no_coords          = 0
+    skipped_planned            = 0
+    skipped_closed             = 0     # added 2026-05-06 — past producers etc.
+    rows_inferred_from_name    = 0     # facility_type recovered from site_name/names
+    rows_scanned               = 0
+    rows_matched               = 0
     link_material_ids_by_facility: dict[uuid.UUID, set[int]] = {}
     pending_links: dict[tuple[uuid.UUID, int], FacilityMaterialLink] = {}
 
@@ -592,7 +683,7 @@ def ingest_mrds(
         dep_id = str(row.get("dep_id", "") or "").strip() or None
 
         # ── Country ───────────────────────────────────────────────────────
-        country = _resolve_country(str(row.get("country", "") or ""))
+        country = _resolve_country(str(row.get("country", "") or ""), country_map)
         if not country:
             log.debug(
                 "mrds.skipped_no_country",
@@ -603,7 +694,7 @@ def ingest_mrds(
             continue
 
         # ── Commodities ───────────────────────────────────────────────────
-        canonical_materials = _resolve_commodities(row)
+        canonical_materials = _resolve_commodities(row, resolver=resolver)
         if not canonical_materials:
             skipped_no_commodity += 1
             continue
@@ -619,25 +710,47 @@ def ingest_mrds(
             skipped_no_coords += 1
             continue
 
-        # ── facility_type ─────────────────────────────────────────────────
-        oper_raw = str(row.get("oper_type", "") or "").lower().strip()
-        facility_type = MRDS_OPER_TYPE_MAP.get(oper_raw, "mine")
-
-        # ── Status ────────────────────────────────────────────────────────
+        # ── Status (filter early — skip rows scoring won't use) ──────────
         status_raw = str(row.get("dev_stat", "") or "").lower().strip()
         status = MRDS_STATUS_MAP.get(status_raw, "planned")
-        # Skip occurrences, prospects, and anything else that resolves to
-        # "planned" — these are mineral occurrences or speculative prospects
-        # that are excluded from operational scoring and add no signal.
-        # Unknown dev_stat values also default to "planned" and are skipped.
+        # Skip:
+        #   * "planned" — prospects, occurrences, exploration, permitted.
+        #     These are mineral occurrences and speculative entries; not
+        #     producing capacity.  ~150k rows of the 304k file.
+        #   * "closed"  — past producer / historical / abandoned / reclaimed.
+        #     ~128k rows.  Long-shuttered mines don't add operational
+        #     scoring signal — the operational pillar measures CURRENT
+        #     productive capacity.  Added 2026-05-06 per partner direction.
+        # Keep:
+        #   * "operating"          — Producer, active, plant
+        #   * "mothballed"         — care/maintenance, suspended, on hold
+        #     (could restart — real signal for operational risk)
+        #   * "under_construction" — development, construction
         if status == "planned":
             skipped_planned += 1
             continue
+        if status == "closed":
+            skipped_closed += 1
+            continue
 
-        # ── Region and mine name ──────────────────────────────────────────
+        # ── Region and mine name (read before facility_type for the
+        #     name-keyword fallback below) ────────────────────────────────
         region   = str(row.get("state", "") or "").strip() or None
         mine_name = str(row.get("site_name", "") or "").strip() or None
         reporter = str(row.get("names", "") or "").strip() or None
+
+        # ── facility_type — with name-keyword fallback (2026-05-06) ─────
+        # 48% of MRDS rows have empty or "unknown" oper_type but ~47% of
+        # those carry classifying keywords in site_name / names.  Recover
+        # that signal before falling back to the conservative "mine"
+        # default.
+        oper_raw = str(row.get("oper_type", "") or "").lower().strip()
+        if not oper_raw or oper_raw == "unknown":
+            inferred = _classify_from_name(mine_name, reporter)
+            if inferred:
+                oper_raw = inferred
+                rows_inferred_from_name += 1
+        facility_type = MRDS_OPER_TYPE_MAP.get(oper_raw, "mine")
 
         metadata: dict = {
             "source": "mrds",
@@ -676,9 +789,15 @@ def ingest_mrds(
                 )
             )
 
+        # facility_type is mutable now (added 2026-05-06) so re-running
+        # ingest after the granularity expansion + name-keyword fallback
+        # reclassifies existing rows.  Without this, old rows would keep
+        # their pre-fix facility_type values and the new logic would only
+        # affect first-time inserts.
         mutable = {
             "name":           mine_name,
             "status":         status,
+            "facility_type":  facility_type,
             "latitude":       lat,
             "longitude":      lon,
             "region":         region,
@@ -689,10 +808,9 @@ def ingest_mrds(
         if facility is None:
             facility = Facility(
                 id=uuid.uuid4(),
-                facility_type=facility_type,
                 country=country,
                 mrds_dep_id=dep_id,
-                **mutable,
+                **mutable,   # includes facility_type (added 2026-05-06)
             )
             session.add(facility)
             session.flush()
@@ -757,8 +875,20 @@ def ingest_mrds(
                     existing_link = pending_links.get((facility.id, material_id))
                     if existing_link is None:
                         continue
+                changed = False
                 if existing_link.is_primary_product != is_primary:
                     existing_link.is_primary_product = is_primary
+                    changed = True
+                # Re-stage existing links so the granularity expansion +
+                # name-keyword fallback (added 2026-05-06) take effect on
+                # rows ingested before this fix.  Previously stage was
+                # write-once; rerunning ingest-mrds left old rows on the
+                # original conservative classification.
+                expected_stage = FACILITY_TYPE_TO_STAGE.get(facility_type)
+                if existing_link.supply_chain_stage != expected_stage:
+                    existing_link.supply_chain_stage = expected_stage
+                    changed = True
+                if changed:
                     links_updated += 1
 
         # Commit every batch_size matched rows so progress survives disconnects.
@@ -774,22 +904,27 @@ def ingest_mrds(
                 facilities_inserted=facilities_inserted,
                 facilities_updated=facilities_updated,
                 skipped_planned=skipped_planned,
+                skipped_closed=skipped_closed,
+                rows_inferred_from_name=rows_inferred_from_name,
             )
 
     # Final commit for the last partial batch
     session.commit()
 
     result = {
-        "rows_scanned":         rows_scanned,
-        "rows_matched":         rows_matched,
-        "facilities_inserted":  facilities_inserted,
-        "facilities_updated":   facilities_updated,
-        "links_inserted":       links_inserted,
-        "links_updated":        links_updated,
-        "skipped_no_country":   skipped_no_country,
-        "skipped_no_commodity": skipped_no_commodity,
-        "skipped_no_coords":    skipped_no_coords,
-        "skipped_planned":      skipped_planned,
+        "rows_scanned":            rows_scanned,
+        "rows_matched":            rows_matched,
+        "facilities_inserted":     facilities_inserted,
+        "facilities_updated":      facilities_updated,
+        "links_inserted":          links_inserted,
+        "links_updated":           links_updated,
+        "skipped_no_country":      skipped_no_country,
+        "skipped_no_commodity":    skipped_no_commodity,
+        "skipped_no_coords":       skipped_no_coords,
+        "skipped_planned":         skipped_planned,
+        # Added 2026-05-06 (N4 audit fix):
+        "skipped_closed":          skipped_closed,
+        "rows_inferred_from_name": rows_inferred_from_name,
     }
     log.info("mrds.done", **result)
     return result

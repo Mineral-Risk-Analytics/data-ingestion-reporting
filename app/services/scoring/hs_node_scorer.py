@@ -46,7 +46,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.models.regulatory import RiskEvent, RiskEventHsMapping
+from app.models.regulatory import RiskEvent, RiskEventGeography, RiskEventHsMapping
 from app.models.scoring import HsCodeGeographyRiskScore
 from app.models.supply import HsCodeMaterialMapping, HsCodeProductionShare
 from app.services.scoring.decay import compute_recency_multiplier
@@ -76,8 +76,28 @@ _EXPORT_WEIGHT = 0.25
 # diagnosis.  Migration 040 promoted ``event_subtype`` to a typed column
 # and aligned both sides on the uppercase form ingesters had been using
 # all along.
-_TARIFF_SUBTYPES = frozenset({"TARIFF"})
+#
+# 2026-05-06 (G11 Scope 2): added ``IMPORT_DISRUPTION`` to ``_TARIFF_SUBTYPES``.
+# GTA emits ``IMPORT_DISRUPTION`` for "Import tariff/quota/ban" interventions;
+# the previous ``{"TARIFF"}`` constant matched zero events in production,
+# leaving ``tariff_exposure`` permanently 0.  See gta._INTERVENTION_SUBTYPE_MAP.
+_TARIFF_SUBTYPES = frozenset({"TARIFF", "IMPORT_DISRUPTION"})
 _EXPORT_SUBTYPES = frozenset({"EXPORT_RESTRICTION"})
+
+# ── Geography contexts consumed by Tariff / Export sub-scores ─────────────
+# Primary    = the implementing country.  For export-side interventions
+#              this IS the producer whose supply just got constrained, so
+#              the export sub-score uses ``geography_context="primary"``.
+# Affected   = the targeted country.  For import-side interventions
+#              (tariffs / quotas / bans on imports from country X), this
+#              is the producer whose exports just got penalised, so the
+#              tariff sub-score uses ``geography_context="affected"``.
+#
+# Events without a matching geography row are excluded entirely (strict
+# attribution per partner direction — no "global" fallback).  See
+# ``app/services/ingestion/gta.py`` ``ingest_gta`` for the writer side.
+_EXPORT_GEOGRAPHY_CONTEXT = "primary"
+_TARIFF_GEOGRAPHY_CONTEXT = "affected"
 
 
 def _compute_hhi(shares: list[float]) -> float:
@@ -188,39 +208,74 @@ def score_hs_node_geography(
     share_values = [s.production_share for s in all_shares if s.production_share > 0]
     hhi_at_stage = _compute_hhi(share_values)
 
-    # ── 5. Tariff events scoped to this HS code ──────────────────────────────
-    # Filter on typed ``event_subtype`` column (migration 040), not the
-    # ingester-specific ``event_type`` — see _TARIFF_SUBTYPES comment above.
+    # ── 5. Tariff events scoped to this HS code AND this country ────────────
+    # G11 (2026-05-06): tariff events are import-side interventions where the
+    # implementing country is the importer; the producer being targeted is in
+    # ``RiskEventGeography`` with ``geography_context="affected"``.  Join on
+    # both the HS code and the affected-country tag so a US tariff on Chinese
+    # lithium lifts CN's score on the lithium HS node, not US's.  Events with
+    # no ``"affected"`` geography row are excluded entirely (strict
+    # attribution; no global fallback).  Filter on typed ``event_subtype``
+    # column (migration 040), not the ingester-specific ``event_type``.
     tariff_rows = db.execute(
-        select(RiskEvent.severity_score, RiskEvent.confidence_score, RiskEvent.event_date)
+        select(
+            RiskEvent.id,
+            RiskEvent.severity_score,
+            RiskEvent.confidence_score,
+            RiskEvent.event_date,
+        )
         .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
+        .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
         .where(
             RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
             RiskEvent.event_subtype.in_(_TARIFF_SUBTYPES),
+            RiskEventGeography.country_code == country_code,
+            RiskEventGeography.geography_context == _TARIFF_GEOGRAPHY_CONTEXT,
         )
     ).all()
 
+    # Normalise event_date (DateTime column) to date for the decay function.
     tariff_events = [
-        (row.severity_score, row.confidence_score, row.event_date)
+        (
+            row.severity_score,
+            row.confidence_score,
+            row.event_date.date() if hasattr(row.event_date, "date") else row.event_date,
+        )
         for row in tariff_rows
     ]
     tariff_exposure = _compute_event_signal(
         tariff_events, as_of_date, RiskCategory.GEOPOLITICAL_TRADE
     )
 
-    # ── 6. Export restriction events scoped to this HS code ─────────────────
-    # Same as tariff filter: typed ``event_subtype`` column (migration 040).
+    # ── 6. Export restriction events scoped to this HS code AND this country ─
+    # G11 (2026-05-06): export-side interventions are filtered by the
+    # implementing country (``geography_context="primary"``) — the country
+    # whose own producers' supply is being constrained.  A China graphite
+    # export ban lifts CN's score on the graphite HS node only, not every
+    # country's.
     export_rows = db.execute(
-        select(RiskEvent.severity_score, RiskEvent.confidence_score, RiskEvent.event_date)
+        select(
+            RiskEvent.id,
+            RiskEvent.severity_score,
+            RiskEvent.confidence_score,
+            RiskEvent.event_date,
+        )
         .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
+        .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
         .where(
             RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
             RiskEvent.event_subtype.in_(_EXPORT_SUBTYPES),
+            RiskEventGeography.country_code == country_code,
+            RiskEventGeography.geography_context == _EXPORT_GEOGRAPHY_CONTEXT,
         )
     ).all()
 
     export_events = [
-        (row.severity_score, row.confidence_score, row.event_date)
+        (
+            row.severity_score,
+            row.confidence_score,
+            row.event_date.date() if hasattr(row.event_date, "date") else row.event_date,
+        )
         for row in export_rows
     ]
     export_restriction = _compute_event_signal(
@@ -235,15 +290,13 @@ def score_hs_node_geography(
     composite_node_score = hhi_component + tariff_component + export_component
 
     # ── 8. Upsert into hs_code_geography_risk_scores ────────────────────────
-    event_ids_consumed = (
-        [r.risk_event_id for r in (
-            db.execute(
-                select(RiskEventHsMapping.risk_event_id).where(
-                    RiskEventHsMapping.hs_mapping_id == hs_mapping_id
-                )
-            ).all()
-        )]
-    )
+    # Pre-2026-05-06 this listed every event tied to the HS mapping, ignoring
+    # country.  After the G11 country-scope filter that was misleading
+    # rationale data (events listed but not actually consumed for this
+    # country's score).  Use the actual filtered result rows instead.
+    event_ids_consumed = sorted({
+        row.id for row in (*tariff_rows, *export_rows)
+    })
 
     metadata: dict = {
         "reference_year": latest_year,

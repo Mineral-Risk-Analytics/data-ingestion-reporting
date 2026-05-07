@@ -67,6 +67,7 @@ from app.models.regulatory import (
     RiskEventHsMapping,
     RiskEventMaterial,
 )
+from app.models.source import Source
 from app.services.ingestion.normalizers.material_resolver import MaterialCache, MaterialResolver
 
 log = structlog.get_logger(__name__)
@@ -77,11 +78,15 @@ log = structlog.get_logger(__name__)
 
 _SOURCE_NAME = "IEA Critical Minerals Policy Tracker"
 _SOURCE_TYPE = "iea_policy_tracker"
+_SOURCE_PHASE = "1"
+_SOURCE_BASE_URL = (
+    "https://www.iea.org/data-and-statistics/data-tools/critical-minerals-policy-tracker"
+)
 
 # Default local path — override via IEA_POLICY_TRACKER_PATH env var or CLI.
 DEFAULT_FILE_PATH = os.environ.get(
     "IEA_POLICY_TRACKER_PATH",
-    "data/iea_policy_tracker.csv",
+    "data/iea/policy_tracker.csv",
 )
 
 # Severity calibration — positive-policy events are low severity by design.
@@ -117,6 +122,69 @@ _DEFAULT_CATEGORY = "regulatory_compliance"
 # ---------------------------------------------------------------------------
 # ISO-3 → ISO-2 country code map (DB-backed)
 # ---------------------------------------------------------------------------
+
+def _get_or_create_source(session: Session) -> int:
+    """Get or create the ``Source`` row for IEA Policy Tracker. Returns id.
+
+    Mirrors the pattern in ``gta.py::_get_or_create_gta_source`` — the
+    SourceDocument table requires a non-null ``source_id``, so the Source
+    row must exist first.  Idempotent: re-runs return the existing row.
+    """
+    existing = session.scalar(select(Source).where(Source.name == _SOURCE_NAME))
+    if existing is not None:
+        return existing.id
+    source = Source(
+        name=_SOURCE_NAME,
+        source_type=_SOURCE_TYPE,
+        phase=_SOURCE_PHASE,
+        is_active=True,
+        config_json={"base_url": _SOURCE_BASE_URL, "method": "csv_download"},
+    )
+    session.add(source)
+    session.flush()
+    log.info("iea_policy_tracker.source_created", source_id=source.id)
+    return source.id
+
+
+def _get_or_create_source_document(
+    session: Session,
+    source_id: int,
+    file_path: str | Path,
+) -> int:
+    """Get or create the SourceDocument row for the current Policy Tracker file.
+
+    Idempotent on (source_id, external_id) where ``external_id`` is the
+    string form of the file path.  Each Policy Tracker download gets its
+    own SourceDocument row keyed by path so re-runs of the same file
+    re-use the row, while a new download (different filename) creates a
+    new one.
+    """
+    external_id = str(file_path)
+    existing = session.scalar(
+        select(SourceDocument).where(
+            SourceDocument.source_id == source_id,
+            SourceDocument.external_id == external_id,
+        )
+    )
+    if existing is not None:
+        return existing.id
+    doc = SourceDocument(
+        source_id=source_id,
+        external_id=external_id,
+        title=_SOURCE_NAME,
+        url=_SOURCE_BASE_URL,
+        document_type="policy_tracker_csv",
+        metadata_json={"local_path": external_id},
+    )
+    session.add(doc)
+    session.flush()
+    log.info(
+        "iea_policy_tracker.source_document_created",
+        source_document_id=doc.id,
+        external_id=external_id,
+    )
+    return doc.id
+
 
 def _build_iso3_map(session: Session) -> dict[str, str]:
     """
@@ -530,25 +598,19 @@ def ingest_policy_tracker(
 
     records = parse_policy_tracker_file(xls_path, iso3_map=iso3_map)
 
-    # Ensure source document exists
-    source_doc = session.scalar(
-        select(SourceDocument).where(
-            SourceDocument.source_type == _SOURCE_TYPE
-        ).limit(1)
-    )
-    if source_doc is None:
-        source_doc = SourceDocument(
-            title=_SOURCE_NAME,
-            source_type=_SOURCE_TYPE,
-            source_url="https://www.iea.org/data-and-statistics/data-tools/critical-minerals-policy-tracker",
-        )
-        session.add(source_doc)
-        session.flush()
+    # Source + SourceDocument scaffolding (fixed 2026-05-06).  Pre-fix this
+    # used SourceDocument(source_type=, source_url=) — neither column exists
+    # on the model; the actual schema requires source_id (FK) + external_id
+    # + url + document_type, so the original code crashed on flush with a
+    # NOT NULL constraint violation.  Now mirrors the gta.py pattern.
+    source_id = _get_or_create_source(session)
+    source_document_id = _get_or_create_source_document(session, source_id, xls_path)
 
     mat_resolver = MaterialResolver(session)
 
     inserted = 0
     skipped = 0
+    skipped_no_material = 0    # added 2026-05-06 (per partner direction)
     failed = 0
     material_links = 0
     hs_mapping_links = 0
@@ -565,6 +627,37 @@ def ingest_policy_tracker(
             )
             if existing:
                 skipped += 1
+                continue
+
+            # ── Pre-resolve material attribution from both paths (2026-05-06) ──
+            # Resolve BEFORE inserting the RiskEvent so we can gate on empty
+            # results and skip the row entirely.  Partner direction: don't
+            # write events that have no resolvable material — they bloat the
+            # events table without contributing actionable scoring signal.
+
+            # Path 1: tech basket → resolve canonical names to material IDs.
+            tech_basket_resolved: list[int] = []
+            for canonical_name in rec["tech_basket_minerals"]:
+                mat = mat_resolver.resolve_by_canonical_name(canonical_name)
+                if mat is not None and mat.id not in tech_basket_resolved:
+                    tech_basket_resolved.append(mat.id)
+
+            # Path 2: keyword scan over title + description.
+            search_text = f"{rec['title']} {rec['description']}"
+            keyword_hits = material_cache.detect(search_text)
+
+            # Gate: skip event entirely if neither path yields a resolvable
+            # material.  We still need the event for evidence-layer use cases
+            # later (positive-policy rationale) but with zero material
+            # attribution, scoring queries that filter on RiskEventMaterial
+            # never see it — it's just dead rows in risk_events.
+            if not tech_basket_resolved and not keyword_hits:
+                skipped_no_material += 1
+                log.debug(
+                    "iea_policy_tracker.skipped_no_material",
+                    title=rec["title"],
+                    countries_raw=rec["countries_raw"],
+                )
                 continue
 
             policy_type_names = rec["policy_type_names"]
@@ -587,12 +680,8 @@ def ingest_policy_tracker(
             title = f"{country_label} — {rec['title']}"[:1024]
             summary = rec["description"][:500] if rec["description"] else None
 
-            # Keyword scan — combines title + description for MaterialCache
-            search_text = f"{rec['title']} {rec['description']}"
-            keyword_hits = material_cache.detect(search_text)
-
             event = RiskEvent(
-                source_document_id=source_doc.id,
+                source_document_id=source_document_id,
                 event_type=event_type,
                 event_date=event_date,
                 title=title,
@@ -640,66 +729,46 @@ def ingest_policy_tracker(
                     countries_raw=rec["countries_raw"],
                 )
 
-            # ── Material junctions ────────────────────────────────────────────
-            # Track which material IDs have been written to avoid duplicate rows.
+            # ── Material + HS junction rows (using pre-resolved data) ─────────
+            # No defensive existence-check queries: we just inserted the
+            # RiskEvent above, so there can't be any junction rows for it
+            # yet.  Within-event dedup is handled by the seen_* sets below.
             seen_material_ids: set[int] = set()
-
-            # Path 1: tech basket — RiskEventMaterial only (no HS attribution)
-            for canonical_name in rec["tech_basket_minerals"]:
-                mat = mat_resolver.resolve_by_canonical_name(canonical_name)
-                if mat is None or mat.id in seen_material_ids:
-                    continue
-                existing_mat = session.scalar(
-                    select(RiskEventMaterial).where(
-                        RiskEventMaterial.risk_event_id == event.id,
-                        RiskEventMaterial.material_id == mat.id,
-                    ).limit(1)
-                )
-                if existing_mat is None:
-                    session.add(RiskEventMaterial(
-                        risk_event_id=event.id,
-                        material_id=mat.id,
-                        relevance_score=0.85,
-                        match_reason="technology_basket",
-                    ))
-                    material_links += 1
-                seen_material_ids.add(mat.id)
-
-            # Path 2: keyword scan — RiskEventMaterial + RiskEventHsMapping
             seen_hs_mapping_ids: set[int] = set()
+
+            # Path 1: tech basket — RiskEventMaterial only (no HS attribution).
+            for mat_id in tech_basket_resolved:
+                if mat_id in seen_material_ids:
+                    continue
+                session.add(RiskEventMaterial(
+                    risk_event_id=event.id,
+                    material_id=mat_id,
+                    relevance_score=0.85,
+                    match_reason="technology_basket",
+                ))
+                material_links += 1
+                seen_material_ids.add(mat_id)
+
+            # Path 2: keyword scan — RiskEventMaterial + RiskEventHsMapping.
             for mat_id, relevance, matched_kw, hs_mapping_id in keyword_hits:
                 if mat_id not in seen_material_ids:
-                    existing_mat = session.scalar(
-                        select(RiskEventMaterial).where(
-                            RiskEventMaterial.risk_event_id == event.id,
-                            RiskEventMaterial.material_id == mat_id,
-                        ).limit(1)
-                    )
-                    if existing_mat is None:
-                        session.add(RiskEventMaterial(
-                            risk_event_id=event.id,
-                            material_id=mat_id,
-                            relevance_score=relevance,
-                            match_reason=f"keyword_scan:{matched_kw[:48]}",
-                        ))
-                        material_links += 1
+                    session.add(RiskEventMaterial(
+                        risk_event_id=event.id,
+                        material_id=mat_id,
+                        relevance_score=relevance,
+                        match_reason=f"keyword_scan:{matched_kw[:48]}",
+                    ))
+                    material_links += 1
                     seen_material_ids.add(mat_id)
 
                 if hs_mapping_id is not None and hs_mapping_id not in seen_hs_mapping_ids:
-                    existing_hs = session.scalar(
-                        select(RiskEventHsMapping).where(
-                            RiskEventHsMapping.risk_event_id == event.id,
-                            RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
-                        ).limit(1)
-                    )
-                    if existing_hs is None:
-                        session.add(RiskEventHsMapping(
-                            risk_event_id=event.id,
-                            hs_mapping_id=hs_mapping_id,
-                            relevance_score=relevance,
-                            match_reason=f"keyword_scan:{matched_kw[:48]}",
-                        ))
-                        hs_mapping_links += 1
+                    session.add(RiskEventHsMapping(
+                        risk_event_id=event.id,
+                        hs_mapping_id=hs_mapping_id,
+                        relevance_score=relevance,
+                        match_reason=f"keyword_scan:{matched_kw[:48]}",
+                    ))
+                    hs_mapping_links += 1
                     seen_hs_mapping_ids.add(hs_mapping_id)
 
             inserted += 1
@@ -725,6 +794,7 @@ def ingest_policy_tracker(
         "total_rows": len(records),
         "inserted": inserted,
         "skipped_duplicate": skipped,
+        "skipped_no_material": skipped_no_material,
         "failed": failed,
         "material_links": material_links,
         "hs_mapping_links": hs_mapping_links,

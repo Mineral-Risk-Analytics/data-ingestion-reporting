@@ -1,9 +1,45 @@
 # Scoring Engine Audit — HS Code Redesign Coverage
 
-> **Date:** 2026-05-03
+> **Date:** 2026-05-03 (last status update 2026-05-06)
 > **Scope:** HS code Level-0 layer + full rollup chain (stage → material+geo → global → chemistry)
 > **Method:** Code read against `docs/scoring.md` and `docs/hs-code-redesign.md`. Verified file-by-file; no runtime/DB inspection.
 > **Audience:** Nicole. No partner-friendly framing — direct findings only.
+
+---
+
+## Status as of 2026-05-06
+
+The original three "structural gaps" called out in the TL;DR below have all
+been resolved.  The remaining open items are scoping/data decisions, not
+code gaps.
+
+| Original gap | Status | Where it landed |
+|---|---|---|
+| G1 — `hs_code_material_mappings.keywords` empty | **Resolved** | Two-tier seeding via `_HS_KEYWORDS_BY_MAPPING` (curated) + `seed_hs_keywords_auto.py` (auto-derived from partner CSV). Coverage 33% → 100%. |
+| G2 — Geopolitical pillar bypasses HS node tariff/export sub-scores | **Resolved** | `_derive_market_geopolitical_inputs` now consumes HS node sub-scores via `STAGE_ROLLUP_WEIGHTS` aggregation when `eligible_nodes` is non-empty. Falls back to legacy event-classification path when no nodes. |
+| G3 — `_TARIFF_SUBTYPES` filter misaligned with ingester writes | **Resolved** | Migration 040 promoted `event_subtype` to a typed column; both sides aligned on uppercase form (`TARIFF`, `EXPORT_RESTRICTION`, `IMPORT_DISRUPTION`). |
+| G4a / N4 — MRDS auto-stage mapping | **Resolved (2026-05-06)** | `mrds.py` now sets `supply_chain_stage` from `oper_type` + name-keyword fallback (refinery / concentrator / quarry / etc.). Active-only filter skips Past Producer + Prospect rows (cuts 304k → ~26k). Granular facility_types route to distinct stages. |
+| G4 Half 1 — Operational pillar stage-awareness | **Resolved (2026-05-06)** | `_facility_structural_dependency` is now stage-aware. Computes per-stage dependency, rolls up via `STAGE_ROLLUP_WEIGHTS`, no default-fill for missing stages. Per-stage breakdown surfaces in rationale_json. New `dep_source` values `mrds_geography_stage_weighted` / `mrds_global_discounted_stage_weighted`. |
+| G5 — `hs_node_scorer` composite has no operational sub-score | **Still open** | Was deferred until G4 data lands. Now feasible after G4 Half 1 + G4a — can be picked up after the G4c partner-curated seed lands. |
+| G6 — `_STAGE_ROLLUP_MIN_NODES = 2` over-triggers fallback | **Open** | Needs telemetry data first to decide between lowering to 1 vs adding per-pair fallback logging. |
+| G7 — Equal-weight fallback in global_rollup logged but not measured | **Resolved** | `coverage.py` diagnostic helper `report_hs_coverage()` now provides aggregate visibility. Also fixed `banned` scope_type missing from `_SCOPE_TYPE_WEIGHT`. |
+| G8 — `_trade_weights` uses single most-recent period | **Resolved (2026-05-06)** | Now averages across last 3 years (annual/Comtrade) or last 12 months (monthly/Census). Also fixed mixed-period bug where Census YYYY-MM was lex-winning over Comtrade YYYY, silently dropping non-US weight. |
+| G9 — `commodity_prices.hs_mapping_id` / `price_form` unused | **Open** | Pink Sheet ingester doesn't write these columns. Lower priority unless a paid stage-resolved price feed is added. |
+| G10 — Inngest cron jobs have no dependency enforcement | **Open** | Watch list. Defer until an actual race is observed. |
+| G11 — HS node event filter ignores per-event country scope | **Resolved (2026-05-06)** | `score_hs_node_geography` now joins `RiskEventGeography` with country + `geography_context` filters: `tariff_exposure` uses `affected` context (producer being tariffed), `export_restriction` uses `primary` (implementing country = producer for export-side). Strict — events without geography rows are excluded. Concurrent GTA Scope 2 fixes: CPC code rejection, Affected Jurisdictions parsing, severity multipliers (subnational/supranational/horizontal). |
+| G12 — `materials.criticality_score` cache refresh | **Verified intact** | Spot-checked during 2026-05-05 addendum. Cache write present in `cli.py:285-286`. |
+
+### What's still open after this session
+
+1. **N3 follow-up — News pipeline material attribution.** SEC EDGAR migrated to dedicated module (done). Census trade material attribution wired (done). Only news remains, and it's still a `StubNewsProvider` — no real-world impact today. Wait until a real news provider (NewsAPI / GDELT / licensed feed) is wired in.
+2. **G6 — `_STAGE_ROLLUP_MIN_NODES` tuning.** Measurement task, not code. Needs telemetry on per-pair fallback frequency before changing the threshold.
+3. **G4b — GEM Iron Ore Mines ingester.** Free open data; useful only for LFP cathode. ~1-2 days when prioritised.
+4. **G4c — Partner-curated facility seed loader.** Code is small (~1 day); the data entry is the unbounded piece. Partner has committed to providing a list.
+5. **G4d — Paid subscription** (Benchmark / S&P / Wood Mackenzie). Budget decision; deferred.
+6. **N5 — 10-digit HTS keyword coverage.** Optional; HS-code-only routing (longest-prefix match) is acceptable today.
+7. **EXPORT_SUBSIDY / TRADE_FINANCE event_subtype.** Newly surfaced 2026-05-06 while decoding GTA's NFI/IFI implementation_level codes. NFI = National Financial Institution, IFI = International Financial Institution; both classes describe subsidy-type interventions (not tariffs/export bans). Currently get `event_subtype=NULL` and skip HS-node sub-scores entirely. Distinct scoring question (subsidy distortion vs sourcing risk). New sub-score, not a fix.
+8. **US-dependency tier scoring** (NIR + apparent consumption + import-source HHI). Deferred per partner consultation.
+9. **Dynamic HCG derivation** / **WGI structural country governance** / **USITC HTS structural tariff baseline**. Original audit's P2/P3 backlog; unchanged.
 
 ---
 
@@ -157,6 +193,16 @@ Numbered, ordered by impact:
 - **Verification:** Run `SELECT event_type, metadata_json->>'event_subtype', count(*) FROM risk_events GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 20;` against the live DB. If `event_type` is NULL or generic and the subtype lives in metadata, this is broken.
 
 ### G4 — No GEM ingester; operational pillar can't be stage-aware (P1)
+
+> **REFRAMED 2026-05-06** — see `scoring-audit-2026-05-addendum.md` →
+> "Reframing G4."  The "GEM ingester" prescription below was based on a
+> misreading of Global Energy Monitor's project catalogue.  GEM does
+> not publish critical-mineral facility data — only iron ore and
+> fossil-fuel infrastructure.  The realistic paths are MRDS
+> auto-stage mapping (free, US-only), GEM Iron Ore (free, iron only),
+> partner-curated facility seed (free, bounded by partner knowledge),
+> or a paid subscription (Benchmark / S&P / Wood Mackenzie).
+
 - **Where:** Migration 029 added `facility_material_links.supply_chain_stage` and `.hs_mapping_id` columns. No writer exists. `app/services/ingestion/gem.py` does not exist.
 - **Effect:** Migration 029 is dormant schema. `_facility_structural_dependency()` in `market_aggregator.py` aggregates by material_id only. A cobalt ore mine outage and a cobalt hydroxide refinery outage are scored identically under "Cobalt × DRC."
 - **Fix:** Two changes needed: (a) build the GEM ingester (substantial — out of P0 scope), (b) update `_facility_structural_dependency()` to filter by `supply_chain_stage` when called from a stage-aware path. (b) is a no-op until (a) ships.

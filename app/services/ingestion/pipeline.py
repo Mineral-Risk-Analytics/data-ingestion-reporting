@@ -21,6 +21,8 @@ from app.models import (
     RawApiPayload,
     Regulation,
     RiskEvent,
+    RiskEventHsMapping,
+    RiskEventMaterial,
     Source,
     SourceDocument,
     TradeFlow,
@@ -264,9 +266,15 @@ class IngestionPipeline:
                 checksum=sha256_bytes(bundle.raw_body),
             )
             max_val = 0.0
+            # N3 audit fix (2026-05-06): track resolved (material_id,
+            # hs_mapping_id) per row so the sample-derived RiskEvent below
+            # can be tagged with the correct material/HS junction rows
+            # instead of dropping that attribution on the floor.
+            resolved_by_row: dict[int, tuple[int | None, int | None]] = {}
             for row in rows:
                 partner_iso = geo.partner_country_iso2(row.partner_code) or row.partner_code
                 mid, hs_mapping_id = materials.resolve_by_hs_code(row.hs_code)
+                resolved_by_row[id(row)] = (mid, hs_mapping_id)
                 tf = TradeFlow(
                     source_document_id=doc.id,
                     period=row.period or period,
@@ -291,13 +299,22 @@ class IngestionPipeline:
                 count += 1
             if rows:
                 sample = max(rows, key=lambda r: r.trade_value_usd or 0)
+                sample_mid, sample_hs_id = resolved_by_row.get(
+                    id(sample), (None, None)
+                )
                 draft = build_trade_risk_event(
                     hs_description=sample.hs_description,
                     partner=sample.partner_name or sample.partner_code,
                     trade_value_usd=max_val or sample.trade_value_usd,
                     import_export=ie,
                 )
-                self._add_risk_event(doc, draft, company_cache)
+                self._add_risk_event(
+                    doc,
+                    draft,
+                    company_cache,
+                    material_id=sample_mid,
+                    hs_mapping_id=sample_hs_id,
+                )
         self._db.flush()
         return count
 
@@ -541,7 +558,25 @@ class IngestionPipeline:
         doc: SourceDocument,
         draft: RiskEventDraft,
         company_cache: list[CachedCompanyInfo],
+        *,
+        material_id: int | None = None,
+        hs_mapping_id: int | None = None,
     ) -> RiskEvent:
+        """Persist a RiskEvent + entity-resolution links.
+
+        Optional ``material_id`` / ``hs_mapping_id`` kwargs (added 2026-05-06
+        as the N3 audit fix) write ``RiskEventMaterial`` and
+        ``RiskEventHsMapping`` junction rows when supplied.  Used by the
+        Census-trade ingestion path which already resolves these IDs at
+        TradeFlow construction time — the resolved values used to fall on
+        the floor when the sample-derived RiskEvent was created.
+
+        Without these kwargs the function preserves its prior behaviour
+        (no junction writes), so news / SEC EDGAR call sites are unchanged.
+        Closing those paths' attribution requires running ``MaterialCache``
+        over filing / article text — tracked separately, see audit follow-up
+        task ("SEC + news pipeline material attribution").
+        """
         ev = RiskEvent(
             source_document_id=doc.id,
             event_type=draft.event_type,
@@ -555,8 +590,27 @@ class IngestionPipeline:
             metadata_json=draft.metadata,
         )
         self._db.add(ev)
-        # Flush to obtain ev.id before entity resolution writes the FK.
+        # Flush to obtain ev.id before junction-row FKs.
         self._db.flush()
+
+        if material_id is not None:
+            self._db.add(
+                RiskEventMaterial(
+                    risk_event_id=ev.id,
+                    material_id=material_id,
+                    relevance_score=1.0,
+                    match_reason="hs_code",
+                )
+            )
+        if hs_mapping_id is not None:
+            self._db.add(
+                RiskEventHsMapping(
+                    risk_event_id=ev.id,
+                    hs_mapping_id=hs_mapping_id,
+                    relevance_score=1.0,
+                    match_reason="trade_flow_match",
+                )
+            )
 
         matches = resolve_companies_for_event(self._db, ev, company_cache)
         persist_company_links(self._db, ev, matches)

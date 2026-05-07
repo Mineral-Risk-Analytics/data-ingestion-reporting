@@ -61,42 +61,173 @@ _PILLAR_COLS = [
 # Weight resolution helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Period averaging window (G8 audit fix, 2026-05-06)
+# ---------------------------------------------------------------------------
+# TradeFlow rows arrive with two distinct period formats from two ingesters:
+#
+#   ``"YYYY"``       — UN Comtrade annual exports (comtrade.py)
+#   ``"YYYY-MM"`` /  — US Census Bureau monthly exports (pipeline.py)
+#   ``"YYYYMM"``       — reporter_country is hardcoded to ``"US"``
+#
+# Pre-fix: ``_trade_weights`` did ``MAX(period)`` over the mixed format,
+# letting the lexicographically-larger Census monthly periods displace
+# Comtrade annual rows.  Symptom: any material with Census coverage saw
+# only US weight in the global rollup, dropping every other producer to
+# zero and silently breaking cross-country comparison.
+#
+# Post-fix: annual and monthly are queried as separate sources.  Annual
+# is the canonical global cross-country source (Comtrade reports every
+# country's exports).  Monthly is US-only by construction and useful
+# only for US-specific scoring contexts.  ``_trade_weights`` prefers
+# annual when it covers the requested geos and falls back to monthly
+# only when no annual coverage exists for those geos.
+#
+# Multi-period averaging absorbs single-year shocks (pandemic, embargo
+# years) that previously distorted the per-material global score.  A
+# 3-year rolling window is industry standard for trade analysis
+# (IEA/OECD use 3-year; USGS uses 5-year for less responsive metrics).
+# A 12-month window is the monthly-data equivalent.
+
+_ANNUAL_PERIODS_TO_AVERAGE = 3
+_MONTHLY_PERIODS_TO_AVERAGE = 12
+
+
+def _is_annual_period(period: str) -> bool:
+    """``True`` for ``"YYYY"`` (Comtrade); ``False`` for ``YYYY-MM``/``YYYYMM`` (Census)."""
+    if not period:
+        return False
+    return len(period) == 4 and period.isdigit()
+
+
 def _trade_weights(
     db: Session,
     material_id: int,
     geo_codes: list[str],
-) -> dict[str, float]:
-    """Return {country_code: trade_value_usd} from TradeFlow for these geos.
+) -> tuple[dict[str, float], dict]:
+    """Return ({country_code: avg_trade_value_usd}, period_metadata).
 
-    Uses the most recent period with export data for this material.
-    Returns an empty dict if no TradeFlow rows exist.
+    Averages export values across the most recent N periods (3 years for
+    annual data, 12 months for monthly).  This smooths single-period
+    shocks (pandemic year, embargo year) that previously distorted
+    per-material global scoring.
+
+    Annual (Comtrade) is preferred for cross-country weighting because
+    Comtrade reports every country's exports.  Monthly (Census) is US-
+    only by construction and is used only as a fallback when no annual
+    coverage exists for the requested geos.
+
+    Returns an empty dict + empty metadata if no usable TradeFlow rows
+    exist.
+
+    period_metadata shape::
+
+        {
+            "granularity": "annual" | "monthly" | None,
+            "periods_averaged": ["2022", "2023", "2024"],  # or YYYY-MMs
+            "n_periods": int,
+            "fallback_used": bool,    # True if monthly used because annual didn't cover
+        }
     """
-    latest_period = db.scalar(
-        select(sqlfunc.max(TradeFlow.period))
-        .where(
-            TradeFlow.material_id == material_id,
-            TradeFlow.import_export_flag == "export",
-        )
+    annual_weights, annual_periods = _trade_weights_for_granularity(
+        db, material_id, geo_codes, annual=True
     )
-    if latest_period is None:
-        return {}
+    if annual_weights:
+        return annual_weights, {
+            "granularity":      "annual",
+            "periods_averaged": annual_periods,
+            "n_periods":        len(annual_periods),
+            "fallback_used":    False,
+        }
 
+    # Annual returned nothing covering these geos — fall back to monthly.
+    # This path is dominated by US-only data (Census) but it's better than
+    # zero coverage; the caller's equal-weight fallback would otherwise
+    # kick in for everyone, which is even less informative.
+    monthly_weights, monthly_periods = _trade_weights_for_granularity(
+        db, material_id, geo_codes, annual=False
+    )
+    return monthly_weights, {
+        "granularity":      "monthly" if monthly_weights else None,
+        "periods_averaged": monthly_periods,
+        "n_periods":        len(monthly_periods),
+        "fallback_used":    bool(monthly_weights),
+    }
+
+
+def _trade_weights_for_granularity(
+    db: Session,
+    material_id: int,
+    geo_codes: list[str],
+    *,
+    annual: bool,
+) -> tuple[dict[str, float], list[str]]:
+    """Inner helper used by ``_trade_weights`` for one granularity.
+
+    Selects the most recent N distinct periods of the requested granularity
+    that have any export data for this material, then averages
+    ``trade_value_usd`` per reporter across those periods.
+
+    Returns ({country_code: average_trade_value_usd}, list_of_periods_used).
+    """
+    target_window = (
+        _ANNUAL_PERIODS_TO_AVERAGE if annual else _MONTHLY_PERIODS_TO_AVERAGE
+    )
+
+    # Step 1: gather all distinct periods with data for this material at
+    # this granularity.  Period is a String column with mixed formats, so
+    # we pull them all and filter in Python — cheap; ~10-20 distinct values.
+    all_periods: list[str] = list(
+        db.scalars(
+            select(TradeFlow.period.distinct()).where(
+                TradeFlow.material_id == material_id,
+                TradeFlow.import_export_flag == "export",
+            )
+        ).all()
+    )
+    matching = [p for p in all_periods if _is_annual_period(p) is annual]
+    if not matching:
+        return {}, []
+
+    # Step 2: pick the N most recent (lexicographic sort works for both
+    # ``YYYY`` and ``YYYY-MM`` / ``YYYYMM`` formats since both are
+    # zero-padded left-to-right).
+    matching.sort(reverse=True)
+    periods_to_use = matching[:target_window]
+
+    # Step 3: per reporter, average trade_value_usd across those periods.
+    # SUM divided by COUNT(DISTINCT period) gives the cross-period average
+    # weighted by per-period sub-aggregation (Comtrade rows can have
+    # multiple HS subheadings per material per period; summing all and
+    # dividing by period count is the right semantic).
     rows = db.execute(
         select(
             TradeFlow.reporter_country,
             sqlfunc.sum(TradeFlow.trade_value_usd).label("total"),
+            sqlfunc.count(sqlfunc.distinct(TradeFlow.period)).label("n_periods"),
         )
         .where(
             TradeFlow.material_id == material_id,
             TradeFlow.import_export_flag == "export",
-            TradeFlow.period == latest_period,
+            TradeFlow.period.in_(periods_to_use),
             TradeFlow.reporter_country.in_(geo_codes),
             TradeFlow.trade_value_usd.is_not(None),
         )
         .group_by(TradeFlow.reporter_country)
     ).all()
 
-    return {row.reporter_country: float(row.total or 0.0) for row in rows if (row.total or 0.0) > 0}
+    out: dict[str, float] = {}
+    for row in rows:
+        total = float(row.total or 0.0)
+        n = int(row.n_periods or 0)
+        if total > 0 and n > 0:
+            # Average over the periods this reporter actually appears in.
+            # If a reporter is missing some periods (e.g. Comtrade gap year),
+            # we don't penalise them by dividing by the full window — that
+            # would understate their typical trade.  Use n distinct periods
+            # the reporter actually has data for.
+            out[row.reporter_country] = total / n
+    return out, periods_to_use
 
 
 def _production_share_weights(
@@ -132,11 +263,11 @@ def _resolve_weights(
     db: Session,
     material_id: int,
     geo_scores: list[MaterialGeographyRiskScore],
-) -> tuple[dict[str, float], str, Optional[float]]:
+) -> tuple[dict[str, float], str, Optional[float], dict]:
     """
     Resolve a weight for every geography in geo_scores.
 
-    Returns (weights, weight_source, total_trade_value_usd).
+    Returns (weights, weight_source, total_trade_value_usd, trade_period_metadata).
 
     weight_source is one of:
         "trade_flow"       — TradeFlow export values (preferred)
@@ -145,9 +276,15 @@ def _resolve_weights(
         "mixed"            — some geos from trade, remaining from production share
 
     total_trade_value_usd is the sum of trade values used (None when not applicable).
+
+    trade_period_metadata describes the periods averaged for the trade-flow path:
+        {"granularity": "annual"|"monthly"|None, "periods_averaged": [...],
+         "n_periods": int, "fallback_used": bool}
+    Empty dict when no trade data was used.  Surfaced into rationale_json so
+    consumers can verify which window of trade data drove the score.
     """
     geo_codes = [s.geography_code for s in geo_scores]
-    trade = _trade_weights(db, material_id, geo_codes)
+    trade, trade_period_metadata = _trade_weights(db, material_id, geo_codes)
     prod = _production_share_weights(db, material_id, geo_codes)
 
     weights: dict[str, float] = {}
@@ -177,7 +314,7 @@ def _resolve_weights(
     else:
         weight_source = "mixed"
 
-    return weights, weight_source, total_trade_value
+    return weights, weight_source, total_trade_value, trade_period_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +386,9 @@ def score_material_global_rollup(
         )
 
     # Step 2: Resolve weights
-    weights, weight_source, total_trade_value = _resolve_weights(db, material_id, geo_scores)
+    weights, weight_source, total_trade_value, trade_period_metadata = _resolve_weights(
+        db, material_id, geo_scores
+    )
 
     weight_sum = sum(weights.values())
     if weight_sum <= 0:
@@ -299,6 +438,7 @@ def score_material_global_rollup(
         "as_of_date": as_of_date.isoformat(),
         "weight_source": weight_source,
         "total_trade_value_usd": total_trade_value,
+        "trade_period_metadata": trade_period_metadata,    # G8 audit fix (2026-05-06)
         "geography_count": len(geo_scores),
         "pillar_weighted_averages": {col: round(v, 2) for col, v in pillar_sums.items()},
         "geographies": geo_detail,

@@ -528,16 +528,21 @@ async def rescore_chemistries_job(ctx: inngest.Context) -> dict:
 # ---------------------------------------------------------------------------
 
 def _target_years() -> list[int]:
-    """Return the 3 most recently complete calendar years.
+    """Return the 3 most recently complete calendar years, **newest first**.
 
     Comtrade annual data for year Y is typically available by March/April of
     Y+1.  Using current_year - 1 as the ceiling is conservative but safe for
     year-round scheduling.
 
-    Example (May 2026): [2023, 2024, 2025]
+    **Order matters**: newest first so the daily job's per-(year × prefix ×
+    flow) iteration prioritises the most recent year.  With a daily quota
+    (~500 calls), this means partial backfills always have current data
+    before older years.
+
+    Example (May 2026): [2025, 2024, 2023]
     """
     end = _today_utc().year - 1
-    return [end - 2, end - 1, end]
+    return [end, end - 1, end - 2]
 
 
 def _sync_get_hs_prefixes() -> list[str]:
@@ -669,26 +674,44 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
     4-digit HS prefixes in hs_code_material_mappings, targeting the 3 most
     recently complete calendar years.
 
+    Iteration order (2026-05-06 — calibrated for 500-call/day quota)
+    -----------------------------------------------------------------
+    Outer to inner: year (newest first) → prefix → flow (X then M).
+
+    Why this order:
+      * **Newest year first** — within budget, the daily run completes
+        the most recent year across every prefix before starting older
+        years.  Partial backfills always have current data, which matters
+        more than historical completeness for live scoring.
+      * **X and M alternate per-prefix** — both flow directions make
+        balanced progress every day rather than "all exports complete
+        first, then start on imports tomorrow."  Scoring uses both:
+        exports drive supply-side concentration, imports drive demand-
+        side dependency.
+
     Rate-limit behaviour
     --------------------
-    The UN Comtrade API allows ~500 calls/day on a subscription key.  Full
-    coverage across 58 reporters × 48 prefixes × 3 years requires ~8,300
-    calls (~17 days).  Each already-committed (reporter × prefix × year)
-    batch is skipped without an API call, so the job makes steady daily
-    progress until coverage is complete.  Once complete, daily runs are
-    near-instant (all batches skipped, 0 API calls).
+    The UN Comtrade API caps free / subscription tiers at ~500 calls/day.
+    The inline 429 circuit breaker (``ComtradeRateLimitExhausted``) raises
+    when 3 consecutive batches all 429-after-retries; that bubbles up
+    here and we stop scheduling further steps for the day so we don't
+    burn quota on doomed retries.  Inngest checkpoints whatever was
+    completed; tomorrow's run picks up where we left off via the DB
+    idempotency check (already-committed batches consume zero API quota).
 
     Step structure
     --------------
-    One Inngest step per (hs_prefix × flow_code) keeps each step well under
-    the ~2 min HTTP timeout.  Inngest checkpoints after every step so a
-    mid-run failure or rate-limit error resumes from the last successful
-    prefix rather than from scratch.
+    One Inngest step per (year × prefix × flow) triple — fine-grained so
+    Inngest memo lets a single failed combination retry without redoing
+    the rest.  Steps are small (~30s typical), well under the ~2 min
+    HTTP timeout.
 
     Post-ingest
     -----------
-    After all prefixes complete, ``build-trade-signals`` is run to refresh
-    EXPORT_DROP, IMPORT_DROP, and TRADE_CONCENTRATION risk events.
+    ``build-trade-signals`` is run only after a clean run (no rate-limit
+    halt).  Running it on a partial backfill produces less reliable
+    EXPORT_DROP / IMPORT_DROP / TRADE_CONCENTRATION events; tomorrow's
+    run will rebuild them after finishing.
     """
     today_iso = _today_utc().isoformat()
     years = _target_years()
@@ -701,46 +724,94 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
     )
     log.info("comtrade_job.prefixes_resolved", count=len(hs_prefixes))
 
-    # Steps 2–N: one step per prefix for exports, then imports.
-    # Keeping flow directions in separate named steps lets Inngest memo them
-    # independently — if the X pass completes fully and M fails mid-run, the
-    # replay skips all X steps and retries only the failed M step.
+    # Steps 2–N: one step per (year × prefix × flow) triple.
+    # Year-desc × prefix × flow nesting prioritises current data and keeps
+    # both flow directions advancing at the same rate.  Step IDs encode all
+    # three dimensions so Inngest memoisation is tightly scoped — a single
+    # failed combination retries itself, not the whole prefix or year.
     total_inserted = 0
     total_api_calls = 0
     total_errors = 0
+    rate_limited = False
 
-    for prefix in hs_prefixes:
-        result: dict = await ctx.step.run(
-            f"ingest-exports-{prefix}",
-            _step_ingest_comtrade_prefix,
-            prefix,
+    for year in years:                                  # newest first
+        for prefix in hs_prefixes:
+            for flow_code, flow_label in (("X", "exports"), ("M", "imports")):
+                step_id = f"ingest-{flow_label}-{year}-{prefix}"
+                try:
+                    result: dict = await ctx.step.run(
+                        step_id,
+                        _step_ingest_comtrade_prefix,
+                        prefix,
+                        [year],   # single year per step — finer granularity
+                        flow_code,
+                    )
+                except Exception as exc:
+                    # Distinguish rate-limit halts from other failures.
+                    # When the circuit breaker trips, stop scheduling
+                    # further steps so we don't burn quota on doomed
+                    # retries; tomorrow's run resumes via DB dedup.
+                    # Match by class name string so we don't have to import
+                    # comtrade module-level into this scheduling layer.
+                    if exc.__class__.__name__ == "ComtradeRateLimitExhausted":
+                        log.warning(
+                            "comtrade_job.rate_limit_halt",
+                            year=year, prefix=prefix, flow=flow_code,
+                            error=str(exc),
+                        )
+                        rate_limited = True
+                        break
+                    raise
+                total_inserted += result.get("inserted", 0)
+                total_api_calls += result.get("api_calls_made", 0)
+                if result.get("error"):
+                    total_errors += 1
+            if rate_limited:
+                break
+        if rate_limited:
+            break
+
+    # Final step: refresh synthetic risk events from trade flow data —
+    # only after a clean run (a rate-limit halt mid-run leaves trade_flows
+    # in a partial state that distorts the synthetic signals; tomorrow's
+    # run rebuilds them after finishing).
+    signals: dict = {}
+    if not rate_limited:
+        signals = await ctx.step.run(
+            "build-trade-signals",
+            _step_build_trade_signals,
             years,
-            "X",
         )
-        total_inserted += result.get("inserted", 0)
-        total_api_calls += result.get("api_calls_made", 0)
-        if result.get("error"):
-            total_errors += 1
 
-    for prefix in hs_prefixes:
-        result = await ctx.step.run(
-            f"ingest-imports-{prefix}",
-            _step_ingest_comtrade_prefix,
-            prefix,
-            years,
-            "M",
-        )
-        total_inserted += result.get("inserted", 0)
-        total_api_calls += result.get("api_calls_made", 0)
-        if result.get("error"):
-            total_errors += 1
-
-    # Final step: refresh synthetic risk events from trade flow data
-    signals: dict = await ctx.step.run(
-        "build-trade-signals",
-        _step_build_trade_signals,
-        years,
+    # Backfill-complete signal (2026-05-06): when a clean run consumed 0
+    # API calls AND wasn't rate-limited, every (year × prefix × reporter ×
+    # flow) combination was skipped via DB idempotency.  That means we're
+    # caught up — Comtrade publishes annually with a 4-6 month lag, so
+    # daily runs from this point forward are wasteful (~14k SELECT
+    # queries/day for nothing).  Logging at WARNING so it's visible in
+    # the Inngest dashboard as a flag.  Action: swap the cron from
+    # ``0 6 * * *`` to ``0 6 * * SUN`` (or monthly) when this fires.
+    backfill_complete = (
+        not rate_limited
+        and total_api_calls == 0
+        and total_errors == 0
+        and len(hs_prefixes) > 0
     )
+    if backfill_complete:
+        log.warning(
+            "comtrade_job.backfill_complete",
+            today=today_iso,
+            years=years,
+            prefixes_processed=len(hs_prefixes),
+            hint=(
+                "All (year × prefix × reporter × flow) combinations are "
+                "already ingested.  Daily runs from now on do ~14k SELECTs "
+                "for nothing.  Switch the cron in scoring_jobs.py from "
+                "'0 6 * * *' to '0 6 * * SUN' (weekly) — Comtrade publishes "
+                "annual data with a 4-6 month lag, so weekly is sufficient "
+                "to pick up new releases within a week of publication."
+            ),
+        )
 
     log.info(
         "comtrade_job.done",
@@ -749,6 +820,8 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
         total_inserted=total_inserted,
         total_api_calls=total_api_calls,
         total_errors=total_errors,
+        rate_limited=rate_limited,
+        backfill_complete=backfill_complete,
         trade_signals=signals,
     )
     return {
@@ -758,6 +831,8 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
         "total_inserted": total_inserted,
         "total_api_calls": total_api_calls,
         "total_errors": total_errors,
+        "rate_limited": rate_limited,
+        "backfill_complete": backfill_complete,
         "trade_signals": signals,
     }
 

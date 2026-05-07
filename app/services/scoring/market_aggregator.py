@@ -139,9 +139,12 @@ _FIG10_CAGR_VOL_MAX   = 0.30   # |CAGR| >= 30% → full base_filing_signal contr
 _MAX_EVENT_IMPACT = 1.56
 
 # Source priority for MaterialCriticalitySignal — higher index = lower priority.
+# Removed 2026-05-06: ``iea_report`` (the iea_reports.py ingester was deleted —
+# it overlapped with usgs_mcs for criticality signals + had a SourceDocument
+# schema bug that crashed the script on first run).  Add back if a future,
+# more rigorous IEA extractor lands.
 _CRITICALITY_SOURCE_PRIORITY: list[str] = [
     "eu_crma",
-    "iea_report",
     "usgs_mcs",
     "manual",
     "patstat",
@@ -588,115 +591,175 @@ def _derive_market_regulatory_inputs(
     return top_event_impacts, scope_obligations, policy_proximity_adjustment
 
 
+# ---------------------------------------------------------------------------
+# Stage-aware operational structural-dependency (G4 Half 1 audit fix, 2026-05-06)
+# ---------------------------------------------------------------------------
+# Statuses considered "at risk" (curtailed supply) and "production assets"
+# (the denominator pool).  "closed" is intentionally excluded from both:
+# MRDS closed/historical records frequently date back decades and represent
+# permanently lost capacity, not curtailed supply — including them would
+# inflate the denominator with irrelevant history and conflate "mine shut
+# forever" with "mine temporarily idled."  The N4 audit fix (2026-05-06)
+# also stops ingesting closed MRDS rows, so for new data this is moot;
+# kept here as defense for any older rows still in the DB.
+_AT_RISK_STATUSES = frozenset({"mothballed"})
+_PRODUCTION_ASSET_STATUSES = frozenset({"operating", "mothballed"})
+
+
 def _facility_structural_dependency(
     db: Session,
     material_id: int,
     geography_code: Optional[str],
-) -> Optional[float]:
-    """Compute structural_dependency from MRDS facility data.
+) -> Optional[dict]:
+    """Compute stage-aware structural dependency from facility data.
 
-    Returns the fraction of known production assets that are NOT currently
-    operating (status 'mothballed' or 'closed') for this (material, geography)
-    pair. Returns None only when no facilities are found at all.
+    Returns ``None`` when no facilities exist for the (material, geography)
+    pair.  Otherwise returns a structured dict::
 
-    Two-tier internal logic:
-      1. Capacity-weighted (preferred): uses annual_capacity_tpy when present.
-         Currently NULL for all MRDS-sourced rows — reserved for future data
-         enrichment or a supplementary source with tonnage figures.
-      2. Count-based fallback: uses site counts when capacity is absent.
-         This is the active path for MRDS data.
+        {
+            "weighted":      float,                # stage-weighted dep (0-1)
+            "stages":        {                     # per-stage breakdown
+                "ore":          {"dependency": 0.20, "method": "count_based",
+                                 "n_at_risk": 2, "n_total": 10, "weight": 0.10},
+                "refined":      {"dependency": 0.50, "method": "count_based",
+                                 "n_at_risk": 1, "n_total": 2,  "weight": 0.25},
+                ...
+            },
+            "stages_used":   ["ore", "refined"],   # keys present in stages
+            "method":        "stage_weighted",     # vs legacy mixed-stage
+        }
 
-    "Total" for the count-based denominator is operating + mothballed + closed
-    (actual and former production assets). Planned / under_construction sites
-    are excluded — they represent future capacity, not curtailed supply.
+    The per-stage dependency uses the same two-tier logic as before
+    (capacity-weighted when ``annual_capacity_tpy`` is populated, else
+    count-based).  The cross-stage rollup uses ``STAGE_ROLLUP_WEIGHTS``
+    (same weights the Material Concentration pillar's HS-node rollup
+    uses), normalised by the sum of weights of stages that actually
+    have data — so a material with only ore-stage facilities returns
+    that ore-stage dependency, not a default-filled 0.3.
 
-    Rationale: if 40% of known lithium mine sites in Chile are non-operational
-    (closed or mothballed), that IS a structural supply risk regardless of
-    whether a risk_event has been ingested.
+    G4 Half 1 design choice (2026-05-06, partner direction): no
+    default-fill across missing stages.  If a material has no refining
+    facilities in our data, refining contributes nothing to the rollup;
+    the score reflects what's measurable, and the gap is visible via
+    ``stages_used`` in rationale_json.
 
-    Geography filter: applied when geography_code is provided, skipped when
-    None (enables a global material-level fallback).
+    Facilities with ``supply_chain_stage IS NULL`` are excluded.  They
+    represent old MRDS rows ingested before the N4 fix added stage
+    classification, or rows whose stage couldn't be inferred from
+    ``oper_type`` or facility name.  Re-running ingest-mrds after the
+    N4 fix backfills these.
+
+    Geography filter: applied when ``geography_code`` is provided, skipped
+    when ``None`` (enables a global material-level fallback at the
+    caller).
     """
     from app.models.facility import Facility, FacilityMaterialLink
     from sqlalchemy import func as sqlfunc
 
-    # "closed" is intentionally excluded from both sets. MRDS closed/historical
-    # records frequently date back decades and represent permanently lost capacity,
-    # not curtailed supply. Including them inflates the denominator with irrelevant
-    # history and conflates "mine shut forever" with "mine temporarily idled."
-    # The metric is: what fraction of the live supply pool is currently curtailed?
-    _AT_RISK_STATUSES = {"mothballed"}
-    _PRODUCTION_ASSET_STATUSES = {"operating", "mothballed"}
-
-    base_filter = [FacilityMaterialLink.material_id == material_id]
+    base_filter = [
+        FacilityMaterialLink.material_id == material_id,
+        FacilityMaterialLink.supply_chain_stage.is_not(None),
+        # Restrict to stages we know how to weight; drops unrecognised
+        # values rather than KeyError'ing on the rollup.
+        FacilityMaterialLink.supply_chain_stage.in_(STAGE_ROLLUP_WEIGHTS.keys()),
+    ]
     if geography_code:
         base_filter.append(Facility.country == geography_code)
 
-    # ── Tier 1: capacity-weighted (active if annual_capacity_tpy is populated) ──
-    total_tpy = db.scalar(
-        select(sqlfunc.sum(FacilityMaterialLink.annual_capacity_tpy))
-        .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
-        .where(
-            *base_filter,
-            FacilityMaterialLink.annual_capacity_tpy.is_not(None),
+    # ── Pull all facility-stage rows in a single query ────────────────────
+    # Returns one row per (stage, status, capacity-bucket).  We aggregate in
+    # Python rather than SQL because the per-stage tier-1/tier-2 logic is
+    # cleaner expressed as Python dispatch.
+    rows = db.execute(
+        select(
+            FacilityMaterialLink.supply_chain_stage.label("stage"),
+            Facility.status.label("status"),
+            FacilityMaterialLink.annual_capacity_tpy.label("capacity"),
         )
+        .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
+        .where(*base_filter)
+    ).all()
+
+    if not rows:
+        return None
+
+    # ── Bucket by stage, then by capacity-known vs unknown, by status ─────
+    # stage_buckets[stage] = {
+    #   "tpy_total": float, "tpy_at_risk": float,    # capacity-weighted side
+    #   "n_total":   int,   "n_at_risk":   int,      # count-based side
+    # }
+    from collections import defaultdict
+    stage_buckets: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"tpy_total": 0.0, "tpy_at_risk": 0.0, "n_total": 0, "n_at_risk": 0}
+    )
+    for row in rows:
+        stage = row.stage
+        if row.status not in _PRODUCTION_ASSET_STATUSES:
+            # Skip planned / under_construction / unknown — not in the live
+            # supply pool we're measuring.
+            continue
+        bucket = stage_buckets[stage]
+        bucket["n_total"] += 1
+        if row.status in _AT_RISK_STATUSES:
+            bucket["n_at_risk"] += 1
+        if row.capacity is not None:
+            bucket["tpy_total"] += float(row.capacity)
+            if row.status in _AT_RISK_STATUSES:
+                bucket["tpy_at_risk"] += float(row.capacity)
+
+    if not stage_buckets:
+        return None  # No facilities matched the production-asset statuses
+
+    # ── Compute per-stage dependency using the two-tier logic ─────────────
+    stages_detail: dict[str, dict] = {}
+    for stage, b in stage_buckets.items():
+        stage_weight = STAGE_ROLLUP_WEIGHTS[stage]
+        if b["tpy_total"] > 0:
+            # Tier 1: capacity-weighted.  Reserved for when capacity data
+            # arrives via G4c (partner-curated) or G4d (paid sub).
+            dep = min(1.0, b["tpy_at_risk"] / b["tpy_total"])
+            method = "capacity_weighted"
+        elif b["n_total"] > 0:
+            # Tier 2: count-based (the active path for MRDS data today).
+            dep = min(1.0, b["n_at_risk"] / b["n_total"])
+            method = "count_based"
+        else:
+            continue   # Stage had only non-production-asset facilities; skip.
+        stages_detail[stage] = {
+            "dependency": round(dep, 4),
+            "method":     method,
+            "n_at_risk":  b["n_at_risk"],
+            "n_total":    b["n_total"],
+            "weight":     stage_weight,
+        }
+
+    if not stages_detail:
+        return None
+
+    # ── Cross-stage rollup: weighted average over stages with data ────────
+    # No default-fill for missing stages (G4 Half 1 partner direction):
+    # divide by the sum of weights of stages that actually contributed.
+    weight_sum = sum(s["weight"] for s in stages_detail.values())
+    weighted_dep = (
+        sum(s["dependency"] * s["weight"] for s in stages_detail.values())
+        / weight_sum
     )
 
-    if total_tpy:
-        at_risk_tpy = db.scalar(
-            select(sqlfunc.sum(FacilityMaterialLink.annual_capacity_tpy))
-            .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
-            .where(
-                *base_filter,
-                FacilityMaterialLink.annual_capacity_tpy.is_not(None),
-                Facility.status.in_(_AT_RISK_STATUSES),
-            )
-        ) or 0.0
-        dep = at_risk_tpy / total_tpy
-        log.debug(
-            "market_aggregator.facility_structural_dependency",
-            material_id=material_id,
-            geography_code=geography_code,
-            method="capacity_weighted",
-            at_risk_tpy=at_risk_tpy,
-            total_tpy=total_tpy,
-            structural_dependency=round(dep, 4),
-        )
-        return min(1.0, dep)
-
-    # ── Tier 2: count-based (MRDS path — no capacity figures available) ──────
-    total_sites = db.scalar(
-        select(sqlfunc.count(Facility.id))
-        .join(FacilityMaterialLink, FacilityMaterialLink.facility_id == Facility.id)
-        .where(
-            *base_filter,
-            Facility.status.in_(_PRODUCTION_ASSET_STATUSES),
-        )
-    ) or 0
-
-    if not total_sites:
-        return None  # No facility data for this material / geography
-
-    at_risk_sites = db.scalar(
-        select(sqlfunc.count(Facility.id))
-        .join(FacilityMaterialLink, FacilityMaterialLink.facility_id == Facility.id)
-        .where(
-            *base_filter,
-            Facility.status.in_(_AT_RISK_STATUSES),
-        )
-    ) or 0
-
-    dep = at_risk_sites / total_sites
     log.debug(
         "market_aggregator.facility_structural_dependency",
         material_id=material_id,
         geography_code=geography_code,
-        method="count_based",
-        at_risk_sites=at_risk_sites,
-        total_sites=total_sites,
-        structural_dependency=round(dep, 4),
+        method="stage_weighted",
+        stages_used=list(stages_detail.keys()),
+        weighted_dependency=round(weighted_dep, 4),
     )
-    return min(1.0, dep)
+
+    return {
+        "weighted":     round(weighted_dep, 4),
+        "stages":       stages_detail,
+        "stages_used":  sorted(stages_detail.keys()),
+        "method":       "stage_weighted",
+    }
 
 
 def _derive_market_operational_inputs(
@@ -705,18 +768,21 @@ def _derive_market_operational_inputs(
     geography_code: str,
     operational_events: list[EventWithRelevance],
     as_of_date: date,
-) -> tuple[float, list[float], str]:
+) -> tuple[float, list[float], str, Optional[dict]]:
     """
-    Returns (structural_dependency, weighted_event_impacts, dep_source).
+    Returns (structural_dependency, weighted_event_impacts, dep_source, stage_breakdown).
 
     structural_dependency — three-tier resolution:
 
-      1. MRDS geography-level: fraction of known production-asset sites in this
-         geography that are mothballed or closed. Uses capacity-weighting when
-         annual_capacity_tpy is populated; falls back to site counts for
-         MRDS-sourced rows (MRDS does not publish capacity figures).
+      1. MRDS geography-level: stage-weighted fraction of production-asset sites
+         that are mothballed.  G4 Half 1 (2026-05-06) made this stage-aware —
+         the per-stage dependency is rolled up using ``STAGE_ROLLUP_WEIGHTS``
+         (ore=0.10, concentrate=0.15, intermediate=0.20, refined=0.25,
+         battery_grade=0.30) over only the stages that have data.  No
+         default-fill for missing stages — partner direction is to honestly
+         reflect what's measurable.
 
-      2. MRDS global fallback: if no MRDS sites exist for this specific
+      2. MRDS global fallback: when no MRDS sites exist for this specific
          geography, try the global material-level fraction (all geographies).
          Discounted by 0.5 to reflect that it's a broader, less specific signal.
 
@@ -732,30 +798,47 @@ def _derive_market_operational_inputs(
         Provenance tag stored in rationale_json so post-run queries can identify
         which (material, geography) pairs are hitting the conservative default
         rather than real facility data.  One of:
-            "mrds_geography"        — real site fraction for this specific geo
-            "mrds_global_discounted"— global site fraction × 0.5 (geo had no sites)
-            "event_derived"         — average severity of capacity-constraint events
-            "default_0.3"           — no facility data and no relevant events;
-                                      conservative placeholder, data gap
+            "mrds_geography_stage_weighted"           — stage-weighted fraction for this geo
+            "mrds_global_discounted_stage_weighted"   — global stage-weighted × 0.5
+            "event_derived"                            — capacity-constraint event severity avg
+            "default_0.3"                              — no data; conservative placeholder
+
+    stage_breakdown:
+        The structured dict from ``_facility_structural_dependency`` describing
+        the per-stage dependency contributions.  ``None`` when struct_dep was
+        derived from events or default (Tier 3).  Surfaced into rationale_json
+        so consumers can see which stages had data and where the gaps are.
     """
     dep_source: str
+    stage_breakdown: Optional[dict] = None
+    struct_dep: Optional[float] = None
 
-    # Tier 1: geography-specific MRDS site fraction
-    struct_dep = _facility_structural_dependency(db, material_id, geography_code)
-    if struct_dep is not None:
-        dep_source = "mrds_geography"
+    # Tier 1: geography-specific MRDS stage-weighted fraction
+    geo_result = _facility_structural_dependency(db, material_id, geography_code)
+    if geo_result is not None:
+        struct_dep = geo_result["weighted"]
+        stage_breakdown = geo_result
+        dep_source = "mrds_geography_stage_weighted"
 
-    # Tier 2: global MRDS fraction (discounted) — when no sites in this geography
+    # Tier 2: global MRDS stage-weighted fraction (discounted) — when no sites
+    # in this geography
     if struct_dep is None:
-        global_dep = _facility_structural_dependency(db, material_id, geography_code=None)
-        if global_dep is not None:
-            struct_dep = global_dep * 0.5
-            dep_source = "mrds_global_discounted"
+        global_result = _facility_structural_dependency(db, material_id, geography_code=None)
+        if global_result is not None:
+            struct_dep = global_result["weighted"] * 0.5
+            # Stash the un-discounted breakdown so consumers can see the full
+            # picture; the 0.5 discount applies only to the rolled-up score.
+            stage_breakdown = {
+                **global_result,
+                "discount_applied": 0.5,
+                "note": "global fallback — no facilities in target geography",
+            }
+            dep_source = "mrds_global_discounted_stage_weighted"
             log.debug(
                 "market_aggregator.facility_global_fallback",
                 material_id=material_id,
                 geography_code=geography_code,
-                global_dep=global_dep,
+                global_dep=global_result["weighted"],
                 discounted=struct_dep,
             )
 
@@ -790,7 +873,7 @@ def _derive_market_operational_inputs(
         for ew in operational_events
     ]
 
-    return struct_dep, weighted_event_impacts, dep_source
+    return struct_dep, weighted_event_impacts, dep_source, stage_breakdown
 
 
 def _score_operational_market(
@@ -1341,7 +1424,7 @@ def score_material_geography(
         db, material_id, geography_code, geo_trade_events, as_of_date,
         eligible_nodes=eligible_nodes,
     )
-    struct_dep, op_impacts, dep_source = _derive_market_operational_inputs(
+    struct_dep, op_impacts, dep_source, stage_breakdown = _derive_market_operational_inputs(
         db, material_id, geography_code, all_op_events, as_of_date
     )
 
@@ -1425,6 +1508,7 @@ def score_material_geography(
             "operational": {
                 "structural_dependency": struct_dep,
                 "structural_dependency_source": dep_source,
+                "stage_breakdown": stage_breakdown,   # G4 Half 1 (2026-05-06)
                 "event_impact_count": len(op_impacts),
             },
             "financial_pressure": {

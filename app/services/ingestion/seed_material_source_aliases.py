@@ -417,6 +417,252 @@ _WORLDBANK_PINKSHEET: list[_AliasRow] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Source: USGS Mineral Resources Data System CSV (mrds)
+#
+# Per-row commodity columns ``commod1`` / ``commod2`` / ``commod3``
+# in the MRDS dataset.  MRDS publishes commodity values primarily as
+# Title-Case full English names ("Lithium", "Copper", "Bauxite"), with
+# some filtered subsets / older exports using chemical-symbol
+# abbreviations ("Li", "Cu") instead.  Both forms are seeded.
+#
+# Storage form below uses Title Case for full names + chemical-symbol
+# capitalisation for short codes; the resolver normalises via
+# ``lower(btrim(source_name))`` so casing/whitespace differences in the
+# source CSV don't matter at lookup time.
+#
+# Ore-stage aliases sharing a canonical (BAUXITE → Aluminum, CHROMITE
+# → Chromium, ZIRCON → Zirconium, etc.) are kept as 3-tuple primaries
+# rather than 4-tuple secondaries: MRDS writes Facility rows, not
+# material-level price/production signals, so the secondary-suppression
+# behaviour the MCS chapters use here doesn't apply.
+#
+# Ported from the legacy ``mrds.MRDS_COMMODITY_MAP`` dict (2026-05-06).
+# The dict still exists as a fallback in ``_resolve_commodities`` for
+# environments that haven't been re-seeded yet; it can be removed once
+# this seed has been applied to all deployments.
+# ---------------------------------------------------------------------------
+
+_MRDS: list[_AliasRow] = [
+    # ── Lithium ──────────────────────────────────────────────────────────
+    ("mrds", "Lithium",                "Lithium"),
+    ("mrds", "Lithium carbonate",      "Lithium"),
+    ("mrds", "Lithium brine",          "Lithium"),
+    ("mrds", "Li",                     "Lithium"),
+    ("mrds", "Lith",                   "Lithium"),
+
+    # ── Cobalt ───────────────────────────────────────────────────────────
+    ("mrds", "Cobalt",                 "Cobalt"),
+    ("mrds", "Co",                     "Cobalt"),
+    ("mrds", "Cob",                    "Cobalt"),
+
+    # ── Nickel ───────────────────────────────────────────────────────────
+    ("mrds", "Nickel",                 "Nickel"),
+    ("mrds", "Ni",                     "Nickel"),
+    ("mrds", "Nick",                   "Nickel"),
+
+    # ── Manganese ────────────────────────────────────────────────────────
+    ("mrds", "Manganese",              "Manganese"),
+    ("mrds", "Mn",                     "Manganese"),
+    ("mrds", "Mang",                   "Manganese"),
+
+    # ── Natural Graphite ─────────────────────────────────────────────────
+    ("mrds", "Graphite",               "Natural Graphite"),
+    ("mrds", "Natural graphite",       "Natural Graphite"),
+    ("mrds", "Graphite, natural",      "Natural Graphite"),
+    ("mrds", "Carbon, graphite",       "Natural Graphite"),
+    ("mrds", "Gr",                     "Natural Graphite"),
+    ("mrds", "Graph",                  "Natural Graphite"),
+
+    # ── Copper ───────────────────────────────────────────────────────────
+    ("mrds", "Copper",                 "Copper"),
+    ("mrds", "Cu",                     "Copper"),
+    ("mrds", "Copp",                   "Copper"),
+
+    # ── Aluminum (incl. ore-stage aliases) ───────────────────────────────
+    ("mrds", "Aluminum",               "Aluminum"),
+    ("mrds", "Aluminium",              "Aluminum"),
+    ("mrds", "Bauxite",                "Aluminum"),
+    ("mrds", "Alumina",                "Aluminum"),
+    ("mrds", "Al",                     "Aluminum"),
+
+    # ── Rare Earth Elements (aggregate canonical) ────────────────────────
+    ("mrds", "Rare earths",            "Rare Earth Elements"),
+    ("mrds", "Rare-earth elements",    "Rare Earth Elements"),
+    ("mrds", "Rare earth elements",    "Rare Earth Elements"),
+    ("mrds", "Rare earth metals",      "Rare Earth Elements"),
+    ("mrds", "Rare earth",             "Rare Earth Elements"),
+    ("mrds", "REE",                    "Rare Earth Elements"),
+    ("mrds", "REO",                    "Rare Earth Elements"),
+    # Light + heavy REEs without individual canonical rows — bundled.
+    ("mrds", "Lanthanum",              "Rare Earth Elements"),
+    ("mrds", "Cerium",                 "Rare Earth Elements"),
+    ("mrds", "Yttrium",                "Rare Earth Elements"),
+    ("mrds", "Europium",               "Rare Earth Elements"),
+    ("mrds", "Gadolinium",             "Rare Earth Elements"),
+    ("mrds", "Holmium",                "Rare Earth Elements"),
+    ("mrds", "Erbium",                 "Rare Earth Elements"),
+    ("mrds", "Ytterbium",              "Rare Earth Elements"),
+    ("mrds", "Lutetium",               "Rare Earth Elements"),
+    ("mrds", "Scandium",               "Rare Earth Elements"),
+    ("mrds", "Samarium",               "Rare Earth Elements"),
+    ("mrds", "La",                     "Rare Earth Elements"),
+    ("mrds", "Ce",                     "Rare Earth Elements"),
+    ("mrds", "Y",                      "Rare Earth Elements"),
+
+    # ── Individual magnet REEs (have own canonical rows) ─────────────────
+    ("mrds", "Neodymium",              "Neodymium"),
+    ("mrds", "Nd",                     "Neodymium"),
+    ("mrds", "Praseodymium",           "Praseodymium"),
+    ("mrds", "Pr",                     "Praseodymium"),
+    ("mrds", "Dysprosium",             "Dysprosium"),
+    ("mrds", "Dy",                     "Dysprosium"),
+    ("mrds", "Terbium",                "Terbium"),
+    ("mrds", "Tb",                     "Terbium"),
+
+    # ── Vanadium ─────────────────────────────────────────────────────────
+    ("mrds", "Vanadium",               "Vanadium"),
+    ("mrds", "V",                      "Vanadium"),
+
+    # ── Silicon (Anode Grade) ────────────────────────────────────────────
+    ("mrds", "Silicon",                "Silicon (Anode Grade)"),
+    ("mrds", "Silicon metal",          "Silicon (Anode Grade)"),
+    ("mrds", "Si",                     "Silicon (Anode Grade)"),
+
+    # ── Phosphate (Battery Grade) ────────────────────────────────────────
+    ("mrds", "Phosphate",              "Phosphate (Battery Grade)"),
+    ("mrds", "Phosphorite",            "Phosphate (Battery Grade)"),
+    ("mrds", "Phosphate rock",         "Phosphate (Battery Grade)"),
+    ("mrds", "P",                      "Phosphate (Battery Grade)"),
+
+    # ── Chromium (incl. chromite ore alias) ──────────────────────────────
+    ("mrds", "Chromium",               "Chromium"),
+    ("mrds", "Chromite",               "Chromium"),
+    ("mrds", "Cr",                     "Chromium"),
+
+    # ── Molybdenum ───────────────────────────────────────────────────────
+    ("mrds", "Molybdenum",             "Molybdenum"),
+    ("mrds", "Mo",                     "Molybdenum"),
+
+    # ── Niobium (incl. historical "Columbium" US name) ───────────────────
+    ("mrds", "Niobium",                "Niobium"),
+    ("mrds", "Columbium",              "Niobium"),
+    ("mrds", "Niobium (columbium)",    "Niobium"),
+    ("mrds", "Nb",                     "Niobium"),
+
+    # ── Tantalum ─────────────────────────────────────────────────────────
+    ("mrds", "Tantalum",               "Tantalum"),
+    ("mrds", "Ta",                     "Tantalum"),
+
+    # ── Titanium (incl. ilmenite/rutile ore aliases) ─────────────────────
+    ("mrds", "Titanium",               "Titanium"),
+    ("mrds", "Ilmenite",               "Titanium"),
+    ("mrds", "Rutile",                 "Titanium"),
+    ("mrds", "Ti",                     "Titanium"),
+
+    # ── Zirconium (incl. zircon ore alias) ───────────────────────────────
+    ("mrds", "Zirconium",              "Zirconium"),
+    ("mrds", "Zircon",                 "Zirconium"),
+    ("mrds", "Zr",                     "Zirconium"),
+
+    # ── Iron Ore (LFP Grade) ─────────────────────────────────────────────
+    ("mrds", "Iron",                   "Iron Ore (LFP Grade)"),
+    ("mrds", "Iron ore",               "Iron Ore (LFP Grade)"),
+    ("mrds", "Fe",                     "Iron Ore (LFP Grade)"),
+
+    # ── Magnesium (incl. magnesite ore alias) ────────────────────────────
+    ("mrds", "Magnesium",              "Magnesium"),
+    ("mrds", "Magnesite",              "Magnesium"),
+    ("mrds", "Mg",                     "Magnesium"),
+
+    # ── Platinum-Group Metals (bundled canonical) ────────────────────────
+    ("mrds", "Platinum",               "Platinum-Group Metals"),
+    ("mrds", "Palladium",              "Platinum-Group Metals"),
+    ("mrds", "Platinum-group metals",  "Platinum-Group Metals"),
+    ("mrds", "Platinum group metals",  "Platinum-Group Metals"),
+    ("mrds", "PGM",                    "Platinum-Group Metals"),
+    ("mrds", "Rhodium",                "Platinum-Group Metals"),
+    ("mrds", "Iridium",                "Platinum-Group Metals"),
+    ("mrds", "Osmium",                 "Platinum-Group Metals"),
+    ("mrds", "Ruthenium",              "Platinum-Group Metals"),
+    ("mrds", "Pt",                     "Platinum-Group Metals"),
+    ("mrds", "Pd",                     "Platinum-Group Metals"),
+
+    # ── Tungsten (incl. wolframite/scheelite ore aliases) ────────────────
+    ("mrds", "Tungsten",               "Tungsten"),
+    ("mrds", "Wolframite",             "Tungsten"),
+    ("mrds", "Scheelite",              "Tungsten"),
+    ("mrds", "W",                      "Tungsten"),
+
+    # ── Tin ──────────────────────────────────────────────────────────────
+    ("mrds", "Tin",                    "Tin"),
+    ("mrds", "Sn",                     "Tin"),
+
+    # ── Silver ───────────────────────────────────────────────────────────
+    ("mrds", "Silver",                 "Silver"),
+    ("mrds", "Ag",                     "Silver"),
+
+    # ── Fluorspar ────────────────────────────────────────────────────────
+    ("mrds", "Fluorspar",              "Fluorspar"),
+    ("mrds", "Fluorite",               "Fluorspar"),
+    ("mrds", "Fluorine",               "Fluorspar"),
+    ("mrds", "F",                      "Fluorspar"),
+
+    # ── Antimony ─────────────────────────────────────────────────────────
+    ("mrds", "Antimony",               "Antimony"),
+    ("mrds", "Sb",                     "Antimony"),
+
+    # ── Zinc ─────────────────────────────────────────────────────────────
+    ("mrds", "Zinc",                   "Zinc"),
+    ("mrds", "Zn",                     "Zinc"),
+
+    # ── Rhenium ──────────────────────────────────────────────────────────
+    ("mrds", "Rhenium",                "Rhenium"),
+
+    # ── Gallium ──────────────────────────────────────────────────────────
+    ("mrds", "Gallium",                "Gallium"),
+    ("mrds", "Ga",                     "Gallium"),
+
+    # ── Germanium ────────────────────────────────────────────────────────
+    ("mrds", "Germanium",              "Germanium"),
+    ("mrds", "Ge",                     "Germanium"),
+
+    # ── Tellurium ────────────────────────────────────────────────────────
+    ("mrds", "Tellurium",              "Tellurium"),
+    ("mrds", "Te",                     "Tellurium"),
+
+    # ── Indium ───────────────────────────────────────────────────────────
+    ("mrds", "Indium",                 "Indium"),
+    ("mrds", "In",                     "Indium"),
+
+    # ── Boron ────────────────────────────────────────────────────────────
+    ("mrds", "Boron",                  "Boron"),
+    ("mrds", "Borax",                  "Boron"),
+    ("mrds", "Borate",                 "Boron"),
+    ("mrds", "B",                      "Boron"),
+
+    # ── Selenium ─────────────────────────────────────────────────────────
+    ("mrds", "Selenium",               "Selenium"),
+    ("mrds", "Se",                     "Selenium"),
+
+    # ── Bismuth ──────────────────────────────────────────────────────────
+    ("mrds", "Bismuth",                "Bismuth"),
+    ("mrds", "Bi",                     "Bismuth"),
+
+    # ── Explicit skips — flagged for partner review ───────────────────────
+    # "Re" was mapped to Rare Earth Elements in the legacy dict, but Re is
+    # the chemical symbol for Rhenium.  Marking it as a skip here forces the
+    # row through partner review rather than silently routing every "Re"-
+    # tagged MRDS row to REE.  To fix: change to ("mrds", "Re", "Rhenium")
+    # if MRDS uses bare "Re" for Rhenium, or keep skipped if MRDS uses the
+    # full word "Rhenium" exclusively (which is the assumption — no MRDS
+    # rows have surfaced bare "Re" so far).
+    ("mrds", "Re", None,
+     "Ambiguous: Re is the chemical symbol for Rhenium but the legacy MRDS "
+     "dict mapped it to Rare Earth Elements. Skipping pending partner review."),
+]
+
+
 # Aggregate of all alias rows.  Order of definition above doesn't matter
 # at write time but matters for readability when editing this file.
 _ALIASES: list[_AliasRow] = [
@@ -425,6 +671,7 @@ _ALIASES: list[_AliasRow] = [
     *_MCS_PDF,
     *_FIG10_PRICES,
     *_WORLDBANK_PINKSHEET,
+    *_MRDS,
 ]
 
 
