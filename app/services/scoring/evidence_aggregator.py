@@ -44,7 +44,10 @@ import structlog
 
 from app.models.company import CompanyMaterialExposure, CompanyScore
 from app.services.scoring.decay import RiskCategory, compute_recency_multiplier
-from app.services.scoring.event_impact import compute_event_impact
+from app.services.scoring.event_impact import (
+    compute_event_impact,
+    relevance_score_to_multiplier,
+)
 from app.services.scoring.evidence_query import EventWithRelevance, SupplierEdge
 
 log = structlog.get_logger(__name__)
@@ -99,7 +102,9 @@ def _impact(
         severity=_safe_severity(ew),
         confidence=_safe_confidence(ew),
         recency_multiplier=recency,
-        relevance_multiplier=ew.relevance_score,
+        # ew.relevance_score is on [0, 1]; map to the [0.70, 1.30]
+        # multiplier domain compute_event_impact validates against.
+        relevance_multiplier=relevance_score_to_multiplier(ew.relevance_score),
     )
 
 

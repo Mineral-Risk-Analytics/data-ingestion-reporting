@@ -74,6 +74,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
+import structlog
+
+log = structlog.get_logger(__name__)
+
 # Reuse country name → ISO-2 mapping from the legacy 2025 parser.  USGS
 # country names are stable across editions; no need to duplicate.
 from app.services.ingestion.seeds.usgs_mcs_parser import _COUNTRY_ISO2
@@ -122,24 +126,63 @@ from app.services.ingestion.seeds.usgs_mcs_parser import _COUNTRY_ISO2
 # the same chapter so the CLI also skips material-level signal upserts.
 
 _CHAPTER_HS_PREFIX: dict[str, str] = {
-    "BAUXITE AND ALUMINA": "2606",  # bauxite is the ore stage of Aluminum
+    # Deprecated 2026-05-09: previously routed BAUXITE AND ALUMINA → 2606
+    # (Aluminum ore stage).  Now handled by ``_DETAIL_STAGE_PATTERNS``
+    # below — "Bauxite, mine production" auto-routes to ore stage and
+    # "Alumina, refinery production" auto-routes to intermediate stage,
+    # so the chapter no longer needs an explicit override.  Kept the
+    # dict empty for future per-chapter overrides.
 }
 
 
+# ---------------------------------------------------------------------------
+# Stage auto-classification by Detail substring (added 2026-05-09)
+# ---------------------------------------------------------------------------
+# Replaces most of the manual ``_DETAIL_TO_HS_PREFIX`` dict.  For each row
+# in a "World *" section whose ``Statistics_detail`` matches one of these
+# patterns (case-insensitive, FIRST match wins — order matters), the
+# parser tags the row with the corresponding supply_chain_stage.  The CLI
+# then resolves ``(material_id, stage)`` to an HsCodeMaterialMapping at
+# write time.
+#
+# Why patterns instead of section names: MCS publishes mixed-stage data
+# inside one section (BAUXITE AND ALUMINA's "World Alumina Refinery and
+# Bauxite Mine Production" carries BOTH refinery and mine rows; Copper's
+# "World Mine and Refinery Production" carries mine + refinery rows).
+# The Statistics_detail column reliably tags each row.
+#
+# Industry naming caveat: "refinery production" maps to ``refined`` stage
+# for most metals (Cu cathode, Pb refined, Zn refined) but to
+# ``intermediate`` for BAUXITE AND ALUMINA (alumina is Al2O3 oxide, not
+# Al metal).  The "alumina, refinery" pattern wins because it appears
+# above the generic "refinery production" pattern.
+_DETAIL_STAGE_PATTERNS: list[tuple[str, str]] = [
+    # ── Specific patterns first (must match before the generic catches) ──
+    ("alumina, refinery",   "intermediate"),  # BAUXITE → Al2O3 oxide intermediate
+    ("bauxite, mine",       "ore"),           # BAUXITE → bauxite ore
+    # ── Generic patterns ─────────────────────────────────────────────────
+    ("smelter production",  "refined"),       # ALUMINUM smelter → Al metal refined
+    ("refinery production", "refined"),       # COPPER refinery → cathode refined
+    ("mine production",     "ore"),           # everything else: mine = ore
+]
+
+
 _DETAIL_TO_HS_PREFIX: dict[tuple[str, str], str] = {
-    # SILICON — partner: ferrosilicon is battery_grade (graphite-alternative
-    # anode); silicon metal is refined.
+    # Sub-type → HS prefix overrides for cases where multiple products
+    # exist at the same supply_chain_stage and stage-based lookup alone
+    # can't disambiguate.  Trimmed 2026-05-09 — Copper entries removed
+    # because the new ``_DETAIL_STAGE_PATTERNS`` auto-classification
+    # produces the same result via stage-based lookup (mine → ore HS 2603,
+    # refinery → refined HS 7403).
+    #
+    # SILICON keeps its overrides because both ferrosilicon and silicon
+    # metal are at the same nominal stage (refined) but trade as different
+    # HS prefixes.  The current seed_hs_mappings has them at:
+    #   720221 — ferrosilicon (≥4% Si) → battery_grade per partner
+    #   280461 — silicon metal (≥99.99% Si) → refined
+    # Stage-based lookup wouldn't distinguish them; explicit override here.
     ("SILICON", "ferrosilicon"):    "720221",
     ("SILICON", "silicon metal"):   "280461",
-
-    # COPPER — mine production = ore stage; refinery production = refined
-    # cathode stage.  Both battery-relevant for current collectors and
-    # battery wiring.
-    ("COPPER", "mine production"):       "2603",
-    ("COPPER", "refinery production"):   "7403",
-
-    # NOTE: many other chapters could have sub-type splits added here as
-    # we identify them.  Keep additions partner-reviewed.
 }
 
 
@@ -370,6 +413,148 @@ def _extract_world_production_per_country(
             country_reserves[iso2] = country_reserves.get(iso2, 0.0) + val
 
     return country_prod, country_reserves, dict(by_year), latest_year, unit
+
+
+def _classify_detail_stage(detail: str) -> Optional[str]:
+    """Return the supply_chain_stage for a Statistics_detail value.
+
+    Walks ``_DETAIL_STAGE_PATTERNS`` in order; returns the first match.
+    Returns None if no pattern matches — caller skips the row (typically
+    rounding-total rows like "Mine production: rounded").
+    """
+    if not detail:
+        return None
+    detail_low = detail.lower()
+    if "rounded" in detail_low:
+        return None  # totals — caller derives world total from country sum
+    for pattern, stage in _DETAIL_STAGE_PATTERNS:
+        if pattern in detail_low:
+            return stage
+    return None
+
+
+def _extract_per_stage_world_production(
+    chapter_rows: list[dict],
+) -> list[tuple[str, str, dict[str, float], Optional[int], str]]:
+    """Group all "World *" production rows by detected supply_chain_stage.
+
+    Replaces the per-substring loop in ``parse_mcs2026_csv`` with auto-
+    detection.  For each supply_chain_stage that has at least one resolvable
+    country production row in the latest year, returns ONE entry:
+
+        (stage, detail_substring, country_prod, latest_year, unit)
+
+    where ``country_prod`` is ``{iso2: production_volume}`` for the latest
+    available year.  Multiple stages are returned when a chapter publishes
+    mixed-stage data in one section (Cu mine + refinery → ore + refined;
+    BAUXITE alumina + bauxite → ore + intermediate).
+
+    Ambiguity handling (added 2026-05-09):
+    Some chapters publish multiple Statistics_detail strings that all
+    classify to the same supply_chain_stage.  Three patterns observed:
+
+      * **Additive** — different products at the same stage that sum into
+        a country's total supply.  Example: SODA ASH "natural" +
+        "synthetic"; PGM "palladium" + "platinum"; CLAYS "bentonite" +
+        "kaolin".
+      * **Duplicate** — same physical supply measured under different
+        unit conventions.  Example: IRON ORE "iron content" + "usable";
+        SELENIUM / TELLURIUM "refinery production" + "concentrate
+        equivalent".  Summing here double-counts.
+      * **Stage-mixed within ore** — DIATOMITE "mine production" + "mine
+        production: processed".  Both technically ore-stage in our
+        taxonomy; processed is downstream of mine.
+
+    We sum per (stage × country) across all detail strings in the same
+    stage.  Rationale: additive cases are handled correctly; duplicate
+    cases double-count both the numerator and denominator equally per
+    country, so the resulting country *share* (which is what HHI consumes)
+    stays roughly accurate.  Stage-mixed cases get conservatively
+    over-counted but they're not in the launch-10 today.  Tradeoff
+    documented in ``docs/scoring-audit-2026-05.md``.
+
+    The previous implementation emitted one entry per (stage × detail)
+    pair, which caused unique-constraint violations downstream because
+    multiple buckets resolve to the same hs_mapping_id at write time and
+    try to insert duplicate rows for the same
+    (hs_mapping_id × country × year × scope × source) key.
+    """
+    # First pass — build (stage, detail) buckets and extract per-country
+    # production per bucket.
+    by_bucket: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for r in chapter_rows:
+        section = r.get("Section", "") or ""
+        if not section.startswith(_WORLD_SECTION_PREFIX):
+            continue
+        stat = (r.get("Statistics") or "").lower()
+        if "production" not in stat:
+            continue
+        detail = (r.get("Statistics_detail") or "").strip()
+        stage = _classify_detail_stage(detail)
+        if stage is None:
+            continue
+        by_bucket[(stage, detail.lower())].append(r)
+
+    # For each bucket, get its per-country production.
+    bucket_extractions: list[
+        tuple[str, str, dict[str, float], Optional[int], str]
+    ] = []
+    for (stage, detail_low), bucket_rows in by_bucket.items():
+        country_prod, _r, _by_year, latest_year, unit = (
+            _extract_world_production_per_country(bucket_rows, detail_substring=None)
+        )
+        if not country_prod:
+            continue
+        bucket_extractions.append(
+            (stage, detail_low, country_prod, latest_year, unit or "")
+        )
+
+    # Consolidate: SUM per (stage × country) across all buckets sharing
+    # a stage.  See docstring for tradeoff rationale.
+    by_stage_country: dict[str, dict[str, float]] = defaultdict(
+        lambda: defaultdict(float)
+    )
+    by_stage_meta: dict[str, dict] = {}
+    by_stage_details: dict[str, list[str]] = defaultdict(list)
+    for stage, detail_low, country_prod, latest_year, unit in bucket_extractions:
+        for iso2, vol in country_prod.items():
+            by_stage_country[stage][iso2] += vol
+        # Keep the meta from the bucket with the most countries (most
+        # comprehensive geographic coverage) — used for unit + year on the
+        # consolidated row, and for the type_substring reported back to
+        # the caller.
+        prev = by_stage_meta.get(stage)
+        if prev is None or len(country_prod) > prev["country_count"]:
+            by_stage_meta[stage] = {
+                "detail_low": detail_low,
+                "latest_year": latest_year,
+                "unit": unit,
+                "country_count": len(country_prod),
+            }
+        by_stage_details[stage].append(detail_low)
+
+    # Audit log: when a stage has more than one source detail string, the
+    # consolidation is non-trivial.  Recorded so we can review later.
+    for stage, details in by_stage_details.items():
+        if len(details) > 1:
+            log.debug(
+                "mcs2026_parser.same_stage_bucket_consolidated",
+                stage=stage,
+                source_details=sorted(details),
+                kept_meta_detail=by_stage_meta[stage]["detail_low"],
+                country_count=len(by_stage_country[stage]),
+            )
+
+    return [
+        (
+            stage,
+            by_stage_meta[stage]["detail_low"],
+            dict(by_stage_country[stage]),
+            by_stage_meta[stage]["latest_year"],
+            by_stage_meta[stage]["unit"],
+        )
+        for stage in by_stage_country
+    ]
 
 
 def _extract_price_unit_from_salient(chapter_rows: list[dict]) -> Optional[str]:
@@ -730,10 +915,57 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
         # ── Price unit derived from USGS Salient Price row ───────────────
         price_unit_usgs = _extract_price_unit_from_salient(chapter_rows)
 
-        # ── Per-HS-node production shares (sub-type splits) ───────────────
-        # _DETAIL_TO_HS_PREFIX is keyed by chapter heading (verbatim CSV
-        # value), so this works regardless of canonical resolution.
+        # ── Per-HS-node production shares ─────────────────────────────────
+        # Two-path build (refactored 2026-05-09):
+        #
+        #   Path A — Stage auto-detection (covers ~all launch-list materials):
+        #     Walk every world-production row, classify by Statistics_detail
+        #     into a supply_chain_stage, group by stage, emit one entry per
+        #     (stage × country).  Entries carry ``stage`` and an empty
+        #     ``hs_code_prefix``; the CLI resolves the prefix via
+        #     ``(material_id, stage)`` lookup at write time.
+        #
+        #   Path B — Sub-type prefix override (Silicon only):
+        #     ``_DETAIL_TO_HS_PREFIX`` still routes ferrosilicon vs silicon
+        #     metal to specific prefixes because both are at the same stage
+        #     and stage-based lookup can't disambiguate.  These entries
+        #     carry an explicit ``hs_code_prefix`` and no ``stage``.
+        #
+        # Path A overrides the stage-detected output with Path B for any
+        # (chapter, detail) pair that's in ``_DETAIL_TO_HS_PREFIX`` — so
+        # Silicon's ferrosilicon vs metal split still works without
+        # double-writing.  No-op for chapters not in the override dict.
         hs_production_shares: list[dict] = []
+        path_b_overrides = {
+            cfg_detail
+            for (cfg_chapter, cfg_detail) in _DETAIL_TO_HS_PREFIX
+            if cfg_chapter == chapter
+        }
+
+        # ── Path A: stage auto-detection ──
+        for stage, detail_low, country_prod, _yr, unit in (
+            _extract_per_stage_world_production(chapter_rows)
+        ):
+            # Skip if this detail substring is handled by the explicit
+            # sub-type override below (Silicon ferrosilicon/silicon metal).
+            if any(ovr in detail_low for ovr in path_b_overrides):
+                continue
+            sub_world = sum(country_prod.values())
+            if sub_world <= 0:
+                continue
+            for iso2, vol in country_prod.items():
+                hs_production_shares.append({
+                    # Empty prefix signals stage-based lookup at write time.
+                    "hs_code_prefix": "",
+                    "stage":          stage,
+                    "country_code":   iso2,
+                    "production_volume": vol,
+                    "production_share":  round(vol / sub_world, 6),
+                    "unit_of_measure":   unit or None,
+                    "type_substring":    detail_low,
+                })
+
+        # ── Path B: explicit sub-type prefix overrides ──
         for (cfg_chapter, cfg_detail), hs_prefix in _DETAIL_TO_HS_PREFIX.items():
             if cfg_chapter != chapter:
                 continue
@@ -747,6 +979,7 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
                 for iso2, vol in sub_country_prod.items():
                     hs_production_shares.append({
                         "hs_code_prefix": hs_prefix,
+                        # No ``stage`` field — caller uses the explicit prefix.
                         "country_code": iso2,
                         "production_volume": vol,
                         "production_share": round(vol / sub_world, 6),
@@ -782,11 +1015,14 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
                 f"Top producing countries: {', '.join(ranked_countries[:5])}."
             )
 
-        # ── Chapter-level HS prefix re-routing ────────────────────────────
-        # If this chapter is listed in ``_CHAPTER_HS_PREFIX``, move the
-        # material-level country shares into hs_production_shares with the
-        # configured stage-specific prefix.  Used for secondary chapters
-        # (e.g. BAUXITE AND ALUMINA → HS 2606 ore stage of Aluminum).
+        # ── Chapter-level HS prefix re-routing (deprecated 2026-05-09) ───
+        # ``_CHAPTER_HS_PREFIX`` is now empty by default — stage auto-
+        # detection handles former entries (BAUXITE AND ALUMINA's bauxite
+        # mine + alumina refinery rows now route via ``stage`` to the
+        # appropriate Aluminum HS mappings without an explicit override).
+        # Block kept in place for future per-chapter overrides if a
+        # chapter publishes production data the auto-detector can't
+        # classify.  Empty dict → block is a no-op today.
         chapter_prefix = _CHAPTER_HS_PREFIX.get(chapter)
         if chapter_prefix and production_shares:
             for ps in production_shares:

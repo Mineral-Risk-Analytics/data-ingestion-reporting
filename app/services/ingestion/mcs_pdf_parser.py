@@ -483,10 +483,42 @@ class MCSPdfParser:
         """
         country_map = self._build_country_map(session)
         material_map = self._build_material_map(session)
-        # Pass the materials list to parse() so the LLM locator can filter
-        # the PDF to chapters that map to a canonical material we score.
+
+        # ── Constrain the LLM to MCS-chapter materials only ──────────────
+        # 2026-05-09: previously passed ``list(material_map.keys())`` — ALL
+        # canonical materials in the DB.  That caused the LLM to fan out
+        # the RARE EARTHS chapter to multiple individual REE breakouts (Nd,
+        # Pr, Dy, Tb) because those names appeared in the allowed-list,
+        # and to attribute Hafnium HTS rows to Zirconium because Hafnium
+        # isn't a canonical.  Result: 8 noise rows per re-ingest.
+        #
+        # Fix: pass only canonical names that have a curated MCS chapter
+        # alias (``material_source_aliases`` with ``source_system='mcs_pdf'``)
+        # — i.e. the partner-reviewed 1:1 chapter→material mapping.  Each
+        # MCS chapter still maps to exactly one canonical, but the LLM no
+        # longer has individual REE / Hafnium names to fan out to.
+        from app.models.supply import MaterialSourceAlias
+        chapter_canonicals = list(session.scalars(
+            select(Material.canonical_name)
+            .join(
+                MaterialSourceAlias,
+                MaterialSourceAlias.canonical_material_id == Material.id,
+            )
+            .where(
+                MaterialSourceAlias.source_system == "mcs_pdf",
+                MaterialSourceAlias.is_skipped.is_(False),
+            )
+            .distinct()
+        ).all())
+        log.info(
+            "mcs_pdf_parser.canonical_filter",
+            total_materials=len(material_map),
+            mcs_chapter_materials=len(chapter_canonicals),
+            note="LLM section locator restricted to materials with curated mcs_pdf aliases",
+        )
+
         sections = self.parse(
-            canonical_materials=list(material_map.keys()),
+            canonical_materials=chapter_canonicals,
             use_llm_sections=use_llm_sections,
         )
 

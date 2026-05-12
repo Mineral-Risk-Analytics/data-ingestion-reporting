@@ -4,6 +4,11 @@ The fetcher tests mock httpx — no real HTTP requests are issued. The
 ingest tests use an in-memory SQLite session with only the tables the
 ingester touches, sidestepping the Postgres-only ARRAY/JSONB columns
 declared elsewhere in the ORM.
+
+EUR-Lex ingest (post 2026-05) is alias-driven: regulations and scopes must
+already exist in the DB; ``ingest_eurlex`` walks ``regulation_aliases`` rows
+for ``source_system='eurlex_celex'`` and attaches documents / summaries /
+risk events.
 """
 
 from __future__ import annotations
@@ -22,24 +27,44 @@ from app.models.regulatory import (
     Regulation,
     RegulationGeographyScope,
     RegulationMaterialScope,
+    RegulationSourceAlias,
     RiskEvent,
+    RiskEventMaterial,
     RiskEventRegulation,
 )
 from app.models.source import Source
 from app.models.supply import Material
 from app.services.ingestion.eurlex import (
-    BATTERY_REGULATIONS,
     EURLEX_HTML_URL,
-    _SEVERITY_BY_STATUS,
+    SEVERITY_BY_STATUS,
     _strip_html,
     fetch_eurlex_summary,
     ingest_eurlex,
 )
 
+# ---------------------------------------------------------------------------
+# Minimal CELEX fixture — mirrors production shape without importing seed data
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# In-memory SQLite session — only the tables the ingester touches
-# ---------------------------------------------------------------------------
+_EURLEX_CELEX_ROWS: list[dict] = [
+    {
+        "celex": "32023R1542",
+        "regulation_key": "EU_TEST_BATTERY_2023",
+        "title": "Test Battery Regulation",
+        "status": "effective",
+        "effective_date": date(2023, 8, 17),
+        "material_name": "Lithium",
+    },
+    {
+        "celex": "32019R1753",
+        "regulation_key": "EU_TEST_CRITICAL_2019",
+        "title": "Test Critical Raw Materials Regulation",
+        "status": "proposed",
+        "effective_date": date(2024, 1, 1),
+        "material_name": "Cobalt",
+    },
+]
+
 
 def _patch_sqlite_jsonb() -> None:
     """Render JSONB as JSON in SQLite DDL.
@@ -52,8 +77,6 @@ def _patch_sqlite_jsonb() -> None:
         SQLiteTypeCompiler.visit_JSONB = SQLiteTypeCompiler.visit_JSON  # type: ignore[attr-defined]
 
 
-# Tables touched by the EUR-Lex ingester. We create only these to avoid the
-# Postgres-specific ARRAY columns elsewhere in the ORM (e.g. InsightPost).
 _EURLEX_TABLES = (
     Source.__table__,
     SourceDocument.__table__,
@@ -61,8 +84,10 @@ _EURLEX_TABLES = (
     Regulation.__table__,
     RegulationMaterialScope.__table__,
     RegulationGeographyScope.__table__,
+    RegulationSourceAlias.__table__,
     RiskEvent.__table__,
     RiskEventRegulation.__table__,
+    RiskEventMaterial.__table__,
 )
 
 
@@ -81,26 +106,58 @@ def session() -> Session:
 
 
 @pytest.fixture()
-def seeded_materials(session: Session) -> dict[str, int]:
-    """Insert every material referenced by ``BATTERY_REGULATIONS``."""
-    needed = {
-        material_name
-        for reg in BATTERY_REGULATIONS
-        for material_name, _ in reg["material_scopes"]
-    }
-    out: dict[str, int] = {}
-    for name in sorted(needed):
-        m = Material(canonical_name=name, category="metal")
+def seeded_eurlex_context(session: Session) -> None:
+    """Insert materials, regulations, scopes, and CELEX aliases for ingest tests."""
+    for row in _EURLEX_CELEX_ROWS:
+        m = Material(canonical_name=row["material_name"], category="metal")
         session.add(m)
         session.flush()
-        out[name] = m.id
+
+        reg = Regulation(
+            regulation_key=row["regulation_key"],
+            title=row["title"],
+            issuing_body="European Union",
+            geography="EU",
+            policy_theme="battery_supply_chain",
+            status=row["status"],
+            publication_date=date(2023, 1, 1),
+            effective_date=row["effective_date"],
+            summary=None,
+            metadata_json={},
+            verified=True,
+        )
+        session.add(reg)
+        session.flush()
+
+        session.add(
+            RegulationMaterialScope(
+                regulation_id=reg.id,
+                material_id=m.id,
+                scope_type="covered",
+            )
+        )
+        session.add(
+            RegulationGeographyScope(
+                regulation_id=reg.id,
+                country_code="EU",
+                scope_type="jurisdiction",
+            )
+        )
+        session.add(
+            RegulationSourceAlias(
+                source_system="eurlex_celex",
+                source_key=row["celex"],
+                regulation_id=reg.id,
+                is_skipped=False,
+            )
+        )
     session.commit()
-    return out
 
 
 # ---------------------------------------------------------------------------
 # _strip_html
 # ---------------------------------------------------------------------------
+
 
 class TestStripHtml:
     def test_strips_tags(self):
@@ -127,6 +184,7 @@ class TestStripHtml:
 # ---------------------------------------------------------------------------
 # fetch_eurlex_summary
 # ---------------------------------------------------------------------------
+
 
 class TestFetchEurlexSummary:
     def test_returns_stripped_text_on_success(self):
@@ -186,31 +244,36 @@ class TestFetchEurlexSummary:
 
 
 # ---------------------------------------------------------------------------
-# ingest_eurlex — first-run inserts
+# ingest_eurlex — alias-driven refresh
 # ---------------------------------------------------------------------------
 
+
 class TestIngestEurlexFirstRun:
-    def test_inserts_all_manifest_regulations(self, session: Session, seeded_materials):
+    def test_processes_all_seeded_celex_aliases(
+        self, session: Session, seeded_eurlex_context: None
+    ):
         result = ingest_eurlex(session, fetch_summaries=False)
 
-        assert result["inserted"] == len(BATTERY_REGULATIONS)
-        assert result["updated"] == 0
-        assert result["skipped"] == 0
+        n = len(_EURLEX_CELEX_ROWS)
+        assert result["celex_processed"] == n
+        assert result["risk_events_created"] == n
+        assert result["source_documents_attached"] == n
+        assert result["summary_skipped"] == n
+        assert result["summary_backfilled"] == 0
+        assert result["unknown_celex"] == 0
 
-        rows = session.scalars(select(Regulation)).all()
-        assert len(rows) == len(BATTERY_REGULATIONS)
-        keys = {r.regulation_key for r in rows}
-        assert keys == {r["regulation_key"] for r in BATTERY_REGULATIONS}
+        assert len(session.scalars(select(Regulation)).all()) == n
+        assert len(session.scalars(select(SourceDocument)).all()) == n
 
-    def test_inserted_regulations_are_marked_verified(
-        self, session: Session, seeded_materials
+    def test_regulations_remain_verified(
+        self, session: Session, seeded_eurlex_context: None
     ):
         ingest_eurlex(session, fetch_summaries=False)
 
         for r in session.scalars(select(Regulation)).all():
-            assert r.verified is True, f"{r.regulation_key} should be verified=True"
+            assert r.verified is True
 
-    def test_creates_source_row(self, session: Session, seeded_materials):
+    def test_creates_source_row(self, session: Session, seeded_eurlex_context: None):
         ingest_eurlex(session, fetch_summaries=False)
 
         sources = session.scalars(select(Source)).all()
@@ -219,41 +282,30 @@ class TestIngestEurlexFirstRun:
         assert sources[0].source_type == "eurlex"
         assert sources[0].phase == "1"
 
-    def test_creates_source_document_per_regulation(
-        self, session: Session, seeded_materials
+    def test_creates_source_document_per_celex(
+        self, session: Session, seeded_eurlex_context: None
     ):
         ingest_eurlex(session, fetch_summaries=False)
 
         docs = session.scalars(select(SourceDocument)).all()
-        assert len(docs) == len(BATTERY_REGULATIONS)
+        assert len(docs) == len(_EURLEX_CELEX_ROWS)
         for doc in docs:
             assert doc.external_id.startswith("eurlex_")
             assert doc.document_type == "regulation"
             assert doc.metadata_json is not None
             assert "celex" in doc.metadata_json
 
-    def test_creates_material_scope_rows(self, session: Session, seeded_materials):
+    def test_propagates_material_links_to_risk_events(
+        self, session: Session, seeded_eurlex_context: None
+    ):
         result = ingest_eurlex(session, fetch_summaries=False)
 
-        expected_total = sum(len(r["material_scopes"]) for r in BATTERY_REGULATIONS)
-        assert result["material_scopes"] == expected_total
-        assert (
-            session.scalar(
-                select(RegulationMaterialScope).where(
-                    RegulationMaterialScope.id.is_not(None)
-                )
-            )
-            is not None
-        )
-
-    def test_creates_geography_scope_rows(self, session: Session, seeded_materials):
-        result = ingest_eurlex(session, fetch_summaries=False)
-
-        expected_total = sum(len(r["geography_scopes"]) for r in BATTERY_REGULATIONS)
-        assert result["geography_scopes"] == expected_total
+        assert result["material_links_created"] >= len(_EURLEX_CELEX_ROWS)
+        links = session.scalars(select(RiskEventMaterial)).all()
+        assert len(links) >= len(_EURLEX_CELEX_ROWS)
 
     def test_summary_is_none_when_fetch_disabled(
-        self, session: Session, seeded_materials
+        self, session: Session, seeded_eurlex_context: None
     ):
         ingest_eurlex(session, fetch_summaries=False)
 
@@ -265,66 +317,38 @@ class TestIngestEurlexFirstRun:
 # ingest_eurlex — idempotency
 # ---------------------------------------------------------------------------
 
+
 class TestIngestEurlexIdempotency:
-    def test_second_run_skips_all(self, session: Session, seeded_materials):
+    def test_second_run_does_not_duplicate_risk_events_or_documents(
+        self, session: Session, seeded_eurlex_context: None
+    ):
         ingest_eurlex(session, fetch_summaries=False)
         result2 = ingest_eurlex(session, fetch_summaries=False)
 
-        assert result2["inserted"] == 0
-        assert result2["updated"] == 0
-        assert result2["skipped"] == len(BATTERY_REGULATIONS)
-        assert result2["material_scopes"] == 0
-        assert result2["geography_scopes"] == 0
-        assert result2["risk_events"] == 0
-        assert result2["regulation_links"] == 0
+        assert result2["risk_events_created"] == 0
+        assert result2["source_documents_attached"] == 0
+        n = len(_EURLEX_CELEX_ROWS)
+        assert len(session.scalars(select(RiskEvent)).all()) == n
+        assert len(session.scalars(select(RiskEventRegulation)).all()) == n
+        assert len(session.scalars(select(SourceDocument)).all()) == n
 
     def test_second_run_does_not_duplicate_regulations(
-        self, session: Session, seeded_materials
+        self, session: Session, seeded_eurlex_context: None
     ):
         ingest_eurlex(session, fetch_summaries=False)
         ingest_eurlex(session, fetch_summaries=False)
 
-        assert (
-            len(session.scalars(select(Regulation)).all())
-            == len(BATTERY_REGULATIONS)
-        )
-
-    def test_second_run_does_not_duplicate_source_documents(
-        self, session: Session, seeded_materials
-    ):
-        ingest_eurlex(session, fetch_summaries=False)
-        ingest_eurlex(session, fetch_summaries=False)
-
-        assert (
-            len(session.scalars(select(SourceDocument)).all())
-            == len(BATTERY_REGULATIONS)
-        )
-
-    def test_second_run_does_not_duplicate_scopes(
-        self, session: Session, seeded_materials
-    ):
-        ingest_eurlex(session, fetch_summaries=False)
-        ingest_eurlex(session, fetch_summaries=False)
-
-        expected_mat = sum(len(r["material_scopes"]) for r in BATTERY_REGULATIONS)
-        expected_geo = sum(len(r["geography_scopes"]) for r in BATTERY_REGULATIONS)
-        assert (
-            len(session.scalars(select(RegulationMaterialScope)).all())
-            == expected_mat
-        )
-        assert (
-            len(session.scalars(select(RegulationGeographyScope)).all())
-            == expected_geo
-        )
+        assert len(session.scalars(select(Regulation)).all()) == len(_EURLEX_CELEX_ROWS)
 
 
 # ---------------------------------------------------------------------------
-# ingest_eurlex — summary backfill on existing rows
+# ingest_eurlex — summary backfill
 # ---------------------------------------------------------------------------
+
 
 class TestIngestEurlexSummaryBackfill:
     def test_backfills_missing_summary_when_fetch_enabled(
-        self, session: Session, seeded_materials
+        self, session: Session, seeded_eurlex_context: None
     ):
         ingest_eurlex(session, fetch_summaries=False)
 
@@ -334,13 +358,12 @@ class TestIngestEurlexSummaryBackfill:
         ):
             result = ingest_eurlex(session, fetch_summaries=True)
 
-        assert result["updated"] == len(BATTERY_REGULATIONS)
-        assert result["inserted"] == 0
+        assert result["summary_backfilled"] == len(_EURLEX_CELEX_ROWS)
         for r in session.scalars(select(Regulation)).all():
             assert r.summary == "Backfilled preamble text."
 
     def test_does_not_overwrite_existing_summary(
-        self, session: Session, seeded_materials
+        self, session: Session, seeded_eurlex_context: None
     ):
         with patch(
             "app.services.ingestion.eurlex.fetch_eurlex_summary",
@@ -354,15 +377,13 @@ class TestIngestEurlexSummaryBackfill:
         ) as fetch_mock:
             result = ingest_eurlex(session, fetch_summaries=True)
 
-        # No fetch should have been issued since every summary was already populated.
         fetch_mock.assert_not_called()
-        assert result["updated"] == 0
-        assert result["skipped"] == len(BATTERY_REGULATIONS)
+        assert result["summary_backfilled"] == 0
         for r in session.scalars(select(Regulation)).all():
             assert r.summary == "Original preamble."
 
     def test_failed_summary_fetch_does_not_break_run(
-        self, session: Session, seeded_materials
+        self, session: Session, seeded_eurlex_context: None
     ):
         with patch(
             "app.services.ingestion.eurlex.fetch_eurlex_summary",
@@ -370,89 +391,54 @@ class TestIngestEurlexSummaryBackfill:
         ):
             result = ingest_eurlex(session, fetch_summaries=True)
 
-        assert result["inserted"] == len(BATTERY_REGULATIONS)
+        assert result["summary_backfilled"] == 0
         for r in session.scalars(select(Regulation)).all():
             assert r.summary is None
 
 
 # ---------------------------------------------------------------------------
-# Manifest data validation
+# Fixture data validation
 # ---------------------------------------------------------------------------
 
-class TestManifestData:
+
+class TestEurlexFixtureData:
     def test_unique_regulation_keys(self):
-        keys = [r["regulation_key"] for r in BATTERY_REGULATIONS]
-        assert len(keys) == len(set(keys)), "regulation_key values must be unique"
+        keys = [r["regulation_key"] for r in _EURLEX_CELEX_ROWS]
+        assert len(keys) == len(set(keys))
 
     def test_unique_celex_numbers(self):
-        celex = [r["celex"] for r in BATTERY_REGULATIONS]
-        assert len(celex) == len(set(celex)), "CELEX numbers must be unique"
-
-    def test_required_keys_present(self):
-        required = {
-            "regulation_key", "celex", "title", "issuing_body", "geography",
-            "status", "publication_date", "effective_date", "policy_theme",
-            "material_scopes", "geography_scopes",
-        }
-        for r in BATTERY_REGULATIONS:
-            missing = required - set(r.keys())
-            assert not missing, f"{r.get('regulation_key')} missing keys: {missing}"
-
-    def test_publication_date_before_effective_date(self):
-        for r in BATTERY_REGULATIONS:
-            assert r["publication_date"] <= r["effective_date"], (
-                f"{r['regulation_key']}: publication_date must precede effective_date"
-            )
+        celex = [r["celex"] for r in _EURLEX_CELEX_ROWS]
+        assert len(celex) == len(set(celex))
 
     def test_url_template_renders(self):
-        for r in BATTERY_REGULATIONS:
+        for r in _EURLEX_CELEX_ROWS:
             url = EURLEX_HTML_URL.format(celex=r["celex"])
             assert url.startswith("https://eur-lex.europa.eu/")
             assert f"CELEX:{r['celex']}" in url
-
-    def test_scope_types_valid(self):
-        # "strategic_raw_material" is used by CRMA Annex II designations.
-        valid_material = {
-            "covered", "restricted", "banned", "disclosure_required",
-            "strategic_raw_material",
-        }
-        valid_geography = {"jurisdiction", "origin_country", "targeted_country"}
-        for r in BATTERY_REGULATIONS:
-            for _, scope_type in r["material_scopes"]:
-                assert scope_type in valid_material, (
-                    f"{r['regulation_key']}: invalid material scope_type {scope_type!r}"
-                )
-            for _, scope_type in r["geography_scopes"]:
-                assert scope_type in valid_geography, (
-                    f"{r['regulation_key']}: invalid geography scope_type {scope_type!r}"
-                )
 
 
 # ---------------------------------------------------------------------------
 # ingest_eurlex — risk event generation
 # ---------------------------------------------------------------------------
 
-class TestIngestEurlexRiskEvents:
-    """Verify that ingest_eurlex generates RiskEvent + RiskEventRegulation rows."""
 
+class TestIngestEurlexRiskEvents:
     def test_creates_one_risk_event_per_regulation(
-        self, session: Session, seeded_materials
+        self, session: Session, seeded_eurlex_context: None
     ):
         result = ingest_eurlex(session, fetch_summaries=False)
 
-        assert result["risk_events"] == len(BATTERY_REGULATIONS)
-        assert result["regulation_links"] == len(BATTERY_REGULATIONS)
-
+        assert result["risk_events_created"] == len(_EURLEX_CELEX_ROWS)
         events = session.scalars(select(RiskEvent)).all()
-        assert len(events) == len(BATTERY_REGULATIONS)
+        assert len(events) == len(_EURLEX_CELEX_ROWS)
 
-    def test_risk_event_fields(self, session: Session, seeded_materials):
+    def test_risk_event_fields(self, session: Session, seeded_eurlex_context: None):
         ingest_eurlex(session, fetch_summaries=False)
 
         events = session.scalars(select(RiskEvent)).all()
         for ev in events:
             assert ev.event_type == "REGULATORY_IMPLEMENTATION"
-            assert ev.event_date is None, "Standing regulations use event_date=None"
+            assert ev.event_date is None
             assert ev.confidence_score == 1.0
             assert ev.verified is True
             assert ev.risk_categories_json == ["regulatory_compliance"]
@@ -463,65 +449,62 @@ class TestIngestEurlexRiskEvents:
             assert "regulation_key" in ev.metadata_json
             assert "celex" in ev.metadata_json
 
-    def test_severity_calibrated_by_status(self, session: Session, seeded_materials):
+    def test_severity_calibrated_by_status(self, session: Session, seeded_eurlex_context: None):
         ingest_eurlex(session, fetch_summaries=False)
 
         events = {ev.metadata_json["regulation_key"]: ev for ev in session.scalars(select(RiskEvent)).all()}
-        for reg in BATTERY_REGULATIONS:
-            ev = events[reg["regulation_key"]]
-            expected = _SEVERITY_BY_STATUS.get(reg["status"], 0.35)
-            assert ev.severity_score == pytest.approx(expected), (
-                f"{reg['regulation_key']}: expected severity {expected}, got {ev.severity_score}"
-            )
+        for row in _EURLEX_CELEX_ROWS:
+            ev = events[row["regulation_key"]]
+            expected = SEVERITY_BY_STATUS.get(row["status"], 0.35)
+            assert ev.severity_score == pytest.approx(expected)
 
     def test_risk_event_linked_to_correct_regulation(
-        self, session: Session, seeded_materials
+        self, session: Session, seeded_eurlex_context: None
     ):
         ingest_eurlex(session, fetch_summaries=False)
 
         junctions = session.scalars(select(RiskEventRegulation)).all()
-        assert len(junctions) == len(BATTERY_REGULATIONS)
+        assert len(junctions) == len(_EURLEX_CELEX_ROWS)
 
         for junction in junctions:
             assert junction.relevance_score == pytest.approx(1.0)
             assert junction.match_reason == "regulation_enacted"
-            # FK integrity: regulation must exist
             reg = session.get(Regulation, junction.regulation_id)
             assert reg is not None
-            # FK integrity: risk event must exist
             ev = session.get(RiskEvent, junction.risk_event_id)
             assert ev is not None
 
-    def test_effective_date_in_metadata(self, session: Session, seeded_materials):
+    def test_effective_date_in_metadata(self, session: Session, seeded_eurlex_context: None):
         ingest_eurlex(session, fetch_summaries=False)
 
         events_by_key = {
-            ev.metadata_json["regulation_key"]: ev
-            for ev in session.scalars(select(RiskEvent)).all()
+            ev.metadata_json["regulation_key"]: ev for ev in session.scalars(select(RiskEvent)).all()
         }
-        for reg in BATTERY_REGULATIONS:
-            ev = events_by_key[reg["regulation_key"]]
-            if reg.get("effective_date") is not None:
-                assert "effective_date" in ev.metadata_json, (
-                    f"{reg['regulation_key']}: effective_date should be in metadata_json"
-                )
-                assert ev.metadata_json["effective_date"] == reg["effective_date"].isoformat()
+        for row in _EURLEX_CELEX_ROWS:
+            ev = events_by_key[row["regulation_key"]]
+            assert "effective_date" in ev.metadata_json
+            assert ev.metadata_json["effective_date"] == row["effective_date"].isoformat()
 
     def test_second_run_does_not_duplicate_risk_events(
-        self, session: Session, seeded_materials
+        self, session: Session, seeded_eurlex_context: None
     ):
         ingest_eurlex(session, fetch_summaries=False)
-        result2 = ingest_eurlex(session, fetch_summaries=False)
+        ingest_eurlex(session, fetch_summaries=False)
 
-        assert result2["risk_events"] == 0
-        assert result2["regulation_links"] == 0
-        assert len(session.scalars(select(RiskEvent)).all()) == len(BATTERY_REGULATIONS)
-        assert len(session.scalars(select(RiskEventRegulation)).all()) == len(BATTERY_REGULATIONS)
+        assert len(session.scalars(select(RiskEvent)).all()) == len(_EURLEX_CELEX_ROWS)
+        assert len(session.scalars(select(RiskEventRegulation)).all()) == len(_EURLEX_CELEX_ROWS)
 
     def test_content_hash_unique_across_regulations(
-        self, session: Session, seeded_materials
+        self, session: Session, seeded_eurlex_context: None
     ):
         ingest_eurlex(session, fetch_summaries=False)
 
         hashes = [ev.content_hash for ev in session.scalars(select(RiskEvent)).all()]
-        assert len(hashes) == len(set(hashes)), "content_hash must be unique per regulation event"
+        assert len(hashes) == len(set(hashes))
+
+
+class TestIngestEurlexEmptyAliases:
+    def test_no_aliases_returns_zero_counts(self, session: Session) -> None:
+        result = ingest_eurlex(session, fetch_summaries=False)
+        assert result["celex_processed"] == 0
+        assert result["risk_events_created"] == 0

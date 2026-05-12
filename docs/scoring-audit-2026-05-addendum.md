@@ -1,6 +1,6 @@
 # Scoring Engine Audit — Ingester Coverage Addendum
 
-> **Date:** 2026-05-05 (last status update 2026-05-06)
+> **Date:** 2026-05-05 (last status update 2026-05-11)
 > **Scope:** Line-by-line review of every ingester against the post-Phase-B
 > HS-code matching infrastructure (alias resolver + word-bounded MaterialCache
 > with inverse-frequency weighting, partner CSV-derived keyword expansion,
@@ -31,9 +31,9 @@ have landed.  Updated table:
 | G4a — MRDS auto-stage | P1 open | **Resolved (= N4).** |
 | G4 Half 1 — Operational pillar stage-awareness | Not yet scoped | **Resolved (2026-05-06).** Stage-aware structural_dependency lands. Per-stage breakdown in rationale_json. No default-fill for missing stages. |
 | G4b — GEM Iron Ore Mines | P1 open | Still open. Bounded scope (LFP/iron-ore only). |
-| G4c — Partner-curated facility seed | P1 open | **In progress.** Partner committed to providing a list. Loader code waiting on partner data. |
+| G4c — Partner-curated facility seed | P1 open | **Engineering: LANDED 2026-05-09.** Loader (`seed_facilities_partner.py`) + CLI + synthetic test (9/9). XLSX template at `Automotive Data Solutions/facility_seed_template.xlsx`. Data still pending — partner is filling in the launch-list materials. |
 | G4d — Paid subscription | P1 future | Still future. |
-| G6 — `_STAGE_ROLLUP_MIN_NODES = 2` | P1 open | Still open. Needs telemetry first. |
+| G6 — `_STAGE_ROLLUP_MIN_NODES = 2` | P1 open | **Resolved 2026-05-09.** Threshold lowered to 1. Measurement against launch-10 showed 22/36 (61%) of pairs were falling to legacy fallback at threshold=2. Single-node rollup math is identity (`(node × stage_weight) / stage_weight = node`); Option-1 fallback covers the no-data case. |
 | G7 — Equal-weight fallback measurement | P0 (deferred) | **Resolved.** `coverage.py::report_hs_coverage()` provides the aggregate. Also fixed `banned` scope_type missing from `_SCOPE_TYPE_WEIGHT`. |
 | G8 — `_trade_weights` single-period fragility | P2 | **Resolved (2026-05-06).** 3-year rolling annual / 12-month rolling monthly. Also fixed mixed-period bug where Census `YYYY-MM` lex-won over Comtrade `YYYY`, silently zeroing non-US weights. |
 | G9 — `commodity_prices.hs_mapping_id` / `price_form` | P2 | **Resolved** (verified 2026-05-06). Pink Sheet ingester now writes both columns via `_HEADER_TO_HS_PREFIX` (11 headers, covers LME-convention metals + battery-grade lithium). Bare-metal headers (Graphite, Manganese without "ore") correctly get NULL — Pink Sheet doesn't disclose the form. |
@@ -296,7 +296,8 @@ add a `RiskEventHsMapping` write next to the existing
 > `_facility_structural_dependency` in `market_aggregator.py` is now
 > stage-aware and rolls up via `STAGE_ROLLUP_WEIGHTS` with no default-
 > fill.  Remaining: G4b (GEM Iron Ore) / G4c (partner-curated seed —
-> in progress) / G4d (paid sub).  Original analysis preserved.
+> loader landed 2026-05-09, awaiting partner data) / G4d (paid sub).
+> Original analysis preserved.
 
 **Where:** `app/services/ingestion/mrds.py`. Writes `Facility` and
 `FacilityMaterialLink` rows. The `hs_mapping_id` field exists (×2
@@ -377,18 +378,25 @@ ranked by feasibility:**
   Populates stage for the US-focused subset of MRDS-ingested facilities.
 * **G4b — GEM Iron Ore Mines ingester.** Small, one-off.  Closes the
   iron-ore (LFP) part of the gap with free open data.  Worth doing.
-* **G4c — Manually curated battery-grade facility seed.** Partner
-  labour: list known facilities for Li, Co, Ni, graphite, REE
-  conversion / anode / cathode / cell production.  Pair with a seed
-  file for `facility_material_links` rows including stage.  Coverage
-  bounded by partner knowledge but free.
+* **G4c — Partner-curated battery-grade facility seed.** Engineering
+  landed 2026-05-09: `seed_facilities_partner.py` reads a partner-edited
+  XLSX (`Automotive Data Solutions/facility_seed_template.xlsx`) and
+  upserts companies → facilities → company_facilities →
+  facility_material_links with full stage / HS-mapping / ownership
+  capture. CLI: `bdi-ingest seed-facilities-partner <file>` (with
+  `--dry-run` for preview). Partner labour ongoing — list known
+  facilities for Li, Co, Ni, graphite, REE conversion / anode / cathode
+  / cell production. Coverage bounded by partner knowledge but free.
 * **G4d — Paid subscription** (Benchmark / S&P / Wood Mackenzie).
   Defer until business case justifies it.  Probably $30–80k/yr at
   startup tier; comprehensive global stage-aware coverage.
 
-**Until at least one of G4a–G4d ships, the operational pillar's
-stage-aware path stays NULL.  The G5 audit gap (no operational
-sub-score in hs_node_scorer composite) remains blocked on this.**
+**G4a + G4c engineering have shipped.** The operational pillar's
+stage-aware path now has a complete code path; what's still NULL in
+prod is downstream of the partner data not yet being entered. The G5
+audit gap (no operational sub-score in hs_node_scorer composite) is
+unblocked from a code-prerequisites standpoint and can be wired up as
+soon as the partner seeds her first batch of facilities.
 
 ---
 
@@ -519,7 +527,8 @@ a row not feeding a pillar isn't always a gap.
 
 The Operational pillar now has stage-aware coverage from MRDS via the
 2026-05-06 N4/G4 Half 1 fixes.  Coverage is mining-heavy — refining-stage
-data is thin until G4c (partner-curated facility seed, in progress) lands.
+data is thin until partner facility data is entered into the G4c
+loader (engineering shipped 2026-05-09; data entry ongoing).
 Materials whose true bottleneck is refining (Li hydroxide, NMC precursor,
 separated REEs) currently show ore-stage-only signals at the operational
 pillar; this is honest representation of the data gap rather than a
@@ -545,24 +554,40 @@ Items completed since 2026-05-03 omitted.
 - ~~G8 — Multi-period trade weighting + mixed-period bug~~ → 3-yr annual / 12-mo monthly rolling, separated by granularity
 - ~~G9 — Pink Sheet `hs_mapping_id` / `price_form`~~ → 11 LME-convention headers wired
 - ~~G11 — Country-scope HS node event filter~~ → Path B Scope 2 with affected/primary geography_context
+- ~~G6 — `_STAGE_ROLLUP_MIN_NODES` over-triggers fallback~~ (resolved 2026-05-09) → threshold lowered to 1 after measurement showed 61% fallback firing rate
+- ~~G5 — HS node operational sub-score~~ (resolved 2026-05-09) → 4-component composite `0.40×HHI + 0.20×tariff + 0.20×export + 0.20×operational` when facility capacity data is present; auto-fallback to 3-component formula otherwise. Five `score_method` values (`hhi_anchored`, `hhi_anchored_with_operational`, `event_only_no_hhi`, `event_only_with_operational`, `operational_only`).  Synthetic test `test_g5_operational_subscore.py` covers all paths.
+- ~~G-Cov-3 — EXPORT_SUBSIDY event_subtype + geopolitical sub-input~~ (resolved 2026-05-09) → GTA classifies 11 subsidy intervention types, IEA tags INVESTMENT_PLEDGE events, classifier returns 3-bucket split (export/tariff/subsidy), Geopolitical pillar runs 4-component profile (`0.40 × country_concentration + 0.30 × export + 0.20 × tariff + 0.10 × subsidy_distortion`) when subsidy data present.  Synthetic test `test_gcov_3_export_subsidy.py` covers parser, classifier, and 3-vs-4-component math.
+- ~~Tier 1.4-extension — GTA / Comtrade confidence threading~~ (resolved 2026-05-09) → `_resolve_material_id` extended to return `(material_id, hs_mapping_id, confidence)`. GTA event-write loop scales `RiskEventMaterial.relevance_score` and `RiskEventHsMapping.relevance_score` by mapping confidence (best-route-wins when a material has multiple HS-code routes in the same event).  `trade_signal_builder._get_annual_totals` and `global_rollup._aggregate_trade_values_for_material` apply `COALESCE(HsCodeMaterialMapping.confidence, 1.0)` as a multiplier on `TradeFlow.trade_value_usd` so country shares reflect mapping confidence (legacy NULL rows fall through at 1.0).  Census trade already threaded via Tier 1.4 in `pipeline.py`.
+- ~~EUR-Lex under-attribution — RegulationMaterialScope → RiskEventMaterial junctions~~ (resolved 2026-05-09) → `eurlex.ingest_eurlex` now writes `RiskEventMaterial` rows from `RegulationMaterialScope` on every newly-emitted event, with relevance keyed off `scope_type` (`banned`=1.00, `restricted`=0.90, `covered`=0.80, `disclosure_required`=0.70). Backfill helper `backfill_regulation_event_materials` adds junctions to pre-existing EUR-Lex events that lack them — idempotent on re-run.  Synthetic test `test_confidence_and_eurlex_attribution.py` covers CT.1–CT.3 + EL.1–EL.2 (5 groups, all pass).
+- ~~pipeline._add_risk_event dedup gap~~ (resolved 2026-05-09) → Census trade events through `pipeline.py._add_risk_event` were inserted without `content_hash` and without an existence check, so every re-run produced duplicate RiskEvent rows. Function now computes `content_hash = sha256(f"{title}|{summary}|{event_date_iso}")` per the standard pattern and returns the existing row when the hash matches. Synthetic test `test_pipeline_dedup.py` (4 groups).
+- ~~Operational tooling — `reset-events` + `reingest-all-events` CLI commands~~ (added 2026-05-09) → `bdi-ingest reset-events --yes` truncates risk_events + 5 junction tables in FK-safe order while preserving source_documents (so re-ingest skips cached fetches). `bdi-ingest reingest-all-events` orchestrates the full re-ingest workflow in dependency order (EUR-Lex → GTA → IEA → OpenSanctions → Federal Register → SEC EDGAR → build-trade-signals). Optional `--reset` flag combines both. Skips ingest-comtrade (confidence weighting applies at query time, re-fetch costs API quota). Dry-run via `--dry-run` on reset-events shows row counts that would be deleted.
+- ~~tests/test_comtrade.py drift~~ (fixed 2026-05-09) → The TestResolveMatertialId class expected the pre-Phase-1.5 single-int return signature. Updated to match the current 3-tuple `(material_id, hs_mapping_id, confidence)` signature plus the `dict[str, list[tuple[int, float, int]]]` mock map shape. Now 40/40 passing including new coverage for confidence-flow-through and tied-confidence-returns-None.
+- ~~TradeFlow.hs_mapping_id backfill~~ (added 2026-05-09) → `bdi-ingest backfill-trade-flow-hs-mappings` re-resolves rows where `material_id IS NOT NULL AND hs_mapping_id IS NULL` (pre-Phase-1.5 rows that lost the FK). Match → UPDATE; material drift (resolved ≠ stored) → logged + left untouched (never silently rewrites material_id). Cursor-paginates by id to avoid re-counting leftover unresolvable rows. Idempotent. Synthetic test `test_trade_flow_backfill.py` (5 groups).
+- ~~Comtrade reattribution after seed expansion~~ (added 2026-05-09) → Sister command `bdi-ingest reattribute-unmapped-trade-flows` covers the inverse case: rows with `material_id IS NULL`. Writes BOTH material_id and hs_mapping_id when the current seed gives an answer. Logs at WARNING per row (vs DEBUG for backfill) because this IS a data change, not just FK fill-in. Used after expanding `hs_code_material_mappings`. Synthetic test `test_reattribute_unmapped_trade_flows.py` (7 groups).
+- ~~Top-3 unresolved HS prefix coverage~~ (added 2026-05-11) → 6 new mappings added to `seed_hs_mappings.py` covering the high-volume unresolved prefixes from the dev-DB diagnostic: `720250 → Chromium` (only missing 7202 subheading), `281810 / 281830 / 2818 → Aluminum` (Alumina chapter), `262030 → Copper` and `262040 → Aluminum` (battery recycling slag).  Diagnostic confirmed 32 of 274 unresolved trade_flows rows recovered; remaining 242 are noise prefixes (3206 / 2915 / 3818 / 2615 / etc.).  **Conflict flag preserved in seed comments:** the new `262040 → Aluminum @ 1.0` dominates the existing `262040 → Vanadium @ 0.9` entry (Vanadium classification dates from pre-WCO-2022 interpretation; partner review pending).  Synthetic test `test_hs_seed_unresolved_coverage.py` (7 groups).
+- ~~N5 decision — 10-digit HTS keyword coverage~~ (decided 2026-05-11) → **Won't fix; keep current implementation.** Diagnostic over 206 10-digit rows in the dev DB showed 72 (35%) carry information the 6-digit path can't recover: 17 REE disambiguation cases (Dy / Tb / Nd / Pr separated from generic REE), 7 non-REE UNIQUE_ATTRIBUTION cases under multi-metal 6-digit prefixes, 21 RECOVERS_FROM_AMBIGUITY cases where 6-digit returns None. Plus 27 CONFIDENCE_DELTA_ONLY cases tightening attribution via Tier 1.4 confidence threading. The current resolver (longest-prefix match, 10 → 6 → 4) handles all these correctly without modification. No design change needed. Diagnostic script at `Automotive Data Solutions/diagnose_10digit_hs_coverage.py` for future audits.
+- ~~Parameter-stable content_hash + UPSERT~~ (resolved 2026-05-11) → `trade_signal_builder` and `opensanctions` ingesters used title-based `content_hash` where the title encoded mutable values (percentage in trade signals, sanctioned-entity count in OpenSanctions geo events, `event_date=now()` in OpenSanctions company events). Re-running after a logic change produced new rows alongside the prior ones. Switched all three to parameter-stable identifiers: `f"{event_subtype}\|material_id={mid}\|country={cc}\|year={yr}"` for trade signals; `f"opensanctions_company\|company_id={uuid}"` and `f"opensanctions_geo\|country={iso2}"` for sanctions. On stable-hash match the existing row is UPDATEd in place — title / severity / summary / metadata refreshed, material + HS junctions rewritten (delete + re-insert), company junctions left alone (partial-rewrite per audit decision). `RiskEvent.updated_at` column added via migration 041 with `onupdate=func.now()` so the most-recent-update timestamp is queryable. Also fixed `build_trade_risk_event` to derive event_date from the `period` parameter (`YYYY-MM` / `YYYYMM` / `YYYY`) instead of `now()` so census trade re-runs hit the pipeline dedup correctly. Synthetic test `test_parameter_stable_upsert.py` (6 groups, all pass).
+- ~~NFI/IFI multiplier recalibration~~ (PARKED 2026-05-11) → Survey of dev-DB data (29 NFI + 4 IFI events) drafted; calibration values (NFI=0.75, IFI=0.50) recommended based on structural reasoning (single-country state finance less binding than tariffs; multilateral development bank financing exempt under WTO Subsidies Agreement). Held pending partner input on whether the domain framing matches. Survey script at `Automotive Data Solutions/diagnose_gta_nfi_ifi.py`. Will land once partner confirms.
 
 ### P1 — open
 
-- **G6 — Lower `_STAGE_ROLLUP_MIN_NODES` to 1, OR add per-pair fallback telemetry.** Needs measurement first; not a code fix yet.
 - **G4b — GEM Iron Ore Mines ingester** (small, iron-ore-only — relevant to LFP cathode).
-- **G4c — Manually curated battery-grade facility seed** — **IN PROGRESS**, partner committed to providing list.
+- **G4c — Partner-curated facility seed.**
+   - **Engineering: LANDED 2026-05-09.** `app/services/ingestion/seed_facilities_partner.py` (loader) + CLI `bdi-ingest seed-facilities-partner <file>` + synthetic test (`Automotive Data Solutions/test_g4c_partner_facility_loader.py`, 9/9 assertions). Partner template at `Automotive Data Solutions/facility_seed_template.xlsx`.
+   - **Data: still pending.** Partner is filling in the launch-list materials (Lithium / Cobalt / Nickel / Graphite / Phosphate / Copper / REE + Manganese / Aluminum / Tungsten as recommended adds). Phosphate has zero facilities currently — flagged as a launch-blocker for that mineral.
+   - **G5 operational sub-score is auto-gated on this data.** Until facility rows with non-NULL `annual_capacity_tpy` exist for a (material × stage × country) tuple, the scorer falls back to the 3-component formula for that tuple — no error, just lower informational content.
 - **G4d — Paid subscription** (Benchmark / S&P / Wood Mackenzie) — deferred until business case justifies it.
 
 ### P2 — backlog
 
 - **N3-news follow-up — wire MaterialCache + junctions when a real news provider replaces StubNewsProvider.** Zero impact today.
 - **N5 — 10-digit HTS keyword coverage** (or accept HS-code-only longest-prefix routing as the design).
-- **EXPORT_SUBSIDY / TRADE_FINANCE event_subtype** — newly surfaced 2026-05-06 from decoding GTA's NFI/IFI implementation_level codes (306 of 1728 battery interventions are subsidy-type, currently get event_subtype=NULL and skip HS-node sub-scores). Distinct scoring question (subsidy distortion vs sourcing risk) — new sub-score, not a fix.
+- ~~EXPORT_SUBSIDY / TRADE_FINANCE event_subtype~~ — closed by G-Cov-3 (resolved 2026-05-09). See resolved-items list above.
 - **US-dependency tier scoring** (NIR + apparent consumption + import-source HHI) — **deferred per partner consultation**.
 - **Dynamic HCG derivation** — `evidence_query.py:81` still hardcoded as `frozenset({"CN","CD","RU"})`; supply_chain_contexts.high_concentration_geos column unused.
 - **WGI / structural country governance baseline.**
 - **USITC HTS structural tariff baseline.**
-- **Decode GTA NFI/IFI implementation_level codes** — currently default to 1.0× multiplier (12.8% of battery interventions). Decoded 2026-05-06: NFI = National Financial Institution (EXIM banks etc), IFI = International Financial Institution (EIB/World Bank etc). Both classes are subsidy-type events that don't reach HS-node sub-scores, so the multiplier doesn't currently matter — but it'll need recalibration if/when EXPORT_SUBSIDY subtype lands.
+- **GTA NFI/IFI multiplier recalibration** — PARKED pending partner input (see resolved-items list above). Survey + recommended values (NFI=0.75, IFI=0.50) drafted; will land once partner confirms framing.
 
 ### P3 — watch list
 

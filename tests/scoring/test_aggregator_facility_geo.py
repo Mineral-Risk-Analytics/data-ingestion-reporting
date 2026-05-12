@@ -52,6 +52,7 @@ def _event(
         confidence_score=confidence,
         metadata_json=metadata,
         event_date=ev_dt,
+        event_subtype=subtype,
     )
     return EventWithRelevance(event=ev, relevance_score=1.0)
 

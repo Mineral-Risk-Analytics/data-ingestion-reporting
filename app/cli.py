@@ -369,23 +369,52 @@ def ingest_usgs_cmd(
                         shares_written += 1
 
             # ── Per-HS-node global production shares ─────────────────────
-            # Sub-type splits (Silicon ferrosilicon vs metal, Copper mine vs
-            # refinery).  Looks up hs_mapping_id via (material_id, prefix,
-            # scope='global') and upserts into hs_code_production_shares.
+            # Two lookup modes (refactored 2026-05-09):
+            #
+            #   Stage-based: parser emits ``stage`` and empty ``hs_code_prefix``.
+            #     Looks up by (material_id, supply_chain_stage, scope=global)
+            #     preferring the lowest digit_count (most general HS prefix
+            #     for that stage).  Used for auto-detected mine/smelter/
+            #     refinery/alumina rows — the bulk of MCS data.
+            #
+            #   Prefix-based: parser emits explicit ``hs_code_prefix``.
+            #     Looks up by (material_id, prefix, scope=global).  Used for
+            #     sub-type overrides where multiple HS prefixes share a stage
+            #     (Silicon ferrosilicon vs silicon metal — both refined).
             for hs_share in hs_production_shares:
-                hs_prefix = hs_share["hs_code_prefix"]
-                hs_mapping = s.scalar(
-                    select(HsCodeMaterialMapping).where(
-                        HsCodeMaterialMapping.material_id == material.id,
-                        HsCodeMaterialMapping.hs_code_prefix == hs_prefix,
-                        HsCodeMaterialMapping.market_scope == "global",
+                hs_prefix = hs_share.get("hs_code_prefix") or ""
+                stage = hs_share.get("stage")
+                hs_mapping = None
+                if hs_prefix:
+                    hs_mapping = s.scalar(
+                        select(HsCodeMaterialMapping).where(
+                            HsCodeMaterialMapping.material_id == material.id,
+                            HsCodeMaterialMapping.hs_code_prefix == hs_prefix,
+                            HsCodeMaterialMapping.market_scope == "global",
+                        )
                     )
-                )
+                elif stage:
+                    # Stage-based: prefer the lowest digit_count (most
+                    # general 4-digit prefix) so production data lands on
+                    # the canonical stage prefix rather than a sub-prefix.
+                    hs_mapping = s.scalar(
+                        select(HsCodeMaterialMapping).where(
+                            HsCodeMaterialMapping.material_id == material.id,
+                            HsCodeMaterialMapping.supply_chain_stage == stage,
+                            HsCodeMaterialMapping.market_scope == "global",
+                        )
+                        .order_by(HsCodeMaterialMapping.digit_count.asc())
+                        .limit(1)
+                    )
                 if hs_mapping is None:
                     hs_shares_skipped_no_mapping += 1
+                    qualifier = (
+                        f"prefix={hs_prefix!r}" if hs_prefix
+                        else f"stage={stage!r}"
+                    )
                     typer.echo(
                         f"  [skip] no hs_code_material_mappings row for "
-                        f"({material.canonical_name!r}, {hs_prefix!r}, global) — "
+                        f"({material.canonical_name!r}, {qualifier}, global) — "
                         f"run seed-hs-mappings first",
                         err=True,
                     )
@@ -1393,6 +1422,156 @@ def ingest_comtrade_cmd(
         s.close()
 
 
+@app.command("backfill-trade-flow-hs-mappings")
+def backfill_trade_flow_hs_mappings_cmd(
+    batch_size: int = typer.Option(
+        2000,
+        "--batch-size",
+        help="Number of TradeFlow rows to fetch and update per pass.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "If set, count rows that WOULD be updated without modifying any "
+            "data.  Pass --no-dry-run (default) to actually write."
+        ),
+    ),
+) -> None:
+    """Populate ``TradeFlow.hs_mapping_id`` for rows missing it.
+
+    Migration 027 added the ``hs_mapping_id`` column but rows ingested
+    before then have it set to NULL.  After the 2026-05-09 confidence-
+    weighting changes those NULL rows fall through at confidence=1.0 via
+    ``COALESCE``, masking the very signal the weighting exists to expose.
+
+    This command re-resolves each affected row's HS code against the
+    current ``hs_code_material_mappings`` and:
+
+      * Updates ``hs_mapping_id`` when the resolved material matches the
+        row's stored ``material_id``.
+      * Logs (does NOT touch) rows where the resolved material differs
+        from the stored one — that's mapping drift, surfaced for review.
+      * Logs and skips rows whose HS code no longer resolves at all.
+
+    Idempotent: re-running after a successful pass is a no-op because the
+    filter excludes rows that already have ``hs_mapping_id`` set.
+
+    Use ``--dry-run`` to see how many rows would change without writing.
+    """
+    from app.services.ingestion.comtrade import backfill_trade_flow_hs_mappings
+    from app.models.supply import TradeFlow
+    from sqlalchemy import select, func as sqlfunc
+
+    s = _session()
+    try:
+        if dry_run:
+            # Count without mutating: same filter the backfill uses.
+            null_rows = s.scalar(
+                select(sqlfunc.count())
+                .select_from(TradeFlow)
+                .where(
+                    TradeFlow.hs_mapping_id.is_(None),
+                    TradeFlow.material_id.is_not(None),
+                )
+            )
+            typer.echo(json.dumps({
+                "ok": True,
+                "dry_run": True,
+                "candidate_rows": int(null_rows or 0),
+                "hint": "drop --dry-run to actually write",
+            }, indent=2))
+            return
+
+        result = backfill_trade_flow_hs_mappings(s, batch_size=batch_size)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2, default=str))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("reattribute-unmapped-trade-flows")
+def reattribute_unmapped_trade_flows_cmd(
+    batch_size: int = typer.Option(
+        2000,
+        "--batch-size",
+        help="Number of TradeFlow rows to fetch and update per pass.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "If set, count rows that WOULD be examined without modifying "
+            "any data.  Pass --no-dry-run (default) to actually write."
+        ),
+    ),
+) -> None:
+    """Re-resolve TradeFlow rows whose ``material_id`` is NULL.
+
+    Use this after expanding ``hs_code_material_mappings`` (via
+    ``bdi-ingest seed-hs-mappings --force``) to pick up the new mappings
+    against historical TradeFlow rows that were previously unresolvable.
+
+    Sister command to ``backfill-trade-flow-hs-mappings``:
+
+      backfill-trade-flow-hs-mappings
+        Fills in ``hs_mapping_id`` for rows that already have
+        ``material_id`` set.  Conservative — never overwrites attribution.
+
+      reattribute-unmapped-trade-flows (this command)
+        Writes BOTH ``material_id`` and ``hs_mapping_id`` for rows where
+        the previous resolution produced None and the current seed gives
+        a valid answer.  Safe — only adds attribution to previously-
+        unattributed rows; nothing existing gets overwritten.  Logged at
+        WARNING per row so the data trail is discoverable.
+
+    Idempotent.  After running, the rows that now have ``material_id``
+    set fall off the NULL filter.  Genuinely unresolvable rows (HS code
+    still doesn't map to anything) are re-examined on subsequent runs
+    but produce zero updates.
+
+    Re-run scoring after this completes (``rescore-market``,
+    ``rescore-global-rollups``) so the new attribution flows through.
+
+    Use ``--dry-run`` to see how many rows would be examined.
+    """
+    from app.services.ingestion.comtrade import (
+        reattribute_unmapped_trade_flows,
+    )
+    from app.models.supply import TradeFlow
+    from sqlalchemy import select, func as sqlfunc
+
+    s = _session()
+    try:
+        if dry_run:
+            null_rows = s.scalar(
+                select(sqlfunc.count())
+                .select_from(TradeFlow)
+                .where(TradeFlow.material_id.is_(None))
+            )
+            typer.echo(json.dumps({
+                "ok": True,
+                "dry_run": True,
+                "candidate_rows": int(null_rows or 0),
+                "hint": (
+                    "drop --dry-run to actually re-resolve.  Some of these "
+                    "may still be unresolvable after running — that's "
+                    "expected for HS prefixes the seed doesn't cover."
+                ),
+            }, indent=2))
+            return
+
+        result = reattribute_unmapped_trade_flows(s, batch_size=batch_size)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2, default=str))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("ingest-opensanctions")
 def ingest_opensanctions_cmd(
     url: Optional[str] = typer.Option(
@@ -1473,6 +1652,74 @@ def seed_facilities_cmd() -> None:
     try:
         result = seed_facilities(s)
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("seed-facilities-partner")
+def seed_facilities_partner_cmd(
+    xlsx_path: str = typer.Argument(
+        ...,
+        help="Path to the partner-curated facility XLSX template "
+             "(see facility_seed_template.xlsx).",
+    ),
+    sheet: str = typer.Option(
+        "Facility Seed", "--sheet",
+        help="Sheet name within the workbook.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Validate + report without committing any changes.",
+    ),
+    include_examples: bool = typer.Option(
+        False, "--include-examples",
+        help="Load the Albemarle/Mineral Resources example rows. "
+             "Off by default so partners can keep them as documentation.",
+    ),
+) -> None:
+    """Load a partner-curated facility seed spreadsheet (G4c).
+
+    Reads ``Facility Seed`` sheet from the provided XLSX and upserts:
+        companies → facilities → company_facilities → facility_material_links
+
+    Idempotent: re-running on the same file is a no-op for unchanged rows.
+    JV facilities (multiple companies on the same site) are captured by
+    repeating the facility row for each owner with their respective
+    ownership_pct.
+
+    \b
+    Run order to close the operational pillar:
+      bdi-ingest seed-materials                       # canonical materials
+      bdi-ingest seed-hs-mappings                     # HS code mappings
+      bdi-ingest seed-facilities-partner <file.xlsx>  # this command
+      bdi-ingest rescore-hs-nodes                     # picks up new facilities
+      bdi-ingest rescore-market                       # operational pillar refresh
+    """
+    from app.services.ingestion.seed_facilities_partner import (
+        load_partner_facility_seed,
+    )
+
+    s = _session()
+    try:
+        report = load_partner_facility_seed(
+            session=s,
+            xlsx_path=xlsx_path,
+            sheet=sheet,
+            dry_run=dry_run,
+            include_examples=include_examples,
+        )
+        out = report.to_dict()
+        out["dry_run"] = dry_run
+        typer.echo(json.dumps({"ok": True, **out}, indent=2, default=str))
+        if report.errors:
+            # Non-zero exit when there were per-row failures so CI / cron
+            # picks up partial-load issues.
+            raise typer.Exit(code=2)
+    except typer.Exit:
+        raise
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
         raise typer.Exit(code=1)
@@ -3323,6 +3570,359 @@ def full_score_cmd(
     _run("rescore-all (pass 2)", ["rescore-all"] + as_of_args)
 
     typer.echo("\n✓  full-score complete.")
+
+
+@app.command("reset-events")
+def reset_events_cmd(
+    confirm: bool = typer.Option(
+        False,
+        "--yes",
+        help=(
+            "Required confirmation flag. Without --yes the command prints the "
+            "row counts that WOULD be deleted and exits without touching data."
+        ),
+    ),
+    keep_source_documents: bool = typer.Option(
+        True,
+        "--keep-source-documents/--purge-source-documents",
+        help=(
+            "Default keeps source_documents so re-ingest can reuse cached "
+            "payloads (SEC EDGAR / Federal Register) and skip the fetch. "
+            "Pass --purge-source-documents only if you actually want to "
+            "re-download every source — slower and costs API quota."
+        ),
+    ),
+) -> None:
+    """Truncate the risk_events + junction tables in FK-safe order.
+
+    Use this when:
+      * Attribution logic changed (e.g. Tier 1.x audits, GTA Scope 2 fixes,
+        EUR-Lex material-junction wiring) and the existing rows reflect
+        the OLD logic — re-ingest is the only way to apply the new rules
+        to historical events.
+      * You want a clean slate before partner / customer review.
+
+    Does NOT touch:
+      * Reference data (materials, hs_code_material_mappings, regulations,
+        regulation_material_scope, regulation_geography_scope, facilities,
+        material_production_shares, commodity_prices, companies, etc.)
+      * Trade flows — the confidence weighting from the 2026-05-09 fix
+        applies at query time via JOIN, so existing TradeFlow rows do
+        not need re-ingest.
+      * Scoring outputs (run rescore-* commands separately after re-ingest).
+
+    Order matters: junction tables are truncated before risk_events to
+    avoid FK violations.  RiskEventGeography, RiskEventCompany,
+    RiskEventMaterial, RiskEventHsMapping, RiskEventRegulation, then
+    risk_events.
+
+    Idempotency notes for re-ingest after a reset:
+      * GTA          — title/summary/event_date come straight from CSV
+                       columns; Scope 2 added metadata only, content_hash
+                       inputs unchanged.  Safe.
+      * IEA          — content_hash(title, countries_raw, year).  Safe.
+      * Federal Reg  — content_hash(document_number, publication_date). Safe.
+      * SEC EDGAR    — dedup via source_document_id existence check. Safe.
+      * EUR-Lex      — dedup via RiskEventRegulation existence check. Safe.
+      * OpenSanctions geo events — title contains entity COUNT; post-
+                       Tier-1.2 the count drops sharply (topic filter),
+                       so re-ingest produces a different content_hash
+                       from any pre-existing rows.  Cleared rows mean
+                       no duplicates; do NOT re-run a second time
+                       without clearing again.
+      * trade_signal_builder — title contains the percentage; Tier 1.4
+                       confidence weighting changes the percentage.
+                       Same rule: cleared rows mean no duplicates;
+                       don't re-run on top.
+      * Census trade — pipeline.py._add_risk_event currently does NOT
+                       set content_hash and has NO dedup check.  Every
+                       re-run inserts duplicates regardless of clears.
+                       Separate fix needed; tracked.
+    """
+    from sqlalchemy import text
+
+    # Order is FK-safe: child junctions first, then risk_events.
+    # We use raw DELETE rather than TRUNCATE because (a) TRUNCATE in
+    # Postgres requires the privilege and (b) on SQLite (used in tests)
+    # TRUNCATE doesn't exist.  Postgres can re-use the same physical
+    # pages after the DELETE so the storage cost is the same.
+    tables_in_order = [
+        "risk_event_companies",
+        "risk_event_materials",
+        "risk_event_hs_mappings",
+        "risk_event_geographies",
+        "risk_event_regulations",
+        "risk_events",
+    ]
+
+    s = _session()
+    try:
+        # Snapshot row counts up-front so the dry-run print and the
+        # actual-run print look identical.
+        counts: dict[str, int] = {}
+        for tbl in tables_in_order:
+            counts[tbl] = s.execute(
+                text(f"SELECT COUNT(*) FROM {tbl}")
+            ).scalar_one()
+
+        if not confirm:
+            typer.echo(json.dumps({
+                "ok": True,
+                "dry_run": True,
+                "would_delete": counts,
+                "hint": "re-run with --yes to actually delete",
+            }, indent=2))
+            return
+
+        # Execute the deletes in order.
+        deleted: dict[str, int] = {}
+        for tbl in tables_in_order:
+            result = s.execute(text(f"DELETE FROM {tbl}"))
+            deleted[tbl] = result.rowcount or 0
+        s.commit()
+
+        # Optionally also purge source_documents (NOT recommended).
+        sd_deleted: Optional[int] = None
+        if not keep_source_documents:
+            # Only delete documents whose source emits risk events
+            # rather than wiping the whole table.
+            sd_result = s.execute(text("DELETE FROM source_documents"))
+            sd_deleted = sd_result.rowcount or 0
+            s.commit()
+
+        typer.echo(json.dumps({
+            "ok": True,
+            "dry_run": False,
+            "deleted": deleted,
+            "source_documents_deleted": sd_deleted,
+        }, indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("reingest-all-events")
+def reingest_all_events_cmd(
+    reset: bool = typer.Option(
+        False,
+        "--reset",
+        help=(
+            "Run `reset-events --yes` first to clear all RiskEvent rows + "
+            "junctions before re-ingesting.  Source documents are preserved "
+            "so ingesters reuse cached payloads where possible."
+        ),
+    ),
+    gta_file: Optional[str] = typer.Option(
+        None,
+        "--gta-file",
+        help=(
+            "Path to a locally-downloaded GTA CSV file.  GTA requires "
+            "registration for bulk access, so the file path must be passed "
+            "explicitly.  If omitted, the GTA step is skipped with a warning."
+        ),
+    ),
+    iea_file: Optional[str] = typer.Option(
+        None,
+        "--iea-file",
+        help=(
+            "Path to the downloaded IEA Critical Minerals Policy Tracker "
+            "CSV/XLSX.  If omitted, the IEA step is skipped with a warning."
+        ),
+    ),
+    federal_register_since: Optional[str] = typer.Option(
+        None,
+        "--fr-since",
+        help=(
+            "Federal Register --since date (YYYY-MM-DD).  Default keeps the "
+            "ingester's own default (90 days).  Pass '2020-01-01' for a "
+            "full historical backfill."
+        ),
+    ),
+    skip: Optional[str] = typer.Option(
+        None,
+        "--skip",
+        help=(
+            "Comma-separated step names to skip.  Valid names: "
+            "eurlex, gta, iea, opensanctions, federal-register, sec-edgar, "
+            "trade-signals."
+        ),
+    ),
+    continue_on_error: bool = typer.Option(
+        False,
+        "--continue-on-error",
+        help=(
+            "Continue running subsequent steps if one fails.  Default "
+            "aborts on first failure (matching `full-score` semantics)."
+        ),
+    ),
+) -> None:
+    """Re-ingest every risk-event-producing source in dependency order.
+
+    Use this after a logic change that invalidates existing RiskEvent rows
+    (e.g., Tier 1.x audits, GTA Scope 2 fix, EUR-Lex material-junction
+    wiring, content_hash format changes).  Combine with --reset to start
+    from a clean slate.
+
+    \b
+    Execution order:
+      1.  reset-events           (only when --reset is set)
+      2.  ingest-eurlex          regulatory standing obligations
+      3.  ingest-gta             trade interventions (requires --gta-file)
+      4.  ingest-iea-policy-tracker
+                                 positive-policy signals (requires --iea-file)
+      5.  ingest-opensanctions   sanctions matches (--force used to bypass
+                                 the 6-day interval gate)
+      6.  ingest-federal-register
+                                 US export-control / tariff / UFLPA notices
+      7.  ingest-sec-edgar       10-K / 10-Q / 8-K material discussion
+      8.  build-trade-signals    derives TRADE_CONCENTRATION / EXPORT_DROP
+                                 from trade_flows (does not re-fetch
+                                 Comtrade itself)
+
+    \b
+    Deliberately NOT included:
+      ingest-comtrade            confidence-weighting applies at query time
+                                 via JOIN, so existing TradeFlow rows do
+                                 not need re-fetching.  Re-run separately
+                                 if you actually need fresh trade volume
+                                 data — costs API quota.
+
+    \b
+    Examples:
+      # Clean reset + full re-ingest (typical scoring-engine fix workflow):
+      bdi-ingest reingest-all-events --reset --gta-file ./data/gta.csv \\
+          --iea-file ./data/iea_policy_tracker.csv
+
+      # Re-run only what doesn't need local files:
+      bdi-ingest reingest-all-events --skip gta,iea
+
+      # Refresh after a Federal Register parser change, skip the rest:
+      bdi-ingest reingest-all-events \\
+          --skip eurlex,gta,iea,opensanctions,sec-edgar,trade-signals
+
+    After completion, run `bdi-ingest full-score` so the new events flow
+    through to material / chemistry / company scores.
+    """
+    import sys
+    import subprocess
+
+    skip_set = {s.strip().lower() for s in (skip or "").split(",") if s.strip()}
+    failures: list[str] = []
+    completed: list[str] = []
+    skipped: list[str] = []
+
+    def _run(step_name: str, args: list[str]) -> bool:
+        """Run a sub-command. Returns True on success, False on failure.
+
+        Honors --continue-on-error: when set, failures are recorded but
+        execution continues to the next step.  When unset, the first
+        failure aborts the whole orchestrator with the sub-command's
+        exit code (mirroring full-score semantics).
+        """
+        typer.echo(f"\n{'='*60}")
+        typer.echo(f"  reingest-all-events  ▶  {step_name}")
+        typer.echo(f"{'='*60}")
+        result = subprocess.run(
+            [sys.executable, "-m", "app.cli"] + args,
+            check=False,
+        )
+        if result.returncode != 0:
+            msg = f"'{step_name}' exited with code {result.returncode}"
+            failures.append(msg)
+            if continue_on_error:
+                typer.echo(
+                    f"\n⚠  {msg} — continuing because --continue-on-error is set.",
+                    err=True,
+                )
+                return False
+            typer.echo(
+                f"\n✗  reingest-all-events aborted: {msg}.",
+                err=True,
+            )
+            raise typer.Exit(code=result.returncode)
+        completed.append(step_name)
+        return True
+
+    def _maybe_skip(name: str, reason: Optional[str] = None) -> bool:
+        """Return True if this step should be skipped."""
+        if name in skip_set:
+            typer.echo(f"\n⊘  Skipping {name} (--skip)")
+            skipped.append(f"{name} (--skip)")
+            return True
+        if reason:
+            typer.echo(f"\n⊘  Skipping {name}: {reason}")
+            skipped.append(f"{name} ({reason})")
+            return True
+        return False
+
+    # ── 1. Optional reset ────────────────────────────────────────────────
+    if reset:
+        _run("reset-events --yes", ["reset-events", "--yes"])
+    else:
+        typer.echo(
+            "\nℹ  --reset not set; existing RiskEvent rows preserved. "
+            "Re-ingest dedups via content_hash so this is safe but means "
+            "rows produced under old logic stay in the table.",
+        )
+
+    # ── 2. EUR-Lex ───────────────────────────────────────────────────────
+    if not _maybe_skip("eurlex"):
+        _run("ingest-eurlex", ["ingest-eurlex"])
+
+    # ── 3. GTA (requires --gta-file) ─────────────────────────────────────
+    if not _maybe_skip(
+        "gta",
+        reason="--gta-file not provided" if not gta_file else None,
+    ):
+        _run("ingest-gta", ["ingest-gta", "--local-file", gta_file])
+
+    # ── 4. IEA Policy Tracker (requires --iea-file) ──────────────────────
+    if not _maybe_skip(
+        "iea",
+        reason="--iea-file not provided" if not iea_file else None,
+    ):
+        _run(
+            "ingest-iea-policy-tracker",
+            ["ingest-iea-policy-tracker", "--file-path", iea_file],
+        )
+
+    # ── 5. OpenSanctions (--force bypasses the 6-day interval gate) ──────
+    if not _maybe_skip("opensanctions"):
+        _run("ingest-opensanctions", ["ingest-opensanctions", "--force"])
+
+    # ── 6. Federal Register ──────────────────────────────────────────────
+    if not _maybe_skip("federal-register"):
+        fr_args = ["ingest-federal-register"]
+        if federal_register_since:
+            fr_args.extend(["--since", federal_register_since])
+        _run("ingest-federal-register", fr_args)
+
+    # ── 7. SEC EDGAR ─────────────────────────────────────────────────────
+    if not _maybe_skip("sec-edgar"):
+        _run("ingest-sec-edgar", ["ingest-sec-edgar"])
+
+    # ── 8. Trade signals (NOT a Comtrade re-fetch — only derives events) ─
+    if not _maybe_skip("trade-signals"):
+        _run("build-trade-signals", ["build-trade-signals"])
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    typer.echo(f"\n{'='*60}")
+    typer.echo("  reingest-all-events  ▶  summary")
+    typer.echo(f"{'='*60}")
+    typer.echo(json.dumps({
+        "ok": len(failures) == 0,
+        "reset": reset,
+        "completed": completed,
+        "skipped": skipped,
+        "failures": failures,
+        "next_step": (
+            "Run `bdi-ingest full-score` to push the new events through "
+            "to material / chemistry / company scoring."
+        ),
+    }, indent=2))
 
 
 def main() -> None:

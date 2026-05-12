@@ -403,7 +403,11 @@ def ingest_pink_sheet(
         if prefix is None:
             hs_mapping_cache[header] = None
             return None
-        _material_id, hs_mapping_id = hs_resolver.resolve_by_hs_code(prefix)
+        # Pink Sheet doesn't write RiskEventMaterial so mapping confidence
+        # isn't threaded downstream — Tier 1.4 audit only affects ingesters
+        # that write event-material junctions.  Unpack the 3rd element to
+        # match the signature change in resolve_by_hs_code (2026-05-09).
+        _material_id, hs_mapping_id, _confidence = hs_resolver.resolve_by_hs_code(prefix)
         if hs_mapping_id is None:
             log.warning(
                 "pinksheet.hs_prefix_unmapped",

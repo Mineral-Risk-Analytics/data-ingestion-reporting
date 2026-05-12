@@ -541,6 +541,23 @@ def _derive_event_type(policy_type_names: list[str]) -> str:
     return "POLICY_MILESTONE"
 
 
+def _derive_event_subtype(event_type: str) -> str | None:
+    """Map an IEA Policy Tracker event_type to a canonical event_subtype.
+
+    Added 2026-05-09 (G-Cov-3 audit fix).  All IEA ``INVESTMENT_PLEDGE``
+    events are subsidy-type by construction — ``_derive_event_type``
+    above already gates the assignment on the same keyword set
+    (invest / financ / fund / grant / subsid).  Tagging them
+    ``EXPORT_SUBSIDY`` lets the Geopolitical pillar route them into the
+    new ``production_subsidy_distortion`` sub-input.  ``POLICY_MILESTONE``
+    events stay event_subtype=None; their downstream scoring path is the
+    Regulatory pillar via the ``regulatory_compliance`` category.
+    """
+    if event_type == "INVESTMENT_PLEDGE":
+        return "EXPORT_SUBSIDY"
+    return None
+
+
 def _derive_category(policy_type_names: list[str]) -> str:
     combined = " ".join(policy_type_names).lower()
     for kw, cat in _CATEGORY_MAP.items():
@@ -629,28 +646,37 @@ def ingest_policy_tracker(
                 skipped += 1
                 continue
 
-            # ── Pre-resolve material attribution from both paths (2026-05-06) ──
-            # Resolve BEFORE inserting the RiskEvent so we can gate on empty
-            # results and skip the row entirely.  Partner direction: don't
-            # write events that have no resolvable material — they bloat the
-            # events table without contributing actionable scoring signal.
+            # ── Pre-resolve material attribution: structured first, keyword fallback ──
+            # 2026-05-09 (Tier 1.1 audit fix): the IEA Policy Tracker rows carry
+            # a partner-curated ``tech_basket_minerals`` field that already
+            # enumerates which materials a policy covers.  When that field
+            # resolves to one-or-more materials, we treat it as authoritative
+            # and SKIP the keyword scan — running both paths concurrently
+            # over-attributed events to incidental mentions (e.g. a cobalt
+            # policy that name-drops lithium in the description).  Keyword
+            # scan remains the fallback when the structured field comes
+            # back empty (rare: IEA doesn't always populate technologies).
+            #
+            # Gating policy unchanged: skip the row when BOTH paths come up
+            # empty so we don't bloat the events table with un-attributable
+            # rows.
 
-            # Path 1: tech basket → resolve canonical names to material IDs.
+            # Path 1 (primary): tech basket → canonical-name resolution.
             tech_basket_resolved: list[int] = []
             for canonical_name in rec["tech_basket_minerals"]:
                 mat = mat_resolver.resolve_by_canonical_name(canonical_name)
                 if mat is not None and mat.id not in tech_basket_resolved:
                     tech_basket_resolved.append(mat.id)
 
-            # Path 2: keyword scan over title + description.
-            search_text = f"{rec['title']} {rec['description']}"
-            keyword_hits = material_cache.detect(search_text)
+            # Path 2 (fallback only): keyword scan over title + description.
+            # Skipped entirely when Path 1 produced results.
+            if tech_basket_resolved:
+                keyword_hits: list[tuple[int, float, str, int | None]] = []
+            else:
+                search_text = f"{rec['title']} {rec['description']}"
+                keyword_hits = material_cache.detect(search_text)
 
-            # Gate: skip event entirely if neither path yields a resolvable
-            # material.  We still need the event for evidence-layer use cases
-            # later (positive-policy rationale) but with zero material
-            # attribution, scoring queries that filter on RiskEventMaterial
-            # never see it — it's just dead rows in risk_events.
+            # Gate: skip event when neither path yields a resolvable material.
             if not tech_basket_resolved and not keyword_hits:
                 skipped_no_material += 1
                 log.debug(
@@ -683,6 +709,7 @@ def ingest_policy_tracker(
             event = RiskEvent(
                 source_document_id=source_document_id,
                 event_type=event_type,
+                event_subtype=_derive_event_subtype(event_type),
                 event_date=event_date,
                 title=title,
                 summary=summary,

@@ -249,6 +249,20 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Antimony and articles thereof — unwrought metal", 1.0, "refined", 4, "global"),
 
     # ── Lithium ───────────────────────────────────────────────────────────
+    # Ore-stage entry added 2026-05-09.  HS 2530 ("Mineral substances NES")
+    # is where spodumene concentrate trades internationally — primarily
+    # Australian hard-rock production (~32% of world Li supply).  Confidence
+    # 0.7 reflects honest stage heterogeneity in MCS "World Mine Production":
+    # Australian spodumene IS ore-stage at HS 2530.90, but Chilean brine
+    # output (~19%) is actually post-evaporation and trades as carbonate
+    # (HS 2836.91, separately seeded as battery_grade). Routing all of MCS
+    # mine production here is directionally correct for Australia / China
+    # hard-rock; over-attributes brine countries to ore stage.  Partner
+    # research can refine per-country attribution later.
+    ("2530", "Lithium",
+     "Mineral substances NES — spodumene concentrate at 2530.90 "
+     "(multi-material 4-digit; also covers magnesium, fluorspar minerals)",
+     0.7, "ore", 4, "global"),
     ("2825", "Lithium",
      "Lithium oxide and hydroxide — primary processed form for battery electrolyte",
      # 2825.20 is lithium hydroxide specifically; dominant battery-grade Li trade
@@ -303,6 +317,15 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("2804", "Selenium",
      "Non-metals — selenium at 2804.50; shares prefix with Si, S, Te",
      0.6, "refined", 4, "global"),
+    # Selenium dioxide (SeO2) is an intermediate inorganic oxide.  Added
+    # 2026-05-09 to clear NULL stage on rows the MCS PDF parser created
+    # from the US HTS tariff table (HS 2811.29.20.00 → derived 6-digit).
+    ("2811", "Selenium",
+     "Other inorganic oxides / acids — selenium dioxide at 2811.29",
+     0.7, "intermediate", 4, "global"),
+    ("281129", "Selenium",
+     "Selenium dioxide (SeO2 — intermediate inorganic oxide)",
+     0.9, "intermediate", 6, "global"),
 
     # ── Individual motor REEs ─────────────────────────────────────────────
     ("2805", "Neodymium",
@@ -722,6 +745,10 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Other antimony articles (wrought)", 0.9, "fabricated", 6, "global"),
 
     # ── Lithium (6-digit) ─────────────────────────────────────────────────
+    ("253090", "Lithium",
+     "Mineral substances NES — spodumene concentrate (Australian hard-rock Li)",
+     # See parent ("2530", "Lithium") for confidence rationale.
+     0.7, "ore", 6, "global"),
     ("282520", "Lithium",
      "Lithium oxide and lithium hydroxide (LiOH·H2O — high-Ni cathode grade)",
      1.0, "battery_grade", 6, "global"),
@@ -738,6 +765,12 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("284690", "Rare Earth Elements",
      "Other rare-earth compounds (oxides, chlorides, carbonates of La, Nd, Pr, Dy, Tb…)",
      0.8, "intermediate", 6, "global"),
+    # Added 2026-05-09 to clear NULL stage on a row inserted by the MCS PDF
+    # parser: ferrocerium is a refined mischmetal alloy (~70% Ce + La/Nd/Pr)
+    # used industrially as flint material — refined-stage REE product.
+    ("360690", "Rare Earth Elements",
+     "Ferrocerium and other pyrophoric alloys — refined REE alloy form",
+     0.7, "refined", 6, "global"),
 
     # Individual motor REEs — narrowed from Rare Earths codes above
     ("280530", "Neodymium",
@@ -1058,6 +1091,77 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("280512", "Lithium",
      "Calcium / strontium / barium — shared 6-digit; lithium-adjacent for some refining inputs",
      0.4, "refined", 6, "global"),
+
+    # ── Comtrade unresolved-prefix coverage (2026-05-11) ─────────────────
+    # Targeted additions for the top-volume HS prefixes that were leaving
+    # TradeFlow rows with material_id IS NULL.  Survey at 2026-05-10 over
+    # ~1,619 trade_flows rows showed 274 unresolved (17%), concentrated in
+    # 7202 / 2818 / 2620 (~$85B of ~$125B unresolved value).  See
+    # docs/scoring-audit-2026-05-addendum.md for the dollar-volume table.
+    #
+    # Each addition is the standard HS 2022 subheading mapping.  No
+    # confidences below 1.0 here — these are single-material 6-digit
+    # codes per the WCO nomenclature, so the resolver's exact-match
+    # Pass 1 handles them cleanly without fighting the existing 4-digit
+    # catch-alls.
+
+    # 7202.50 — Ferrosilicochromium.  The only HS 2022 subheading under
+    # chapter 7202 not previously seeded; 720211/19/21/29/30/41/49/60/70/
+    # 80/91/92/93/99 were all already covered.  Chromium is the primary
+    # metal recovered from FeSiCr.
+    ("720250", "Chromium",
+     "Ferrosilicochromium (FeSiCr) — stainless and tool-steel intermediate",
+     1.0, "intermediate", 6, "global"),
+
+    # 2818 — Aluminium oxide / hydroxide / corundum.  281820 (calcined
+    # alumina) was already seeded; 281810 and 281830 are added here so
+    # the full 2818 chapter resolves.  Also adding a 4-digit catch-all so
+    # any rows reported at the aggregated 2818 level resolve cleanly via
+    # the resolver's Pass 2 (4-digit fallback) — important because Comtrade
+    # occasionally returns 4-digit aggregates when reporters don't disclose
+    # below the heading level.
+    ("281810", "Aluminum",
+     "Artificial corundum, whether or not chemically defined — abrasive/refractory aluminum form",
+     1.0, "intermediate", 6, "global"),
+    ("281830", "Aluminum",
+     "Aluminium hydroxide — alumina precursor / aluminium chemical intermediate",
+     1.0, "intermediate", 6, "global"),
+    ("2818", "Aluminum",
+     "Aluminium oxide (including artificial corundum); aluminium hydroxide — 4-digit catch-all "
+     "for aggregated trade flows that don't disclose the 6-digit subheading",
+     # All 281810/20/30 subheadings unambiguously trace to Aluminum supply
+     # chain, so the 4-digit roll-up is genuinely a single-material prefix.
+     0.9, "intermediate", 4, "global"),
+
+    # 2620 — Slag, ash and residues containing metals.  Battery recycling
+    # pathway.  Existing seed has 262040 → Vanadium @ 0.9 (steel slag
+    # interpretation) and 262099 → Titanium/Vanadium.  Added below are
+    # the two unambiguous standard mappings (262030 copper-bearing slag,
+    # 262040 aluminium-bearing slag per WCO HS 2022).
+    #
+    # CONFLICT FLAG — 262040: existing seed maps this to Vanadium at 0.9
+    # with the comment "steel slag — secondary V source".  Per WCO HS 2022
+    # the subheading is officially "Aluminium-bearing slag and residues."
+    # Adding 262040 → Aluminum at 1.0 below means it will win the exact-
+    # match path (top-confidence) over the existing Vanadium entry.  If
+    # the original Vanadium classification was deliberate (capturing
+    # vanadium recovery from V-rich steel slag), the resolver behaviour
+    # changes: rows previously attributed to Vanadium will now go to
+    # Aluminum.  Decide with partner; if Vanadium attribution should be
+    # preserved, remove the Aluminum entry below or downgrade its
+    # confidence to 0.8 so the existing 0.9 Vanadium wins.
+    #
+    # 262099 (Li-ion black mass) is deliberately NOT added here — black-
+    # mass material attribution is an open partner-data-decision question.
+    # Existing 262099 → Titanium/Vanadium entries left alone.  See ticket.
+    ("262030", "Copper",
+     "Copper-bearing slag, ash and residues — secondary copper / battery recycling stream",
+     1.0, "scrap", 6, "global"),
+    ("262040", "Aluminum",
+     "Aluminium-bearing slag, ash and residues (WCO HS 2022) — secondary aluminum / battery "
+     "recycling stream.  CONFLICTS with existing 262040 → Vanadium @ 0.9 (steel-slag "
+     "interpretation); this 1.0 entry wins exact-match resolution.  Reconcile with partner.",
+     1.0, "scrap", 6, "global"),
 ]
 
 

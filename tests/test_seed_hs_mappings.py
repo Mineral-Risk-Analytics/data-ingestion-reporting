@@ -16,29 +16,30 @@ from app.services.ingestion.seed_hs_mappings import _MAPPINGS, upsert_hs_mapping
 
 class TestMappingsData:
     def test_all_confidence_values_in_range(self):
-        for hs, name, desc, conf in _MAPPINGS:
+        for hs, name, desc, conf, *_ in _MAPPINGS:
             assert 0.0 <= conf <= 1.0, (
                 f"Confidence {conf} out of range for ({hs}, {name!r})"
             )
 
     def test_no_blank_descriptions(self):
-        for hs, name, desc, conf in _MAPPINGS:
+        for hs, name, desc, conf, *_ in _MAPPINGS:
             assert desc and desc.strip(), (
                 f"Blank description for ({hs}, {name!r})"
             )
 
-    def test_all_hs_prefixes_are_4_digit_strings(self):
-        pattern = re.compile(r"^\d{4}$")
-        for hs, name, desc, conf in _MAPPINGS:
+    def test_all_hs_prefixes_are_four_to_six_digit_strings(self):
+        """Prefixes are usually 4-digit chapters; some rows use a 6-digit subheading."""
+        pattern = re.compile(r"^\d{4,6}$")
+        for hs, name, desc, conf, *_ in _MAPPINGS:
             assert pattern.match(hs), (
-                f"HS prefix {hs!r} for {name!r} is not a 4-digit string"
+                f"HS prefix {hs!r} for {name!r} is not a 4–6 digit string"
             )
 
     def test_mappings_list_is_non_empty(self):
         assert len(_MAPPINGS) > 50, "Expected at least 50 mappings"
 
     def test_known_materials_have_entries(self):
-        names_in_mappings = {name for _, name, _, _ in _MAPPINGS}
+        names_in_mappings = {name for _, name, _, _, *_ in _MAPPINGS}
         expected = {"Lithium", "Nickel", "Cobalt", "Natural Graphite", "Manganese", "Copper"}
         for mat in expected:
             assert mat in names_in_mappings, f"Expected '{mat}' to have at least one HS mapping"
@@ -46,38 +47,38 @@ class TestMappingsData:
     def test_multi_material_prefixes_are_allowed(self):
         """Prefixes like 2615 should appear multiple times for different materials."""
         prefix_counts: dict[str, int] = {}
-        for hs, _, _, _ in _MAPPINGS:
+        for hs, _, _, _, *_ in _MAPPINGS:
             prefix_counts[hs] = prefix_counts.get(hs, 0) + 1
         # 2615 maps to Vanadium, Niobium, Tantalum, Zirconium
         assert prefix_counts.get("2615", 0) >= 4
 
     def test_8112_maps_to_multiple_materials(self):
         """Chapter 81 (8112) should cover Gallium, Germanium, Indium, Niobium, Chromium."""
-        ch81_materials = {name for hs, name, _, _ in _MAPPINGS if hs == "8112"}
+        ch81_materials = {name for hs, name, _, _, *_ in _MAPPINGS if hs == "8112"}
         expected = {"Gallium", "Germanium", "Indium", "Niobium", "Chromium"}
         assert expected.issubset(ch81_materials)
 
     def test_lithium_has_multiple_prefixes(self):
         """Lithium should have entries for 2825 (hydroxide), 2836 (carbonate), 2805 (metal)."""
-        lithium_prefixes = {hs for hs, name, _, _ in _MAPPINGS if name == "Lithium"}
+        lithium_prefixes = {hs for hs, name, _, _, *_ in _MAPPINGS if name == "Lithium"}
         assert {"2825", "2836", "2805"}.issubset(lithium_prefixes)
 
     def test_no_duplicate_hs_material_pairs(self):
         """Each (hs_prefix, canonical_name) pair must appear at most once."""
         seen: set[tuple[str, str]] = set()
-        for hs, name, _, _ in _MAPPINGS:
+        for hs, name, _, _, *_ in _MAPPINGS:
             pair = (hs, name)
             assert pair not in seen, f"Duplicate mapping: {pair}"
             seen.add(pair)
 
     def test_sodium_ion_materials_covered(self):
         """Sodium should have HS mappings for Na-ion tracking."""
-        sodium_prefixes = {hs for hs, name, _, _ in _MAPPINGS if name == "Sodium"}
+        sodium_prefixes = {hs for hs, name, _, _, *_ in _MAPPINGS if name == "Sodium"}
         assert len(sodium_prefixes) >= 1
 
     def test_ree_individual_covered(self):
         """Individual motor REEs should have HS mappings."""
-        covered = {name for _, name, _, _ in _MAPPINGS}
+        covered = {name for _, name, _, _, *_ in _MAPPINGS}
         for ree in ("Neodymium", "Praseodymium", "Dysprosium", "Terbium"):
             assert ree in covered, f"{ree} has no HS mappings"
 
@@ -153,7 +154,12 @@ class TestUpsertHsMappings:
 
         result = upsert_hs_mappings(session)
 
-        total = result["inserted"] + result["skipped_unknown_material"] + result["skipped_existing"]
+        total = (
+            result["inserted"]
+            + result["skipped_unknown_material"]
+            + result["skipped_existing"]
+            + result["updated"]
+        )
         assert total == len(_MAPPINGS)
 
     def test_idempotent_skips_existing_rows(self):
@@ -215,9 +221,18 @@ class TestUpsertHsMappings:
         session.flush.assert_not_called()
 
     def test_returns_correct_keys(self):
-        """Result dict always contains the three expected keys."""
+        """Result dict exposes mapping counts plus keyword upsert stats."""
         session = _make_session([])
 
         result = upsert_hs_mappings(session)
 
-        assert set(result.keys()) == {"inserted", "skipped_existing", "skipped_unknown_material"}
+        assert set(result.keys()) == {
+            "inserted",
+            "updated",
+            "skipped_existing",
+            "skipped_unknown_material",
+            "keywords_set",
+            "keywords_overwritten",
+            "keywords_skipped_existing",
+            "keywords_skipped_no_row",
+        }

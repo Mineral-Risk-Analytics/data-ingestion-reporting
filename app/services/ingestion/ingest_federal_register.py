@@ -80,7 +80,7 @@ from app.services.ingestion.entity_resolution import (
     resolve_companies_for_event,
 )
 from app.services.ingestion.normalizers.geography_resolver import GeographyCache
-from app.services.ingestion.normalizers.material_resolver import MaterialCache
+from app.services.ingestion.normalizers.material_resolver import MaterialCache, MaterialResolver
 from app.services.ingestion.parsers.regulation_parser import parse_federal_register_document
 
 log = structlog.get_logger(__name__)
@@ -218,6 +218,96 @@ TARGETED_QUERIES: list[QueryConfig] = [
         base_severity_boost=0.0,
     ),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Federal Register topic → material name mapping (Tier 1.5 audit, 2026-05-09)
+# ---------------------------------------------------------------------------
+# The Federal Register API returns a curated ``topics`` list per document
+# (controlled vocabulary maintained by the Office of the Federal Register).
+# Pre-2026-05-09 we stored topics in SourceDocument.metadata_json but didn't
+# consult them for material attribution — every notice fell back to free-text
+# keyword matching on the abstract.  That over-attributed events that
+# mention "lithium" in passing while really being about a different
+# regulatory area.
+#
+# When ``topics`` resolves to one or more canonical materials, we treat that
+# as authoritative (same pattern as IEA Policy Tracker's
+# tech_basket_minerals).  Topics that don't map (e.g. "Imports", "Exports",
+# "Tariff" — event-type topics, not materials) are silently skipped here;
+# the query.event_subtype already captures the regulatory category.
+#
+# The map intentionally focuses on launch-list materials.  Topics not in
+# the map fall through to MaterialCache.detect on title+abstract.
+_TOPIC_MATERIAL_MAP: dict[str, str] = {
+    # Direct material topics — single canonical resolution
+    "lithium":            "Lithium",
+    "cobalt":             "Cobalt",
+    "nickel":             "Nickel",
+    "manganese":          "Manganese",
+    "graphite":           "Natural Graphite",
+    "aluminum":           "Aluminum",
+    "aluminium":          "Aluminum",
+    "copper":             "Copper",
+    "tungsten":           "Tungsten",
+    "iron":               "Iron Ore (LFP Grade)",
+    "iron ore":           "Iron Ore (LFP Grade)",
+    "phosphate":          "Phosphate (Battery Grade)",
+    "rare earth":         "Rare Earth Elements",
+    "rare earths":        "Rare Earth Elements",
+    "rare-earth":         "Rare Earth Elements",
+    # Topics that don't map to a single material — left out intentionally:
+    #   "critical materials" / "critical minerals" — too broad (no single
+    #   target); the abstract-text keyword scan will narrow this when
+    #   relevant materials are actually named in the body.
+    #   "imports" / "exports" / "tariff" — event-type topics, not materials.
+}
+
+
+# Relevance assigned to topic-derived material attributions.  Same magnitude
+# as the unique-keyword path in MaterialCache (0.90 base) — a topic match
+# is at least as confident as a stage-specific keyword match because the
+# Federal Register's controlled vocabulary is editor-curated rather than
+# auto-generated.
+_TOPIC_MATCH_RELEVANCE = 0.90
+
+
+def _resolve_topics_to_materials(
+    topics: list[str],
+    mat_resolver: "MaterialResolver",
+) -> list[tuple[int, float, str, int | None]]:
+    """Translate Federal Register topic strings to material matches.
+
+    Returns tuples in the same shape MaterialCache.detect uses so callers
+    can pass the result through ``_persist_material_links`` unchanged:
+    ``(material_id, relevance, matched_keyword, hs_mapping_id)``.
+
+    ``hs_mapping_id`` is None — topic attribution is stage-ambiguous in
+    the same way canonical_name matches are.
+
+    Topics not in ``_TOPIC_MATERIAL_MAP`` are skipped silently.  Duplicate
+    materials (multiple topics resolving to the same material — rare but
+    possible) are collapsed; the first topic wins.
+    """
+    seen_material_ids: set[int] = set()
+    matches: list[tuple[int, float, str, int | None]] = []
+    for raw_topic in topics:
+        if not raw_topic:
+            continue
+        canonical_name = _TOPIC_MATERIAL_MAP.get(raw_topic.lower().strip())
+        if canonical_name is None:
+            continue
+        material = mat_resolver.resolve_by_canonical_name(canonical_name)
+        if material is None or material.id in seen_material_ids:
+            continue
+        seen_material_ids.add(material.id)
+        matches.append((
+            material.id,
+            _TOPIC_MATCH_RELEVANCE,
+            f"fr_topic:{raw_topic[:48]}",
+            None,
+        ))
+    return matches
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +700,7 @@ def backfill_fr_links(
         }
     """
     material_cache = MaterialCache.build(session)
+    material_resolver = MaterialResolver(session)
     geo_cache = GeographyCache.build(session)
 
     # Subqueries to check existing links — used only in non-force mode to
@@ -661,7 +752,22 @@ def backfill_fr_links(
             events_skipped += 1
             continue
 
-        detected_materials = material_cache.detect(search_text)
+        # Material attribution: topics first, keyword fallback (Tier 1.5
+        # audit, 2026-05-09).  Topics live in
+        # ``SourceDocument.metadata_json['topics']`` — pulled from the FR
+        # API at ingest time.  When topics resolve to materials we skip
+        # the keyword scan, matching the live ingester's behaviour.
+        topics: list[str] = []
+        if ev.source_document_id is not None:
+            sd = session.get(SourceDocument, ev.source_document_id)
+            if sd is not None and isinstance(sd.metadata_json, dict):
+                raw_topics = sd.metadata_json.get("topics") or []
+                if isinstance(raw_topics, list):
+                    topics = [t for t in raw_topics if isinstance(t, str)]
+
+        detected_materials = _resolve_topics_to_materials(topics, material_resolver)
+        if not detected_materials:
+            detected_materials = material_cache.detect(search_text)
         detected_geos = geo_cache.detect(search_text)
 
         if dry_run:
@@ -963,6 +1069,7 @@ def ingest_federal_register(
     source = _get_or_create_source(session)
     company_cache = build_company_cache(session)
     material_cache = MaterialCache.build(session)
+    material_resolver = MaterialResolver(session)
     geo_cache = GeographyCache.build(session)
 
     # Track document_numbers claimed by earlier queries to avoid duplicate events
@@ -1088,10 +1195,24 @@ def ingest_federal_register(
                         parsed.doc_type, parsed.abstract_text, parsed.title, query
                     )
 
-                    # Detect geographies and materials from title + abstract
+                    # Detect geographies and materials.
+                    # Material attribution: structured first, keyword fallback
+                    # (Tier 1.5 audit, 2026-05-09).  When the FR API's
+                    # controlled-vocabulary ``topics`` resolve to one or more
+                    # canonical materials via ``_TOPIC_MATERIAL_MAP``, that's
+                    # the authoritative signal and we skip the abstract-text
+                    # keyword scan entirely.  Falls back to MaterialCache only
+                    # when topics are absent or unmapped.  Same pattern as the
+                    # IEA Policy Tracker / OpenSanctions fixes that landed
+                    # earlier the same day.
                     search_text = " ".join(filter(None, [parsed.title, parsed.abstract_text]))
                     detected_geos = geo_cache.detect(search_text)
-                    detected_materials = material_cache.detect(search_text)
+                    detected_materials = _resolve_topics_to_materials(
+                        parsed.topics, material_resolver,
+                    )
+                    if not detected_materials:
+                        # Topics didn't resolve — fall back to keyword scan.
+                        detected_materials = material_cache.detect(search_text)
 
                     # Set geo_primary to the highest-relevance primary geography
                     # (used for display in RiskEvent.geography_json)

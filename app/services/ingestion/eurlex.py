@@ -62,8 +62,10 @@ from sqlalchemy.orm import Session
 from app.models.documents import SourceDocument
 from app.models.regulatory import (
     Regulation,
+    RegulationMaterialScope,
     RegulationSourceAlias,
     RiskEvent,
+    RiskEventMaterial,
     RiskEventRegulation,
 )
 from app.models.source import Source
@@ -244,6 +246,69 @@ def status_severity_weight(status: str | None) -> float:
     return SEVERITY_BY_STATUS.get(status, DEFAULT_REGULATION_SEVERITY)
 
 
+# Relevance score by RegulationMaterialScope.scope_type.  Used when
+# propagating the regulation's scoped materials onto the emitted RiskEvent.
+#
+# Calibration:
+#   banned (1.00)              — the regulation explicitly prohibits this
+#                                material; events should surface at full weight.
+#   restricted (0.90)          — regulation imposes constraints (caps, due-
+#                                diligence requirements, geographic limits).
+#   covered (0.80)             — material falls under the regulation's
+#                                purview but no specific prohibition.
+#   disclosure_required (0.70) — softest binding; only requires reporting.
+#
+# The 0.70–1.00 band intentionally sits above keyword-based attribution
+# scores (typically 0.50–0.85) — RegulationMaterialScope is partner-curated,
+# which is the highest-confidence attribution mechanism we have.
+_SCOPE_RELEVANCE: dict[str, float] = {
+    "banned": 1.00,
+    "restricted": 0.90,
+    "covered": 0.80,
+    "disclosure_required": 0.70,
+}
+_DEFAULT_SCOPE_RELEVANCE = 0.80
+
+
+def _attach_material_scope_to_event(
+    session: Session,
+    event_id: int,
+    regulation_id: int,
+) -> int:
+    """Write one RiskEventMaterial row per RegulationMaterialScope entry.
+
+    Returns the number of junction rows added.  Idempotent at the
+    (event_id, material_id) pair level — the surrounding loop only calls
+    this after an event was newly created, so duplicate writes are not
+    expected, but we still guard against them.
+    """
+    scopes = session.scalars(
+        select(RegulationMaterialScope).where(
+            RegulationMaterialScope.regulation_id == regulation_id
+        )
+    ).all()
+    if not scopes:
+        return 0
+
+    added = 0
+    seen_material_ids: set[int] = set()
+    for scope in scopes:
+        if scope.material_id in seen_material_ids:
+            continue
+        seen_material_ids.add(scope.material_id)
+        relevance = _SCOPE_RELEVANCE.get(scope.scope_type, _DEFAULT_SCOPE_RELEVANCE)
+        session.add(
+            RiskEventMaterial(
+                risk_event_id=event_id,
+                material_id=scope.material_id,
+                relevance_score=relevance,
+                match_reason=f"regulation_scope:{scope.scope_type}",
+            )
+        )
+        added += 1
+    return added
+
+
 def _build_regulation_event(
     regulation: Regulation,
     celex: str,
@@ -371,6 +436,7 @@ def ingest_eurlex(
     unknown_celex = skipped_celex = 0
     source_docs_attached = 0
     risk_events_created = 0
+    material_links_created = 0
     now_iso = datetime.now(timezone.utc).isoformat()
 
     for celex in celex_list:
@@ -438,6 +504,18 @@ def ingest_eurlex(
             session.flush()
             junction.risk_event_id = event.id
             session.add(junction)
+
+            # Propagate the regulation's scoped materials onto the event so
+            # the per-material event feed actually surfaces EU regulations.
+            # Without this, RegulationMaterialScope lived in isolation —
+            # the regulation knew which materials it covered, but the
+            # emitted RiskEvent did not, leaving the material-level feed
+            # under-attributed for any user filtering by mineral.
+            material_links_created += _attach_material_scope_to_event(
+                session,
+                event_id=event.id,
+                regulation_id=regulation.id,
+            )
             risk_events_created += 1
             log.info(
                 "eurlex.risk_event_created",
@@ -457,6 +535,66 @@ def ingest_eurlex(
         "skipped_celex": skipped_celex,
         "source_documents_attached": source_docs_attached,
         "risk_events_created": risk_events_created,
+        "material_links_created": material_links_created,
     }
     log.info("eurlex.ingest.done", **result_summary)
     return result_summary
+
+
+# ---------------------------------------------------------------------------
+# Backfill: attach material junctions onto previously-ingested EUR-Lex events
+# ---------------------------------------------------------------------------
+
+def backfill_regulation_event_materials(session: Session) -> dict[str, int]:
+    """Add RiskEventMaterial rows for past EUR-Lex events that lack them.
+
+    Use when this attribution fix lands on a DB that already has EUR-Lex
+    events ingested without material junctions.  Safe to re-run: for each
+    candidate event we check the (event_id, material_id) pair and only
+    insert junctions for scoped materials that aren't already linked.
+
+    Returns counts:
+        events_examined:   how many EUR-Lex-linked RiskEvents we looked at
+        events_updated:    how many of those got at least one new junction
+        material_links_added: total new RiskEventMaterial rows inserted
+    """
+    # Pull every RiskEvent linked to a Regulation via RiskEventRegulation.
+    rows = session.execute(
+        select(RiskEvent.id, RiskEventRegulation.regulation_id)
+        .join(
+            RiskEventRegulation,
+            RiskEventRegulation.risk_event_id == RiskEvent.id,
+        )
+    ).all()
+
+    events_examined = len(rows)
+    events_updated = 0
+    material_links_added = 0
+
+    for event_id, regulation_id in rows:
+        # Skip if this event already has any RiskEventMaterial row — we
+        # don't want to mix scope-derived attribution with content-derived
+        # attribution after the fact.
+        already_linked = session.execute(
+            select(RiskEventMaterial.id)
+            .where(RiskEventMaterial.risk_event_id == event_id)
+            .limit(1)
+        ).first()
+        if already_linked is not None:
+            continue
+
+        added = _attach_material_scope_to_event(
+            session, event_id=event_id, regulation_id=regulation_id
+        )
+        if added > 0:
+            events_updated += 1
+            material_links_added += added
+
+    session.commit()
+    result = {
+        "events_examined": events_examined,
+        "events_updated": events_updated,
+        "material_links_added": material_links_added,
+    }
+    log.info("eurlex.backfill_material_links.done", **result)
+    return result

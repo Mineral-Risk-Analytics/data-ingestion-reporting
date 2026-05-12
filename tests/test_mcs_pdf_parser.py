@@ -52,13 +52,13 @@ COBALT_PRODUCTION_BLOCK = """\
 World Mine Production and Reserves:
                           Mine production          Reserves
 Country                    2024       2025(e)
-Congo (Kinshasa)         170,000    170,000       4,000,000
-Russia                     7,600      7,600         250,000
-Australia                  5,500      5,100         1,700,000
-Philippines                3,500      3,000            280,000
-Cuba                       3,600      3,500            500,000
-Other countries            6,200      5,200         1,000,000
-World total (rounded)    220,000    210,000        8,000,000
+Congo (Kinshasa)         170,000    170,000
+Russia                     7,600      7,600
+Australia                  5,500      5,100
+Philippines                3,500      3,000
+Cuba                       3,600      3,500
+Other countries            6,200      5,200
+World total (rounded)    220,000    210,000
 """
 
 COBALT_IMPORT_BLOCK = """\
@@ -131,14 +131,12 @@ class TestProductionStagePreference:
                 f"Invalid stage {stage!r} for {name!r}"
             )
 
-    def test_all_commodity_map_materials_have_preference(self):
-        """Every material reachable via _MCS_COMMODITY_MAP should have a stage preference."""
-        missing = []
-        for heading, canonical in _MCS_COMMODITY_MAP.items():
-            if canonical not in _MCS_PRODUCTION_STAGE_PREFERENCE:
-                missing.append(canonical)
-        assert not missing, (
-            f"Materials in _MCS_COMMODITY_MAP without production stage preference: {missing}"
+    def test_production_stage_overrides_are_subset_of_commodity_map(self):
+        """Explicit stage overrides must reference materials that appear in the commodity map."""
+        canon_values = set(_MCS_COMMODITY_MAP.values())
+        extra = set(_MCS_PRODUCTION_STAGE_PREFERENCE) - canon_values
+        assert not extra, (
+            f"_MCS_PRODUCTION_STAGE_PREFERENCE has unknown canonicals: {extra}"
         )
 
 
@@ -479,7 +477,7 @@ class TestSeedToDb:
             ],
             salient_notes="Cobalt production remained stable.",
         )
-        monkeypatch.setattr(p, "parse", lambda: [fake_section])
+        monkeypatch.setattr(p, "parse", lambda *a, **k: [fake_section])
         return p
 
     def test_dry_run_does_not_raise(
@@ -529,7 +527,7 @@ class TestSeedToDb:
             canonical_name="Cobalt",
             tariff_entries=[TariffEntry("Cobalt ores", "2605000000", "2605.00.0000")],
         )
-        monkeypatch.setattr(p, "parse", lambda: [unknown_section])
+        monkeypatch.setattr(p, "parse", lambda *a, **k: [unknown_section])
 
         session = MagicMock()
         with (

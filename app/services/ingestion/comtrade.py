@@ -47,7 +47,7 @@ Important notes
 from __future__ import annotations
 
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 import structlog
@@ -477,31 +477,40 @@ def _build_hs_material_map(
 def _resolve_material_id(
     hs_code: str,
     hs_material_map: dict[str, list[tuple[int, float, int]]],
-) -> tuple[Optional[int], Optional[int]]:
-    """Return ``(material_id, hs_mapping_id)`` for a 6-digit hs_code.
+) -> tuple[Optional[int], Optional[int], Optional[float]]:
+    """Return ``(material_id, hs_mapping_id, confidence)`` for a 6-digit hs_code.
 
     Uses a two-pass strategy:
 
     Pass 1 — exact match on the full hs_code string (up to 6 digits).
         If exactly one material maps to this code, return it.
         If multiple map to it, return the highest-confidence one; if tied,
-        return (None, None) — genuinely ambiguous at this granularity.
+        return (None, None, None) — genuinely ambiguous at this granularity.
 
     Pass 2 — 4-digit prefix fallback.
         Collect all mapping rows whose 4-digit prefix is a prefix of hs_code.
         Apply the same single/highest-confidence/tie-means-None logic.
 
-    Returning (None, None) for ambiguous shared-prefix codes is intentional —
-    NULL values are honest; wrong IDs silently poison scoring.
+    Returning (None, None, None) for ambiguous shared-prefix codes is
+    intentional — NULL values are honest; wrong IDs silently poison scoring.
+
+    2026-05-09 (Tier 1.4 audit, scope extension): added the third
+    ``confidence`` element so GTA/Comtrade callers can downscale
+    ``RiskEventMaterial.relevance_score`` for low-confidence mappings.
+    Callers that don't need confidence can ignore it:
+        ``mid, hs_id, _ = _resolve_material_id(code, hs_map)``.
     """
     # Pass 1: exact 6-digit (or shorter if stored that way) match.
     exact = hs_material_map.get(hs_code)
     if exact:
         if len(exact) == 1:
-            return exact[0][0], exact[0][2]
+            mid, conf, hs_id = exact[0]
+            return mid, hs_id, conf
         max_conf = max(c for _, c, _ in exact)
-        top = [(mid, hs_id) for mid, c, hs_id in exact if c == max_conf]
-        return (top[0][0], top[0][1]) if len(top) == 1 else (None, None)
+        top = [(mid, hs_id, c) for mid, c, hs_id in exact if c == max_conf]
+        if len(top) == 1:
+            return top[0][0], top[0][1], top[0][2]
+        return None, None, None
 
     # Pass 2: 4-digit prefix fallback.
     candidates: list[tuple[int, float, int]] = []
@@ -510,11 +519,13 @@ def _resolve_material_id(
             candidates.extend(entries)
 
     if not candidates:
-        return None, None
+        return None, None, None
 
     max_conf = max(c for _, c, _ in candidates)
-    top = [(mid, hs_id) for mid, c, hs_id in candidates if c == max_conf]
-    return (top[0][0], top[0][1]) if len(top) == 1 else (None, None)
+    top = [(mid, hs_id, c) for mid, c, hs_id in candidates if c == max_conf]
+    if len(top) == 1:
+        return top[0][0], top[0][1], top[0][2]
+    return None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -795,7 +806,10 @@ def ingest_comtrade(
 
                     batch_added = 0
                     for row_dict in normalised:
-                        material_id, hs_mapping_id = _resolve_material_id(
+                        # Confidence is recoverable downstream via
+                        # hs_mapping_id → HsCodeMaterialMapping.confidence;
+                        # TradeFlow only stores the FK so we discard it here.
+                        material_id, hs_mapping_id, _hs_conf = _resolve_material_id(
                             row_dict.get("hs_code") or "", hs_material_map
                         )
                         if material_id is None:
@@ -855,3 +869,373 @@ def ingest_comtrade(
         "api_calls_made": api_calls_made,
         "errors": errors,
     }
+
+
+# ---------------------------------------------------------------------------
+# Backfill: hs_mapping_id for pre-Phase-1.5 TradeFlow rows
+# ---------------------------------------------------------------------------
+
+def backfill_trade_flow_hs_mappings(
+    session: Session,
+    batch_size: int = 2_000,
+    log_mismatch_samples: int = 20,
+) -> dict[str, int]:
+    """Populate ``TradeFlow.hs_mapping_id`` for rows ingested before Phase 1.5.
+
+    Migration 027 added ``hs_mapping_id`` to ``trade_flows``.  Rows ingested
+    before then have ``material_id`` set (from the legacy resolver) but
+    ``hs_mapping_id IS NULL``.  The 2026-05-09 confidence-weighting changes
+    in ``trade_signal_builder._get_annual_totals`` and
+    ``global_rollup._aggregate_trade_values_for_material`` use the FK to
+    reach ``HsCodeMaterialMapping.confidence``; NULL rows fall through at
+    confidence=1.0 via ``COALESCE``, which preserves backwards-compat but
+    masks the very signal the weighting is meant to expose.
+
+    This function re-resolves each affected row's HS code against the
+    current ``hs_code_material_mappings`` table.  Three outcomes per row:
+
+      Match
+        Resolved ``material_id`` equals the row's stored ``material_id``
+        → UPDATE ``hs_mapping_id`` to the resolved value.
+
+      Mismatch (mapping drift)
+        Resolved ``material_id`` differs from the row's stored
+        ``material_id``.  This means the prefix-to-material mapping has
+        shifted since ingest.  Left alone and logged at WARNING.  The
+        backfill does NOT silently rewrite ``material_id`` — that would
+        invalidate every aggregate downstream that grouped by the old
+        material attribution.
+
+      Unmapped
+        Resolved ``material_id`` is None at every prefix length.  The HS
+        code no longer has a mapping at all.  Left alone and logged at
+        DEBUG (these are usually historical rows on prefixes the partner
+        de-scoped).
+
+    Idempotent: re-running is a no-op since the filter excludes rows that
+    now have ``hs_mapping_id`` set.
+
+    Args:
+        session:               SQLAlchemy session, committed per batch.
+        batch_size:            How many rows to fetch + update per pass.
+                               Default 2000 keeps memory bounded on dev DBs
+                               with millions of TradeFlow rows.
+        log_mismatch_samples:  Maximum number of mismatch examples to
+                               accumulate in the return dict for inspection
+                               (not in the count — these are samples).
+
+    Returns:
+        Dict with counts and a short sample of mismatches::
+
+          {
+              "examined": int,
+              "updated": int,
+              "mismatched": int,
+              "unmapped": int,
+              "mismatch_samples": [
+                  {"trade_flow_id": int, "hs_code": str,
+                   "stored_material_id": int, "resolved_material_id": int},
+                  ...
+              ],
+          }
+    """
+    hs_material_map = _build_hs_material_map(session)
+    if not hs_material_map:
+        log.warning(
+            "comtrade.backfill_hs_mappings.empty_mapping_table",
+            hint=(
+                "hs_code_material_mappings is empty — run "
+                "`bdi-ingest seed-hs-mappings` first."
+            ),
+        )
+        return {
+            "examined": 0,
+            "updated": 0,
+            "mismatched": 0,
+            "unmapped": 0,
+            "mismatch_samples": [],
+        }
+
+    examined = 0
+    updated = 0
+    mismatched = 0
+    unmapped = 0
+    mismatch_samples: list[dict[str, Any]] = []
+
+    # Process in batches with id-cursor pagination so mismatched / unmapped
+    # rows (which stay in the NULL filter after this run) don't get
+    # re-counted on the next iteration.  ``last_id`` advances strictly
+    # monotonically — every batch examines a disjoint set of TradeFlow ids.
+    last_id = 0
+    while True:
+        rows = session.execute(
+            select(TradeFlow.id, TradeFlow.hs_code, TradeFlow.material_id)
+            .where(
+                TradeFlow.hs_mapping_id.is_(None),
+                TradeFlow.material_id.is_not(None),
+                TradeFlow.id > last_id,
+            )
+            .order_by(TradeFlow.id)
+            .limit(batch_size)
+        ).all()
+
+        if not rows:
+            break
+
+        # Build per-batch update payload: {trade_flow_id: hs_mapping_id}
+        # Collected in memory then bulk-applied; cheaper than per-row UPDATE.
+        updates: dict[int, int] = {}
+        for tf_id, hs_code, stored_mid in rows:
+            examined += 1
+            # Advance the cursor regardless of outcome so the next iteration
+            # picks up after this row whether or not we mutated it.
+            if tf_id > last_id:
+                last_id = tf_id
+            if not hs_code:
+                unmapped += 1
+                continue
+            resolved_mid, resolved_hs_id, _conf = _resolve_material_id(
+                str(hs_code), hs_material_map
+            )
+            if resolved_mid is None:
+                unmapped += 1
+                log.debug(
+                    "comtrade.backfill_hs_mappings.no_mapping",
+                    trade_flow_id=tf_id,
+                    hs_code=hs_code,
+                )
+                continue
+            if resolved_mid != stored_mid:
+                mismatched += 1
+                if len(mismatch_samples) < log_mismatch_samples:
+                    mismatch_samples.append({
+                        "trade_flow_id": tf_id,
+                        "hs_code": hs_code,
+                        "stored_material_id": stored_mid,
+                        "resolved_material_id": resolved_mid,
+                    })
+                log.warning(
+                    "comtrade.backfill_hs_mappings.mapping_drift",
+                    trade_flow_id=tf_id,
+                    hs_code=hs_code,
+                    stored_material_id=stored_mid,
+                    resolved_material_id=resolved_mid,
+                    hint=(
+                        "Prefix → material mapping has shifted since "
+                        "original ingest.  Row left untouched; investigate "
+                        "before deciding whether to re-attribute."
+                    ),
+                )
+                continue
+            if resolved_hs_id is None:
+                # Should not happen — _resolve_material_id only returns a
+                # material_id when it has a mapping row to point at — but
+                # guard just in case.
+                unmapped += 1
+                continue
+            updates[tf_id] = resolved_hs_id
+
+        # Apply the batch.  Build a single UPDATE per mapping_id grouping
+        # to keep the round-trip count small.
+        if updates:
+            # Group by hs_mapping_id so we can do one UPDATE...WHERE id IN (...)
+            # per distinct mapping rather than one per row.
+            by_mapping: dict[int, list[int]] = {}
+            for tf_id, hs_id in updates.items():
+                by_mapping.setdefault(hs_id, []).append(tf_id)
+            for hs_id, tf_ids in by_mapping.items():
+                session.execute(
+                    TradeFlow.__table__.update()
+                    .where(TradeFlow.id.in_(tf_ids))
+                    .values(hs_mapping_id=hs_id)
+                )
+                updated += len(tf_ids)
+            session.commit()
+
+        log.info(
+            "comtrade.backfill_hs_mappings.batch_done",
+            examined=examined,
+            updated=updated,
+            mismatched=mismatched,
+            unmapped=unmapped,
+            last_id=last_id,
+        )
+
+    result = {
+        "examined": examined,
+        "updated": updated,
+        "mismatched": mismatched,
+        "unmapped": unmapped,
+        "mismatch_samples": mismatch_samples,
+    }
+    log.info("comtrade.backfill_hs_mappings.done", **{
+        k: v for k, v in result.items() if k != "mismatch_samples"
+    })
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Re-attribution: TradeFlow rows whose material_id is still NULL
+# ---------------------------------------------------------------------------
+
+def reattribute_unmapped_trade_flows(
+    session: Session,
+    batch_size: int = 2_000,
+    log_attribution_samples: int = 20,
+) -> dict[str, Any]:
+    """Re-resolve ``TradeFlow`` rows that have ``material_id IS NULL``.
+
+    Use this after expanding ``hs_code_material_mappings`` to pick up the
+    new mappings against historical TradeFlow rows whose HS codes
+    previously had no resolution.  Sister function to
+    ``backfill_trade_flow_hs_mappings``, but with a different filter and
+    different semantics:
+
+      backfill_trade_flow_hs_mappings
+        Targets rows where ``material_id IS NOT NULL AND hs_mapping_id
+        IS NULL`` — fills in the FK, refuses to rewrite ``material_id``.
+        Conservative: never changes attribution, only adds it.
+
+      reattribute_unmapped_trade_flows (this function)
+        Targets rows where ``material_id IS NULL`` — when the current
+        seed produces a valid resolution, writes BOTH ``material_id``
+        AND ``hs_mapping_id``.  More invasive: this IS a data change.
+        Safe because it only adds attribution to previously-unattributed
+        rows; nothing gets overwritten.
+
+    Logged at WARNING (not DEBUG) for each row written so the data trail
+    is discoverable in the structured logs.  Returns a sample of newly-
+    attributed rows for inspection.
+
+    Idempotent: after running, rows that now have ``material_id`` set
+    fall off the filter.  Rows that remain unresolvable (HS code still
+    doesn't map to anything in the seed) are re-examined on subsequent
+    runs but produce zero updates.  Cursor pagination by ``id > last_id``
+    keeps the leftover rows from being re-counted.
+
+    Args:
+        session:                  SQLAlchemy session, committed per batch.
+        batch_size:               Rows fetched and updated per pass.
+        log_attribution_samples:  Cap on number of attribution examples
+                                  collected in the return dict (samples,
+                                  not the count — examined count is full).
+
+    Returns:
+        ::
+
+          {
+              "examined": int,         # rows pulled by the NULL filter
+              "attributed": int,       # rows newly given (material_id, hs_mapping_id)
+              "still_unmapped": int,   # rows the new seed still can't resolve
+              "attribution_samples": [
+                  {"trade_flow_id": int, "hs_code": str,
+                   "new_material_id": int, "new_hs_mapping_id": int,
+                   "confidence": float},
+                  ...
+              ],
+          }
+    """
+    hs_material_map = _build_hs_material_map(session)
+    if not hs_material_map:
+        log.warning(
+            "comtrade.reattribute_unmapped.empty_mapping_table",
+            hint=(
+                "hs_code_material_mappings is empty — run "
+                "`bdi-ingest seed-hs-mappings` first."
+            ),
+        )
+        return {
+            "examined": 0,
+            "attributed": 0,
+            "still_unmapped": 0,
+            "attribution_samples": [],
+        }
+
+    examined = 0
+    attributed = 0
+    still_unmapped = 0
+    attribution_samples: list[dict[str, Any]] = []
+
+    # Cursor-paginate by id so unresolvable leftover rows don't get
+    # re-examined on the next iteration.  Same pattern as the backfill.
+    last_id = 0
+    while True:
+        rows = session.execute(
+            select(TradeFlow.id, TradeFlow.hs_code)
+            .where(
+                TradeFlow.material_id.is_(None),
+                TradeFlow.id > last_id,
+            )
+            .order_by(TradeFlow.id)
+            .limit(batch_size)
+        ).all()
+
+        if not rows:
+            break
+
+        # Per-batch: {trade_flow_id: (material_id, hs_mapping_id)}
+        updates: dict[int, tuple[int, Optional[int]]] = {}
+        for tf_id, hs_code in rows:
+            examined += 1
+            if tf_id > last_id:
+                last_id = tf_id
+            if not hs_code:
+                still_unmapped += 1
+                continue
+            resolved_mid, resolved_hs_id, resolved_conf = _resolve_material_id(
+                str(hs_code), hs_material_map
+            )
+            if resolved_mid is None:
+                still_unmapped += 1
+                continue
+            updates[tf_id] = (resolved_mid, resolved_hs_id)
+            if len(attribution_samples) < log_attribution_samples:
+                attribution_samples.append({
+                    "trade_flow_id": tf_id,
+                    "hs_code": hs_code,
+                    "new_material_id": resolved_mid,
+                    "new_hs_mapping_id": resolved_hs_id,
+                    "confidence": resolved_conf,
+                })
+            log.warning(
+                "comtrade.reattribute_unmapped.new_attribution",
+                trade_flow_id=tf_id,
+                hs_code=hs_code,
+                new_material_id=resolved_mid,
+                new_hs_mapping_id=resolved_hs_id,
+                confidence=resolved_conf,
+            )
+
+        # Apply the batch.  Group by (material_id, hs_mapping_id) so
+        # rows with the same resolution get a single UPDATE.
+        if updates:
+            grouped: dict[tuple[int, Optional[int]], list[int]] = {}
+            for tf_id, pair in updates.items():
+                grouped.setdefault(pair, []).append(tf_id)
+            for (mid, hs_id), tf_ids in grouped.items():
+                session.execute(
+                    TradeFlow.__table__.update()
+                    .where(TradeFlow.id.in_(tf_ids))
+                    .values(material_id=mid, hs_mapping_id=hs_id)
+                )
+                attributed += len(tf_ids)
+            session.commit()
+
+        log.info(
+            "comtrade.reattribute_unmapped.batch_done",
+            examined=examined,
+            attributed=attributed,
+            still_unmapped=still_unmapped,
+            last_id=last_id,
+        )
+
+    result = {
+        "examined": examined,
+        "attributed": attributed,
+        "still_unmapped": still_unmapped,
+        "attribution_samples": attribution_samples,
+    }
+    log.info("comtrade.reattribute_unmapped.done", **{
+        k: v for k, v in result.items() if k != "attribution_samples"
+    })
+    return result

@@ -15,19 +15,28 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
 from app.models.company import Company, CompanyScore
+from app.models.documents import SourceDocument
+from app.models.regulatory import RiskEvent, RiskEventMaterial
 from app.models.reporting import AnalystNote
 from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
+from app.models.source import Source
 from app.models.supply import HsCodeMaterialMapping, Material, MaterialProductionShare
 from app.schemas.dashboard import (
     ConfidenceBucket,
+    CoreMineralsScored,
+    CoverageGapItem,
+    CoverageGaps,
     DashboardOverview,
     PillarProgress,
     ProductionCountryItem,
     RecentNoteItem,
+    RecentRiskEvents30d,
     ScoreRunProgress,
+    SourceCount,
     StageCount,
     TopMaterialRisk,
 )
+from app.services.scoring.launch_list import LAUNCH_LIST_CANONICAL_NAMES
 
 _LOW_CONFIDENCE_THRESHOLD = 0.6
 
@@ -38,6 +47,28 @@ _PILLARS = [
     ("operational_score", "Operational"),
     ("financial_pressure_score", "Financial pressure"),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Coverage-gap thresholds (analyst-view dashboard, 2026-05-11)
+# ---------------------------------------------------------------------------
+# A launch-list mineral is flagged as a coverage gap if ANY of these are true:
+#
+#   no_global_score   — no MaterialGlobalRiskScore row exists
+#   stale_score       — latest as_of_date is older than this many days
+#   thin_events       — fewer than N risk events in the last 90 days
+#   thin_pillars      — fewer than this many pillars have non-fallback signal
+#                       at the latest score (pillar > 0)
+#
+# Calibrated to surface launch-blockers without flagging materials that are
+# legitimately quiet.  Phosphate currently fails the thin_events check (no
+# facility coverage yet), which is the intended behaviour — surfacing it for
+# follow-up rather than papering over it.
+
+_GAP_STALE_DAYS = 30
+_GAP_THIN_EVENTS_WINDOW_DAYS = 90
+_GAP_THIN_EVENTS_MIN = 5
+_GAP_THIN_PILLARS_MIN = 3
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -151,6 +182,13 @@ def dashboard_overview(
         )
         or 0
     )
+
+    # ------------------------------------------------------------------
+    # Launch-list-centric KPIs (2026-05-11 analyst-view dashboard)
+    # ------------------------------------------------------------------
+    core_minerals_scored = _compute_core_minerals_scored(db)
+    recent_risk_events = _compute_recent_risk_events_30d(db, now=now)
+    coverage_gaps = _compute_coverage_gaps(db, now=now)
 
     # ------------------------------------------------------------------
     # Top materials by risk (latest global score, top 5)
@@ -372,7 +410,237 @@ def dashboard_overview(
         material_count_this_quarter=material_this_quarter,
         suspect_mappings_count=suspect_count,
         recent_notes_entity_count_7d=entity_count_7d,
+        # 2026-05-11 launch-list-centric KPIs
+        core_minerals_scored=core_minerals_scored,
+        recent_risk_events_30d=recent_risk_events,
+        coverage_gaps=coverage_gaps,
         top_materials_by_risk=top_materials,
         score_run_progress=score_run,
         recent_activity=recent_activity,
     )
+
+
+# ---------------------------------------------------------------------------
+# Launch-list KPI helpers (2026-05-11)
+# ---------------------------------------------------------------------------
+
+def _compute_core_minerals_scored(db: Session) -> CoreMineralsScored:
+    """Count launch-list materials with a current global risk score.
+
+    "Current" = has at least one ``MaterialGlobalRiskScore`` row with a
+    non-null ``overall_risk_score``.  Materials in the launch list that
+    aren't in the Materials table at all are reported as unscored
+    (they're missing from the system entirely) so the analyst sees the
+    same gap whether the cause is data absence or row absence.
+    """
+    total = len(LAUNCH_LIST_CANONICAL_NAMES)
+
+    # Pull every launch-list material that has a non-null global score
+    scored_rows = db.execute(
+        select(Material.canonical_name)
+        .join(
+            MaterialGlobalRiskScore,
+            MaterialGlobalRiskScore.material_id == Material.id,
+        )
+        .where(
+            Material.canonical_name.in_(LAUNCH_LIST_CANONICAL_NAMES),
+            MaterialGlobalRiskScore.overall_risk_score.isnot(None),
+        )
+        .distinct()
+    ).all()
+    scored_names = {row[0] for row in scored_rows}
+
+    unscored = [
+        name for name in LAUNCH_LIST_CANONICAL_NAMES if name not in scored_names
+    ]
+
+    return CoreMineralsScored(
+        scored=len(scored_names),
+        total=total,
+        unscored_names=unscored,
+    )
+
+
+def _compute_recent_risk_events_30d(
+    db: Session, *, now: datetime,
+) -> RecentRiskEvents30d:
+    """Risk-event volume in the trailing 30 days vs the 30 days before that.
+
+    Joins ``risk_events`` → ``source_documents`` → ``sources`` to surface the
+    top contributing sources.  Excludes events with no source_document_id
+    (legacy / system-generated rows).
+    """
+    cutoff_30d = now - timedelta(days=30)
+    cutoff_60d = now - timedelta(days=60)
+
+    # Total counts: current 30d and previous 30d
+    count_30d = int(
+        db.scalar(
+            select(func.count())
+            .select_from(RiskEvent)
+            .where(RiskEvent.created_at >= cutoff_30d)
+        )
+        or 0
+    )
+    count_prev = int(
+        db.scalar(
+            select(func.count())
+            .select_from(RiskEvent)
+            .where(
+                RiskEvent.created_at >= cutoff_60d,
+                RiskEvent.created_at < cutoff_30d,
+            )
+        )
+        or 0
+    )
+
+    # Top sources in the current 30d window
+    source_rows = db.execute(
+        select(
+            Source.name.label("source_name"),
+            func.count(RiskEvent.id).label("n"),
+        )
+        .join(SourceDocument, SourceDocument.id == RiskEvent.source_document_id)
+        .join(Source, Source.id == SourceDocument.source_id)
+        .where(RiskEvent.created_at >= cutoff_30d)
+        .group_by(Source.name)
+        .order_by(func.count(RiskEvent.id).desc())
+        .limit(5)
+    ).all()
+
+    top_sources = [
+        SourceCount(source_name=row.source_name, count=int(row.n))
+        for row in source_rows
+    ]
+
+    return RecentRiskEvents30d(
+        count=count_30d,
+        prev_period_count=count_prev,
+        top_sources=top_sources,
+    )
+
+
+def _compute_coverage_gaps(db: Session, *, now: datetime) -> CoverageGaps:
+    """Identify launch-list materials failing any quality bar.
+
+    Four reasons a mineral can be flagged:
+
+      ``no_global_score``  No ``MaterialGlobalRiskScore`` row exists at all.
+      ``stale_score``      Latest score's ``as_of_date`` is older than
+                           ``_GAP_STALE_DAYS`` (30 days).
+      ``thin_events``      Fewer than ``_GAP_THIN_EVENTS_MIN`` (5) risk
+                           events in the last ``_GAP_THIN_EVENTS_WINDOW_DAYS``
+                           (90 days).
+      ``thin_pillars``     Fewer than ``_GAP_THIN_PILLARS_MIN`` (3) of the
+                           five pillar columns have score > 0 at the
+                           latest ``MaterialGlobalRiskScore`` row.
+
+    A single material can carry multiple reasons (each one is appended).
+    The dashboard KPI card uses the count for the headline; drill-down
+    views can render the per-material reason list.
+    """
+    cutoff_stale = now - timedelta(days=_GAP_STALE_DAYS)
+    cutoff_events = now - timedelta(days=_GAP_THIN_EVENTS_WINDOW_DAYS)
+
+    # Pull all launch-list materials that exist in the DB
+    materials = db.execute(
+        select(Material.id, Material.canonical_name).where(
+            Material.canonical_name.in_(LAUNCH_LIST_CANONICAL_NAMES),
+        )
+    ).all()
+    materials_by_name = {row.canonical_name: row.id for row in materials}
+
+    # Latest global score per material — used for stale + thin_pillars checks
+    latest_global_subq = (
+        select(MaterialGlobalRiskScore)
+        .distinct(MaterialGlobalRiskScore.material_id)
+        .order_by(
+            MaterialGlobalRiskScore.material_id,
+            MaterialGlobalRiskScore.as_of_date.desc(),
+            MaterialGlobalRiskScore.id.desc(),
+        )
+    ).subquery()
+
+    latest_rows = db.execute(
+        select(
+            latest_global_subq.c.material_id,
+            latest_global_subq.c.overall_risk_score,
+            latest_global_subq.c.as_of_date,
+            latest_global_subq.c.material_concentration_score,
+            latest_global_subq.c.geopolitical_trade_score,
+            latest_global_subq.c.regulatory_compliance_score,
+            latest_global_subq.c.operational_score,
+            latest_global_subq.c.financial_pressure_score,
+        ).where(
+            latest_global_subq.c.material_id.in_(materials_by_name.values()),
+        )
+    ).all()
+    latest_by_mat = {row.material_id: row for row in latest_rows}
+
+    # Recent risk-event counts per launch-list material via
+    # RiskEventMaterial.  Empty dict for materials with no events at all.
+    event_count_rows = db.execute(
+        select(
+            RiskEventMaterial.material_id,
+            func.count(RiskEvent.id).label("n"),
+        )
+        .join(RiskEvent, RiskEvent.id == RiskEventMaterial.risk_event_id)
+        .where(
+            RiskEventMaterial.material_id.in_(materials_by_name.values()),
+            RiskEvent.created_at >= cutoff_events,
+        )
+        .group_by(RiskEventMaterial.material_id)
+    ).all()
+    event_count_by_mat = {row.material_id: int(row.n) for row in event_count_rows}
+
+    gap_items: list[CoverageGapItem] = []
+    # Iterate in launch-list order so the output is presentation-stable
+    for name in LAUNCH_LIST_CANONICAL_NAMES:
+        material_id = materials_by_name.get(name)
+        reasons: list[str] = []
+
+        if material_id is None:
+            # Material not even in the DB — count as the most severe gap
+            gap_items.append(CoverageGapItem(
+                material_id=-1,  # sentinel; downstream consumers can filter
+                canonical_name=name,
+                reasons=["no_global_score", "material_row_missing"],
+            ))
+            continue
+
+        latest = latest_by_mat.get(material_id)
+        if latest is None or latest.overall_risk_score is None:
+            reasons.append("no_global_score")
+        else:
+            if latest.as_of_date is not None:
+                as_of_dt = datetime.combine(
+                    latest.as_of_date, datetime.min.time(), tzinfo=timezone.utc,
+                ) if not isinstance(latest.as_of_date, datetime) else latest.as_of_date
+                if as_of_dt < cutoff_stale:
+                    reasons.append("stale_score")
+            # Count pillars with non-fallback signal
+            pillar_values = [
+                latest.material_concentration_score,
+                latest.geopolitical_trade_score,
+                latest.regulatory_compliance_score,
+                latest.operational_score,
+                latest.financial_pressure_score,
+            ]
+            non_zero = sum(
+                1 for v in pillar_values if v is not None and v > 0
+            )
+            if non_zero < _GAP_THIN_PILLARS_MIN:
+                reasons.append("thin_pillars")
+
+        events_in_window = event_count_by_mat.get(material_id, 0)
+        if events_in_window < _GAP_THIN_EVENTS_MIN:
+            reasons.append("thin_events")
+
+        if reasons:
+            gap_items.append(CoverageGapItem(
+                material_id=material_id,
+                canonical_name=name,
+                reasons=reasons,
+            ))
+
+    return CoverageGaps(count=len(gap_items), materials=gap_items)

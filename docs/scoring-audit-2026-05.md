@@ -1,13 +1,23 @@
 # Scoring Engine Audit — HS Code Redesign Coverage
 
-> **Date:** 2026-05-03 (last status update 2026-05-06)
+> **Date:** 2026-05-03 (last status update 2026-05-11)
 > **Scope:** HS code Level-0 layer + full rollup chain (stage → material+geo → global → chemistry)
 > **Method:** Code read against `docs/scoring.md` and `docs/hs-code-redesign.md`. Verified file-by-file; no runtime/DB inspection.
 > **Audience:** Nicole. No partner-friendly framing — direct findings only.
+>
+> **Most recent work (2026-05-09 → 2026-05-11):** parameter-stable
+> content_hash + UPSERT for `trade_signal_builder` and `opensanctions`;
+> `pipeline._add_risk_event` dedup gap closed; new operational tooling
+> (`reset-events`, `reingest-all-events`, `backfill-trade-flow-hs-mappings`,
+> `reattribute-unmapped-trade-flows`); 6 new HS mappings covering the
+> top-3 unresolved Comtrade prefixes; N5 (10-digit HTS) decided as
+> won't-fix after diagnostic; NFI/IFI multiplier recalibration parked
+> pending partner input. See `scoring-audit-2026-05-addendum.md` for
+> full details of each.
 
 ---
 
-## Status as of 2026-05-06
+## Status as of 2026-05-11
 
 The original three "structural gaps" called out in the TL;DR below have all
 been resolved.  The remaining open items are scoping/data decisions, not
@@ -20,11 +30,11 @@ code gaps.
 | G3 — `_TARIFF_SUBTYPES` filter misaligned with ingester writes | **Resolved** | Migration 040 promoted `event_subtype` to a typed column; both sides aligned on uppercase form (`TARIFF`, `EXPORT_RESTRICTION`, `IMPORT_DISRUPTION`). |
 | G4a / N4 — MRDS auto-stage mapping | **Resolved (2026-05-06)** | `mrds.py` now sets `supply_chain_stage` from `oper_type` + name-keyword fallback (refinery / concentrator / quarry / etc.). Active-only filter skips Past Producer + Prospect rows (cuts 304k → ~26k). Granular facility_types route to distinct stages. |
 | G4 Half 1 — Operational pillar stage-awareness | **Resolved (2026-05-06)** | `_facility_structural_dependency` is now stage-aware. Computes per-stage dependency, rolls up via `STAGE_ROLLUP_WEIGHTS`, no default-fill for missing stages. Per-stage breakdown surfaces in rationale_json. New `dep_source` values `mrds_geography_stage_weighted` / `mrds_global_discounted_stage_weighted`. |
-| G5 — `hs_node_scorer` composite has no operational sub-score | **Still open** | Was deferred until G4 data lands. Now feasible after G4 Half 1 + G4a — can be picked up after the G4c partner-curated seed lands. |
-| G6 — `_STAGE_ROLLUP_MIN_NODES = 2` over-triggers fallback | **Open** | Needs telemetry data first to decide between lowering to 1 vs adding per-pair fallback logging. |
+| G5 — `hs_node_scorer` composite has no operational sub-score | **Resolved (2026-05-09)** | 4-sub-score composite landed: `0.40×HHI + 0.20×tariff + 0.20×export + 0.20×operational` when facility capacity data is present; auto-falls back to the legacy 3-sub-score formula otherwise. Five `score_method` values cover all combinations. Batch enumerator unions facility-pairs alongside share-pairs and event-pairs. |
+| G6 — `_STAGE_ROLLUP_MIN_NODES = 2` over-triggers fallback | **Resolved (2026-05-09)** | Threshold lowered to 1 after measurement against launch-10 showed 22/36 (61%) of scored pairs were falling to legacy fallback at threshold=2. Single-node rollup math is clean: `(node × stage_weight) / stage_weight = node`. The Option-1 event-only fallback (also 2026-05-06) covers the no-data case so single-node noise is not a concern. |
 | G7 — Equal-weight fallback in global_rollup logged but not measured | **Resolved** | `coverage.py` diagnostic helper `report_hs_coverage()` now provides aggregate visibility. Also fixed `banned` scope_type missing from `_SCOPE_TYPE_WEIGHT`. |
 | G8 — `_trade_weights` uses single most-recent period | **Resolved (2026-05-06)** | Now averages across last 3 years (annual/Comtrade) or last 12 months (monthly/Census). Also fixed mixed-period bug where Census YYYY-MM was lex-winning over Comtrade YYYY, silently dropping non-US weight. |
-| G9 — `commodity_prices.hs_mapping_id` / `price_form` unused | **Open** | Pink Sheet ingester doesn't write these columns. Lower priority unless a paid stage-resolved price feed is added. |
+| G9 — `commodity_prices.hs_mapping_id` / `price_form` unused | **Resolved (2026-05-06)** | Pink Sheet ingester refactor wired 11 LME-convention headers to `hs_mapping_id` + `price_form`. Spodumene vs lithium hydroxide now distinguishable downstream. |
 | G10 — Inngest cron jobs have no dependency enforcement | **Open** | Watch list. Defer until an actual race is observed. |
 | G11 — HS node event filter ignores per-event country scope | **Resolved (2026-05-06)** | `score_hs_node_geography` now joins `RiskEventGeography` with country + `geography_context` filters: `tariff_exposure` uses `affected` context (producer being tariffed), `export_restriction` uses `primary` (implementing country = producer for export-side). Strict — events without geography rows are excluded. Concurrent GTA Scope 2 fixes: CPC code rejection, Affected Jurisdictions parsing, severity multipliers (subnational/supranational/horizontal). |
 | G12 — `materials.criticality_score` cache refresh | **Verified intact** | Spot-checked during 2026-05-05 addendum. Cache write present in `cli.py:285-286`. |
@@ -32,14 +42,16 @@ code gaps.
 ### What's still open after this session
 
 1. **N3 follow-up — News pipeline material attribution.** SEC EDGAR migrated to dedicated module (done). Census trade material attribution wired (done). Only news remains, and it's still a `StubNewsProvider` — no real-world impact today. Wait until a real news provider (NewsAPI / GDELT / licensed feed) is wired in.
-2. **G6 — `_STAGE_ROLLUP_MIN_NODES` tuning.** Measurement task, not code. Needs telemetry on per-pair fallback frequency before changing the threshold.
-3. **G4b — GEM Iron Ore Mines ingester.** Free open data; useful only for LFP cathode. ~1-2 days when prioritised.
-4. **G4c — Partner-curated facility seed loader.** Code is small (~1 day); the data entry is the unbounded piece. Partner has committed to providing a list.
+2. **G4b — GEM Iron Ore Mines ingester.** Free open data; useful only for LFP cathode. ~1-2 days when prioritised.
+3. **G4c — Partner-curated facility seed.** **Engineering: LANDED 2026-05-09.** `app/services/ingestion/seed_facilities_partner.py` reads the partner XLSX template and upserts companies → facilities → company_facilities → facility_material_links idempotently; CLI `bdi-ingest seed-facilities-partner <file>` with `--dry-run`. Partner template lives at `Automotive Data Solutions/facility_seed_template.xlsx`. **Data: still pending** — partner is filling in the launch-list materials.
+4. **G5 — HS node operational sub-score.** **Engineering: LANDED 2026-05-09.** Composite formula extended from 3 sub-scores (`0.50×HHI + 0.25×tariff + 0.25×export`) to 4 sub-scores (`0.40×HHI + 0.20×tariff + 0.20×export + 0.20×operational`) when facility capacity data is available. Five scoring paths now exist; `score_method` enum extended (`hhi_anchored`, `hhi_anchored_with_operational`, `event_only_no_hhi`, `event_only_with_operational`, `operational_only`). Auto-fallback: when no facility capacity rows exist for `(material × stage × country)`, scorer reverts to the previous 3-sub-score formula. Batch enumerator extended to union facility-pairs in addition to share-pairs and event-pairs. Synthetic test passes all 8 assertions including end-to-end batch run. Operational impact is data-gated — most MRDS facilities have NULL `annual_capacity_tpy`, so the new sub-score only fires on partner-curated facility rows (via the G4c loader). See `app/services/scoring/hs_node_scorer.py::_compute_operational_signal`.
 5. **G4d — Paid subscription** (Benchmark / S&P / Wood Mackenzie). Budget decision; deferred.
-6. **N5 — 10-digit HTS keyword coverage.** Optional; HS-code-only routing (longest-prefix match) is acceptable today.
-7. **EXPORT_SUBSIDY / TRADE_FINANCE event_subtype.** Newly surfaced 2026-05-06 while decoding GTA's NFI/IFI implementation_level codes. NFI = National Financial Institution, IFI = International Financial Institution; both classes describe subsidy-type interventions (not tariffs/export bans). Currently get `event_subtype=NULL` and skip HS-node sub-scores entirely. Distinct scoring question (subsidy distortion vs sourcing risk). New sub-score, not a fix.
+6. ~~**N5 — 10-digit HTS keyword coverage.**~~ **Decided won't-fix 2026-05-11.** Diagnostic over 206 10-digit rows confirmed 72 (35%) carry information the 6-digit path can't recover (REE disambiguation + 7 non-REE UNIQUE_ATTRIBUTION + 21 RECOVERS_FROM_AMBIGUITY). Current longest-prefix resolver handles all cases correctly. Keeping 10-digit coverage as-is; no resolver change needed. See `Automotive Data Solutions/diagnose_10digit_hs_coverage.py`.
+7. **G-Cov-3 — EXPORT_SUBSIDY event_subtype + geopolitical sub-input.** **LANDED 2026-05-09.** GTA `_INTERVENTION_SUBTYPE_MAP` now classifies 11 subsidy intervention types as `EXPORT_SUBSIDY`. IEA Policy Tracker sets `event_subtype="EXPORT_SUBSIDY"` on INVESTMENT_PLEDGE events. `_classify_geo_events` returns a 3-bucket split (export / tariff / subsidy). `_derive_market_geopolitical_inputs` returns a 5-tuple including `production_subsidy_distortion`. Geopolitical pillar runs a 4-component scoring profile (`0.40 × country_concentration + 0.30 × export + 0.20 × tariff + 0.10 × subsidy_distortion`) when subsidy data present; falls back to legacy 3-component (`0.40/0.35/0.25`) otherwise. Synthetic test `test_gcov_3_export_subsidy.py` (5/5 assertions). **G-Cov-4 (event-driven operational signals) still deferred** until partner facility data lands — structural baseline needs to be meaningful before layering operational events on top.
 8. **US-dependency tier scoring** (NIR + apparent consumption + import-source HHI). Deferred per partner consultation.
 9. **Dynamic HCG derivation** / **WGI structural country governance** / **USITC HTS structural tariff baseline**. Original audit's P2/P3 backlog; unchanged.
+10. **GTA NFI/IFI severity multipliers** — parked 2026-05-11. Survey done, recommended values drafted (NFI=0.75, IFI=0.50). Awaiting partner input before applying. See addendum's resolved-items list for details.
+11. **2026-05-11 operational/UX backend changes (all LANDED):** parameter-stable `content_hash` + UPSERT semantics for `trade_signal_builder` and `opensanctions` (mutable percentage / count no longer creates duplicates on re-run); `pipeline._add_risk_event` dedup gap closed; `RiskEvent.updated_at` column (migration 041); new CLI commands `reset-events`, `reingest-all-events`, `backfill-trade-flow-hs-mappings`, `reattribute-unmapped-trade-flows`; 6 new HS mappings closing 32 of 274 unresolved trade flow rows (720250, 281810/30, 2818, 262030, 262040); `build_trade_risk_event` derives event_date from Census period rather than `now()`. See addendum's resolved-items list for per-item detail and test coverage.
 
 ---
 

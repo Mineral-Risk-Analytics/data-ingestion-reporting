@@ -57,7 +57,10 @@ from app.services.scoring import (
     regulatory_risk,
 )
 from app.services.scoring.decay import compute_recency_multiplier
-from app.services.scoring.event_impact import compute_event_impact
+from app.services.scoring.event_impact import (
+    compute_event_impact,
+    relevance_score_to_multiplier,
+)
 from app.services.scoring.evidence_query import (
     EventWithRelevance,
     HIGH_CONCENTRATION_GEOS,
@@ -109,7 +112,21 @@ STAGE_ROLLUP_WEIGHTS: dict[str, float] = {
 # Minimum number of Level-0 stage nodes required to use the stage-weighted
 # rollup path.  Below this threshold we fall back to the legacy
 # material_risk.score_material_exposure() path.
-_STAGE_ROLLUP_MIN_NODES = 2
+#
+# Threshold history:
+#   2026-05-06: Set to 2 — initial conservative value to avoid single-node
+#               noise feeding the rollup.
+#   2026-05-09: Lowered to 1.  G6 audit measurement against the launch-10
+#               materials showed 22 of 36 scored (material × country) pairs
+#               (61%) fell to legacy fallback at threshold=2, because most
+#               materials only have ore-stage scoring.  Single-node rollup
+#               is mathematically clean — the formula
+#               ``(node × stage_weight) / stage_weight`` collapses to
+#               ``node`` exactly — and the Option-1 event-only fallback
+#               (2026-05-06) handles materials with no production-share
+#               data so single-node noise from empty materials is not a
+#               concern.  See ``docs/scoring-audit-2026-05.md`` G6.
+_STAGE_ROLLUP_MIN_NODES = 1
 
 # ── Pink Sheet (commodity_prices) thresholds — short-window ─────────────
 # CV (coefficient of variation = std/mean) over the look-back window
@@ -200,7 +217,9 @@ def _event_impact(
         severity=float(ew.event.severity_score or 0.5),
         confidence=float(ew.event.confidence_score or 0.5),
         recency_multiplier=recency,
-        relevance_multiplier=ew.relevance_score,
+        # ew.relevance_score is on [0, 1]; map to the [0.70, 1.30]
+        # multiplier domain compute_event_impact validates against.
+        relevance_multiplier=relevance_score_to_multiplier(ew.relevance_score),
     )
 
 
@@ -217,14 +236,26 @@ def _avg_impact_normalised(
 
 def _classify_geo_events(
     events: list[EventWithRelevance],
-) -> tuple[list[EventWithRelevance], list[EventWithRelevance]]:
-    """Split events into (export_restriction_events, tariff_events)."""
+) -> tuple[list[EventWithRelevance], list[EventWithRelevance], list[EventWithRelevance]]:
+    """Split events into (export_restriction, tariff, subsidy) buckets.
+
+    Subsidy bucket added 2026-05-09 (G-Cov-3).  Detection is event_subtype-only:
+    title-text heuristics are unreliable here (a sentence like "U.S. EXIM
+    Bank finances export contract for X" does not contain the word
+    "subsidy" but is exactly the kind of event we want to capture).  GTA
+    and IEA Policy Tracker ingesters set ``event_subtype="EXPORT_SUBSIDY"``
+    on the relevant rows; pre-2026-05-09 events have NULL subtype and
+    will need a re-ingest to flow into this bucket.
+    """
     export_events: list[EventWithRelevance] = []
     tariff_events: list[EventWithRelevance] = []
+    subsidy_events: list[EventWithRelevance] = []
     for ew in events:
         subtype = ew.event.event_subtype or ""  # typed col (migration 040)
         text = (ew.event.title or "").lower()
-        if subtype == "EXPORT_RESTRICTION" or (
+        if subtype == "EXPORT_SUBSIDY":
+            subsidy_events.append(ew)
+        elif subtype == "EXPORT_RESTRICTION" or (
             "export" in text and ("restrict" in text or "ban" in text or "control" in text)
         ):
             export_events.append(ew)
@@ -232,7 +263,7 @@ def _classify_geo_events(
             "tariff" in text or "trade policy" in text or "section 301" in text
         ):
             tariff_events.append(ew)
-    return export_events, tariff_events
+    return export_events, tariff_events, subsidy_events
 
 
 def _dedup_events(*event_lists: list[EventWithRelevance]) -> list[EventWithRelevance]:
@@ -358,11 +389,18 @@ def _derive_market_geopolitical_inputs(
     as_of_date: date,
     *,
     eligible_nodes: Optional[list["HsCodeGeographyRiskScore"]] = None,
-) -> tuple[float, float, float, str]:
+) -> tuple[float, float, float, Optional[float], str]:
     """
     Returns (country_concentration, export_restriction_exposure, tariff_exposure,
-             geopolitical_method) where the floats are on [0, 1.0] and
-    geopolitical_method is one of:
+             production_subsidy_distortion, geopolitical_method) where the
+    floats are on [0, 1.0].  ``production_subsidy_distortion`` is
+    ``None`` when no EXPORT_SUBSIDY events exist for this (material ×
+    geography) pair (triggers the 3-component scoring profile in
+    ``geopolitical_risk.score_geopolitical_trade``); any numeric value
+    (including 0.0) triggers the 4-component profile.  Added 2026-05-09
+    as part of the G-Cov-3 audit fix.
+
+    ``geopolitical_method`` is one of:
 
         "event_classification"  — only the legacy geography-anchored event
                                   path fired (HS nodes absent or below the
@@ -429,13 +467,30 @@ def _derive_market_geopolitical_inputs(
         )
 
     # ── Path 1: event classification (geography-anchored) ──────────────────
-    export_events, tariff_events = _classify_geo_events(geo_trade_events)
+    export_events, tariff_events, subsidy_events = _classify_geo_events(
+        geo_trade_events
+    )
     event_export = _avg_impact_normalised(
         export_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
     )
     event_tariff = _avg_impact_normalised(
         tariff_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
     )
+
+    # ── Production-subsidy distortion (G-Cov-3, 2026-05-09) ────────────────
+    # EXPORT_SUBSIDY events flow into a separate Geopolitical sub-input
+    # rather than tariff/export — subsidies don't restrict trade, they
+    # distort downstream competition.  Score is None (not 0.0) when no
+    # subsidy events exist so the Geopolitical pillar falls back to the
+    # legacy 3-component profile; once any subsidy event lands, the
+    # 4-component profile fires.  See docs/coverage-gap-plan-2026-05.md
+    # § G-Cov-3.
+    if subsidy_events:
+        subsidy_distortion: Optional[float] = _avg_impact_normalised(
+            subsidy_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
+        )
+    else:
+        subsidy_distortion = None
 
     # ── Path 2: HS-node aggregate (material × stage scoped) — G2 fix ───────
     # Skip when no nodes were passed (caller hasn't fetched them) or when
@@ -474,9 +529,15 @@ def _derive_market_geopolitical_inputs(
                 event_export=event_export,
                 hs_export=hs_export,
             )
-            return country_concentration, export_exposure, tariff_exposure, method
+            return (
+                country_concentration, export_exposure, tariff_exposure,
+                subsidy_distortion, method,
+            )
 
-    return country_concentration, event_export, event_tariff, method
+    return (
+        country_concentration, event_export, event_tariff,
+        subsidy_distortion, method,
+    )
 
 
 def _resolve_compliance_weight(
@@ -873,7 +934,83 @@ def _derive_market_operational_inputs(
         for ew in operational_events
     ]
 
+    # G-Cov-2 (2026-05-06): EXPORT_RESTRICTION events curtail supply, which
+    # is operationally meaningful — but they're already tagged on the
+    # Geopolitical category and feed that pillar via the HS-node scorer.
+    # Fold them into the operational event component at HALF WEIGHT so the
+    # operational pillar reflects the supply-curtailment signal without
+    # double-counting the same event across two pillars at full weight.
+    # Strict country attribution: requires a `RiskEventGeography` row with
+    # `geography_context="primary"` matching the target geography (the G11
+    # convention where the implementing country IS the producer for export-
+    # side interventions).  Events without geography rows are excluded —
+    # consistent with the G11 strict-attribution philosophy.
+    export_restriction_impacts = _export_restriction_operational_impacts(
+        db, material_id, geography_code, as_of_date
+    )
+    weighted_event_impacts.extend(export_restriction_impacts)
+
     return struct_dep, weighted_event_impacts, dep_source, stage_breakdown
+
+
+# G-Cov-2 (2026-05-06): half-weight applied to EXPORT_RESTRICTION events
+# that feed the Operational pillar.  The same event already contributes to
+# the Geopolitical pillar at full weight via the HS-node scorer; half-
+# weighting here prevents double-counting while still letting supply-
+# curtailment signals raise operational scores on materials where MRDS
+# coverage is thin.
+_EXPORT_RESTRICTION_OPERATIONAL_WEIGHT = 0.5
+
+
+def _export_restriction_operational_impacts(
+    db: Session,
+    material_id: int,
+    geography_code: str,
+    as_of_date: date,
+) -> list[float]:
+    """Return half-weighted operational-event impacts for EXPORT_RESTRICTION
+    events scoped to (material, geography).
+
+    Country attribution mirrors the G11 strict path in hs_node_scorer:
+    require a ``RiskEventGeography`` row with
+    ``geography_context="primary"`` matching ``geography_code``.  The
+    implementing country IS the producer for export-side interventions
+    (China imposes graphite export controls → CN is the producer being
+    constrained); ``"primary"`` is exactly that tagging convention.
+
+    Returns an empty list when no qualifying events exist.
+    """
+    from app.models.regulatory import (
+        RiskEvent,
+        RiskEventGeography,
+        RiskEventMaterial,
+    )
+
+    rows = db.execute(
+        select(RiskEvent)
+        .join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
+        .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
+        .where(
+            RiskEventMaterial.material_id == material_id,
+            RiskEvent.event_subtype == "EXPORT_RESTRICTION",
+            RiskEventGeography.country_code == geography_code,
+            RiskEventGeography.geography_context == "primary",
+        )
+        .distinct()
+    ).scalars().all()
+
+    if not rows:
+        return []
+
+    impacts: list[float] = []
+    for ev in rows:
+        # Wrap each RiskEvent in an EventWithRelevance shim so we reuse the
+        # existing _event_impact helper.  relevance_score=1.0 because the
+        # half-weight is applied below, not in the relevance dimension.
+        ew = EventWithRelevance(event=ev, relevance_score=1.0)
+        full_impact = _event_impact(ew, RiskCategory.OPERATIONAL, as_of_date)
+        impacts.append(full_impact * _EXPORT_RESTRICTION_OPERATIONAL_WEIGHT)
+    return impacts
 
 
 def _score_operational_market(
@@ -1420,7 +1557,9 @@ def score_material_geography(
     crit, conc, trade_vol = _derive_market_material_inputs(
         criticality_signal, geography_code, all_trade_events, as_of_date
     )
-    ctry_conc, exp_rest, tariff, geo_method = _derive_market_geopolitical_inputs(
+    (
+        ctry_conc, exp_rest, tariff, subsidy_distortion, geo_method,
+    ) = _derive_market_geopolitical_inputs(
         db, material_id, geography_code, geo_trade_events, as_of_date,
         eligible_nodes=eligible_nodes,
     )
@@ -1452,7 +1591,10 @@ def score_material_geography(
         stage_rollup_method = "material_fallback"
         stage_rollup_count = len(eligible_nodes)  # 0 or 1
 
-    geo_score = geopolitical_risk.score_geopolitical_trade(ctry_conc, exp_rest, tariff)
+    geo_score = geopolitical_risk.score_geopolitical_trade(
+        ctry_conc, exp_rest, tariff,
+        production_subsidy_distortion=subsidy_distortion,
+    )
     reg_score = regulatory_risk.score_regulatory_profile(
         top_reg_impacts, scope_obligations, prox_adj
     )
@@ -1493,6 +1635,12 @@ def score_material_geography(
                 "country_concentration": ctry_conc,
                 "export_restriction_exposure": exp_rest,
                 "tariff_exposure": tariff,
+                # G-Cov-3 (2026-05-09): EXPORT_SUBSIDY event signal.  None
+                # when no subsidy events exist for this (material × geo) —
+                # triggers the 3-component Geopolitical scoring profile.
+                # Any numeric value (incl. 0.0) triggers the 4-component
+                # profile.  See geopolitical_risk.score_geopolitical_trade.
+                "production_subsidy_distortion": subsidy_distortion,
                 # G2 fix (May 2026): records whether export/tariff sub-inputs
                 # came from the legacy event-classification path only or
                 # were combined via max() with the HS-node stage-weighted

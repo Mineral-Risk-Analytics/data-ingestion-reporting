@@ -286,6 +286,7 @@ class TestDeriveFinancialInputs:
         ev.severity_score = severity
         ev.confidence_score = confidence
         ev.event_date = None
+        ev.event_subtype = subtype
         ev.metadata_json = {"event_subtype": subtype}
         ev.title = title
         return EventWithRelevance(event=ev, relevance_score=0.80)
@@ -336,6 +337,7 @@ class TestDeriveOperationalInputs:
         ev.severity_score = severity
         ev.confidence_score = 0.6
         ev.event_date = None
+        ev.event_subtype = subtype
         ev.metadata_json = {"event_subtype": subtype}
         ev.title = ""
         return EventWithRelevance(event=ev, relevance_score=0.80)

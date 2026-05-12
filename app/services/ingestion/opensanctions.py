@@ -106,6 +106,53 @@ _BATCH_SIZE = 100
 # Only these schema types are relevant for company matching.
 _COMPANY_SCHEMAS = {"Company", "Organization", "LegalEntity", "PublicBody"}
 
+# ── Topic relevance filter (added 2026-05-09, Tier 1.2 audit) ───────────
+# OpenSanctions tags each entity with one or more ``topics`` describing
+# why it's listed.  For a mineral supply-chain risk model, only a subset
+# of topics are actually informative — a sanctioned individual for tax
+# fraud doesn't tell us anything about minerals, but a sanctioned
+# state-owned enterprise tagged ``gov.soe`` + ``export.control`` does.
+#
+# Pre-2026-05-09 the parser kept every Company/Organization/LegalEntity/
+# PublicBody row regardless of topic, which flooded the
+# ``geography_sanctions_exposure`` event counts with PEP-fraud / war-crime
+# / wanted-individual records.  Filtering by topic at parse time cuts
+# that noise.
+#
+# Topics retained (any-of match → keep the entity):
+_MATERIAL_RELEVANT_TOPICS: frozenset[str] = frozenset({
+    # Direct sanctions impact on the entity or anyone connected to it
+    "sanction",            # primary sanctions listing
+    "sanction.linked",     # sanctioned via association
+    # Export-control and trade-restriction lists
+    "export.control",      # US Entity List, EU dual-use export controls
+    "export.risk",         # export risk flag
+    # Critical-minerals-relevant entity types
+    "gov.soe",             # state-owned enterprise (CN minerals SOEs etc.)
+    "mil",                 # military-linked entities
+    "forced.labor",        # Xinjiang / DRC concerns directly relevant to minerals
+    # Procurement-exclusion lists — affects supplier qualification
+    "corp.disqual",        # disqualified company
+    "debarment",           # government debarment
+    # Financial-crime topics that could cascade to material supply
+    "crime.fin",           # financial crime — counterparty risk
+    "crime.boss",          # organised crime senior figures (limited mineral relevance but kept)
+})
+
+# Topics explicitly EXCLUDED (any-of match → drop the entity).
+# Documented for clarity even though the include-list above is the
+# operative filter — entities only matching these are noise for our use case.
+_TOPIC_EXCLUDED_NOISE: frozenset[str] = frozenset({
+    "crime.fraud",         # tax fraud / shell-company fraud — not material-relevant
+    "crime.terror",        # individual terror designations
+    "crime.war",           # war-crime PEPs (already covered by sanctions if relevant)
+    "crime.theft",         # individual theft
+    "pol.indiv",           # individual politicians
+    "role.judge",          # judicial roles
+    "wanted",              # wanted individuals (FBI etc.)
+    "poi",                 # generic "person of interest"
+})
+
 # NOTE: _DEFAULT_HIGH_CONCENTRATION_GEOS was removed in Phase 2.
 # The list is now loaded from countries.is_sanctions_risk (DB-backed).
 # To change the list, update is_sanctions_risk flags via seed_countries.py
@@ -171,6 +218,21 @@ def _split_pipe(value: str) -> list[str]:
     return [part.strip() for part in value.split("|") if part.strip()]
 
 
+def _split_topics(value: str) -> list[str]:
+    """Split the OpenSanctions ``topics`` cell into a non-empty list.
+
+    Unlike other fields in targets.simple.csv (aliases, countries,
+    identifiers) which use ``|`` as the delimiter, ``topics`` uses ``;``.
+    Tolerant of either separator so the test-suite CSV fixtures and real
+    OpenSanctions exports both work.
+    """
+    if not value:
+        return []
+    # Normalise both delimiters to one separator, then split.
+    normalised = value.replace("|", ";")
+    return [part.strip() for part in normalised.split(";") if part.strip()]
+
+
 def _parse_date(value: str) -> Optional[datetime]:
     """Parse an ISO date string to a datetime, returning None on failure."""
     if not value:
@@ -201,8 +263,11 @@ def _extract_leis(identifiers_cell: str) -> list[str]:
 def parse_sanctions_csv(buf: io.BytesIO) -> list[dict]:
     """Parse the CSV buffer into a list of sanctioned entity dicts.
 
-    Only keeps rows where ``schema`` is one of:
-        Company, Organization, LegalEntity, PublicBody
+    Only keeps rows where:
+      - ``schema`` is one of: Company, Organization, LegalEntity, PublicBody
+      - ``topics`` overlaps with ``_MATERIAL_RELEVANT_TOPICS`` (added
+        2026-05-09 Tier 1.2 audit — drops PEPs/fraud/wanted-individual
+        rows that aren't informative for mineral supply chain risk).
 
     Parses in a single streaming pass — does not load all rows into memory.
 
@@ -213,6 +278,7 @@ def parse_sanctions_csv(buf: io.BytesIO) -> list[dict]:
         leis              (list[str] — extracted from ``identifiers`` column)
         countries         (list[str] — uppercase ISO2 codes)
         datasets          (list[str])
+        topics            (list[str] — material-relevant topics only)
         first_seen        (datetime | None)
         last_seen         (datetime | None)
     """
@@ -222,10 +288,27 @@ def parse_sanctions_csv(buf: io.BytesIO) -> list[dict]:
     reader = csv.DictReader(io.TextIOWrapper(io.BytesIO(buf.read()), encoding="utf-8"))
 
     results: list[dict] = []
+    schema_drops = 0
+    topic_drops = 0
     for row in reader:
         schema = (row.get("schema") or "").strip()
         if schema not in _COMPANY_SCHEMAS:
+            schema_drops += 1
             continue
+
+        # Topic relevance filter — drop entities whose ALL topics are
+        # outside the material-relevant set.  Entities with no topics
+        # listed are kept (rare; defensive — name-matching against our
+        # companies table still applies, and an entity with no topic
+        # listed but a strong company match is worth keeping).
+        topics = _split_topics(row.get("topics") or "")
+        if topics:
+            relevant_topics = [t for t in topics if t in _MATERIAL_RELEVANT_TOPICS]
+            if not relevant_topics:
+                topic_drops += 1
+                continue
+        else:
+            relevant_topics = []
 
         # Aliases: split, lowercase, dedupe, exclude primary name duplicate
         primary_name = (row.get("name") or "").strip()
@@ -248,12 +331,18 @@ def parse_sanctions_csv(buf: io.BytesIO) -> list[dict]:
                 "leis": leis,
                 "countries": countries,
                 "datasets": datasets,
+                "topics": relevant_topics,
                 "first_seen": _parse_date(row.get("first_seen") or ""),
                 "last_seen": _parse_date(row.get("last_seen") or ""),
             }
         )
 
-    log.info("opensanctions.parse.done", entity_count=len(results))
+    log.info(
+        "opensanctions.parse.done",
+        entity_count=len(results),
+        dropped_by_schema=schema_drops,
+        dropped_by_topic=topic_drops,
+    )
     return results
 
 
@@ -514,14 +603,51 @@ def _attribute_geo_event_to_materials(
 
 
 # ---------------------------------------------------------------------------
-# Content hash
+# Content hash — parameter-stable identifiers (2026-05-11)
 # ---------------------------------------------------------------------------
+#
+# OpenSanctions company and geography events are conceptually *states*, not
+# point-in-time occurrences.  The previous hash inputs (title + summary +
+# event_date=now) embedded mutable values (the sanctioned-entity count, the
+# dataset list, the run timestamp) so re-running this ingester produced a
+# *new* row alongside the prior one rather than updating the existing row
+# in place.  After the topic filter landed (Tier 1.2, 2026-05-09), counts
+# also dropped sharply, which would have created visible duplicates against
+# any pre-fix rows.
+#
+# Stable-key hashing keys on the conceptual identity of the signal:
+#   - Company event:  one row per matched company
+#   - Geo event:      one row per high-concentration country
+# When the same identity recurs across runs, the existing row is UPDATEd
+# in place (title / severity / summary / metadata refreshed, material +
+# geography junctions deleted and re-inserted; company junctions left
+# alone per the partial-rewrite audit decision).
 
-def _content_hash(title: str, summary: str, event_date: Optional[datetime]) -> str:
-    """SHA-256 of ``'{title}|{summary}|{date_isoformat}'``."""
+def _company_event_stable_key(company_id: str) -> str:
+    """Stable identifier for an OpenSanctions company-match event."""
+    return f"opensanctions_company|company_id={company_id}"
+
+
+def _geo_event_stable_key(country_iso2: str) -> str:
+    """Stable identifier for an OpenSanctions country-geo event."""
+    return f"opensanctions_geo|country={country_iso2}"
+
+
+def _content_hash(stable_key: str) -> str:
+    """SHA-256 of a parameter-stable event identifier."""
+    return hashlib.sha256(stable_key.encode()).hexdigest()
+
+
+# Backwards-compat shim so anything importing the old three-arg helper
+# still works.  Logs a warning at import time.  Will be removed in a
+# future release; new callers should use ``_content_hash(stable_key)``
+# directly.
+def _content_hash_legacy(
+    title: str, summary: str, event_date: Optional[datetime]
+) -> str:
+    """Deprecated.  Pre-2026-05-11 title-based hash.  Do not use."""
     date_str = event_date.date().isoformat() if event_date else ""
-    parts = f"{title}|{summary}|{date_str}"
-    return hashlib.sha256(parts.encode()).hexdigest()
+    return hashlib.sha256(f"{title}|{summary}|{date_str}".encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -576,11 +702,13 @@ def ingest_opensanctions(
                                   the full ~300 MB snapshot more than once a
                                   week. Pass 0 to force a run.
 
-    Returns:
+    Returns (post-2026-05-11 UPSERT semantics):
         {
-            "company_events_inserted": int,
-            "company_events_skipped_existing": int,
+            "company_events_inserted": int,    # new sanctions_listing rows
+            "company_events_updated":  int,    # existing rows refreshed
+            "company_events_skipped_existing": 0,  # legacy key, always 0
             "geography_events_inserted": int,
+            "geography_events_updated":  int,
             "companies_matched": int,
             "total_entities_parsed": int,
             "skipped_too_recent": bool,
@@ -596,8 +724,10 @@ def ingest_opensanctions(
             )
             return {
                 "company_events_inserted": 0,
+                "company_events_updated": 0,
                 "company_events_skipped_existing": 0,
                 "geography_events_inserted": 0,
+                "geography_events_updated": 0,
                 "company_material_links": 0,
                 "geo_material_links": 0,
                 "companies_matched": 0,
@@ -623,8 +753,9 @@ def ingest_opensanctions(
     entities = parse_sanctions_csv(buf)
 
     company_events_inserted = 0
-    company_events_skipped = 0
+    company_events_updated = 0
     geography_events_inserted = 0
+    geography_events_updated = 0
     company_material_links = 0
     geo_material_links = 0
     batch_count = 0
@@ -640,25 +771,77 @@ def ingest_opensanctions(
             f"Matched against {len(matched_entities)} sanctioned entity record(s) "
             f"in: {', '.join(datasets)}"
         )
-        ch = _content_hash(title, summary, event_date)
-
-        existing = session.scalar(
-            select(RiskEvent).where(RiskEvent.content_hash == ch)
-        )
-        if existing is not None:
-            log.debug(
-                "opensanctions.company_event.skip",
-                company=company.canonical_name,
-                content_hash=ch,
-            )
-            company_events_skipped += 1
-            continue
+        ch = _content_hash(_company_event_stable_key(str(company.id)))
 
         primary_country = (
             matched_entities[0]["countries"][0]
             if matched_entities[0]["countries"]
             else None
         )
+
+        metadata = {
+            "opensanctions_ids": [e["opensanctions_id"] for e in matched_entities],
+            "datasets": datasets,
+        }
+
+        existing = session.scalar(
+            select(RiskEvent).where(RiskEvent.content_hash == ch)
+        )
+        if existing is not None:
+            # In-place UPDATE.  Rewrite fields that depend on the latest
+            # snapshot of OpenSanctions data; refresh geography +
+            # material junctions; leave the named-company link alone.
+            existing.event_date = event_date
+            existing.title = title
+            existing.summary = summary
+            existing.severity_score = 1.0
+            existing.geography_json = {"primary": primary_country}
+            existing.metadata_json = metadata
+            session.flush()
+
+            # Refresh geographies + material attribution
+            from sqlalchemy import delete as _sql_delete
+            session.execute(
+                _sql_delete(RiskEventGeography).where(
+                    RiskEventGeography.risk_event_id == existing.id,
+                )
+            )
+            session.execute(
+                _sql_delete(RiskEventMaterial).where(
+                    RiskEventMaterial.risk_event_id == existing.id,
+                )
+            )
+
+            seen_countries: set[str] = set()
+            for e in matched_entities:
+                for country in e["countries"]:
+                    if country and country not in seen_countries:
+                        seen_countries.add(country)
+                        session.add(
+                            RiskEventGeography(
+                                risk_event_id=existing.id,
+                                country_code=country,
+                                geography_context="primary",
+                                relevance_score=1.0,
+                            )
+                        )
+            material_link_count = _attribute_company_event_to_materials(
+                session,
+                risk_event_id=existing.id,
+                company=company,
+            )
+            company_material_links += material_link_count
+            company_events_updated += 1
+            log.info(
+                "opensanctions.company_event.updated",
+                company=company.canonical_name,
+                matched_count=len(matched_entities),
+                event_id=str(existing.id),
+            )
+            batch_count += 1
+            if batch_count % _BATCH_SIZE == 0:
+                session.flush()
+            continue
 
         event = RiskEvent(
             event_type="sanctions_listing",
@@ -667,13 +850,17 @@ def ingest_opensanctions(
             summary=summary,
             severity_score=1.0,
             confidence_score=1.0,
-            risk_categories_json=["geopolitical_trade"],
+            # G-Cov-1 (2026-05-06): sanctions ARE regulatory action, so the
+            # same event feeds both the Geopolitical pillar (supply-side
+            # restriction signal) AND the Regulatory pillar (compliance
+            # burden imposed on importers + named entities).  Tagging both
+            # categories lets the regulatory aggregator pick these up
+            # without duplicating the underlying RiskEvent row.  See
+            # docs/coverage-gap-plan-2026-05.md.
+            risk_categories_json=["geopolitical_trade", "regulatory_compliance"],
             geography_json={"primary": primary_country},
             content_hash=ch,
-            metadata_json={
-                "opensanctions_ids": [e["opensanctions_id"] for e in matched_entities],
-                "datasets": datasets,
-            },
+            metadata_json=metadata,
         )
         session.add(event)
         session.flush()
@@ -768,13 +955,65 @@ def ingest_opensanctions(
             f"OpenSanctions bulk data contains {count} company/organisation records "
             f"linked to {country} across datasets: {', '.join(dataset_sample)}"
         )
-        ch = _content_hash(title, summary, event_date)
+        ch = _content_hash(_geo_event_stable_key(country))
+        severity = min(1.0, count / 500)
+        metadata = {
+            "sanctioned_entity_count": count,
+            "datasets": dataset_sample,
+        }
 
         existing = session.scalar(
             select(RiskEvent).where(RiskEvent.content_hash == ch)
         )
         if existing is not None:
-            log.debug("opensanctions.geo_event.skip", country=country, content_hash=ch)
+            # In-place UPDATE.  Title and severity both shift with `count`,
+            # so refresh every field.  Then rewrite geography + material
+            # junctions (the sanctioned-entity set may have changed
+            # composition, not just size).
+            existing.event_date = event_date
+            existing.title = title
+            existing.summary = summary
+            existing.severity_score = severity
+            existing.geography_json = {"primary": country}
+            existing.metadata_json = metadata
+            session.flush()
+
+            from sqlalchemy import delete as _sql_delete
+            session.execute(
+                _sql_delete(RiskEventGeography).where(
+                    RiskEventGeography.risk_event_id == existing.id,
+                )
+            )
+            session.execute(
+                _sql_delete(RiskEventMaterial).where(
+                    RiskEventMaterial.risk_event_id == existing.id,
+                )
+            )
+            session.add(
+                RiskEventGeography(
+                    risk_event_id=existing.id,
+                    country_code=country,
+                    geography_context="primary",
+                    relevance_score=1.0,
+                )
+            )
+            geo_link_count = _attribute_geo_event_to_materials(
+                session,
+                risk_event_id=existing.id,
+                country_code=country,
+            )
+            geo_material_links += geo_link_count
+            geography_events_updated += 1
+            log.info(
+                "opensanctions.geo_event.updated",
+                country=country,
+                sanctioned_count=count,
+                severity=severity,
+                material_links=geo_link_count,
+            )
+            batch_count += 1
+            if batch_count % _BATCH_SIZE == 0:
+                session.flush()
             continue
 
         geo_event = RiskEvent(
@@ -782,15 +1021,19 @@ def ingest_opensanctions(
             event_date=event_date,
             title=title,
             summary=summary,
-            severity_score=min(1.0, count / 500),
+            severity_score=severity,
             confidence_score=0.85,
-            risk_categories_json=["geopolitical_trade"],
+            # G-Cov-1 (2026-05-06): sanctions ARE regulatory action, so the
+            # same event feeds both the Geopolitical pillar (supply-side
+            # restriction signal) AND the Regulatory pillar (compliance
+            # burden imposed on importers + named entities).  Tagging both
+            # categories lets the regulatory aggregator pick these up
+            # without duplicating the underlying RiskEvent row.  See
+            # docs/coverage-gap-plan-2026-05.md.
+            risk_categories_json=["geopolitical_trade", "regulatory_compliance"],
             geography_json={"primary": country},
             content_hash=ch,
-            metadata_json={
-                "sanctioned_entity_count": count,
-                "datasets": dataset_sample,
-            },
+            metadata_json=metadata,
         )
         session.add(geo_event)
         session.flush()
@@ -833,7 +1076,7 @@ def ingest_opensanctions(
             "opensanctions.geo_event.inserted",
             country=country,
             sanctioned_count=count,
-            severity=min(1.0, count / 500),
+            severity=severity,
             material_links=geo_link_count,
         )
         geography_events_inserted += 1
@@ -847,8 +1090,9 @@ def ingest_opensanctions(
     log.info(
         "opensanctions.ingest.done",
         company_events_inserted=company_events_inserted,
-        company_events_skipped_existing=company_events_skipped,
+        company_events_updated=company_events_updated,
         geography_events_inserted=geography_events_inserted,
+        geography_events_updated=geography_events_updated,
         company_material_links=company_material_links,
         geo_material_links=geo_material_links,
         companies_matched=len(matches),
@@ -856,11 +1100,16 @@ def ingest_opensanctions(
     )
     return {
         "company_events_inserted": company_events_inserted,
-        "company_events_skipped_existing": company_events_skipped,
+        "company_events_updated": company_events_updated,
         "geography_events_inserted": geography_events_inserted,
+        "geography_events_updated": geography_events_updated,
         "company_material_links": company_material_links,
         "geo_material_links": geo_material_links,
         "companies_matched": len(matches),
         "total_entities_parsed": len(entities),
         "skipped_too_recent": False,
+        # Backwards-compat key — under parameter-stable UPSERT semantics
+        # there's no longer a "skipped" path; same-data re-runs UPDATE in
+        # place.  Kept as 0 so dashboards and CLI output don't break.
+        "company_events_skipped_existing": 0,
     }

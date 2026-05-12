@@ -31,9 +31,9 @@ class MaterialResolver:
 
     def resolve_by_hs_code(
         self, hs_code: str | None
-    ) -> tuple[int | None, int | None]:
+    ) -> tuple[int | None, int | None, float | None]:
         """
-        Return ``(material_id, hs_mapping_id)`` for an HS code string.
+        Return ``(material_id, hs_mapping_id, confidence)`` for an HS code string.
 
         Implements a longest-prefix match against ``hs_code_material_mappings``
         (market_scope='global').  Tries progressively shorter prefixes in the
@@ -42,18 +42,20 @@ class MaterialResolver:
         treaty) and standard 4/6-digit UN Comtrade codes.
 
         Disambiguation rules (applied at each prefix length):
-          - Exactly one match → return (material_id, id).
+          - Exactly one match → return (material_id, id, confidence).
           - Multiple matches → take the row with the highest confidence.
-            If tied at the same confidence → return (None, None): genuinely
-            ambiguous, not safe to assign.
+            If tied at the same confidence → return (None, None, None):
+            genuinely ambiguous, not safe to assign.
 
-        Returns (None, None) if no mapping is found at any prefix length.
+        Returns (None, None, None) if no mapping is found at any prefix length.
 
-        NOTE: changed from ``int | None`` in Phase 1 — callers must unpack
-        the tuple.  The old signature returned material_id only.
+        2026-05-09 (Tier 1.4 audit): added the third ``confidence`` element so
+        callers can downscale ``RiskEventMaterial.relevance_score`` for
+        low-confidence mappings.  Callers that don't need confidence can
+        ignore it (``mid, hs_id, _ = resolver.resolve_by_hs_code(code)``).
         """
         if not hs_code:
-            return None, None
+            return None, None, None
 
         # Normalise: strip whitespace and dots (DB prefix may be stored as
         # "85.07" or "8507"; we compare without dots either way).
@@ -79,17 +81,17 @@ class MaterialResolver:
                 continue
 
             if len(rows) == 1:
-                return rows[0].material_id, rows[0].id
+                return rows[0].material_id, rows[0].id, float(rows[0].confidence)
 
             # Multiple mappings at this prefix: take highest confidence.
             max_conf = max(r.confidence for r in rows)
             top = [r for r in rows if r.confidence == max_conf]
             if len(top) == 1:
-                return top[0].material_id, top[0].id
+                return top[0].material_id, top[0].id, float(top[0].confidence)
             # Tied confidence → genuinely ambiguous at this granularity.
-            return None, None
+            return None, None, None
 
-        return None, None
+        return None, None, None
 
     def resolve_by_canonical_name(self, name: str) -> Material | None:
         return self._db.execute(
@@ -210,6 +212,27 @@ class MaterialCache:
     # exclusion at seed-generation time.  Callers that want stricter
     # filtering pass a higher value at ``detect()`` time.
     DEFAULT_MIN_RELEVANCE = 0.10
+
+    # ── Attribution cap (added 2026-05-09, Tier 1.3 audit) ────────────────
+    # Caps applied AFTER per-material best-match selection in ``detect()``.
+    #
+    # ``DEFAULT_MAX_MATERIALS`` — keep at most N materials per event,
+    # ordered by relevance descending.  Catches the "topical event mentions
+    # cobalt once" case from over-attributing 2-3 incidental matches.
+    #
+    # ``DEFAULT_LIST_THRESHOLD`` — when an event matches MORE than this
+    # many distinct materials, drop ALL attributions.  Strong signal that
+    # the source is a generic critical-minerals list (Federal Register
+    # "Critical Materials Assessment" notices, SEC 10-K risk factors
+    # mentioning every mineral defensively) rather than an event focused
+    # on any one material.  Suppress wholesale rather than attributing
+    # 47 weak matches that flood the user's events feed.
+    #
+    # Both can be overridden per-call via ``detect()`` kwargs for ingester-
+    # specific tuning (e.g., a focused trade event might legitimately
+    # mention 4-5 materials and shouldn't be dropped).
+    DEFAULT_MAX_MATERIALS = 3
+    DEFAULT_LIST_THRESHOLD = 5
 
     def __init__(self, entries: list[tuple[str, int, float, int | None]]) -> None:
         import re
@@ -333,12 +356,15 @@ class MaterialCache:
         text: str,
         *,
         min_relevance: float | None = None,
+        max_materials: int | None = None,
+        list_threshold: int | None = None,
     ) -> list[tuple[int, float, str, int | None]]:
         """
         Scan text for material keywords.
 
         Returns [(material_id, relevance_score, matched_keyword, hs_mapping_id)],
-        one entry per material.  Per-material selection rules:
+        sorted by relevance descending, capped at ``max_materials``.
+        Per-material selection rules:
           - relevance_score: highest score across all matching keywords
           - hs_mapping_id:   prefer non-None (stage attribution) even when the
                              stage-specific keyword scores slightly lower than the
@@ -349,6 +375,17 @@ class MaterialCache:
         ``"rescue"``.  Multi-word phrases match as substrings between
         word boundaries on each end.
 
+        Attribution caps (added 2026-05-09, Tier 1.3 audit):
+          - ``max_materials`` (default 3): keep only the top-N materials
+            by relevance.  Catches incidental mentions in event titles /
+            summaries.
+          - ``list_threshold`` (default 5): when MORE than this many
+            distinct materials match, return an EMPTY list.  Strong
+            signal that the source is a generic critical-minerals list
+            (Federal Register "Critical Materials Assessment" notices,
+            SEC 10-K defensive risk-factor sections) rather than a
+            focused event.
+
         Args:
             text:           The text to scan.
             min_relevance:  Drop matches whose final score falls below
@@ -358,11 +395,21 @@ class MaterialCache:
                             requires either a unique keyword or the
                             canonical name); set to 0.0 to retain
                             every match.
+            max_materials:  Max number of materials returned per event,
+                            ordered by relevance.  Defaults to
+                            ``DEFAULT_MAX_MATERIALS`` (3).  Pass a large
+                            number to disable.
+            list_threshold: When more than this many distinct materials
+                            match, drop ALL attributions wholesale.
+                            Defaults to ``DEFAULT_LIST_THRESHOLD`` (5).
+                            Pass a large number (e.g. 999) to disable.
         """
         if not text:
             return []
 
         threshold = self.DEFAULT_MIN_RELEVANCE if min_relevance is None else min_relevance
+        cap = self.DEFAULT_MAX_MATERIALS if max_materials is None else max_materials
+        list_cap = self.DEFAULT_LIST_THRESHOLD if list_threshold is None else list_threshold
 
         # material_id → (score, keyword, hs_mapping_id)
         best: dict[int, tuple[float, str, int | None]] = {}
@@ -392,7 +439,14 @@ class MaterialCache:
                     # Same or lower score but this match carries stage attribution
                     best[mat_id] = (ex_score, ex_kw, hs_mapping_id)
 
-        return [
+        # ── Apply Tier 1.3 attribution caps ──────────────────────────────
+        # 1. Drop all if >list_threshold materials matched (generic list signal).
+        if len(best) > list_cap:
+            return []
+        # 2. Sort by relevance descending and cap at max_materials.
+        results = [
             (mat_id, score, kw, hs_id)
             for mat_id, (score, kw, hs_id) in best.items()
         ]
+        results.sort(key=lambda r: r[1], reverse=True)
+        return results[:cap]

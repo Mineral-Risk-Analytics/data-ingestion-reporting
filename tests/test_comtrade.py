@@ -145,10 +145,30 @@ class TestParseComtradeRows:
 # _build_hs_material_map and _resolve_material_id
 # ---------------------------------------------------------------------------
 
-def _mock_hs_row(prefix: str, material_id: int) -> MagicMock:
+def _mock_hs_row(
+    prefix: str,
+    material_id: int,
+    *,
+    confidence: float = 1.0,
+    mapping_id: int | None = None,
+) -> MagicMock:
+    """Build a mock ``HsCodeMaterialMapping`` row.
+
+    Carries ``hs_code_prefix``, ``material_id``, ``confidence`` and ``id``
+    — the four fields ``_build_hs_material_map`` reads off each row.
+    ``mapping_id`` defaults to a stable hash-derived value when omitted so
+    tests don't have to set it explicitly when they don't care.
+    """
     row = MagicMock()
     row.hs_code_prefix = prefix
     row.material_id = material_id
+    row.confidence = confidence
+    # Stable but non-colliding default — distinct per (prefix, material_id).
+    row.id = (
+        mapping_id
+        if mapping_id is not None
+        else hash((prefix, material_id)) & 0xFFFF
+    )
     return row
 
 
@@ -161,35 +181,113 @@ def _mock_session_for_hs_map(hs_rows: list) -> MagicMock:
 
 
 class TestBuildHsMaterialMap:
-    def test_returns_prefix_to_material_id_dict(self):
-        rows = [_mock_hs_row("8507", 1), _mock_hs_row("2604", 2)]
+    """``_build_hs_material_map`` returns ``dict[str, list[tuple[int, float, int]]]``.
+
+    Each entry is a list of ``(material_id, confidence, hs_mapping_id)``
+    tuples — a single prefix can resolve to multiple materials when the
+    underlying HS code covers more than one (e.g. ores-and-concentrates
+    catch-alls).  Confidence and hs_mapping_id flow through to
+    ``_resolve_material_id`` for downstream relevance weighting.
+    """
+
+    def test_returns_prefix_to_tuple_list_dict(self):
+        rows = [
+            _mock_hs_row("8507", 1, confidence=1.0, mapping_id=10),
+            _mock_hs_row("2604", 2, confidence=0.8, mapping_id=20),
+        ]
         session = _mock_session_for_hs_map(rows)
         result = _build_hs_material_map(session)
-        assert result["8507"] == 1
-        assert result["2604"] == 2
+
+        assert result["8507"] == [(1, 1.0, 10)]
+        assert result["2604"] == [(2, 0.8, 20)]
+
+    def test_multiple_materials_per_prefix_collated(self):
+        """Shared 4-digit prefix → both candidates appear in the list."""
+        rows = [
+            _mock_hs_row("2615", 3, confidence=0.5, mapping_id=30),
+            _mock_hs_row("2615", 4, confidence=0.5, mapping_id=31),
+        ]
+        session = _mock_session_for_hs_map(rows)
+        result = _build_hs_material_map(session)
+
+        assert sorted(result["2615"]) == [(3, 0.5, 30), (4, 0.5, 31)]
+
+    def test_dots_stripped_from_prefix(self):
+        """Stored ``"85.07"`` is keyed without dots so it can be compared
+        against raw HS codes that come from Comtrade without dots."""
+        row = _mock_hs_row("85.07", 1, confidence=1.0, mapping_id=10)
+        session = _mock_session_for_hs_map([row])
+        result = _build_hs_material_map(session)
+
+        assert "8507" in result
+        assert "85.07" not in result
 
     def test_empty_mappings_returns_empty_dict(self):
         session = _mock_session_for_hs_map([])
         assert _build_hs_material_map(session) == {}
 
 
-class TestResolveMatertialId:
-    def test_six_digit_code_matches_four_digit_prefix(self):
-        hs_map = {"8507": 1, "2604": 2}
-        assert _resolve_material_id("850760", hs_map) == 1
+class TestResolveMaterialId:
+    """``_resolve_material_id`` returns ``(material_id, hs_mapping_id, confidence)``.
 
-    def test_returns_none_for_unrecognised_code(self):
-        hs_map = {"8507": 1}
-        assert _resolve_material_id("280450", hs_map) is None
+    The third element (confidence) was added 2026-05-09 as part of the
+    Tier 1.4 audit extension so callers can downscale
+    ``RiskEventMaterial.relevance_score`` for low-confidence prefix
+    matches.  Callers that don't need confidence can ignore it:
+        ``mid, hs_id, _ = _resolve_material_id(code, hs_map)``.
+    """
 
-    def test_returns_none_for_empty_code(self):
-        hs_map = {"8507": 1}
-        assert _resolve_material_id("", hs_map) is None
+    def test_exact_six_digit_match(self):
+        hs_map = {"850760": [(1, 1.0, 10)]}
+        assert _resolve_material_id("850760", hs_map) == (1, 10, 1.0)
+
+    def test_four_digit_prefix_fallback(self):
+        """``850760`` has no exact match; falls back to the 4-digit ``8507``."""
+        hs_map = {"8507": [(1, 1.0, 10)]}
+        assert _resolve_material_id("850760", hs_map) == (1, 10, 1.0)
+
+    def test_confidence_flows_through_low_confidence_mapping(self):
+        """Low-confidence prefix matches return their actual confidence so
+        downstream callers can downweight relevance accordingly."""
+        hs_map = {"2530": [(1, 0.4, 11)]}
+        result = _resolve_material_id("253099", hs_map)
+        assert result == (1, 11, 0.4)
+
+    def test_unrecognised_code_returns_all_none(self):
+        hs_map = {"8507": [(1, 1.0, 10)]}
+        assert _resolve_material_id("280450", hs_map) == (None, None, None)
+
+    def test_empty_code_returns_all_none(self):
+        hs_map = {"8507": [(1, 1.0, 10)]}
+        assert _resolve_material_id("", hs_map) == (None, None, None)
 
     def test_longer_prefix_not_confused_with_shorter(self):
-        hs_map = {"2836": 3}
-        assert _resolve_material_id("283610", hs_map) == 3
-        assert _resolve_material_id("280450", hs_map) is None
+        hs_map = {"2836": [(3, 1.0, 30)]}
+        assert _resolve_material_id("283610", hs_map) == (3, 30, 1.0)
+        assert _resolve_material_id("280450", hs_map) == (None, None, None)
+
+    def test_multiple_candidates_highest_confidence_wins(self):
+        """When a prefix has multiple candidates and one has a higher
+        confidence than the others, that one wins."""
+        hs_map = {
+            "2615": [
+                (3, 0.4, 30),
+                (4, 0.9, 31),  # highest confidence
+                (5, 0.4, 32),
+            ]
+        }
+        assert _resolve_material_id("2615", hs_map) == (4, 31, 0.9)
+
+    def test_tied_top_confidence_returns_all_none(self):
+        """Ambiguity at the same confidence level is honest NULL rather
+        than an arbitrary pick that silently poisons scoring."""
+        hs_map = {
+            "2615": [
+                (3, 0.5, 30),
+                (4, 0.5, 31),  # tied with the first row
+            ]
+        }
+        assert _resolve_material_id("2615", hs_map) == (None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +296,16 @@ class TestResolveMatertialId:
 
 class TestExternalId:
     def test_format(self):
-        assert _external_id("CN", "8507", 2023) == "comtrade_C_A_HS_8507_CN_2023"
+        # flow_code defaults to "X" (exports); see _external_id signature.
+        # Imports would produce comtrade_M_A_HS_... ; the flow_code is part
+        # of the key so export/import runs against the same reporter/HS/year
+        # don't trip each other's idempotency check.
+        assert _external_id("CN", "8507", 2023) == "comtrade_X_A_HS_8507_CN_2023"
+
+    def test_flow_code_distinguishes_export_from_import(self):
+        export_id = _external_id("CN", "8507", 2023, flow_code="X")
+        import_id = _external_id("CN", "8507", 2023, flow_code="M")
+        assert export_id != import_id
 
     def test_unique_per_combination(self):
         ids = {

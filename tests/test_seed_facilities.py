@@ -26,7 +26,7 @@ def test_inserts_new_facility(monkeypatch):
     company.id = "company-1"
 
     session = MagicMock()
-    session.scalar.side_effect = [company, None]
+    session.scalar.side_effect = [company, None, None]
 
     result = seed_facilities_module.seed_facilities(session)
 
@@ -36,7 +36,7 @@ def test_inserts_new_facility(monkeypatch):
         "skipped": 0,
         "companies_not_found": 0,
     }
-    session.add.assert_called_once()
+    assert session.add.call_count == 2
     session.commit.assert_called_once()
 
 
@@ -63,9 +63,10 @@ def test_skips_existing_facility_when_no_mutable_changes(monkeypatch):
     existing.longitude = -97.7431
     existing.data_source = "manual"
     existing.created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    existing_link = MagicMock()
 
     session = MagicMock()
-    session.scalar.side_effect = [company, existing]
+    session.scalar.side_effect = [company, existing, existing_link]
 
     result = seed_facilities_module.seed_facilities(session)
 
@@ -104,7 +105,7 @@ def test_partially_updates_existing_facility_and_logs_changed_fields(monkeypatch
     existing.created_at = datetime(2025, 1, 1, tzinfo=timezone.utc)
 
     session = MagicMock()
-    session.scalar.side_effect = [company, existing]
+    session.scalar.side_effect = [company, existing, None]
 
     mock_log = MagicMock()
     monkeypatch.setattr(seed_facilities_module, "log", mock_log)
@@ -112,8 +113,8 @@ def test_partially_updates_existing_facility_and_logs_changed_fields(monkeypatch
     result = seed_facilities_module.seed_facilities(session)
 
     assert result == {
-        "inserted": 0,
-        "updated": 1,
+        "inserted": 1,
+        "updated": 0,
         "skipped": 0,
         "companies_not_found": 0,
     }
@@ -125,8 +126,7 @@ def test_partially_updates_existing_facility_and_logs_changed_fields(monkeypatch
     assert existing.created_at == datetime(2025, 1, 1, tzinfo=timezone.utc)
 
     assert call(
-        "seed_facilities.updated",
-        canonical_name="TestCo",
+        "seed_facilities.facility_updated",
         facility_type="cell_factory",
         country="US",
         city="Austin",

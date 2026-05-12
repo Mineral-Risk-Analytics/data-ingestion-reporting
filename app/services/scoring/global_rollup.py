@@ -38,7 +38,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
-from app.models.supply import Material, MaterialProductionShare, TradeFlow
+from app.models.supply import (
+    HsCodeMaterialMapping,
+    Material,
+    MaterialProductionShare,
+    TradeFlow,
+)
 from app.services.scoring.market_aggregator import MARKET_PILLAR_WEIGHTS
 from app.services.scoring.supplier_risk import SCORING_VERSION
 
@@ -200,11 +205,24 @@ def _trade_weights_for_granularity(
     # weighted by per-period sub-aggregation (Comtrade rows can have
     # multiple HS subheadings per material per period; summing all and
     # dividing by period count is the right semantic).
+    #
+    # Confidence weighting (2026-05-09 audit extension):
+    #   Each row's trade_value_usd is multiplied by the HS→material mapping
+    #   confidence so ambiguous prefix matches contribute proportionally less
+    #   to a country's share weight.  Rows ingested before hs_mapping_id was
+    #   tracked (NULL) fall through at confidence 1.0 — backwards-compatible.
+    confidence_expr = sqlfunc.coalesce(HsCodeMaterialMapping.confidence, 1.0)
+    weighted_value = TradeFlow.trade_value_usd * confidence_expr
+
     rows = db.execute(
         select(
             TradeFlow.reporter_country,
-            sqlfunc.sum(TradeFlow.trade_value_usd).label("total"),
+            sqlfunc.sum(weighted_value).label("total"),
             sqlfunc.count(sqlfunc.distinct(TradeFlow.period)).label("n_periods"),
+        )
+        .outerjoin(
+            HsCodeMaterialMapping,
+            HsCodeMaterialMapping.id == TradeFlow.hs_mapping_id,
         )
         .where(
             TradeFlow.material_id == material_id,

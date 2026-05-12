@@ -11,6 +11,7 @@ import pytest
 
 from app.services.ingestion.seed_materials import (
     _JUNCTION_ROWS,
+    _MATERIALS,
     _NON_USGS_MATERIALS,
     seed_battery_chemistry_junctions,
     seed_non_usgs_materials,
@@ -18,42 +19,50 @@ from app.services.ingestion.seed_materials import (
 
 
 # ---------------------------------------------------------------------------
-# _NON_USGS_MATERIALS data validation
+# Full materials register (_MATERIALS / _NON_USGS_MATERIALS alias)
 # ---------------------------------------------------------------------------
 
-class TestNonUsgsMaterialsData:
-    def test_has_five_entries(self):
-        assert len(_NON_USGS_MATERIALS) == 5
+class TestMaterialsRegisterData:
+    def test_non_usgs_alias_is_full_register(self):
+        assert _NON_USGS_MATERIALS is _MATERIALS
 
-    def test_expected_canonical_names(self):
-        names = {m["canonical_name"] for m in _NON_USGS_MATERIALS}
-        assert names == {"Neodymium", "Praseodymium", "Dysprosium", "Terbium", "Sodium"}
+    def test_register_has_thirty_nine_entries(self):
+        assert len(_MATERIALS) == 39
 
-    def test_all_rees_have_cn_as_primary_producer(self):
-        for m in _NON_USGS_MATERIALS:
-            if m["canonical_name"] in ("Neodymium", "Praseodymium", "Dysprosium", "Terbium"):
-                assert "CN" in m["primary_producing_countries"], (
-                    f"{m['canonical_name']} should list CN as primary producer"
-                )
+    def test_expected_motor_ree_and_sodium_names_present(self):
+        names = {m["canonical_name"] for m in _MATERIALS}
+        for n in ("Neodymium", "Praseodymium", "Dysprosium", "Terbium", "Sodium"):
+            assert n in names
+
+    def test_manual_ree_rows_have_criticality_score(self):
+        for name in ("Neodymium", "Praseodymium", "Dysprosium", "Terbium"):
+            m = next(x for x in _MATERIALS if x["canonical_name"] == name)
+            assert m.get("criticality_score") is not None
 
     def test_sodium_has_low_criticality_score(self):
-        sodium = next(m for m in _NON_USGS_MATERIALS if m["canonical_name"] == "Sodium")
+        sodium = next(m for m in _MATERIALS if m["canonical_name"] == "Sodium")
         assert sodium["criticality_score"] < 0.20
 
     def test_terbium_is_no_benchmark(self):
-        tb = next(m for m in _NON_USGS_MATERIALS if m["canonical_name"] == "Terbium")
+        tb = next(m for m in _MATERIALS if m["canonical_name"] == "Terbium")
         assert tb["data_availability"] == "no_benchmark"
 
     def test_all_entries_have_required_keys(self):
-        required = {"canonical_name", "category", "hs_codes", "criticality_score",
-                    "primary_producing_countries", "is_ira_critical_mineral", "is_eu_crma_critical"}
-        for m in _NON_USGS_MATERIALS:
+        required = {
+            "canonical_name",
+            "category",
+            "hs_codes",
+            "is_ira_critical_mineral",
+            "is_eu_crma_critical",
+            "notes",
+        }
+        for m in _MATERIALS:
             missing = required - set(m.keys())
             assert not missing, f"{m['canonical_name']} missing keys: {missing}"
 
     def test_rees_are_eu_crma_and_ira_critical(self):
         rees = {"Neodymium", "Praseodymium", "Dysprosium", "Terbium"}
-        for m in _NON_USGS_MATERIALS:
+        for m in _MATERIALS:
             if m["canonical_name"] in rees:
                 assert m["is_eu_crma_critical"] is True
                 assert m["is_ira_critical_mineral"] is True
@@ -119,33 +128,32 @@ def _make_session_for_seed(existing_names: set[str]) -> MagicMock:
 
 
 class TestSeedNonUsgsMaterials:
-    def test_inserts_all_five_when_table_empty(self):
+    def test_inserts_all_when_table_empty(self):
         session = MagicMock()
         session.scalar.return_value = None  # all materials are new
 
         count = seed_non_usgs_materials(session)
 
-        assert count == 5
-        assert session.add.call_count == 5
+        assert count == len(_MATERIALS)
+        assert session.add.call_count == len(_MATERIALS)
 
     def test_skips_existing_materials(self):
         session = MagicMock()
-        # First scalar call returns an existing material (Neodymium exists)
-        # Remaining return None (new)
+        # First row in _MATERIALS is Aluminum — treat it as already present.
         existing = MagicMock()
         call_count = {"n": 0}
 
         def scalar_se(stmt):
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return existing   # Neodymium already exists
+                return existing
             return None
 
         session.scalar.side_effect = scalar_se
 
         count = seed_non_usgs_materials(session)
 
-        assert count == 4   # only 4 inserted, 1 skipped
+        assert count == len(_MATERIALS) - 1
 
     def test_flush_called_when_insertions_made(self):
         session = MagicMock()

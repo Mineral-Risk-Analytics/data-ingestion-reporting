@@ -22,9 +22,28 @@ Company linkage (risk_event_companies):
   source_geography matching the signal country and material_id matching
   the signal material is linked with relevance_score = 0.85.
 
-Idempotency:
-  content_hash (SHA-256 of title + event_date ISO string) prevents duplicate
-  events on re-run. Re-running after new Comtrade years are ingested is safe.
+Idempotency (parameter-stable UPSERT — 2026-05-11):
+  content_hash is computed from a stable key
+  ``f"{event_subtype}|material_id={mid}|country={cc}|year={yr}"`` rather
+  than from the human-readable title.  Re-running this module against the
+  same trade_flows data is a no-op on the existence check, but when the
+  underlying calculation changes (e.g. confidence weighting in
+  ``_get_annual_totals`` shifts country shares), the existing row is
+  UPDATEd in place — title/severity/summary/metadata are rewritten,
+  material + HS junctions are deleted and re-inserted, company junctions
+  are left alone (partial-rewrite per audit decision).
+
+  Result-dict counters split inserts from updates::
+
+      concentration_events           # new TRADE_CONCENTRATION rows
+      concentration_events_updated   # existing rows updated in place
+      export_drop_events             # new EXPORT_RESTRICTION rows
+      export_drop_events_updated
+      import_drop_events             # new IMPORT_DISRUPTION rows
+      import_drop_events_updated
+
+  ``skipped_existing`` is retained for backwards-compat but always 0 under
+  UPSERT semantics — what would have been a skip is now an update.
 
 Severity calibration:
   TRADE_CONCENTRATION
@@ -60,7 +79,7 @@ from app.models.regulatory import (
     RiskEventHsMapping,
     RiskEventMaterial,
 )
-from app.models.supply import TradeFlow
+from app.models.supply import HsCodeMaterialMapping, TradeFlow
 
 log = structlog.get_logger(__name__)
 
@@ -102,22 +121,42 @@ def _drop_severity(drop_fraction: float) -> float:
     return 0.50  # 0.20–0.29
 
 
-def _content_hash(title: str, event_date: datetime) -> str:
-    payload = f"{title}|{event_date.date().isoformat()}"
-    return hashlib.sha256(payload.encode()).hexdigest()
+def _stable_event_key(
+    event_subtype: str,
+    material_id: int,
+    reporter_country: str,
+    year: int,
+) -> str:
+    """Return the stable identifier for a derived trade signal.
+
+    TRADE_CONCENTRATION / EXPORT_RESTRICTION / IMPORT_DISRUPTION events
+    derived from trade_flows are conceptually *states*, not point-in-time
+    occurrences.  "Country X is 67% of material Y's exports for year Z" is
+    a state that updates as the underlying calculation changes (e.g. when
+    confidence weighting in ``_get_annual_totals`` shifts the country shares).
+
+    Hashing on this stable identifier — rather than on the title (which
+    encodes the mutable percentage) — means re-running this module after a
+    confidence calibration change UPDATEs the existing row in place rather
+    than creating a duplicate alongside it.
+
+    The four-tuple ``(event_subtype, material_id, reporter_country, year)``
+    uniquely identifies one signal-state row.  Same identity → same hash →
+    UPSERT.
+    """
+    return f"{event_subtype}|material_id={material_id}|country={reporter_country}|year={year}"
+
+
+def _content_hash(stable_key: str) -> str:
+    """SHA-256 of the parameter-stable event identifier."""
+    return hashlib.sha256(stable_key.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def _event_exists(db: Session, ch: str) -> bool:
-    return db.scalar(
-        select(RiskEvent.id).where(RiskEvent.content_hash == ch).limit(1)
-    ) is not None
-
-
-def _insert_event(
+def _upsert_event(
     db: Session,
     title: str,
     summary: str,
@@ -128,11 +167,56 @@ def _insert_event(
     material_id: int,
     material_name: str,
     year: int,
-) -> Optional[int]:
-    """Insert a RiskEvent row. Returns new event id, or None if already exists."""
-    ch = _content_hash(title, event_date)
-    if _event_exists(db, ch):
-        return None
+) -> tuple[int, bool]:
+    """Insert or update a RiskEvent row keyed on the parameter-stable hash.
+
+    Returns ``(event_id, was_inserted)``:
+      * ``was_inserted=True``  — new row created.  Caller should write
+        material / HS / company junction rows for the first time.
+      * ``was_inserted=False`` — existing row updated in place.  Caller
+        should refresh material + HS junctions (delete + re-insert) but
+        leave company junctions alone (partial-rewrite semantics per
+        2026-05-11 audit decision; see docs/scoring-audit-2026-05-addendum.md).
+
+    The stable hash means second runs against unchanged data hit the
+    existing row; the UPDATE refreshes ``updated_at`` (via the ORM's
+    ``onupdate=func.now()``) but every other column is rewritten with the
+    current calculation's output, so the row reflects the latest state.
+    """
+    ch = _content_hash(_stable_event_key(
+        event_subtype, material_id, reporter_country, year,
+    ))
+
+    metadata = {
+        # event_subtype kept in metadata_json for one release cycle —
+        # downstream readers migrated to the typed column 2026-05-05;
+        # JSON copy retained for backwards compatibility while we
+        # confirm nothing else reads it.  Drop after one production cycle.
+        "event_subtype": event_subtype,
+        "reporter_country": reporter_country,
+        "material_id": material_id,
+        "material_name": material_name,
+        "reference_year": year,
+        "source": "trade_flow_analysis",
+    }
+
+    existing = db.scalar(
+        select(RiskEvent).where(RiskEvent.content_hash == ch).limit(1)
+    )
+    if existing is not None:
+        # In-place UPDATE.  Rewrite every column that depends on the
+        # current calculation so the row reflects the latest state.
+        existing.event_subtype = event_subtype
+        existing.event_date = event_date
+        existing.title = title
+        existing.summary = summary
+        existing.severity_score = round(severity, 2)
+        existing.confidence_score = 0.75
+        existing.risk_categories_json = [RiskCategory.GEOPOLITICAL_TRADE.value]
+        existing.geography_json = {"primary": reporter_country}
+        existing.metadata_json = metadata
+        db.flush()
+        return existing.id, False
 
     event = RiskEvent(
         event_type="GEOPOLITICAL_TRADE",
@@ -145,22 +229,35 @@ def _insert_event(
         risk_categories_json=[RiskCategory.GEOPOLITICAL_TRADE.value],
         geography_json={"primary": reporter_country},
         content_hash=ch,
-        metadata_json={
-            # event_subtype kept in metadata_json for one release cycle —
-            # downstream readers migrated to the typed column 2026-05-05;
-            # JSON copy retained for backwards compatibility while we
-            # confirm nothing else reads it.  Drop after one production cycle.
-            "event_subtype": event_subtype,
-            "reporter_country": reporter_country,
-            "material_id": material_id,
-            "material_name": material_name,
-            "reference_year": year,
-            "source": "trade_flow_analysis",
-        },
+        metadata_json=metadata,
     )
     db.add(event)
     db.flush()
-    return event.id
+    return event.id, True
+
+
+def _clear_material_and_hs_junctions(db: Session, event_id: int) -> None:
+    """Delete RiskEventMaterial + RiskEventHsMapping rows for an event.
+
+    Called on UPDATE path of ``_upsert_event`` so the subsequent
+    ``_link_material`` call writes fresh junctions without hitting
+    ``uq_risk_event_material`` / ``uq_risk_event_hs_mapping`` constraints.
+    Company junctions are intentionally NOT cleared (partial-rewrite
+    decision, 2026-05-11) — company exposure changes evolve more slowly
+    than trade-share calculations and re-querying CompanyMaterialExposure
+    on every UPSERT pass would add noise without changing scoring.
+    """
+    from sqlalchemy import delete
+    db.execute(
+        delete(RiskEventMaterial).where(
+            RiskEventMaterial.risk_event_id == event_id,
+        )
+    )
+    db.execute(
+        delete(RiskEventHsMapping).where(
+            RiskEventHsMapping.risk_event_id == event_id,
+        )
+    )
 
 
 def _link_material(
@@ -254,13 +351,30 @@ def _get_annual_totals(
 
     Returns {(material_id, reporter_country, year): total_trade_value_usd}.
     Only includes rows with partner_country='WLD' and material_id IS NOT NULL.
+
+    Confidence weighting (2026-05-09 audit extension):
+      Each row's ``trade_value_usd`` is multiplied by the HS→material mapping
+      confidence (from ``HsCodeMaterialMapping``) before summing.  This down-
+      weights ambiguous 4-digit prefix matches (e.g. "ores and concentrates"
+      catch-alls) so a country's share of a material's trade is closer to
+      its share of *that specific material* rather than its share of "things
+      tagged with this prefix".  Rows with no ``hs_mapping_id`` (historical,
+      pre-Phase-1.5 backfill) fall through at confidence 1.0 so the metric
+      remains backwards-compatible.
     """
+    confidence_expr = func.coalesce(HsCodeMaterialMapping.confidence, 1.0)
+    weighted_value = (TradeFlow.trade_value_usd * confidence_expr)
+
     rows = db.execute(
         select(
             TradeFlow.material_id,
             TradeFlow.reporter_country,
             TradeFlow.period,
-            func.sum(TradeFlow.trade_value_usd).label("total_usd"),
+            func.sum(weighted_value).label("total_usd"),
+        )
+        .outerjoin(
+            HsCodeMaterialMapping,
+            HsCodeMaterialMapping.id == TradeFlow.hs_mapping_id,
         )
         .where(
             TradeFlow.partner_country == "WLD",
@@ -403,10 +517,16 @@ def build_trade_signals(
         by_mat_year_imports.setdefault((mat_id, year), {})[country] = total
 
     concentration_events = 0
+    concentration_events_updated = 0
     export_drop_events = 0
+    export_drop_events_updated = 0
     import_drop_events = 0
+    import_drop_events_updated = 0
     company_links = 0
-    skipped_existing = 0
+    # Retained for backwards-compat with callers reading the result dict;
+    # under parameter-stable UPSERT semantics this counter always stays 0
+    # since same-data re-runs UPDATE in place rather than skip.
+    skipped_existing = 0  # noqa: F841 — used in result dict
 
     for (mat_id, year), country_totals in sorted(by_mat_year.items()):
         mat_name = material_names.get(mat_id, f"material_{mat_id}")
@@ -434,7 +554,7 @@ def build_trade_signals(
             )
             event_date = datetime(year, 12, 31, tzinfo=timezone.utc)
 
-            event_id = _insert_event(
+            event_id, was_inserted = _upsert_event(
                 db,
                 title=title,
                 summary=summary,
@@ -446,17 +566,25 @@ def build_trade_signals(
                 material_name=mat_name,
                 year=year,
             )
-            if event_id is None:
-                skipped_existing += 1
-                continue
-
-            _link_material(
-                db, event_id, mat_id,
-                hs_mapping_ids=hs_ids_by_export_signal.get((mat_id, country, year)),
-            )
-            linked = _link_companies(db, event_id, mat_id, country)
-            company_links += linked
-            concentration_events += 1
+            if was_inserted:
+                _link_material(
+                    db, event_id, mat_id,
+                    hs_mapping_ids=hs_ids_by_export_signal.get((mat_id, country, year)),
+                )
+                linked = _link_companies(db, event_id, mat_id, country)
+                company_links += linked
+                concentration_events += 1
+            else:
+                # Existing row updated in place — refresh material + HS
+                # junctions, leave company junctions alone (per the
+                # partial-rewrite decision; 2026-05-11).
+                _clear_material_and_hs_junctions(db, event_id)
+                _link_material(
+                    db, event_id, mat_id,
+                    hs_mapping_ids=hs_ids_by_export_signal.get((mat_id, country, year)),
+                )
+                concentration_events_updated += 1
+                linked = 0  # company junctions untouched
 
             log.info(
                 "trade_signal_builder.concentration_event",
@@ -466,6 +594,7 @@ def build_trade_signals(
                 share=round(share, 3),
                 severity=severity,
                 companies_linked=linked,
+                was_inserted=was_inserted,
             )
 
         # ── EXPORT_DROP signals ───────────────────────────────────────────
@@ -497,7 +626,7 @@ def build_trade_signals(
             )
             event_date = datetime(year, 12, 31, tzinfo=timezone.utc)
 
-            event_id = _insert_event(
+            event_id, was_inserted = _upsert_event(
                 db,
                 title=title,
                 summary=summary,
@@ -509,17 +638,22 @@ def build_trade_signals(
                 material_name=mat_name,
                 year=year,
             )
-            if event_id is None:
-                skipped_existing += 1
-                continue
-
-            _link_material(
-                db, event_id, mat_id,
-                hs_mapping_ids=hs_ids_by_export_signal.get((mat_id, country, year)),
-            )
-            linked = _link_companies(db, event_id, mat_id, country)
-            company_links += linked
-            export_drop_events += 1
+            if was_inserted:
+                _link_material(
+                    db, event_id, mat_id,
+                    hs_mapping_ids=hs_ids_by_export_signal.get((mat_id, country, year)),
+                )
+                linked = _link_companies(db, event_id, mat_id, country)
+                company_links += linked
+                export_drop_events += 1
+            else:
+                _clear_material_and_hs_junctions(db, event_id)
+                _link_material(
+                    db, event_id, mat_id,
+                    hs_mapping_ids=hs_ids_by_export_signal.get((mat_id, country, year)),
+                )
+                export_drop_events_updated += 1
+                linked = 0
 
             log.info(
                 "trade_signal_builder.export_drop_event",
@@ -529,6 +663,7 @@ def build_trade_signals(
                 drop_fraction=round(drop_fraction, 3),
                 severity=severity,
                 companies_linked=linked,
+                was_inserted=was_inserted,
             )
 
     # ── IMPORT_DROP signals ───────────────────────────────────────────────────
@@ -567,7 +702,7 @@ def build_trade_signals(
             )
             event_date = datetime(year, 12, 31, tzinfo=timezone.utc)
 
-            event_id = _insert_event(
+            event_id, was_inserted = _upsert_event(
                 db,
                 title=title,
                 summary=summary,
@@ -579,20 +714,25 @@ def build_trade_signals(
                 material_name=mat_name,
                 year=year,
             )
-            if event_id is None:
-                skipped_existing += 1
-                continue
-
-            _link_material(
-                db, event_id, mat_id,
-                hs_mapping_ids=hs_ids_by_import_signal.get((mat_id, country, year)),
-            )
-            # For import signals, the reporter is the consuming country —
-            # link companies that source this material from any geography
-            # (not just the consuming country itself).
-            linked = _link_companies(db, event_id, mat_id, country)
-            company_links += linked
-            import_drop_events += 1
+            if was_inserted:
+                _link_material(
+                    db, event_id, mat_id,
+                    hs_mapping_ids=hs_ids_by_import_signal.get((mat_id, country, year)),
+                )
+                # For import signals, the reporter is the consuming country —
+                # link companies that source this material from any geography
+                # (not just the consuming country itself).
+                linked = _link_companies(db, event_id, mat_id, country)
+                company_links += linked
+                import_drop_events += 1
+            else:
+                _clear_material_and_hs_junctions(db, event_id)
+                _link_material(
+                    db, event_id, mat_id,
+                    hs_mapping_ids=hs_ids_by_import_signal.get((mat_id, country, year)),
+                )
+                import_drop_events_updated += 1
+                linked = 0
 
             log.info(
                 "trade_signal_builder.import_drop_event",
@@ -602,6 +742,7 @@ def build_trade_signals(
                 drop_fraction=round(drop_fraction, 3),
                 severity=severity,
                 companies_linked=linked,
+                was_inserted=was_inserted,
             )
 
     db.commit()
@@ -609,15 +750,23 @@ def build_trade_signals(
     log.info(
         "trade_signal_builder.done",
         concentration_events=concentration_events,
+        concentration_events_updated=concentration_events_updated,
         export_drop_events=export_drop_events,
+        export_drop_events_updated=export_drop_events_updated,
         import_drop_events=import_drop_events,
+        import_drop_events_updated=import_drop_events_updated,
         company_links=company_links,
-        skipped_existing=skipped_existing,
     )
     return {
         "concentration_events": concentration_events,
+        "concentration_events_updated": concentration_events_updated,
         "export_drop_events": export_drop_events,
+        "export_drop_events_updated": export_drop_events_updated,
         "import_drop_events": import_drop_events,
+        "import_drop_events_updated": import_drop_events_updated,
         "company_links": company_links,
-        "skipped_existing": skipped_existing,
+        # Kept for backwards-compat with callers that read this key —
+        # under UPSERT semantics, "skipped_existing" no longer happens;
+        # what would have been skipped is now reported as *_updated.
+        "skipped_existing": 0,
     }

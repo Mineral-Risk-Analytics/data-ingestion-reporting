@@ -289,6 +289,26 @@ def ingest_sec_edgar(
     material_cache = MaterialCache.build(session)
     company_cache = build_company_cache(session)
 
+    # ── Optional Haiku classifier refinement layer (Tier 3 audit, 2026-05-09) ──
+    # Auto-enabled when ANTHROPIC_API_KEY is present; falls back gracefully
+    # to keyword-only attribution otherwise.  Refines MaterialCache.detect
+    # output by asking Haiku 4.5 whether each candidate material is what the
+    # filing is *materially about* vs incidentally mentioned in defensive
+    # risk-factor language.  See material_classifier.py module docstring.
+    from app.models.supply import Material
+    from app.services.ingestion.material_classifier import MaterialClassifier
+    materials_by_id = {
+        m.id: m.canonical_name
+        for m in session.scalars(select(Material)).all()
+    }
+    material_classifier = MaterialClassifier(materials_by_id=materials_by_id)
+    log.info(
+        "sec_edgar.classifier_status",
+        enabled=material_classifier.enabled,
+        note=("Haiku refinement active" if material_classifier.enabled
+              else "keyword-only attribution (set ANTHROPIC_API_KEY to enable)"),
+    )
+
     filings_seen = 0
     filings_inserted = 0
     risk_events_inserted = 0
@@ -359,19 +379,27 @@ def ingest_sec_edgar(
                 session.flush()
                 risk_events_inserted += 1
 
-                # ── 3. Material attribution via MaterialCache (NEW vs pipeline) ──
+                # ── 3. Material attribution: keyword pre-filter + LLM refine ──
+                # Two-step attribution (Tier 3 audit, 2026-05-09):
+                #   a) MaterialCache.detect gives a cheap keyword-based
+                #      candidate set (already capped at top-3 by Tier 1.3).
+                #   b) When Haiku is enabled, MaterialClassifier.classify
+                #      asks the LLM whether each candidate is the filing's
+                #      actual subject vs an incidental risk-factor mention.
+                #      Rejected candidates get dropped; confirmed ones have
+                #      their relevance scaled by Haiku's confidence.
+                #      When Haiku is disabled, classify() is a passthrough.
+                #
                 # The old pipeline.py path ran no MaterialCache and produced
-                # zero material/HS junctions.  Run detect over the filing's
-                # narrative excerpt — typically the part of the 10-K /
-                # 8-K that mentions specific commodity exposures, supply
-                # chain risk, or material-cost callouts.
+                # zero material/HS junctions.
                 search_text = " ".join(
                     filter(None, [event.title, event.summary])
                 )
                 if search_text.strip():
                     detected = material_cache.detect(search_text)
+                    refined = material_classifier.classify(search_text, detected)
                     mat_w, hs_w = _persist_material_links(
-                        session, event, detected
+                        session, event, refined
                     )
                     mat_links_total += mat_w
                     hs_links_total += hs_w

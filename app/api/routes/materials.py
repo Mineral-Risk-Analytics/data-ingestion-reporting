@@ -15,12 +15,19 @@ from sqlalchemy.orm import Session, selectinload
 from app.api.deps import get_current_user, get_db
 from app.models.battery_chemistry import BatteryChemistry
 from app.models.criticality_signal import MaterialCriticalitySignal
+from app.models.regulatory import RiskEventHsMapping
 from app.models.reporting import AnalystNote
-from app.models.scoring import MaterialGlobalRiskScore
-from app.models.supply import HsCodeMaterialMapping, Material, MaterialProductionShare
+from app.models.scoring import HsCodeGeographyRiskScore, MaterialGlobalRiskScore
+from app.models.supply import (
+    HsCodeMaterialMapping,
+    HsCodeProductionShare,
+    Material,
+    MaterialProductionShare,
+)
 from app.schemas.common import PaginatedResponse, VerifiedResponse, VerifiedUpdate
 from app.schemas.materials import (
     CountryShareItem,
+    HsMappingGeographyRead,
     HsMappingRead,
     HsMismatchItem,
     MappingHealth,
@@ -62,12 +69,208 @@ def _is_chapter_mismatch(mapping: HsCodeMaterialMapping, material: Material) -> 
     return bool(material_chapters) and mapping_chapter not in material_chapters
 
 
+def _load_mapping_aggregates(
+    db: Session,
+    mapping_ids: list[int],
+) -> dict[int, dict]:
+    """Bulk pre-load the per-mapping aggregate data the frontend needs.
+
+    Returns ``{mapping_id: {"geographies": list[HsMappingGeographyRead],
+    "node_score": float|None, "hhi": float|None, "events_open": int,
+    "scored_at": datetime|None}}``.
+
+    Three queries are issued (one per source table); rows are joined in
+    Python rather than SQL because the per-source filters
+    (latest_reference_year, market_scope='global', latest as_of_date) make
+    a single SQL JOIN gnarly without a CTE.  Three small queries beat one
+    large one for readability + per-row debug ergonomics.
+
+    Empty input → empty dict, no DB hits.
+    """
+    if not mapping_ids:
+        return {}
+
+    # Per-mapping aggregate skeleton.  Defaults match the frontend's
+    # "no scoring yet / no production data yet" rendering.
+    out: dict[int, dict] = {
+        mid: {
+            "geographies_by_country": {},   # {country_code: HsMappingGeographyRead}
+            "node_score": None,
+            "hhi": None,
+            "events_open": 0,
+            "scored_at": None,
+            # Roll-up of per-country score_method values.  ``"hhi_anchored"``
+            # if any geography on the node has anchored data; otherwise
+            # ``"event_only_no_hhi"`` if all scores came from the fallback.
+            # Stays None if nothing is scored yet.
+            "score_method": None,
+        }
+        for mid in mapping_ids
+    }
+
+    # ── 1. Production shares (latest reference_year per mapping) ──────────
+    # Subquery: for each mapping, pick the most recent reference_year that
+    # has any rows.  Then pull all rows for (mapping, that year, global).
+    latest_year_sq = (
+        select(
+            HsCodeProductionShare.hs_mapping_id,
+            func.max(HsCodeProductionShare.reference_year).label("max_year"),
+        )
+        .where(
+            HsCodeProductionShare.hs_mapping_id.in_(mapping_ids),
+            HsCodeProductionShare.market_scope == "global",
+        )
+        .group_by(HsCodeProductionShare.hs_mapping_id)
+        .subquery()
+    )
+    share_rows = db.execute(
+        select(HsCodeProductionShare)
+        .join(
+            latest_year_sq,
+            and_(
+                HsCodeProductionShare.hs_mapping_id == latest_year_sq.c.hs_mapping_id,
+                HsCodeProductionShare.reference_year == latest_year_sq.c.max_year,
+            ),
+        )
+        .where(HsCodeProductionShare.market_scope == "global")
+        .order_by(HsCodeProductionShare.production_share.desc())
+    ).scalars().all()
+    for row in share_rows:
+        bucket = out[row.hs_mapping_id]
+        country = row.country_code.upper() if row.country_code else "??"
+        bucket["geographies_by_country"][country] = HsMappingGeographyRead(
+            country_code=country,
+            production_share=float(row.production_share) if row.production_share is not None else None,
+            production_volume=float(row.production_volume) if row.production_volume is not None else None,
+            reference_year=row.reference_year,
+        )
+
+    # ── 2. HS-node geography scores (latest as_of_date per mapping/country) ──
+    latest_score_sq = (
+        select(
+            HsCodeGeographyRiskScore.hs_mapping_id,
+            HsCodeGeographyRiskScore.country_code,
+            HsCodeGeographyRiskScore.as_of_date,
+            HsCodeGeographyRiskScore.hhi_at_stage,
+            HsCodeGeographyRiskScore.tariff_exposure,
+            HsCodeGeographyRiskScore.export_restriction,
+            HsCodeGeographyRiskScore.composite_node_score,
+            HsCodeGeographyRiskScore.metadata_json,   # carries score_method
+            func.row_number()
+            .over(
+                partition_by=(
+                    HsCodeGeographyRiskScore.hs_mapping_id,
+                    HsCodeGeographyRiskScore.country_code,
+                ),
+                order_by=HsCodeGeographyRiskScore.as_of_date.desc(),
+            )
+            .label("rn"),
+        )
+        .where(
+            HsCodeGeographyRiskScore.hs_mapping_id.in_(mapping_ids),
+            HsCodeGeographyRiskScore.market_scope == "global",
+        )
+        .subquery()
+    )
+    score_rows = db.execute(
+        select(latest_score_sq).where(latest_score_sq.c.rn == 1)
+    ).all()
+    for row in score_rows:
+        mid = row.hs_mapping_id
+        country = (row.country_code or "??").upper()
+        bucket = out.get(mid)
+        if bucket is None:
+            continue
+        # Find or create the geography breakdown row.
+        geo = bucket["geographies_by_country"].get(country)
+        if geo is None:
+            # Score row exists but no production share — keep the country
+            # visible to the partner so they see why the row scored.
+            geo = HsMappingGeographyRead(country_code=country)
+            bucket["geographies_by_country"][country] = geo
+        geo.hhi = float(row.hhi_at_stage) if row.hhi_at_stage is not None else None
+        geo.tariff_exposure = float(row.tariff_exposure) if row.tariff_exposure is not None else None
+        geo.export_restriction = (
+            float(row.export_restriction) if row.export_restriction is not None else None
+        )
+        geo.score = (
+            float(row.composite_node_score) if row.composite_node_score is not None else None
+        )
+        geo.scored_at = row.as_of_date if row.as_of_date else None
+        # Pluck score_method out of the metadata blob.  Tolerates both legacy
+        # rows (no key) and the new dual-path rows (Option 1, 2026-05-06).
+        meta = row.metadata_json if row.metadata_json else {}
+        geo.score_method = meta.get("score_method") if isinstance(meta, dict) else None
+        # Aggregate-level rollup
+        if geo.score is not None:
+            current_max = bucket["node_score"]
+            if current_max is None or geo.score > current_max:
+                bucket["node_score"] = geo.score
+        if geo.scored_at is not None:
+            if bucket["scored_at"] is None or geo.scored_at > bucket["scored_at"]:
+                bucket["scored_at"] = geo.scored_at
+        # Method rollup: ``"hhi_anchored"`` wins over ``"event_only_no_hhi"``
+        # if any geography on this node has anchored data.  This drives the
+        # frontend's "no production base" badge — only show it when the
+        # node had to fall back across the board.
+        if geo.score_method == "hhi_anchored":
+            bucket["score_method"] = "hhi_anchored"
+        elif (
+            geo.score_method == "event_only_no_hhi"
+            and bucket["score_method"] != "hhi_anchored"
+        ):
+            bucket["score_method"] = "event_only_no_hhi"
+
+    # ── 3. Open events count per mapping ────────────────────────────────
+    event_count_rows = db.execute(
+        select(
+            RiskEventHsMapping.hs_mapping_id,
+            func.count(RiskEventHsMapping.risk_event_id).label("cnt"),
+        )
+        .where(RiskEventHsMapping.hs_mapping_id.in_(mapping_ids))
+        .group_by(RiskEventHsMapping.hs_mapping_id)
+    ).all()
+    for mid, cnt in event_count_rows:
+        bucket = out.get(mid)
+        if bucket is not None:
+            bucket["events_open"] = int(cnt or 0)
+
+    # ── Aggregate hhi: production-weighted average across geographies ───
+    # Use production_share as the weight when available, otherwise plain mean.
+    for mid, bucket in out.items():
+        geos = list(bucket["geographies_by_country"].values())
+        hhis = [
+            (g.hhi, g.production_share)
+            for g in geos
+            if g.hhi is not None
+        ]
+        if hhis:
+            weighted = [
+                (hhi, share if share is not None else 0.0)
+                for hhi, share in hhis
+            ]
+            total_weight = sum(w for _, w in weighted)
+            if total_weight > 0:
+                bucket["hhi"] = sum(hhi * w for hhi, w in weighted) / total_weight
+            else:
+                bucket["hhi"] = sum(hhi for hhi, _ in weighted) / len(weighted)
+
+    return out
+
+
 def _annotate_mapping(
     mapping: HsCodeMaterialMapping,
     material: Material,
     cross_mapped: set[str],
+    aggregates: Optional[dict[int, dict]] = None,
 ) -> HsMappingRead:
-    """Build a ``HsMappingRead`` with all mismatch flags set."""
+    """Build a ``HsMappingRead`` with mismatch flags + (optional) aggregates set.
+
+    ``aggregates`` is the bulk-loaded dict from ``_load_mapping_aggregates``.
+    When ``None`` the mismatch-only path is preserved (used by the global
+    mismatches view + the list-materials count pass, which don't need the
+    expensive joins).
+    """
     is_low = mapping.confidence < _LOW_CONFIDENCE_THRESHOLD
     is_missing = not mapping.description
     is_chapter = _is_chapter_mismatch(mapping, material)
@@ -78,6 +281,24 @@ def _annotate_mapping(
     out.is_missing_description = is_missing
     out.is_chapter_mismatch = is_chapter
     out.is_cross_mapped = is_cross
+
+    if aggregates is not None:
+        agg = aggregates.get(mapping.id)
+        if agg is not None:
+            geos = list(agg["geographies_by_country"].values())
+            # Stable order: largest production share first, then alphabetical.
+            geos.sort(
+                key=lambda g: (
+                    -(g.production_share or 0.0),
+                    g.country_code,
+                )
+            )
+            out.geographies = geos
+            out.node_score = agg["node_score"]
+            out.hhi = agg["hhi"]
+            out.events_open = agg["events_open"]
+            out.scored_at = agg["scored_at"]
+            out.score_method = agg["score_method"]
     return out
 
 
@@ -258,7 +479,16 @@ def get_material(
         raise HTTPException(status_code=404, detail="Material not found")
 
     cross_mapped = _cross_mapped_prefixes(db)
-    annotated_mappings = [_annotate_mapping(m, mat, cross_mapped) for m in mat.hs_mappings]
+    # Bulk-load production shares + node scores + event counts so the
+    # frontend HS Codes & Stages tab renders Geography / SHARE / HHI /
+    # TARIFF / EXPORT / SCORE columns without per-row queries.
+    aggregates = _load_mapping_aggregates(
+        db, [m.id for m in mat.hs_mappings]
+    )
+    annotated_mappings = [
+        _annotate_mapping(m, mat, cross_mapped, aggregates)
+        for m in mat.hs_mappings
+    ]
     health = _compute_health(annotated_mappings)
 
     # Enrich chemistry_uses with slug + name from the parent chemistry row.
@@ -334,7 +564,11 @@ def list_material_hs_mappings(
 
     mappings = db.scalars(q.order_by(HsCodeMaterialMapping.hs_code_prefix)).all()
     cross_mapped = _cross_mapped_prefixes(db)
-    return [_annotate_mapping(m, mat, cross_mapped) for m in mappings]
+    aggregates = _load_mapping_aggregates(db, [m.id for m in mappings])
+    return [
+        _annotate_mapping(m, mat, cross_mapped, aggregates)
+        for m in mappings
+    ]
 
 
 # ---------------------------------------------------------------------------

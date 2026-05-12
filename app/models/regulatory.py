@@ -283,6 +283,17 @@ class RiskEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # Refreshed on every ORM-mediated UPDATE.  Used by ingesters that
+    # switched to parameter-stable content_hash + UPSERT semantics
+    # (trade_signal_builder, opensanctions company + geo events,
+    # 2026-05-11) so operators can query for rows touched in a recent
+    # re-ingest pass.  See migration 041 for backfill details.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
 
     source_document: Mapped[Optional["SourceDocument"]] = relationship(
         back_populates="risk_events"

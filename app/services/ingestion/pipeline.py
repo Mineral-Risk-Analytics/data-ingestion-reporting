@@ -53,7 +53,7 @@ from app.services.ingestion.parsers import (
     parse_sec_filing,
 )
 from app.services.ingestion.run_tracker import IngestionRunTracker
-from app.utils.hashing import sha256_bytes
+from app.utils.hashing import sha256_bytes, sha256_text
 
 log = structlog.get_logger(__name__)
 from app.utils.storage import LocalFilesystemStorage, get_local_storage
@@ -270,11 +270,11 @@ class IngestionPipeline:
             # hs_mapping_id) per row so the sample-derived RiskEvent below
             # can be tagged with the correct material/HS junction rows
             # instead of dropping that attribution on the floor.
-            resolved_by_row: dict[int, tuple[int | None, int | None]] = {}
+            resolved_by_row: dict[int, tuple[int | None, int | None, float | None]] = {}
             for row in rows:
                 partner_iso = geo.partner_country_iso2(row.partner_code) or row.partner_code
-                mid, hs_mapping_id = materials.resolve_by_hs_code(row.hs_code)
-                resolved_by_row[id(row)] = (mid, hs_mapping_id)
+                mid, hs_mapping_id, mapping_conf = materials.resolve_by_hs_code(row.hs_code)
+                resolved_by_row[id(row)] = (mid, hs_mapping_id, mapping_conf)
                 tf = TradeFlow(
                     source_document_id=doc.id,
                     period=row.period or period,
@@ -299,14 +299,21 @@ class IngestionPipeline:
                 count += 1
             if rows:
                 sample = max(rows, key=lambda r: r.trade_value_usd or 0)
-                sample_mid, sample_hs_id = resolved_by_row.get(
-                    id(sample), (None, None)
+                sample_mid, sample_hs_id, sample_conf = resolved_by_row.get(
+                    id(sample), (None, None, None)
                 )
                 draft = build_trade_risk_event(
                     hs_description=sample.hs_description,
                     partner=sample.partner_name or sample.partner_code,
                     trade_value_usd=max_val or sample.trade_value_usd,
                     import_export=ie,
+                    # Anchor the event to the Census reporting period so
+                    # re-running against the same payload reuses the same
+                    # content_hash via pipeline._add_risk_event dedup.
+                    # Without this, event_date=now() would shift each run
+                    # and pipeline._add_risk_event would silently insert
+                    # a duplicate.  See 2026-05-11 audit.
+                    period=sample.period or period,
                 )
                 self._add_risk_event(
                     doc,
@@ -314,6 +321,7 @@ class IngestionPipeline:
                     company_cache,
                     material_id=sample_mid,
                     hs_mapping_id=sample_hs_id,
+                    mapping_confidence=sample_conf,
                 )
         self._db.flush()
         return count
@@ -561,6 +569,7 @@ class IngestionPipeline:
         *,
         material_id: int | None = None,
         hs_mapping_id: int | None = None,
+        mapping_confidence: float | None = None,
     ) -> RiskEvent:
         """Persist a RiskEvent + entity-resolution links.
 
@@ -571,34 +580,88 @@ class IngestionPipeline:
         TradeFlow construction time — the resolved values used to fall on
         the floor when the sample-derived RiskEvent was created.
 
+        ``mapping_confidence`` (added 2026-05-09, Tier 1.4 audit) is the
+        partner-curated confidence on the ``hs_code_material_mappings``
+        row used to resolve the attribution.  When supplied, the resulting
+        ``RiskEventMaterial.relevance_score`` and
+        ``RiskEventHsMapping.relevance_score`` are multiplied by this value
+        so that a low-confidence mapping (e.g. REE → HS 2617 at 0.5
+        because bastnasite/monazite share the prefix with non-REE ores)
+        produces a low-relevance attribution downstream filters can drop.
+        ``None`` preserves the legacy ``relevance_score=1.0`` for
+        backwards compatibility.
+
         Without these kwargs the function preserves its prior behaviour
         (no junction writes), so news / SEC EDGAR call sites are unchanged.
         Closing those paths' attribution requires running ``MaterialCache``
         over filing / article text — tracked separately, see audit follow-up
         task ("SEC + news pipeline material attribution").
+
+        Idempotency (added 2026-05-09):
+          A ``content_hash`` derived from ``(title, summary, event_date)``
+          is now computed before insert and used as a dedup key.  If an
+          existing event with the same hash is found, this function
+          returns it unmodified — no new row, no duplicate junction
+          writes (they'd violate the ``uq_risk_event_material`` /
+          ``uq_risk_event_hs_mapping`` constraints anyway).  Census trade
+          re-ingest, which previously produced a fresh duplicate row on
+          every run, is now properly idempotent.
         """
+        title = (draft.title or "")[:1024]
+        summary_str = draft.summary or ""
+        date_str = (
+            draft.event_date.isoformat() if draft.event_date is not None else ""
+        )
+        # The same shape used by gta.py / opensanctions.py / trade_signal_builder.
+        content_hash = sha256_text(f"{title}|{summary_str}|{date_str}")
+
+        existing = self._db.scalar(
+            select(RiskEvent).where(RiskEvent.content_hash == content_hash).limit(1)
+        )
+        if existing is not None:
+            # Re-running on top of existing data — return the prior event
+            # without re-adding junctions.  The unique constraints on
+            # (risk_event_id, material_id) and (risk_event_id, hs_mapping_id)
+            # would reject duplicates anyway; bailing here is the cleaner
+            # path and avoids an integrity error tickling the session.
+            log.debug(
+                "pipeline.add_risk_event.skip_existing",
+                event_id=existing.id,
+                content_hash=content_hash[:16],
+            )
+            return existing
+
         ev = RiskEvent(
             source_document_id=doc.id,
             event_type=draft.event_type,
             event_date=draft.event_date,
-            title=draft.title[:1024],
+            title=title,
             summary=draft.summary,
             severity_score=draft.severity_score,
             confidence_score=draft.confidence_score,
             risk_categories_json=draft.risk_categories,
             geography_json=draft.geography,
             metadata_json=draft.metadata,
+            content_hash=content_hash,
         )
         self._db.add(ev)
         # Flush to obtain ev.id before junction-row FKs.
         self._db.flush()
+
+        # Confidence-weighted relevance — clamped to [0, 1] for safety
+        # even though ``hs_code_material_mappings.confidence`` is already
+        # constrained at insert time.
+        effective_relevance = (
+            1.0 if mapping_confidence is None
+            else max(0.0, min(1.0, float(mapping_confidence)))
+        )
 
         if material_id is not None:
             self._db.add(
                 RiskEventMaterial(
                     risk_event_id=ev.id,
                     material_id=material_id,
-                    relevance_score=1.0,
+                    relevance_score=effective_relevance,
                     match_reason="hs_code",
                 )
             )
@@ -607,7 +670,7 @@ class IngestionPipeline:
                 RiskEventHsMapping(
                     risk_event_id=ev.id,
                     hs_mapping_id=hs_mapping_id,
-                    relevance_score=1.0,
+                    relevance_score=effective_relevance,
                     match_reason="trade_flow_match",
                 )
             )

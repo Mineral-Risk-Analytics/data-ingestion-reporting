@@ -17,16 +17,19 @@ migration 021_drop_legacy_scores. See docs/deprecation-audit.md §A1, §A2.
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from sqlalchemy import (
     Date, DateTime, Float, ForeignKey, Integer,
     SmallInteger, String, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+if TYPE_CHECKING:
+    from app.models.supply import HsCodeMaterialMapping
 
 
 class MaterialGeographyRiskScore(Base):
@@ -211,6 +214,17 @@ class HsCodeGeographyRiskScore(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+    # Relationship — lets the market aggregator's stage-weighted rollup
+    # access ``n.hs_mapping.supply_chain_stage`` and ``stage_sequence``
+    # without a manual lookup.  Added 2026-05-09 (was missing — the bug
+    # was masked until G6 threshold lowered to 1 caused the rollup path
+    # to fire in production for the first time).  ``lazy="joined"`` is
+    # OK here because every consumer already needs the mapping; no risk
+    # of accidentally fetching mappings we won't read.
+    hs_mapping: Mapped["HsCodeMaterialMapping"] = relationship(
+        "HsCodeMaterialMapping", lazy="joined",
     )
 
 

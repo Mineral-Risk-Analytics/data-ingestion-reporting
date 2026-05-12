@@ -268,8 +268,12 @@ DEFAULT_GTA_CATEGORY = "geopolitical_trade"
 #   EXPORT_RESTRICTION  → export_restriction_exposure pillar
 # Demand-side interventions (importing country restricts inbound trade):
 #   IMPORT_DISRUPTION   → trade_volatility pillar (lower weight)
-# No subtype is set for instruments that don't map cleanly to either bucket
-# (State aid, Investment measure, Procurement) — text matching handles those.
+# Production subsidies (implementing country subsidises domestic production
+# — distorts downstream competition without restricting trade):
+#   EXPORT_SUBSIDY      → production_subsidy_distortion sub-input on
+#                         the Geopolitical pillar (G-Cov-3, 2026-05-09)
+# No subtype is set for instruments that don't map cleanly to any bucket
+# (Procurement, Public-private partnership) — text matching handles those.
 _INTERVENTION_SUBTYPE_MAP: dict[str, str] = {
     # Export-side interventions (implementing country IS the producer
     # whose supply just got constrained).
@@ -293,6 +297,25 @@ _INTERVENTION_SUBTYPE_MAP: dict[str, str] = {
     "Import quotas":                 "IMPORT_DISRUPTION",
     "Import ban":                    "IMPORT_DISRUPTION",
     "Import bans":                   "IMPORT_DISRUPTION",
+    # Production-subsidy interventions (G-Cov-3, 2026-05-09).
+    # GTA classifies these under several distinct intervention_type
+    # strings; ~306 of 1,728 battery interventions (~18%) fall in this
+    # bucket and previously got event_subtype=NULL.  See
+    # docs/coverage-gap-plan-2026-05.md G-Cov-3 for the inventory and
+    # the scoring-side wiring (production_subsidy_distortion).
+    "Trade finance":                          "EXPORT_SUBSIDY",
+    "State loan":                             "EXPORT_SUBSIDY",
+    "Financial assistance in foreign market": "EXPORT_SUBSIDY",
+    "Loan guarantee":                         "EXPORT_SUBSIDY",
+    "Financial grant":                        "EXPORT_SUBSIDY",
+    "State aid, unspecified":                 "EXPORT_SUBSIDY",
+    "Equity stake":                           "EXPORT_SUBSIDY",
+    "Financial investment support":           "EXPORT_SUBSIDY",
+    # Production subsidies that target output rather than trade — same
+    # bucket because the downstream distortion mechanism is identical.
+    "Production subsidy":                     "EXPORT_SUBSIDY",
+    "Production subsidies":                   "EXPORT_SUBSIDY",
+    "Producer support":                       "EXPORT_SUBSIDY",
 }
 
 # RiskEvent.event_type is String(128); truncate to fit.
@@ -1140,12 +1163,22 @@ def ingest_gta(
         # hs_code_material_mapping.  Pre-resolve the codes here so the loop
         # below doesn't re-walk them and so the gate has a definitive answer
         # before any DB writes.
+        #
+        # 2026-05-09 (Tier 1.4 scope extension): also carry the mapping's
+        # confidence forward so RiskEventMaterial / RiskEventHsMapping
+        # relevance_score can be downscaled for low-confidence prefixes
+        # (e.g. 4-digit fallbacks). Without this every GTA event was
+        # written at hardcoded 0.9 regardless of how shaky the HS→material
+        # link was, which made the per-material event feed noisy for
+        # broadly-stamped tariffs.
         event_subtype = _INTERVENTION_SUBTYPE_MAP.get(intervention_type)
-        resolved_codes: list[tuple[int, Optional[int]]] = []
+        resolved_codes: list[tuple[int, Optional[int], Optional[float]]] = []
         for hs_code in matched_hs_codes:
-            mat_id, hs_map_id = _resolve_material_id(hs_code, hs_material_map)
+            mat_id, hs_map_id, hs_conf = _resolve_material_id(
+                hs_code, hs_material_map
+            )
             if mat_id is not None:
-                resolved_codes.append((mat_id, hs_map_id))
+                resolved_codes.append((mat_id, hs_map_id, hs_conf))
         if not resolved_codes:
             skipped_no_resolved_material += 1
             log.debug(
@@ -1274,31 +1307,54 @@ def ingest_gta(
 
         # ── Material + HS junction rows ────────────────────────────────────
         # ``resolved_codes`` was pre-built above as part of Gate 2.
-        seen_material_ids: set[int] = set()
-        seen_hs_mapping_ids: set[int] = set()
-        for material_id, hs_mapping_id in resolved_codes:
-            if material_id not in seen_material_ids:
-                session.add(
-                    RiskEventMaterial(
-                        risk_event_id=event.id,
-                        material_id=material_id,
-                        relevance_score=0.9,
-                        match_reason="hs_code",
-                    )
+        #
+        # Relevance is the GTA event's intrinsic confidence (0.9, the same
+        # value stamped on the RiskEvent itself) scaled by the HS→material
+        # mapping confidence.  This means a precise 6-digit lithium tariff
+        # gets relevance ≈ 0.9 × 1.0 = 0.9, while a 4-digit "ores and
+        # concentrates" tariff that only weakly maps to a material gets
+        # something like 0.9 × 0.4 = 0.36.  When a material has multiple
+        # matching HS codes in the same event, we keep the highest
+        # resulting relevance rather than blindly first-wins.
+        _BASE_REL = 0.9
+
+        material_best_rel: dict[int, float] = {}
+        hs_mapping_best_rel: dict[int, float] = {}
+        for material_id, hs_mapping_id, hs_conf in resolved_codes:
+            scaled = _BASE_REL * (hs_conf if hs_conf is not None else 1.0)
+            # Clamp to [0, 1] in case a future mapping gets confidence > 1.
+            if scaled > 1.0:
+                scaled = 1.0
+            elif scaled < 0.0:
+                scaled = 0.0
+            prev = material_best_rel.get(material_id)
+            if prev is None or scaled > prev:
+                material_best_rel[material_id] = scaled
+            if hs_mapping_id is not None:
+                prev_hs = hs_mapping_best_rel.get(hs_mapping_id)
+                if prev_hs is None or scaled > prev_hs:
+                    hs_mapping_best_rel[hs_mapping_id] = scaled
+
+        for material_id, relevance in material_best_rel.items():
+            session.add(
+                RiskEventMaterial(
+                    risk_event_id=event.id,
+                    material_id=material_id,
+                    relevance_score=relevance,
+                    match_reason="hs_code",
                 )
-                material_links_created += 1
-                seen_material_ids.add(material_id)
-            if hs_mapping_id is not None and hs_mapping_id not in seen_hs_mapping_ids:
-                session.add(
-                    RiskEventHsMapping(
-                        risk_event_id=event.id,
-                        hs_mapping_id=hs_mapping_id,
-                        relevance_score=0.9,
-                        match_reason="hs_code",
-                    )
+            )
+            material_links_created += 1
+        for hs_mapping_id, relevance in hs_mapping_best_rel.items():
+            session.add(
+                RiskEventHsMapping(
+                    risk_event_id=event.id,
+                    hs_mapping_id=hs_mapping_id,
+                    relevance_score=relevance,
+                    match_reason="hs_code",
                 )
-                hs_mapping_links_created += 1
-                seen_hs_mapping_ids.add(hs_mapping_id)
+            )
+            hs_mapping_links_created += 1
 
         inserted += 1
         pending_in_batch += 1

@@ -21,6 +21,30 @@ def compute_effective_confidence(severity: float, confidence: float) -> float:
     return confidence
 
 
+def relevance_score_to_multiplier(relevance_score: float) -> float:
+    """Map a [0, 1] relevance probability to a [0.70, 1.30] multiplier.
+
+    Background (2026-05-09): ``RiskEventMaterial.relevance_score`` and
+    ``RiskEventGeography.relevance_score`` are stored on [0, 1] (probability-
+    style — 1.0 = directly attributed, ~0.1 = weakly keyword-detected).  But
+    ``compute_event_impact`` accepts ``relevance_multiplier`` on [0.70,
+    1.30] (Bayesian-style, centered on 1.0).  Passing a raw relevance_score
+    directly raised ``ValueError: relevance_multiplier must be 0.70-1.30``
+    for any event with relevance < 0.70.  Pre-G6 the rollup path almost
+    never fired in production so the bug stayed hidden; lowering
+    _STAGE_ROLLUP_MIN_NODES to 1 surfaced it.
+
+    Mapping:
+        relevance_score = 0.0  →  0.70  (slight discount — weakly attached)
+        relevance_score = 0.5  →  1.00  (neutral)
+        relevance_score = 1.0  →  1.30  (boost — directly attributed)
+
+    Inputs outside [0, 1] are clamped before mapping.
+    """
+    clamped = max(0.0, min(1.0, relevance_score))
+    return 0.70 + 0.60 * clamped
+
+
 def compute_event_impact(
     severity: float,
     confidence: float,

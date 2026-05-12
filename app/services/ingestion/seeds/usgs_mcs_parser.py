@@ -46,109 +46,72 @@ from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Country name → ISO2 mapping for countries appearing in the MCS dataset.
-# Extend as needed when new countries appear in future MCS editions.
+#
+# 2026-05-09 refactor: this dict used to be hand-maintained alongside
+# ``seed_countries._COUNTRIES``, which carries the same data in its
+# ``common_names`` field.  The two drifted independently, causing a class
+# of silent-drop bugs (PHOSPHATE ROCK lost Israel/Syria/Tunisia for months
+# because seed_countries had them but ``_COUNTRY_ISO2`` didn't).
+#
+# Below: ``_COUNTRY_ISO2`` is now AUTO-DERIVED from ``seed_countries._COUNTRIES``
+# at parser load time.  ``_COUNTRY_ISO2_OVERRIDES`` adds MCS-specific name
+# variants that shouldn't pollute the canonical ``common_names`` field
+# (e.g. region-disambiguated forms like "Korea, Republic of" that USGS
+# uses but Comtrade / GeographyCache don't).
+#
+# To add support for a new country: edit ``seed_countries._COUNTRIES``
+# and re-run ``bdi-ingest seed-countries``.  The parser picks up the new
+# names automatically on next import.  Use ``_COUNTRY_ISO2_OVERRIDES``
+# only when MCS uses a name that doesn't belong in the seed's
+# ``common_names`` (rare).
 # ---------------------------------------------------------------------------
-_COUNTRY_ISO2: dict[str, str] = {
-    "Afghanistan": "AF",
-    "Albania": "AL",
-    "Algeria": "DZ",
-    "Angola": "AO",
-    "Argentina": "AR",
-    "Armenia": "AM",
-    "Australia": "AU",
-    "Austria": "AT",
-    "Azerbaijan": "AZ",
-    "Bahrain": "BH",
-    "Bolivia": "BO",
-    "Bosnia and Herzegovina": "BA",
-    "Brazil": "BR",
-    "Bulgaria": "BG",
-    "Burma": "MM",
-    "Cambodia": "KH",
-    "Canada": "CA",
-    "Chile": "CL",
-    "China": "CN",
-    "Colombia": "CO",
-    "Congo (Kinshasa)": "CD",
-    "Cuba": "CU",
-    "Czech Republic": "CZ",
-    "Czechia": "CZ",
-    "Ecuador": "EC",
-    "Egypt": "EG",
-    "Eritrea": "ER",
-    "Ethiopia": "ET",
-    "Finland": "FI",
-    "France": "FR",
-    "Gabon": "GA",
-    "Germany": "DE",
-    "Ghana": "GH",
-    "Greece": "GR",
-    "Guinea": "GN",
-    "Guyana": "GY",
-    "Iceland": "IS",
-    "India": "IN",
-    "Indonesia": "ID",
-    "Iran": "IR",
-    "Ireland": "IE",
-    "Italy": "IT",
-    "Jamaica": "JM",
-    "Japan": "JP",
-    "Jordan": "JO",
-    "Kazakhstan": "KZ",
-    "Kenya": "KE",
-    "Korea, North": "KP",
+
+# MCS-specific name variants that don't belong in seed_countries.common_names.
+# Kept here because the seed's ``common_names`` is read by GTA / GeographyCache
+# / Comtrade for free-text and trade-flow attribution; adding USGS-style
+# names there would introduce false positives in those code paths.
+_COUNTRY_ISO2_OVERRIDES: dict[str, str] = {
+    # USGS uses "Korea, Republic of" / "Korea, North"; other ingesters
+    # use "South Korea" / "North Korea".  Seed common_names carries the
+    # latter; this dict adds the USGS form.
     "Korea, Republic of": "KR",
-    "Kosovo": "XK",
-    "Kyrgyzstan": "KG",
-    "Laos": "LA",
-    "Madagascar": "MG",
-    "Malaysia": "MY",
-    "Mali": "ML",
-    "Mauritania": "MR",
-    "Mexico": "MX",
-    "Mongolia": "MN",
-    "Morocco": "MA",
-    "Mozambique": "MZ",
-    "Namibia": "NA",
-    "New Caledonia": "NC",
-    "Niger": "NE",
-    "Nigeria": "NG",
-    "Norway": "NO",
-    "Pakistan": "PK",
-    "Papua New Guinea": "PG",
-    "Peru": "PE",
-    "Philippines": "PH",
-    "Poland": "PL",
-    "Portugal": "PT",
-    "Romania": "RO",
-    "Russia": "RU",
-    "Saudi Arabia": "SA",
-    "Senegal": "SN",
-    "Serbia": "RS",
-    "Sierra Leone": "SL",
-    "Slovakia": "SK",
-    "South Africa": "ZA",
-    "Spain": "ES",
-    "Sudan": "SD",
-    "Sweden": "SE",
-    "Tajikistan": "TJ",
-    "Tanzania": "TZ",
-    "Thailand": "TH",
-    "Togo": "TG",
-    "Turkey": "TR",
-    "Türkiye": "TR",
-    "Turkmenistan": "TM",
-    "Uganda": "UG",
-    "Ukraine": "UA",
-    "United Arab Emirates": "AE",
-    "United Kingdom": "GB",
-    "United States": "US",
-    "Uzbekistan": "UZ",
-    "Venezuela": "VE",
-    "Vietnam": "VN",
-    "Zambia": "ZM",
-    "Zimbabwe": "ZW",
+    "Korea, North": "KP",
+    "Czech Republic": "CZ",   # USGS form; seed uses "Czechia"
+    "Burma": "MM",            # USGS uses "Burma"; seed uses "Myanmar"
+    "Côte d’Ivoire": "CI",    # U+2019 right single quotation mark — verbatim from MCS file
+    "Côte d'Ivoire": "CI",    # ASCII apostrophe fallback
 }
+
+
+def _build_country_lookup() -> dict[str, str]:
+    """Walk ``seed_countries._COUNTRIES`` and build a name→ISO-2 lookup.
+
+    Indexes both the canonical ``name`` and every entry in ``common_names``
+    so MCS country names (e.g. "Russia") resolve via the same dict that
+    GTA / Comtrade / etc. use.
+
+    Imported lazily inside the function to avoid a circular import at
+    module load time (``seed_countries`` imports models, models import
+    base, base imports nothing from the parser side).
+    """
+    from app.services.ingestion.seed_countries import _COUNTRIES  # local import
+
+    lookup: dict[str, str] = {}
+    for entry in _COUNTRIES:
+        iso2 = entry["iso2"]
+        if entry.get("name"):
+            lookup[entry["name"]] = iso2
+        for alt in entry.get("common_names") or []:
+            lookup[alt] = iso2
+    # MCS-specific name overrides win over seed values if they conflict
+    # (which they shouldn't — overrides are explicitly USGS-only forms).
+    lookup.update(_COUNTRY_ISO2_OVERRIDES)
+    return lookup
+
+
+# Lazily resolved on first lookup so the parser remains importable even
+# when seed_countries can't be loaded (e.g. minimal test fixtures).
+_COUNTRY_ISO2: dict[str, str] = _build_country_lookup()
 
 # Aggregate/non-country rows to exclude from country rankings.
 _EXCLUDE_COUNTRIES = {

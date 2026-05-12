@@ -835,6 +835,604 @@ _COUNTRIES: list[dict] = [
         "is_major_producer": False, "is_major_consumer": True,
         "notes": "Bloc identifier used in regulation_geography_scope and risk_event_geography.",
     },
+
+    # ── Added 2026-05-09: countries appearing in MCS 2026 World Production
+    # rows that were missing from this seed.  Five affect launch-10 chapters
+    # (PHOSPHATE ROCK: IL/SY/TN; TUNGSTEN: RW already present; GRAPHITE: LK
+    # already present; REE: GL — reserves only, no current production).
+    # The remainder appear in non-launch chapters (potash, soda ash, talc,
+    # etc.) but are added here so future MCS editions don't silently drop
+    # their data.  Minimal entries — flags default False; partner can
+    # promote individuals if/when they become priority producers.
+
+    # Phosphate Rock producers (Middle East / North Africa)
+    {
+        "iso2": "IL", "name": "Israel", "iso3": "ISR", "region": "Asia",
+        "comtrade_code": 376,
+        "common_names": ["Israel"],
+        "detection_patterns": [
+            {"pattern": "israel",  "context": "primary"},
+            {"pattern": "israeli", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Phosphate Rock and bromine producer (Dead Sea Works / ICL).",
+    },
+    {
+        "iso2": "TN", "name": "Tunisia", "iso3": "TUN", "region": "Africa",
+        "comtrade_code": 788,
+        "common_names": ["Tunisia"],
+        "detection_patterns": [
+            {"pattern": "tunisia",  "context": "primary"},
+            {"pattern": "tunisian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Phosphate Rock — top-10 global producer (Compagnie des Phosphates de Gafsa).",
+    },
+    {
+        "iso2": "SY", "name": "Syria", "iso3": "SYR", "region": "Asia",
+        "comtrade_code": 760,
+        "common_names": ["Syria", "Syrian Arab Republic"],
+        "detection_patterns": [
+            {"pattern": "syria",  "context": "primary"},
+            {"pattern": "syrian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": True,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Phosphate Rock producer (limited operations under sanctions).",
+    },
+
+    # Greenland — REE reserves (no current production); Botswana — natural soda ash
+    {
+        "iso2": "GL", "name": "Greenland", "iso3": "GRL", "region": "Europe",
+        "comtrade_code": 304,
+        "common_names": ["Greenland"],
+        "detection_patterns": [
+            {"pattern": "greenland", "context": "primary"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Significant REE reserves (Kvanefjeld, Kringlerne) — production not yet active.",
+    },
+    {
+        "iso2": "BW", "name": "Botswana", "iso3": "BWA", "region": "Africa",
+        "comtrade_code": 72,
+        "common_names": ["Botswana"],
+        "detection_patterns": [
+            {"pattern": "botswana", "context": "primary"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Natural soda ash producer (Botswana Ash); also copper/nickel via Khoemacau.",
+    },
+
+    # Belarus — sanctioned potash producer
+    {
+        "iso2": "BY", "name": "Belarus", "iso3": "BLR", "region": "Europe",
+        "comtrade_code": 112,
+        "common_names": ["Belarus", "Belorussia"],
+        "detection_patterns": [
+            {"pattern": "belarus",     "context": "primary"},
+            {"pattern": "belarusian",  "context": "mentioned"},
+            {"pattern": "belorussian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": True,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Potash (Belaruskali) — sanctions disruption since 2021.",
+    },
+
+    # Smaller producers — minimal entries, flags default false
+    {
+        "iso2": "BT", "name": "Bhutan", "iso3": "BTN", "region": "Asia",
+        "comtrade_code": 64,
+        "common_names": ["Bhutan"],
+        "detection_patterns": [{"pattern": "bhutan", "context": "primary"}],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "CM", "name": "Cameroon", "iso3": "CMR", "region": "Africa",
+        "comtrade_code": 120,
+        "common_names": ["Cameroon"],
+        "detection_patterns": [
+            {"pattern": "cameroon",   "context": "primary"},
+            {"pattern": "cameroonian","context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "CY", "name": "Cyprus", "iso3": "CYP", "region": "Europe",
+        "comtrade_code": 196,
+        "common_names": ["Cyprus"],
+        "detection_patterns": [
+            {"pattern": "cyprus",   "context": "primary"},
+            {"pattern": "cypriot",  "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "DK", "name": "Denmark", "iso3": "DNK", "region": "Europe",
+        "comtrade_code": 208,
+        "common_names": ["Denmark"],
+        "detection_patterns": [
+            {"pattern": "denmark",  "context": "primary"},
+            {"pattern": "danish",   "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "EE", "name": "Estonia", "iso3": "EST", "region": "Europe",
+        "comtrade_code": 233,
+        "common_names": ["Estonia"],
+        "detection_patterns": [
+            {"pattern": "estonia",  "context": "primary"},
+            {"pattern": "estonian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "GE", "name": "Georgia", "iso3": "GEO", "region": "Asia",
+        "comtrade_code": 268,
+        "common_names": ["Georgia"],
+        # Note: NO detection_patterns — "georgia" collides with the US state
+        # of Georgia, which appears in MRDS / facility free-text data.  Keep
+        # detection off until partner adds context-aware disambiguation.
+        "detection_patterns": None,
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Caucasus country — manganese producer (Chiatura).",
+    },
+    {
+        "iso2": "GT", "name": "Guatemala", "iso3": "GTM", "region": "North America",
+        "comtrade_code": 320,
+        "common_names": ["Guatemala"],
+        "detection_patterns": [
+            {"pattern": "guatemala",  "context": "primary"},
+            {"pattern": "guatemalan", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "KW", "name": "Kuwait", "iso3": "KWT", "region": "Asia",
+        "comtrade_code": 414,
+        "common_names": ["Kuwait"],
+        "detection_patterns": [
+            {"pattern": "kuwait",  "context": "primary"},
+            {"pattern": "kuwaiti", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "LV", "name": "Latvia", "iso3": "LVA", "region": "Europe",
+        "comtrade_code": 428,
+        "common_names": ["Latvia"],
+        "detection_patterns": [
+            {"pattern": "latvia",  "context": "primary"},
+            {"pattern": "latvian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "LS", "name": "Lesotho", "iso3": "LSO", "region": "Africa",
+        "comtrade_code": 426,
+        "common_names": ["Lesotho"],
+        "detection_patterns": [{"pattern": "lesotho", "context": "primary"}],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "LT", "name": "Lithuania", "iso3": "LTU", "region": "Europe",
+        "comtrade_code": 440,
+        "common_names": ["Lithuania"],
+        "detection_patterns": [
+            {"pattern": "lithuania",  "context": "primary"},
+            {"pattern": "lithuanian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "OM", "name": "Oman", "iso3": "OMN", "region": "Asia",
+        "comtrade_code": 512,
+        "common_names": ["Oman"],
+        "detection_patterns": [
+            {"pattern": "oman",  "context": "primary"},
+            {"pattern": "omani", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "QA", "name": "Qatar", "iso3": "QAT", "region": "Asia",
+        "comtrade_code": 634,
+        "common_names": ["Qatar"],
+        "detection_patterns": [
+            {"pattern": "qatar",  "context": "primary"},
+            {"pattern": "qatari", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "TT", "name": "Trinidad and Tobago", "iso3": "TTO", "region": "North America",
+        "comtrade_code": 780,
+        "common_names": ["Trinidad and Tobago", "Trinidad"],
+        "detection_patterns": [{"pattern": "trinidad", "context": "primary"}],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+
+    # ── Added 2026-05-09 (second wave): countries that were in the parser's
+    # legacy ``_COUNTRY_ISO2`` dict but missing from this seed.  Architectural
+    # cleanup — single source of truth for country name → ISO-2 resolution
+    # is now this seed's ``common_names`` field.  Several affect launch-10
+    # data: PHOSPHATE ROCK (Jordan/Algeria/Senegal/Mali); SILICON (Iceland);
+    # ALUMINUM via BAUXITE chapter (Greece/Jamaica/Sierra Leone/Mauritania/
+    # Guyana producers).  Lithium is a separate launch material; Mali is a
+    # listed lithium producer.
+
+    # Phosphate Rock producers
+    {
+        "iso2": "JO", "name": "Jordan", "iso3": "JOR", "region": "Asia",
+        "comtrade_code": 400,
+        "common_names": ["Jordan"],
+        "detection_patterns": [
+            {"pattern": "jordan",   "context": "primary"},
+            {"pattern": "jordanian","context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Phosphate Rock and potash producer (Jordan Phosphate Mines / APC).",
+    },
+    {
+        "iso2": "DZ", "name": "Algeria", "iso3": "DZA", "region": "Africa",
+        "comtrade_code": 12,
+        "common_names": ["Algeria"],
+        "detection_patterns": [
+            {"pattern": "algeria",  "context": "primary"},
+            {"pattern": "algerian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Phosphate Rock producer (Ferphos).",
+    },
+    {
+        "iso2": "SN", "name": "Senegal", "iso3": "SEN", "region": "Africa",
+        "comtrade_code": 686,
+        "common_names": ["Senegal"],
+        "detection_patterns": [
+            {"pattern": "senegal",   "context": "primary"},
+            {"pattern": "senegalese","context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Phosphate Rock and zircon producer.",
+    },
+
+    # Bauxite producers (BAUXITE AND ALUMINA chapter feeds Aluminum ore stage)
+    {
+        "iso2": "GR", "name": "Greece", "iso3": "GRC", "region": "Europe",
+        "comtrade_code": 300,
+        "common_names": ["Greece"],
+        "detection_patterns": [
+            {"pattern": "greece", "context": "primary"},
+            {"pattern": "greek",  "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Bauxite producer (Mytilineos / Aluminium of Greece).",
+    },
+    {
+        "iso2": "JM", "name": "Jamaica", "iso3": "JAM", "region": "North America",
+        "comtrade_code": 388,
+        "common_names": ["Jamaica"],
+        "detection_patterns": [
+            {"pattern": "jamaica",  "context": "primary"},
+            {"pattern": "jamaican", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Bauxite producer.",
+    },
+    {
+        "iso2": "SL", "name": "Sierra Leone", "iso3": "SLE", "region": "Africa",
+        "comtrade_code": 694,
+        "common_names": ["Sierra Leone"],
+        "detection_patterns": [{"pattern": "sierra leone", "context": "primary"}],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Bauxite, rutile (titanium ore), iron ore.",
+    },
+    {
+        "iso2": "GY", "name": "Guyana", "iso3": "GUY", "region": "South America",
+        "comtrade_code": 328,
+        "common_names": ["Guyana"],
+        "detection_patterns": [{"pattern": "guyana", "context": "primary"}],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Bauxite producer.",
+    },
+    {
+        "iso2": "MR", "name": "Mauritania", "iso3": "MRT", "region": "Africa",
+        "comtrade_code": 478,
+        "common_names": ["Mauritania"],
+        "detection_patterns": [
+            {"pattern": "mauritania",  "context": "primary"},
+            {"pattern": "mauritanian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Iron ore producer (SNIM); copper.",
+    },
+
+    # Silicon metal / ferrosilicon producers
+    {
+        "iso2": "IS", "name": "Iceland", "iso3": "ISL", "region": "Europe",
+        "comtrade_code": 352,
+        "common_names": ["Iceland"],
+        "detection_patterns": [
+            {"pattern": "iceland",   "context": "primary"},
+            {"pattern": "icelandic", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Silicon metal smelter (PCC BakkiSilicon); aluminum smelting.",
+    },
+
+    # Lithium producers (Mali appears in MCS 2026 lithium production)
+    {
+        "iso2": "ML", "name": "Mali", "iso3": "MLI", "region": "Africa",
+        "comtrade_code": 466,
+        "common_names": ["Mali"],
+        "detection_patterns": [
+            {"pattern": "mali",   "context": "primary"},
+            {"pattern": "malian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Lithium (Goulamina), gold producer.",
+    },
+
+    # Other countries appearing in MCS production rows
+    {
+        "iso2": "AF", "name": "Afghanistan", "iso3": "AFG", "region": "Asia",
+        "comtrade_code": 4,
+        "common_names": ["Afghanistan"],
+        "detection_patterns": [
+            {"pattern": "afghanistan", "context": "primary"},
+            {"pattern": "afghan",      "context": "mentioned"},
+        ],
+        "is_sanctions_risk": True,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Significant lithium / REE / copper reserves; production limited.",
+    },
+    {
+        "iso2": "AL", "name": "Albania", "iso3": "ALB", "region": "Europe",
+        "comtrade_code": 8,
+        "common_names": ["Albania"],
+        "detection_patterns": [
+            {"pattern": "albania",  "context": "primary"},
+            {"pattern": "albanian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Chromite producer.",
+    },
+    {
+        "iso2": "AM", "name": "Armenia", "iso3": "ARM", "region": "Asia",
+        "comtrade_code": 51,
+        "common_names": ["Armenia"],
+        "detection_patterns": [
+            {"pattern": "armenia",  "context": "primary"},
+            {"pattern": "armenian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Copper, molybdenum producer.",
+    },
+    {
+        "iso2": "AZ", "name": "Azerbaijan", "iso3": "AZE", "region": "Asia",
+        "comtrade_code": 31,
+        "common_names": ["Azerbaijan"],
+        "detection_patterns": [
+            {"pattern": "azerbaijan", "context": "primary"},
+            {"pattern": "azeri",      "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "BH", "name": "Bahrain", "iso3": "BHR", "region": "Asia",
+        "comtrade_code": 48,
+        "common_names": ["Bahrain"],
+        "detection_patterns": [
+            {"pattern": "bahrain",  "context": "primary"},
+            {"pattern": "bahraini", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": True, "is_major_consumer": False,
+        "notes": "Aluminum smelter (Aluminium Bahrain / ALBA).",
+    },
+    {
+        "iso2": "BA", "name": "Bosnia and Herzegovina", "iso3": "BIH", "region": "Europe",
+        "comtrade_code": 70,
+        "common_names": ["Bosnia and Herzegovina", "Bosnia"],
+        "detection_patterns": [
+            {"pattern": "bosnia",     "context": "primary"},
+            {"pattern": "bosnian",    "context": "mentioned"},
+            {"pattern": "herzegovina","context": "primary"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "BG", "name": "Bulgaria", "iso3": "BGR", "region": "Europe",
+        "comtrade_code": 100,
+        "common_names": ["Bulgaria"],
+        "detection_patterns": [
+            {"pattern": "bulgaria",  "context": "primary"},
+            {"pattern": "bulgarian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Copper smelter (Aurubis Bulgaria); lead/zinc.",
+    },
+    {
+        "iso2": "KH", "name": "Cambodia", "iso3": "KHM", "region": "Asia",
+        "comtrade_code": 116,
+        "common_names": ["Cambodia"],
+        "detection_patterns": [
+            {"pattern": "cambodia",  "context": "primary"},
+            {"pattern": "cambodian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "CO", "name": "Colombia", "iso3": "COL", "region": "South America",
+        "comtrade_code": 170,
+        "common_names": ["Colombia"],
+        "detection_patterns": [
+            {"pattern": "colombia",  "context": "primary"},
+            {"pattern": "colombian", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Coal, ferronickel, gold.",
+    },
+    {
+        "iso2": "ER", "name": "Eritrea", "iso3": "ERI", "region": "Africa",
+        "comtrade_code": 232,
+        "common_names": ["Eritrea"],
+        "detection_patterns": [{"pattern": "eritrea", "context": "primary"}],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Copper, zinc, gold producer.",
+    },
+    {
+        "iso2": "IE", "name": "Ireland", "iso3": "IRL", "region": "Europe",
+        "comtrade_code": 372,
+        "common_names": ["Ireland"],
+        "detection_patterns": [
+            {"pattern": "ireland", "context": "primary"},
+            {"pattern": "irish",   "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Zinc mining (Tara Mines).",
+    },
+    {
+        "iso2": "KE", "name": "Kenya", "iso3": "KEN", "region": "Africa",
+        "comtrade_code": 404,
+        "common_names": ["Kenya"],
+        "detection_patterns": [
+            {"pattern": "kenya",  "context": "primary"},
+            {"pattern": "kenyan", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Soda ash, fluorspar producer.",
+    },
+    {
+        "iso2": "XK", "name": "Kosovo", "iso3": "XKX", "region": "Europe",
+        "comtrade_code": None,  # Kosovo lacks an M49 numeric code
+        "common_names": ["Kosovo"],
+        "detection_patterns": [{"pattern": "kosovo", "context": "primary"}],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Lead, zinc, lignite.  No UN M49 code; ISO 3166-1 alpha-2 'XK' is provisional.",
+    },
+    {
+        "iso2": "KG", "name": "Kyrgyzstan", "iso3": "KGZ", "region": "Asia",
+        "comtrade_code": 417,
+        "common_names": ["Kyrgyzstan"],
+        "detection_patterns": [
+            {"pattern": "kyrgyzstan", "context": "primary"},
+            {"pattern": "kyrgyz",     "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Gold (Kumtor); antimony.",
+    },
+    {
+        "iso2": "NE", "name": "Niger", "iso3": "NER", "region": "Africa",
+        "comtrade_code": 562,
+        "common_names": ["Niger"],
+        "detection_patterns": [
+            {"pattern": "niger",     "context": "primary"},
+            # Skip "nigerien" / "nigerian" — high collision with Nigeria
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Uranium producer (Orano).",
+    },
+    {
+        "iso2": "SD", "name": "Sudan", "iso3": "SDN", "region": "Africa",
+        "comtrade_code": 729,
+        "common_names": ["Sudan"],
+        "detection_patterns": [
+            {"pattern": "sudan",    "context": "primary"},
+            {"pattern": "sudanese", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": True,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Gold producer; chromium.",
+    },
+    {
+        "iso2": "TJ", "name": "Tajikistan", "iso3": "TJK", "region": "Asia",
+        "comtrade_code": 762,
+        "common_names": ["Tajikistan"],
+        "detection_patterns": [
+            {"pattern": "tajikistan", "context": "primary"},
+            {"pattern": "tajik",      "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Aluminum smelter (TALCO); antimony.",
+    },
+    {
+        "iso2": "TG", "name": "Togo", "iso3": "TGO", "region": "Africa",
+        "comtrade_code": 768,
+        "common_names": ["Togo"],
+        "detection_patterns": [
+            {"pattern": "togo",    "context": "primary"},
+            {"pattern": "togolese","context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Phosphate Rock producer.",
+    },
+    {
+        "iso2": "TM", "name": "Turkmenistan", "iso3": "TKM", "region": "Asia",
+        "comtrade_code": 795,
+        "common_names": ["Turkmenistan"],
+        "detection_patterns": [
+            {"pattern": "turkmenistan", "context": "primary"},
+            {"pattern": "turkmen",      "context": "mentioned"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+    },
+    {
+        "iso2": "VE", "name": "Venezuela", "iso3": "VEN", "region": "South America",
+        "comtrade_code": 862,
+        "common_names": ["Venezuela"],
+        "detection_patterns": [
+            {"pattern": "venezuela",  "context": "primary"},
+            {"pattern": "venezuelan", "context": "mentioned"},
+        ],
+        "is_sanctions_risk": True,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Iron ore, bauxite (limited operations under sanctions).",
+    },
 ]
 
 
@@ -849,10 +1447,18 @@ def seed_countries(session: Session) -> dict[str, int]:
     ``common_names``, ``comtrade_code``, and flag columns without touching
     ``created_at``.
 
-    Returns ``{"inserted": int, "updated": int}``.
+    Returns ``{"inserted": int, "updated": int, "total": int}``.
     """
-    inserted = updated = 0
+    from sqlalchemy import select
 
+    # Snapshot the iso2 set BEFORE the loop so we can distinguish inserts
+    # from updates without relying on ``result.rowcount`` (which psycopg3
+    # returns as 0 or -1 for ``INSERT ... ON CONFLICT DO UPDATE`` — bug
+    # surfaced 2026-05-09 when the function reported 0/0 despite all 50
+    # rows successfully landing in the table).
+    existing_iso2s = set(session.scalars(select(Country.iso2)).all())
+
+    inserted = updated = 0
     for c in _COUNTRIES:
         stmt = (
             pg_insert(Country)
@@ -873,13 +1479,21 @@ def seed_countries(session: Session) -> dict[str, int]:
                 },
             )
         )
-        result = session.execute(stmt)
-        # rowcount == 1 for both insert and update in pg; use matched_rows
-        if result.rowcount == 1:
-            # Distinguish insert vs update via a pre-check is expensive; just
-            # count all upserted rows and report as inserted for simplicity.
+        session.execute(stmt)
+        if c["iso2"] in existing_iso2s:
+            updated += 1
+        else:
             inserted += 1
 
     session.flush()
-    log.info("seed_countries.done", total=len(_COUNTRIES))
-    return {"inserted": inserted, "updated": updated}
+    log.info(
+        "seed_countries.done",
+        inserted=inserted,
+        updated=updated,
+        total=len(_COUNTRIES),
+    )
+    return {
+        "inserted": inserted,
+        "updated": updated,
+        "total": len(_COUNTRIES),
+    }

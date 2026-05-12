@@ -8,6 +8,46 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class HsMappingGeographyRead(BaseModel):
+    """Per-country breakdown for one HS mapping node.
+
+    Combines the most recent ``hs_code_production_shares`` row (Geography +
+    production_share) with any matching ``hs_code_geography_risk_scores``
+    row (TARIFF / EXPORT / SCORE) and counted ``risk_event_hs_mappings``
+    events.  Populated by the route handler from a bulk pre-load so the
+    frontend HS Codes & Stages tab can render per-row geography + scoring
+    without per-row roundtrips.
+
+    All score fields are Optional — they're ``None`` until
+    ``rescore-hs-nodes`` populates ``hs_code_geography_risk_scores``.
+    Production_share alone (no scores) is the steady state between MCS
+    ingest and the next scoring run.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    country_code: str
+    # ── From hs_code_production_shares (latest reference_year, market_scope='global')
+    production_share: Optional[float] = None     # 0–1
+    production_volume: Optional[float] = None
+    reference_year: Optional[int] = None
+    # ── From hs_code_geography_risk_scores (latest as_of_date, market_scope='global')
+    hhi: Optional[float] = None                  # 0–1, hhi_at_stage
+    tariff_exposure: Optional[float] = None      # 0–1
+    export_restriction: Optional[float] = None   # 0–1
+    score: Optional[float] = None                # 0–100, composite_node_score
+    scored_at: Optional[datetime] = None
+    # ── ``score_method`` plucked from ``HsCodeGeographyRiskScore.metadata_json``
+    # ``"hhi_anchored"`` = canonical 0.50×HHI + 0.25×tariff + 0.25×export
+    # ``"event_only_no_hhi"`` = fallback 0.5×tariff + 0.5×export when no
+    # production-share data exists at this stage (Option 1, 2026-05-06).
+    # Frontend uses this to show a "no production base" badge so partner
+    # understands why HHI is blank on a scored row.
+    score_method: Optional[str] = None
+    # ── Event counts joined from risk_event_hs_mappings
+    events_open: int = 0
+
+
 class HsMappingRead(BaseModel):
     """Serializes ``HsCodeMaterialMapping`` rows.
 
@@ -18,6 +58,13 @@ class HsMappingRead(BaseModel):
     seed_hs_mappings — no aliasing needed.  Used by the frontend HS Codes &
     Stages tab to group rows by stage and to surface the partner-curated
     keyword aliases used for trade-event attribution.
+
+    Aggregate fields (``geographies``, ``hhi``, ``node_score``,
+    ``events_open``, ``scored_at``) are populated by the route handler from
+    a bulk pre-load against ``hs_code_production_shares`` +
+    ``hs_code_geography_risk_scores`` + ``risk_event_hs_mappings``.  All are
+    Optional / default-empty so callers that don't enrich (e.g. the global
+    mismatches view) still serialize cleanly.
     """
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
@@ -41,6 +88,21 @@ class HsMappingRead(BaseModel):
     is_missing_description: bool = False
     is_chapter_mismatch: bool = False
     is_cross_mapped: bool = False
+
+    # ── Aggregate / breakdown fields (added 2026-05-06) ─────────────────
+    # Populated by the route handler from a bulk pre-load.  Optional so
+    # callers that don't enrich (mismatches view, global lists) still
+    # serialize cleanly.
+    geographies: List[HsMappingGeographyRead] = []
+    hhi: Optional[float] = None                  # weighted avg across geographies
+    node_score: Optional[float] = None           # max composite_node_score across geos
+    events_open: int = 0                         # total RiskEventHsMapping count
+    scored_at: Optional[datetime] = None         # most recent scoring as_of_date
+    # Node-level method rollup (2026-05-06). ``"hhi_anchored"`` if any
+    # geography on the node was scored with production data, else
+    # ``"event_only_no_hhi"`` if the only scores came from the fallback,
+    # else None.  Frontend keys the "no production base" badge off this.
+    score_method: Optional[str] = None
 
     @property
     def is_mismatched(self) -> bool:

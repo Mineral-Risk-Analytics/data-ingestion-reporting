@@ -15,10 +15,12 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.base import Base
+from app.models.country import Country
 from app.models.documents import SourceDocument
 from app.models.regulatory import (
     RiskEvent,
     RiskEventGeography,
+    RiskEventHsMapping,
     RiskEventMaterial,
 )
 from app.models.source import Source
@@ -51,12 +53,14 @@ def _patch_sqlite_jsonb() -> None:
 
 
 _GTA_TABLES = (
+    Country.__table__,
     Source.__table__,
     SourceDocument.__table__,
     Material.__table__,
     HsCodeMaterialMapping.__table__,
     RiskEvent.__table__,
     RiskEventGeography.__table__,
+    RiskEventHsMapping.__table__,
     RiskEventMaterial.__table__,
 )
 
@@ -95,6 +99,8 @@ def seeded_materials_and_hs(session: Session) -> dict[str, int]:
                 material_id=m.id,
                 description=f"{name} HS prefix {hs}",
                 confidence=1.0,
+                digit_count=len(hs),
+                market_scope="global",
             )
         )
     session.commit()
@@ -165,8 +171,9 @@ class TestSplitHsCodes:
     def test_comma_separator(self):
         assert _split_hs_codes("250410,260400") == ["250410", "260400"]
 
-    def test_zero_pads_short_codes(self):
-        assert _split_hs_codes("2504") == ["002504"]
+    def test_drops_short_codes_as_cpc_not_hs(self):
+        """Fewer than 6 digits is treated as CPC/malformed — not zero-padded to HS-6."""
+        assert _split_hs_codes("2504") == []
 
     def test_strips_dots_and_keeps_digits(self):
         assert _split_hs_codes("26.04.00") == ["260400"]
@@ -359,14 +366,15 @@ class TestIngestGta:
         ):
             result = ingest_gta(session, since_year=2018)
 
-        # 1001, 1002, 1006 → 3 events (Atlantis row has no resolved country
-        # but the event is still created per the spec).
-        assert result["inserted"] == 3
+        # 1001, 1002 → 2 events. Row 1006 (Atlantis) has no resolved country and
+        # is skipped (see ``skipped_unknown_country``).
+        assert result["inserted"] == 2
         assert result["downloaded_rows"] == 3
         assert result["skipped_existing"] == 0
+        assert result["skipped_unknown_country"] == 1
 
         events = session.scalars(select(RiskEvent)).all()
-        assert len(events) == 3
+        assert len(events) == 2
         for e in events:
             assert e.verified is False
             assert e.confidence_score == 0.9
@@ -425,8 +433,8 @@ class TestIngestGta:
 
         # graphite (250410+250490 → both match prefix 2504 → 1 material link)
         # nickel  (260400 → 1 material link)
-        # atlantis lithium (283691 → matches 2836 → 1 material link)
-        assert result["material_links"] == 3
+        # Atlantis lithium row is not ingested (unresolved jurisdiction).
+        assert result["material_links"] == 2
 
         links = session.scalars(select(RiskEventMaterial)).all()
         for link in links:
@@ -463,13 +471,13 @@ class TestIngestGta:
             result2 = ingest_gta(session, since_year=2018)
 
         assert result2["inserted"] == 0
-        assert result2["skipped_existing"] == 3
+        assert result2["skipped_existing"] == 2
         assert result2["material_links"] == 0
         assert result2["geography_links"] == 0
 
         # No duplication.
-        assert len(session.scalars(select(RiskEvent)).all()) == 3
-        assert len(session.scalars(select(RiskEventMaterial)).all()) == 3
+        assert len(session.scalars(select(RiskEvent)).all()) == 2
+        assert len(session.scalars(select(RiskEventMaterial)).all()) == 2
         assert len(session.scalars(select(RiskEventGeography)).all()) == 2
 
     def test_since_year_filter_applied(self, session, seeded_materials_and_hs):
