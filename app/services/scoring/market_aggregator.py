@@ -128,6 +128,15 @@ STAGE_ROLLUP_WEIGHTS: dict[str, float] = {
 #               concern.  See ``docs/scoring-audit-2026-05.md`` G6.
 _STAGE_ROLLUP_MIN_NODES = 1
 
+# ── Facility-presence floor for country_concentration fallback ──────────
+# Set when no MaterialProductionShare row exists for the (material, country)
+# pair but MRDS has at least one FacilityMaterialLink row for that material
+# in that country.  See _derive_market_geopolitical_inputs for full
+# rationale.  0.02 sits below the smallest USGS-tracked producer share
+# (Cobalt AU = 0.01) so it's clearly a presence marker, not a real share.
+# Contribution to pillar: 0.40 × 0.02 = 0.8 score points out of 100.
+_FACILITY_PRESENCE_FLOOR = 0.02
+
 # ── Pink Sheet (commodity_prices) thresholds — short-window ─────────────
 # CV (coefficient of variation = std/mean) over the look-back window
 # scaled into base_filing_signal (0-40).
@@ -281,6 +290,8 @@ def _dedup_events(*event_lists: list[EventWithRelevance]) -> list[EventWithRelev
 # ---------------------------------------------------------------------------
 
 def _derive_market_material_inputs(
+    db: Session,
+    material_id: int,
     criticality_signal: Optional[MaterialCriticalitySignal],
     geography_code: str,
     trade_events: list[EventWithRelevance],
@@ -304,10 +315,20 @@ def _derive_market_material_inputs(
         Five-component composite, each [0, 1]:
           0.45 × production HHI (hhi_score)
           0.15 × reserve HHI    (reserve_hhi_score) — forward-looking concentration
-          0.25 × HCG binary     (1.0 if geography is CN/CD/RU, else 0.0)
+          0.25 × producer signal (geography's actual MCS share of this material;
+                                   falls back to facility-presence floor 0.02 if
+                                   MRDS knows about a facility here, else 0.0)
           0.10 × capacity stress (capacity_utilization normalised; high util = tight market)
           0.05 × supply trend    (production YoY contraction only; growth = no extra risk)
         All weights sum to 1.0.  Any absent component falls back to a neutral 0.5.
+
+        Producer-signal history: this sub-input was a hardcoded binary HCG flag
+        (1.0 if geography ∈ {CN, CD, RU}, else 0.0) prior to 2026-05-12, which
+        forced CD to "max concentration" for materials it doesn't produce
+        (Aluminum, Iron Ore, Manganese, Graphite, Nickel, Phosphate, REE) and
+        RU on Lithium/Manganese.  Same phantom-producer problem the Geopolitical
+        pillar's country_concentration had — fixed in parallel with the same
+        Option-B (MCS-share + facility-presence floor) approach.
 
     trade_volatility:
         Average normalised event_impact for GEOPOLITICAL_TRADE events for this
@@ -337,8 +358,39 @@ def _derive_market_material_inputs(
     criticality = 0.70 * hhi_criticality + 0.30 * scarcity_signal
 
     # ── concentration ────────────────────────────────────────────────────────
-    is_hcg = geography_code in HIGH_CONCENTRATION_GEOS
-    hcg_component = 1.0 if is_hcg else 0.0
+    # Producer-signal component (renamed from "hcg_component" 2026-05-12).
+    # Was: hardcoded {CN, CD, RU} binary. Now: actual MCS share for this
+    # (material, country) pair, with the same facility-presence floor we
+    # apply in the Geopolitical pillar's country_concentration fallback.
+    # See the function docstring for the phantom-producer rationale.
+    _producer_share_row = db.scalar(
+        select(MaterialProductionShare)
+        .where(
+            MaterialProductionShare.material_id == material_id,
+            MaterialProductionShare.country_code == geography_code,
+            MaterialProductionShare.production_share > 0,
+        )
+        .order_by(MaterialProductionShare.reference_year.desc())
+        .limit(1)
+    )
+    if _producer_share_row is not None:
+        producer_signal = float(_producer_share_row.production_share)
+    else:
+        # No MCS row — check facility-presence floor.
+        from app.models.facility import Facility, FacilityMaterialLink
+
+        _has_facility = db.scalar(
+            select(FacilityMaterialLink.id)
+            .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
+            .where(
+                FacilityMaterialLink.material_id == material_id,
+                Facility.country == geography_code,
+            )
+            .limit(1)
+        )
+        producer_signal = (
+            _FACILITY_PRESENCE_FLOOR if _has_facility is not None else 0.0
+        )
 
     prod_hhi = float(sig.hhi_score) if sig and sig.hhi_score is not None else 0.5
     res_hhi  = float(sig.reserve_hhi_score) if sig and sig.reserve_hhi_score is not None else 0.5
@@ -364,7 +416,7 @@ def _derive_market_material_inputs(
     concentration = (
         0.45 * prod_hhi
         + 0.15 * res_hhi
-        + 0.25 * hcg_component
+        + 0.25 * producer_signal
         + 0.10 * cap_stress
         + 0.05 * trend_stress
     )
@@ -442,7 +494,7 @@ def _derive_market_geopolitical_inputs(
         geography (no HS code attribution) appear in path 1 and not 2.
         Taking max() ensures neither contribution is silently dropped.
     """
-    # Primary: production share from MaterialProductionShare
+    # Primary: production share from MaterialProductionShare (USGS MCS).
     share_row = db.scalar(
         select(MaterialProductionShare)
         .where(
@@ -456,13 +508,49 @@ def _derive_market_geopolitical_inputs(
     if share_row is not None:
         country_concentration = float(share_row.production_share)
     else:
-        # Fallback: HCG binary flag for well-known concentrated geographies.
-        # Fires when production share data has not been ingested for this pair.
-        country_concentration = 1.0 if geography_code in HIGH_CONCENTRATION_GEOS else 0.0
+        # Secondary: facility-presence floor (2026-05-12, audit fix).
+        # USGS MCS only reports producers above ~1% of world output, so any
+        # country with a smaller-but-real footprint (e.g. Sri Lanka graphite)
+        # gets no MCS row at all.  Previously the code fell back to a
+        # hardcoded HIGH_CONCENTRATION_GEOS = {CN, CD, RU} set that returned
+        # country_concentration = 1.0 — a phantom-producer signal that
+        # forced CD to "max concentration" for materials it doesn't produce
+        # (Aluminum, Iron Ore, Manganese, Graphite, Nickel, Phosphate, REE)
+        # and RU on Lithium / Manganese.  The HCG fallback inflated 85-94%
+        # of scored (material, country) pairs across the launch list.
+        #
+        # New behavior: if MRDS knows about at least one facility for this
+        # material in this country, return a small floor value (0.02) to
+        # acknowledge "we know there's some production here, just below
+        # USGS's reporting threshold."  Otherwise 0.0 (no signal).
+        #
+        # Floor calibration: 0.02 sits below the smallest USGS-tracked
+        # share (Cobalt AU = 0.01) so it's identifiable as a presence
+        # marker rather than a real share.  Combined with the pillar's
+        # 0.40 weight on country_concentration that's worth 0.8 score
+        # points out of 100 — appreciable but not dominating.
+        from app.models.facility import Facility, FacilityMaterialLink
+
+        _has_facility = db.scalar(
+            select(FacilityMaterialLink.id)
+            .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
+            .where(
+                FacilityMaterialLink.material_id == material_id,
+                Facility.country == geography_code,
+            )
+            .limit(1)
+        )
+        if _has_facility is not None:
+            country_concentration = _FACILITY_PRESENCE_FLOOR
+            fallback_label = "facility_presence_floor"
+        else:
+            country_concentration = 0.0
+            fallback_label = "no_signal"
         log.debug(
             "market_aggregator.geo.production_share_fallback",
             material_id=material_id,
             geography_code=geography_code,
+            fallback_label=fallback_label,
             fallback_value=country_concentration,
         )
 
@@ -829,9 +917,16 @@ def _derive_market_operational_inputs(
     geography_code: str,
     operational_events: list[EventWithRelevance],
     as_of_date: date,
-) -> tuple[float, list[float], str, Optional[dict]]:
+) -> tuple[Optional[float], list[float], str, Optional[dict]]:
     """
     Returns (structural_dependency, weighted_event_impacts, dep_source, stage_breakdown).
+
+    ``structural_dependency`` is ``None`` when no facility data and no
+    capacity-constraint events exist for the (material, geography) pair
+    — added 2026-05-12 as a follow-up to the Step 2 audit so the
+    operational pillar doesn't impute a silent 12-point ghost from the
+    legacy 0.3 placeholder.  Callers (``_score_operational_market``)
+    redistribute pillar weight to events when this is None.
 
     structural_dependency — three-tier resolution:
 
@@ -881,27 +976,21 @@ def _derive_market_operational_inputs(
         stage_breakdown = geo_result
         dep_source = "mrds_geography_stage_weighted"
 
-    # Tier 2: global MRDS stage-weighted fraction (discounted) — when no sites
-    # in this geography
-    if struct_dep is None:
-        global_result = _facility_structural_dependency(db, material_id, geography_code=None)
-        if global_result is not None:
-            struct_dep = global_result["weighted"] * 0.5
-            # Stash the un-discounted breakdown so consumers can see the full
-            # picture; the 0.5 discount applies only to the rolled-up score.
-            stage_breakdown = {
-                **global_result,
-                "discount_applied": 0.5,
-                "note": "global fallback — no facilities in target geography",
-            }
-            dep_source = "mrds_global_discounted_stage_weighted"
-            log.debug(
-                "market_aggregator.facility_global_fallback",
-                material_id=material_id,
-                geography_code=geography_code,
-                global_dep=global_result["weighted"],
-                discounted=struct_dep,
-            )
+    # Tier 2 (DISABLED 2026-05-12, Step 2 audit Fix B): global MRDS
+    # stage-weighted fraction × 0.5.  This path imputed a global structural-
+    # dependency value to countries with no per-material facility data,
+    # which mathematically produces JP-style inversions (a country with no
+    # graphite mines inheriting the global graphite mothballed-fraction).
+    # Currently the fallback returns 0 because no facility in the DB carries
+    # a mothballed status — Tier 2 is therefore moot in practice — but the
+    # principled fix is to skip it: countries with no facility data should
+    # surface as a coverage gap (Tier 3 / default), not be imputed.  When
+    # the MRDS parser fix (ticket #61) lands status-diverse data, this gate
+    # prevents accidental cross-country contamination on day one.
+    #
+    # If a future analysis wants a global comparison baseline, prefer
+    # rendering it as a UI annotation rather than folding it into the
+    # per-country score.
 
     # Tier 3: event-derived baseline — when no MRDS data exists for this material
     if struct_dep is None:
@@ -920,13 +1009,28 @@ def _derive_market_operational_inputs(
             ) / len(struct_events)
             dep_source = "event_derived"
         else:
-            struct_dep = 0.3
-            dep_source = "default_0.3"
+            # Final tier: no MRDS data AND no capacity-constraint events.
+            # 2026-05-12 (Step 2 audit follow-up): switched from default
+            # 0.3 placeholder to None.  The placeholder was contributing a
+            # silent 12-point ghost (0.40 weight × 0.3 default × 100) to
+            # every (material, country) pair lacking facility data, which
+            # for the current launch list means every pair.  None signals
+            # honest "we don't have the data to score this," and
+            # _score_operational_market redistributes the operational
+            # pillar to 100% event-component when struct_dep is None.
+            # Revisit once curated facility data (G4c track) populates
+            # status-diverse MRDS rows.
+            struct_dep = None
+            dep_source = "no_signal"
             log.debug(
-                "market_aggregator.structural_dependency_default",
+                "market_aggregator.structural_dependency_missing",
                 material_id=material_id,
                 geography_code=geography_code,
-                note="No MRDS facility data and no capacity-constraint events; using 0.3 placeholder",
+                note=(
+                    "No MRDS facility data and no capacity-constraint events; "
+                    "structural_dependency = None.  Operational pillar will "
+                    "score from events only."
+                ),
             )
 
     weighted_event_impacts = [
@@ -1014,12 +1118,28 @@ def _export_restriction_operational_impacts(
 
 
 def _score_operational_market(
-    struct_dep: float,
+    struct_dep: Optional[float],
     op_impacts: list[float],
 ) -> float:
-    """40% structural dependency + 60% weighted event rollup, capped at 100."""
+    """Operational pillar: structural dependency + weighted event rollup.
+
+    Default weights: 40% structural_dependency, 60% events.  When
+    ``struct_dep`` is None (no facility data AND no capacity-constraint
+    events for this material × geography — see
+    ``_derive_market_operational_inputs`` Tier-3 note), the pillar
+    redistributes to 100% event-component rather than imputing a
+    placeholder.  This makes "we don't know" visibly score as the
+    event signal alone — countries with no events under this regime
+    score 0, which is honest given the data state.
+
+    Result capped at 100.
+    """
     event_component = sum(op_impacts) / len(op_impacts) if op_impacts else 0.0
-    raw = (0.40 * struct_dep + 0.60 * event_component) * 100
+    if struct_dep is None:
+        # No facility signal: pillar is 100% event-driven.
+        raw = event_component * 100
+    else:
+        raw = (0.40 * struct_dep + 0.60 * event_component) * 100
     return min(100.0, raw)
 
 
@@ -1540,6 +1660,49 @@ def score_material_geography(
         for ew in lst
     })
 
+    # Intersection event count (migration 042): events tagged to BOTH this
+    # material AND this geography, within each category's lookback window.
+    # Distinct from ``total_event_count`` (the UNION).  Stored separately so
+    # the UI can display "events about this material in this country" — a
+    # number an analyst can read at face value — without losing the audit
+    # trail of what was fed into the score.
+    #
+    # 2026-05-12 (Step 2 audit, Fix A / B): the intersection is now ALSO
+    # the input the Material and Operational pillar sub-input derivations
+    # consume.  Previously they consumed the union, which dragged
+    # trade_volatility and weighted_event_impacts toward the material-wide
+    # event floor regardless of geography — graphite × Brazil's
+    # trade_volatility was almost identical to graphite × China's.  Using
+    # the intersection means each country's sub-input reflects only events
+    # genuinely tagged to that (material, country) pair; countries with
+    # no intersection events fall back to the derivation's default (0.3
+    # for trade_volatility, empty list for op_impacts).
+    #
+    # An event is in the intersection iff it appears in BOTH the material-
+    # anchored half AND the geography-anchored half of the same category's
+    # event union.  We already have those two lists, so a set intersection
+    # avoids a second round-trip to the DB.
+    _mat_trade_ids = {ew.event.id for ew in material_trade_events}
+    _geo_trade_ids = {ew.event.id for ew in geo_trade_events}
+    _mat_op_ids = {ew.event.id for ew in material_op_events}
+    _geo_op_ids = {ew.event.id for ew in geo_op_events}
+    _trade_intersect_ids = _mat_trade_ids & _geo_trade_ids
+    _op_intersect_ids = _mat_op_ids & _geo_op_ids
+    geo_specific_event_count = len(_trade_intersect_ids | _op_intersect_ids)
+
+    # Build the actual intersection event lists for Material / Operational
+    # pillar derivation.  Source from material_trade_events / material_op_events
+    # because they carry the HS-confidence-adjusted relevance_score
+    # (_apply_hs_confidence_multiplier was applied to those — the geo-anchored
+    # lists were not adjusted for HS confidence, so deferring to the material
+    # side preserves the score-confidence semantics established in Tier 1.4).
+    geo_specific_trade_events = [
+        ew for ew in material_trade_events if ew.event.id in _trade_intersect_ids
+    ]
+    geo_specific_op_events = [
+        ew for ew in material_op_events if ew.event.id in _op_intersect_ids
+    ]
+
     # --- STEP 3: Fetch HS nodes early so both the Material Concentration
     # pillar (stage-weighted composite_node_score rollup) and the
     # Geopolitical pillar (G2 fix — HS-node tariff/export aggregates) can
@@ -1554,8 +1717,24 @@ def score_material_geography(
     ]
 
     # --- STEP 4: Derive sub-inputs ---
+    # Event-list-choice contract (2026-05-12, Step 2 audit Fix A/B):
+    #   Material pillar       — geo_specific_trade_events (intersection)
+    #       Why: trade_volatility was leaky against the union.  Falls back to
+    #       0.3 default when intersection is empty, which is intentional —
+    #       a country with no graphite-specific trade events shouldn't
+    #       inherit China's graphite trade-event impact.
+    #   Geopolitical pillar   — geo_trade_events (geo-anchored only)
+    #       Why: sub-inputs are designed around "events tagged to this
+    #       geography for this category" — country_concentration uses the
+    #       MaterialProductionShare table separately, so the event list
+    #       only needs the geo-anchored half.
+    #   Operational pillar    — geo_specific_op_events (intersection)
+    #       Why: same logic as Material — weighted_event_impacts was leaky
+    #       against the union.  Empty intersection → empty event_component
+    #       (operational score becomes 100% structural_dependency).
     crit, conc, trade_vol = _derive_market_material_inputs(
-        criticality_signal, geography_code, all_trade_events, as_of_date
+        db, material_id, criticality_signal, geography_code,
+        geo_specific_trade_events, as_of_date,
     )
     (
         ctry_conc, exp_rest, tariff, subsidy_distortion, geo_method,
@@ -1564,7 +1743,7 @@ def score_material_geography(
         eligible_nodes=eligible_nodes,
     )
     struct_dep, op_impacts, dep_source, stage_breakdown = _derive_market_operational_inputs(
-        db, material_id, geography_code, all_op_events, as_of_date
+        db, material_id, geography_code, geo_specific_op_events, as_of_date
     )
 
     # --- STEP 5: Score each pillar ---
@@ -1684,6 +1863,12 @@ def score_material_geography(
         "event_counts": {
             "trade_events": len(all_trade_events),
             "operational_events": len(all_op_events),
+            # Migration 042: surface the intersection (material ∩ geography)
+            # alongside the union counts so analysts inspecting the rationale
+            # can see how much of the consumed signal is genuinely
+            # geo-specific vs. inherited from the global material pool.
+            "trade_events_geo_specific": len(_mat_trade_ids & _geo_trade_ids),
+            "operational_events_geo_specific": len(_mat_op_ids & _geo_op_ids),
         },
         "notes": (
             f"Market score for {geography_code} (material_id={material_id}). "
@@ -1707,6 +1892,7 @@ def score_material_geography(
         financial_pressure_score=fin_score,
         overall_risk_score=overall,
         event_count=total_event_count,
+        event_count_geo_specific=geo_specific_event_count,
         rationale_json=rationale,
         scoring_version=SCORING_VERSION,
         stage_rollup_count=stage_rollup_count,
@@ -1728,6 +1914,7 @@ def score_material_geography(
             "financial_pressure_score":       fin_score,
             "overall_risk_score":             overall,
             "event_count":                    total_event_count,
+            "event_count_geo_specific":       geo_specific_event_count,
             "rationale_json":                 rationale,
             "scoring_version":                SCORING_VERSION,
             "stage_rollup_count":             stage_rollup_count,
@@ -1746,6 +1933,7 @@ def score_material_geography(
                     "financial_pressure_score":     fin_score,
                     "overall_risk_score":           overall,
                     "event_count":                  total_event_count,
+                    "event_count_geo_specific":     geo_specific_event_count,
                     "rationale_json":               rationale,
                     "scoring_version":              SCORING_VERSION,
                     "stage_rollup_count":           stage_rollup_count,

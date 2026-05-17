@@ -6,6 +6,7 @@ analysts spot bad seed data before it corrupts trade-flow scores.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -15,7 +16,8 @@ from sqlalchemy.orm import Session, selectinload
 from app.api.deps import get_current_user, get_db
 from app.models.battery_chemistry import BatteryChemistry
 from app.models.criticality_signal import MaterialCriticalitySignal
-from app.models.regulatory import RiskEventHsMapping
+from app.models.facility import FacilityMaterialLink
+from app.models.regulatory import RiskEvent, RiskEventHsMapping, RiskEventMaterial
 from app.models.reporting import AnalystNote
 from app.models.scoring import HsCodeGeographyRiskScore, MaterialGlobalRiskScore
 from app.models.supply import (
@@ -24,6 +26,7 @@ from app.models.supply import (
     Material,
     MaterialProductionShare,
 )
+from app.services.scoring.launch_list import LAUNCH_LIST_CANONICAL_NAMES
 from app.schemas.common import PaginatedResponse, VerifiedResponse, VerifiedUpdate
 from app.schemas.materials import (
     CountryShareItem,
@@ -33,6 +36,7 @@ from app.schemas.materials import (
     MappingHealth,
     MaterialDetail,
     MaterialListItem,
+    MaterialListPillarScore,
 )
 from app.schemas.note import AnalystNoteCreate, AnalystNoteRead
 
@@ -334,6 +338,71 @@ def _get_material_or_404(db: Session, material_id: int) -> Material:
 # GET /materials
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Risk-score trend helper (2026-05-11; revised from event-count → score-based)
+# ---------------------------------------------------------------------------
+# Trend signal derived from the actual MaterialGlobalRiskScore time series:
+# compare the most recent overall score to the most recent prior snapshot
+# at least 7 days older.  Replaces the event-volume heuristic that was a
+# stand-in until score history accumulated.
+#
+# Rationale: more events doesn't mean more risk.  Some ingesters
+# (IEA Policy Tracker INVESTMENT_PLEDGE) emit constructive signals at
+# low severity.  A spike of those would have rendered "rising" red on
+# the dashboard while the actual risk picture was improving.  Trending
+# on the composite score is the only signal that's semantically correct
+# for "is risk going up?" — the question the chip is supposed to answer.
+#
+# Calibration choices, documented inline:
+#
+#   * Lookback = 7 days.  Find the most recent snapshot whose
+#     as_of_date is at least 7 days before the current snapshot.
+#   * Threshold = ±5 points on the 0–100 scale.  Anything inside this
+#     band reads "stable".  Below this, the move is well within
+#     normal week-to-week variance for a composite score built from
+#     5 pillars each ranging 0–100.
+#   * Max-lookback guard = 30 days.  If the most recent prior snapshot
+#     is more than 30 days older than current, return None — we'd
+#     effectively be comparing this month's score to last quarter's
+#     and the trend label would be meaningless.
+
+_SCORE_TREND_LOOKBACK_DAYS = 7
+_SCORE_TREND_MIN_DELTA = 5.0
+_SCORE_TREND_MAX_LOOKBACK_DAYS = 30
+
+
+def _compute_score_trend(
+    current_score: Optional[float],
+    prior_score: Optional[float],
+) -> Optional[str]:
+    """Return ``"rising"`` / ``"stable"`` / ``"declining"`` or None.
+
+    ``current_score`` is the latest MaterialGlobalRiskScore.overall.
+    ``prior_score`` is the score from at least 7 days earlier (but no
+    more than 30 days earlier — see ``_SCORE_TREND_MAX_LOOKBACK_DAYS``).
+    None means insufficient score history — UI renders a dash.
+    """
+    if current_score is None or prior_score is None:
+        return None
+    delta = current_score - prior_score
+    if delta > _SCORE_TREND_MIN_DELTA:
+        return "rising"
+    if delta < -_SCORE_TREND_MIN_DELTA:
+        return "declining"
+    return "stable"
+
+
+_PILLAR_COLUMNS_FOR_LIST = [
+    ("material_concentration_score", "Material Concentration"),
+    ("geopolitical_trade_score", "Geopolitical / Trade"),
+    ("regulatory_compliance_score", "Regulatory Compliance"),
+    ("operational_score", "Operational"),
+    ("financial_pressure_score", "Financial Pressure"),
+]
+
+_MATERIALS_LIST_EVENT_WINDOW_DAYS = 90
+
+
 @router.get("/materials", response_model=PaginatedResponse[MaterialListItem])
 def list_materials(
     page: int = Query(1, ge=1),
@@ -342,10 +411,26 @@ def list_materials(
     category: Optional[str] = Query(None),
     is_ira_critical: Optional[bool] = Query(None),
     is_eu_crma_critical: Optional[bool] = Query(None),
-    has_mismatched_mappings: Optional[bool] = Query(None),
+    is_launch_list: Optional[bool] = Query(
+        None,
+        description=(
+            "Restrict to launch-list materials (the core 10 minerals the v1 "
+            "product focuses on).  Pass true to scope to launch list, false "
+            "for non-launch-list-only, omit for all."
+        ),
+    ),
     _user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[MaterialListItem]:
+    """Paginated materials list with analyst-view per-row enrichments.
+
+    2026-05-11: dropped the ``has_mismatched_mappings`` query param and
+    the per-material mismatch-count computation along with it — the HS
+    mismatch UI was retired from the Materials page.  Added per-row
+    enrichments (launch-list flag, top-producer shares with %, latest
+    per-pillar scores, 90-day risk-event count) so the list view can
+    render the new analyst-focused row layout without N+1 round-trips.
+    """
     q: Select = select(Material)
 
     if search:
@@ -362,6 +447,10 @@ def list_materials(
         q = q.where(Material.is_ira_critical_mineral == is_ira_critical)
     if is_eu_crma_critical is not None:
         q = q.where(Material.is_eu_crma_critical == is_eu_crma_critical)
+    if is_launch_list is True:
+        q = q.where(Material.canonical_name.in_(LAUNCH_LIST_CANONICAL_NAMES))
+    elif is_launch_list is False:
+        q = q.where(~Material.canonical_name.in_(LAUNCH_LIST_CANONICAL_NAMES))
 
     total = db.scalar(select(func.count()).select_from(q.subquery()))
     materials = db.scalars(
@@ -370,57 +459,34 @@ def list_materials(
         .limit(limit)
     ).all()
 
-    # Per-material HS mapping counts — one bulk query for efficiency.
     material_ids = [m.id for m in materials]
     mapping_counts: dict[int, int] = {}
-    mismatch_counts: dict[int, int] = {}
     if material_ids:
-        cross_mapped = _cross_mapped_prefixes(db)
-        count_rows = (
-            db.execute(
-                select(
-                    HsCodeMaterialMapping.material_id,
-                    func.count(HsCodeMaterialMapping.id).label("cnt"),
-                )
-                .where(HsCodeMaterialMapping.material_id.in_(material_ids))
-                .group_by(HsCodeMaterialMapping.material_id)
+        count_rows = db.execute(
+            select(
+                HsCodeMaterialMapping.material_id,
+                func.count(HsCodeMaterialMapping.id).label("cnt"),
             )
-            .all()
-        )
+            .where(HsCodeMaterialMapping.material_id.in_(material_ids))
+            .group_by(HsCodeMaterialMapping.material_id)
+        ).all()
         for mid, cnt in count_rows:
             mapping_counts[mid] = cnt
 
-        # Mismatch counts per material
-        all_mappings = db.scalars(
-            select(HsCodeMaterialMapping)
-            .where(HsCodeMaterialMapping.material_id.in_(material_ids))
-        ).all()
-        # Group by material_id
-        mat_map: dict[int, list[HsCodeMaterialMapping]] = {}
-        for mapping in all_mappings:
-            mat_map.setdefault(mapping.material_id, []).append(mapping)
-
-        # Need material objects for chapter mismatch check
-        mat_by_id = {m.id: m for m in materials}
-        for mid, mappings_list in mat_map.items():
-            mat = mat_by_id.get(mid)
-            if mat is None:
-                continue
-            annotated = [_annotate_mapping(m, mat, cross_mapped) for m in mappings_list]
-            mismatch_counts[mid] = sum(
-                1 for a in annotated if (
-                    a.is_low_confidence or a.is_missing_description
-                    or a.is_chapter_mismatch or a.is_cross_mapped
-                )
-            )
-
-    # Latest global risk score per material — one bulk query using a ranked subquery.
-    global_risk_scores: dict[int, float] = {}
+    # ── Latest global risk score + per-pillar values per material ─────
+    # Single ranked-window query pulls everything we need for the
+    # overall score AND the 5 pillar scores in one round-trip.
+    latest_score_data: dict[int, dict] = {}
     if material_ids:
         latest_score_sq = (
             select(
                 MaterialGlobalRiskScore.material_id,
                 MaterialGlobalRiskScore.overall_risk_score,
+                MaterialGlobalRiskScore.material_concentration_score,
+                MaterialGlobalRiskScore.geopolitical_trade_score,
+                MaterialGlobalRiskScore.regulatory_compliance_score,
+                MaterialGlobalRiskScore.operational_score,
+                MaterialGlobalRiskScore.financial_pressure_score,
                 func.row_number()
                 .over(
                     partition_by=MaterialGlobalRiskScore.material_id,
@@ -435,22 +501,115 @@ def list_materials(
             select(
                 latest_score_sq.c.material_id,
                 latest_score_sq.c.overall_risk_score,
+                latest_score_sq.c.material_concentration_score,
+                latest_score_sq.c.geopolitical_trade_score,
+                latest_score_sq.c.regulatory_compliance_score,
+                latest_score_sq.c.operational_score,
+                latest_score_sq.c.financial_pressure_score,
             ).where(latest_score_sq.c.rn == 1)
         ).all()
-        for mid, score in score_rows:
-            if score is not None:
-                global_risk_scores[mid] = score
+        for row in score_rows:
+            latest_score_data[row.material_id] = {
+                "overall": row.overall_risk_score,
+                "material_concentration_score": row.material_concentration_score,
+                "geopolitical_trade_score": row.geopolitical_trade_score,
+                "regulatory_compliance_score": row.regulatory_compliance_score,
+                "operational_score": row.operational_score,
+                "financial_pressure_score": row.financial_pressure_score,
+            }
+
+    # ── Top producer shares per material ──────────────────────────────
+    # Latest reference_year per material, then top 3 producers by share.
+    top_producer_shares: dict[int, list[CountryShareItem]] = {}
+    if material_ids:
+        latest_year_sq = (
+            select(
+                MaterialProductionShare.material_id,
+                func.max(MaterialProductionShare.reference_year).label("yr"),
+            )
+            .where(MaterialProductionShare.material_id.in_(material_ids))
+            .group_by(MaterialProductionShare.material_id)
+        ).subquery()
+        share_rows = db.execute(
+            select(
+                MaterialProductionShare.material_id,
+                MaterialProductionShare.country_code,
+                MaterialProductionShare.production_share,
+            )
+            .join(
+                latest_year_sq,
+                and_(
+                    MaterialProductionShare.material_id == latest_year_sq.c.material_id,
+                    MaterialProductionShare.reference_year == latest_year_sq.c.yr,
+                ),
+            )
+            .where(MaterialProductionShare.production_share.isnot(None))
+            .order_by(
+                MaterialProductionShare.material_id,
+                MaterialProductionShare.production_share.desc(),
+            )
+        ).all()
+        for mid, code, share in share_rows:
+            lst = top_producer_shares.setdefault(mid, [])
+            if len(lst) >= 3:
+                continue
+            # production_share is stored as a 0-1 fraction; surface as int %
+            pct = round(float(share) * 100) if share is not None else 0
+            lst.append(CountryShareItem(code=code, share_pct=pct))
+
+    # ── Risk-event count per material in the last 90 days ─────────────
+    # Matches the coverage matrix window so the Materials page and the
+    # dashboard tell the same story.
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        days=_MATERIALS_LIST_EVENT_WINDOW_DAYS,
+    )
+    recent_event_counts: dict[int, int] = {}
+    if material_ids:
+        event_count_rows = db.execute(
+            select(
+                RiskEventMaterial.material_id,
+                func.count(RiskEvent.id).label("n"),
+            )
+            .join(RiskEvent, RiskEvent.id == RiskEventMaterial.risk_event_id)
+            .where(
+                RiskEventMaterial.material_id.in_(material_ids),
+                RiskEvent.created_at >= cutoff,
+            )
+            .group_by(RiskEventMaterial.material_id)
+        ).all()
+        for mid, n in event_count_rows:
+            recent_event_counts[mid] = int(n)
+
+    launch_list_set = {name.lower() for name in LAUNCH_LIST_CANONICAL_NAMES}
 
     items: list[MaterialListItem] = []
     for mat in materials:
         item = MaterialListItem.model_validate(mat)
         item.hs_mapping_count = mapping_counts.get(mat.id, 0)
-        item.mapping_mismatch_count = mismatch_counts.get(mat.id, 0)
-        item.latest_overall_risk_score = global_risk_scores.get(mat.id)
-        if has_mismatched_mappings is True and item.mapping_mismatch_count == 0:
-            continue
-        if has_mismatched_mappings is False and item.mapping_mismatch_count > 0:
-            continue
+        item.mapping_mismatch_count = 0  # mismatch UI retired 2026-05-11
+        item.latest_overall_risk_score = (
+            latest_score_data.get(mat.id, {}).get("overall")
+        )
+
+        # 2026-05-11 enrichments
+        item.is_launch_list = (mat.canonical_name or "").lower() in launch_list_set
+        item.top_producer_shares = top_producer_shares.get(mat.id, [])
+        item.recent_event_count_90d = recent_event_counts.get(mat.id, 0)
+
+        pillar_data = latest_score_data.get(mat.id, {})
+        item.pillar_scores = [
+            MaterialListPillarScore(
+                name=col_name,
+                label=col_label,
+                score=pillar_data.get(col_name),
+                has_signal=bool(
+                    pillar_data.get(col_name) is not None
+                    and pillar_data.get(col_name) > 0
+                ),
+            )
+            for col_name, col_label in _PILLAR_COLUMNS_FOR_LIST
+        ]
+
         items.append(item)
 
     return PaginatedResponse(data=items, total=total or 0, page=page, limit=limit)
@@ -535,11 +694,82 @@ def get_material(
             for row in share_rows
         ]
 
+    # ── 2026-05-11 analyst-view enrichments ──────────────────────────
+    now = datetime.now(timezone.utc)
+    cutoff_90d = now - timedelta(days=90)
+
+    # Risk events in last 90 days mapped via RiskEventMaterial — matches
+    # the same window the dashboard uses everywhere else.
+    recent_events_n = int(
+        db.scalar(
+            select(func.count())
+            .select_from(RiskEvent)
+            .join(
+                RiskEventMaterial,
+                RiskEventMaterial.risk_event_id == RiskEvent.id,
+            )
+            .where(
+                RiskEventMaterial.material_id == material_id,
+                RiskEvent.created_at >= cutoff_90d,
+            )
+        )
+        or 0
+    )
+
+    # Risk-score trend — compare latest MaterialGlobalRiskScore to the
+    # most recent snapshot at least 7 days older.  Returns None when
+    # there's no prior snapshot or the prior is too stale.
+    latest_score_row = db.scalar(
+        select(MaterialGlobalRiskScore)
+        .where(MaterialGlobalRiskScore.material_id == material_id)
+        .order_by(MaterialGlobalRiskScore.as_of_date.desc())
+        .limit(1)
+    )
+    score_trend: Optional[str] = None
+    if latest_score_row is not None and latest_score_row.overall_risk_score is not None:
+        prior_cutoff = latest_score_row.as_of_date - timedelta(
+            days=_SCORE_TREND_LOOKBACK_DAYS,
+        )
+        max_lookback_cutoff = latest_score_row.as_of_date - timedelta(
+            days=_SCORE_TREND_MAX_LOOKBACK_DAYS,
+        )
+        prior_score_row = db.scalar(
+            select(MaterialGlobalRiskScore)
+            .where(
+                MaterialGlobalRiskScore.material_id == material_id,
+                MaterialGlobalRiskScore.as_of_date <= prior_cutoff,
+                MaterialGlobalRiskScore.as_of_date >= max_lookback_cutoff,
+                MaterialGlobalRiskScore.overall_risk_score.isnot(None),
+            )
+            .order_by(MaterialGlobalRiskScore.as_of_date.desc())
+            .limit(1)
+        )
+        if prior_score_row is not None:
+            score_trend = _compute_score_trend(
+                latest_score_row.overall_risk_score,
+                prior_score_row.overall_risk_score,
+            )
+
+    # Facility coverage — any link, any stage, any capacity.  Matches
+    # the (loosened) gap-detection check; 0 = launch-blocker for the
+    # operational pillar's structural input.
+    facility_n = int(
+        db.scalar(
+            select(func.count())
+            .select_from(FacilityMaterialLink)
+            .where(FacilityMaterialLink.material_id == material_id)
+        )
+        or 0
+    )
+
     detail = MaterialDetail.model_validate(mat)
     detail.hs_mappings = annotated_mappings
     detail.mapping_health = health
     detail.chemistry_uses = enriched_uses
     detail.country_production_shares = country_shares
+    detail.recent_event_count_90d = recent_events_n
+    detail.facility_count = facility_n
+    detail.score_trend_7d = score_trend
     return detail
 
 
@@ -569,62 +799,6 @@ def list_material_hs_mappings(
         _annotate_mapping(m, mat, cross_mapped, aggregates)
         for m in mappings
     ]
-
-
-# ---------------------------------------------------------------------------
-# GET /hs-mappings/mismatches  (global mismatches view)
-# ---------------------------------------------------------------------------
-
-@router.get("/hs-mappings/mismatches", response_model=PaginatedResponse[HsMismatchItem])
-def list_hs_mismatches(
-    page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=200),
-    _user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> PaginatedResponse[HsMismatchItem]:
-    cross_mapped = _cross_mapped_prefixes(db)
-
-    all_mappings = db.scalars(
-        select(HsCodeMaterialMapping)
-        .options(selectinload(HsCodeMaterialMapping.material))
-        .order_by(HsCodeMaterialMapping.confidence, HsCodeMaterialMapping.hs_code_prefix)
-    ).all()
-
-    mismatched: list[HsMismatchItem] = []
-    for mapping in all_mappings:
-        mat = mapping.material
-        is_low = mapping.confidence < _LOW_CONFIDENCE_THRESHOLD
-        is_miss = not mapping.description
-        is_chap = _is_chapter_mismatch(mapping, mat)
-        is_cross = mapping.hs_code_prefix in cross_mapped
-
-        if not (is_low or is_miss or is_chap or is_cross):
-            continue
-
-        mismatched.append(
-            HsMismatchItem(
-                id=mapping.id,
-                hs_code=mapping.hs_code_prefix,
-                material_id=mat.id,
-                material_canonical_name=mat.canonical_name,
-                hs_description=mapping.description,
-                mapping_confidence=mapping.confidence,
-                is_low_confidence=is_low,
-                is_missing_description=is_miss,
-                is_chapter_mismatch=is_chap,
-                is_cross_mapped=is_cross,
-                material_url=f"/data/materials/{mat.id}",
-            )
-        )
-
-    total = len(mismatched)
-    start = (page - 1) * limit
-    return PaginatedResponse(
-        data=mismatched[start : start + limit],
-        total=total,
-        page=page,
-        limit=limit,
-    )
 
 
 # ---------------------------------------------------------------------------

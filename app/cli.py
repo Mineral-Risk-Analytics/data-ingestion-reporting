@@ -3592,6 +3592,20 @@ def reset_events_cmd(
             "re-download every source — slower and costs API quota."
         ),
     ),
+    source: Optional[str] = typer.Option(
+        None,
+        "--source",
+        help=(
+            "Restrict the reset to a single source.  Matches sources.name "
+            "or sources.source_type, case-insensitive.  Examples: 'gta', "
+            "'Global Trade Alert', 'opensanctions', 'eur-lex', "
+            "'federal_register'.  Without this flag the reset clears every "
+            "RiskEvent across all sources.  Useful when one ingester's "
+            "attribution logic changed (e.g. the GTA structural classifier "
+            "from 2026-05-12) and you want to re-ingest only that source's "
+            "events without re-running every other ingester."
+        ),
+    ),
 ) -> None:
     """Truncate the risk_events + junction tables in FK-safe order.
 
@@ -3646,53 +3660,137 @@ def reset_events_cmd(
     # Postgres requires the privilege and (b) on SQLite (used in tests)
     # TRUNCATE doesn't exist.  Postgres can re-use the same physical
     # pages after the DELETE so the storage cost is the same.
-    tables_in_order = [
+    junction_tables = [
         "risk_event_companies",
         "risk_event_materials",
         "risk_event_hs_mappings",
         "risk_event_geographies",
         "risk_event_regulations",
-        "risk_events",
     ]
+    tables_in_order = junction_tables + ["risk_events"]
 
     s = _session()
     try:
+        # ── Resolve --source to a source_id (when supplied) ───────────────
+        # Matches either sources.name (e.g. "Global Trade Alert") or
+        # sources.source_type (e.g. "gta") case-insensitively so callers
+        # don't need to know which one is canonical.  Returns a single
+        # row; an ambiguous match (very unlikely — name and source_type
+        # are both stored as distinct strings) takes the first hit.
+        source_id: Optional[int] = None
+        source_name: Optional[str] = None
+        if source is not None:
+            src_row = s.execute(
+                text(
+                    """
+                    SELECT id, name FROM sources
+                    WHERE LOWER(name) = LOWER(:s)
+                       OR LOWER(source_type) = LOWER(:s)
+                    LIMIT 1
+                    """
+                ),
+                {"s": source.strip()},
+            ).first()
+            if src_row is None:
+                typer.echo(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": (
+                                f"No source matched '{source}'.  Check the "
+                                "sources table — match is case-insensitive "
+                                "against name OR source_type."
+                            ),
+                        }
+                    ),
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            source_id, source_name = src_row[0], src_row[1]
+
+        # Filter clauses for the count/delete queries.  When source_id is
+        # None we touch every row (legacy behavior).  When set, we use a
+        # subquery on source_documents → risk_events so junction deletes
+        # only hit rows belonging to the named source.  The subquery
+        # approach works on both Postgres and SQLite without array params.
+        if source_id is None:
+            risk_events_where = ""
+            junction_where = ""
+            params: dict = {}
+        else:
+            risk_events_where = (
+                "WHERE source_document_id IN "
+                "(SELECT id FROM source_documents WHERE source_id = :sid)"
+            )
+            junction_where = (
+                "WHERE risk_event_id IN ("
+                "SELECT id FROM risk_events "
+                "WHERE source_document_id IN "
+                "(SELECT id FROM source_documents WHERE source_id = :sid)"
+                ")"
+            )
+            params = {"sid": source_id}
+
         # Snapshot row counts up-front so the dry-run print and the
         # actual-run print look identical.
         counts: dict[str, int] = {}
-        for tbl in tables_in_order:
+        for tbl in junction_tables:
             counts[tbl] = s.execute(
-                text(f"SELECT COUNT(*) FROM {tbl}")
+                text(f"SELECT COUNT(*) FROM {tbl} {junction_where}"),
+                params,
             ).scalar_one()
+        counts["risk_events"] = s.execute(
+            text(f"SELECT COUNT(*) FROM risk_events {risk_events_where}"),
+            params,
+        ).scalar_one()
+
+        scope = (
+            f"source='{source_name}' (id={source_id})"
+            if source_id is not None
+            else "all sources"
+        )
 
         if not confirm:
             typer.echo(json.dumps({
                 "ok": True,
                 "dry_run": True,
+                "scope": scope,
                 "would_delete": counts,
                 "hint": "re-run with --yes to actually delete",
             }, indent=2))
             return
 
-        # Execute the deletes in order.
+        # Execute the deletes in order — junctions first, then events.
         deleted: dict[str, int] = {}
-        for tbl in tables_in_order:
-            result = s.execute(text(f"DELETE FROM {tbl}"))
+        for tbl in junction_tables:
+            result = s.execute(text(f"DELETE FROM {tbl} {junction_where}"), params)
             deleted[tbl] = result.rowcount or 0
+        result = s.execute(
+            text(f"DELETE FROM risk_events {risk_events_where}"),
+            params,
+        )
+        deleted["risk_events"] = result.rowcount or 0
         s.commit()
 
         # Optionally also purge source_documents (NOT recommended).
+        # When --source is set we restrict the purge to that source so a
+        # scoped reset can also clear its cached payloads if requested.
         sd_deleted: Optional[int] = None
         if not keep_source_documents:
-            # Only delete documents whose source emits risk events
-            # rather than wiping the whole table.
-            sd_result = s.execute(text("DELETE FROM source_documents"))
+            if source_id is None:
+                sd_result = s.execute(text("DELETE FROM source_documents"))
+            else:
+                sd_result = s.execute(
+                    text("DELETE FROM source_documents WHERE source_id = :sid"),
+                    {"sid": source_id},
+                )
             sd_deleted = sd_result.rowcount or 0
             s.commit()
 
         typer.echo(json.dumps({
             "ok": True,
             "dry_run": False,
+            "scope": scope,
             "deleted": deleted,
             "source_documents_deleted": sd_deleted,
         }, indent=2))

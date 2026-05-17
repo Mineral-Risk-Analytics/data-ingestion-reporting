@@ -66,6 +66,59 @@ _MAX_OUTPUT_TOKENS = 1024
 _REQUEST_TIMEOUT_S = 30
 
 
+_RELEVANCE_TOOL_SCHEMA = {
+    "name": "assess_battery_industry_relevance",
+    "description": (
+        "Decide whether a policy or regulatory event is relevant to the EV "
+        "battery industry / critical minerals supply chain.  Use is_relevant "
+        "= true when the text discusses: lithium-ion batteries, EV / electric "
+        "vehicles, battery materials (Li/Co/Ni/Mn/graphite/phosphate/Cu/Al/"
+        "REE/etc.), mining-refining-processing of critical minerals, battery "
+        "recycling, energy storage, or supply-chain policy affecting any of "
+        "these.  Use is_relevant = false for events about unrelated industries "
+        "(agriculture, semiconductors-only, generic forced-labor laws, "
+        "historical/colonial decrees, biofuels, generic environmental rules "
+        "without mineral framing)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "is_relevant": {
+                "type": "boolean",
+                "description": "True iff the policy is in scope for EV-battery / critical-minerals analysis.",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "Confidence in the verdict on [0, 1]",
+                "minimum": 0.0,
+                "maximum": 1.0,
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Brief (≤200 chars) phrase explaining the verdict — name "
+                    "the specific battery/CRM topic OR the off-scope subject."
+                ),
+            },
+        },
+        "required": ["is_relevant", "confidence"],
+    },
+}
+
+
+_RELEVANCE_SYSTEM_PROMPT = (
+    "You are a domain expert on the EV battery supply chain.  Your job is "
+    "to decide whether a policy or regulatory event is in scope for a "
+    "battery-industry critical-minerals analysis.  Return your verdict via "
+    "the assess_battery_industry_relevance tool.  Bias toward 'is_relevant "
+    "= true' when the text plausibly affects critical minerals, battery "
+    "materials, mining/refining/recycling, or EV supply chains, even if no "
+    "specific mineral is named; bias toward 'is_relevant = false' for "
+    "policies clearly about other domains (agriculture, semiconductors "
+    "alone, forced-labor due-diligence laws not focused on minerals, etc.)."
+)
+
+
 _TOOL_SCHEMA = {
     "name": "classify_materials",
     "description": (
@@ -73,10 +126,19 @@ _TOOL_SCHEMA = {
         "materially about that material (vs incidentally mentioning it). "
         "Return one entry per candidate.  Materials are 'materially about' "
         "when the text discusses supply, demand, pricing, regulation, "
-        "operations, contracts, or specific business risk for them; "
-        "'incidentally mentioned' when they appear in a generic critical-"
-        "minerals list, a multi-material risk-factor sentence, or as one "
-        "among many supply-chain inputs without focused discussion."
+        "operations, contracts, or specific business risk for them; OR when "
+        "the text itself is a policy that DESIGNATES, LISTS, OR CLASSIFIES "
+        "the material as critical, strategic, or otherwise prioritised by a "
+        "government (e.g., 'Critical Minerals List', 'Strategic Minerals "
+        "Designation', 'National Mineral Inventory', or any sovereign act "
+        "naming a set of materials for prioritised treatment) — the listing "
+        "itself IS the regulatory event for each named material and should "
+        "count as 'materially about' even when no further per-mineral "
+        "discussion follows.  'Incidentally mentioned' applies to materials "
+        "that appear in passing within a non-targeting context — generic "
+        "critical-minerals rhetoric in an unrelated policy, a multi-material "
+        "risk-factor sentence in a 10-K filing, or as one of many examples "
+        "in a paragraph that isn't itself a designation list."
     ),
     "input_schema": {
         "type": "object",
@@ -93,8 +155,12 @@ _TOOL_SCHEMA = {
                         "is_material": {
                             "type": "boolean",
                             "description": (
-                                "True if the text is genuinely about this "
-                                "material; False if only incidentally mentioned."
+                                "True if the text discusses this material "
+                                "substantively, OR if the text is a policy "
+                                "that designates / lists / classifies this "
+                                "material as critical or strategic.  False "
+                                "only when the material appears as a passing "
+                                "mention in a non-targeting context."
                             ),
                         },
                         "confidence": {
@@ -171,6 +237,20 @@ class MaterialClassifier:
         if enabled is False:
             self._enabled = False
         else:
+            # 2026-05-12 fix: load .env BEFORE the env-var check.  The
+            # previous code only ran load_dotenv() inside _call_haiku() /
+            # _call_haiku_relevance(), which meant a user with the key in
+            # .env (but not exported to the shell process) saw _enabled =
+            # False at construction time — the API-call sites' load_dotenv
+            # never fired because the classifier had already short-
+            # circuited.  Load here so the env-var check sees .env-only
+            # keys.  load_dotenv is idempotent + cheap so repeated calls
+            # are harmless.
+            try:
+                from dotenv import load_dotenv  # type: ignore
+                load_dotenv()
+            except ImportError:
+                pass
             self._enabled = bool(os.environ.get("ANTHROPIC_API_KEY")) and enabled is not False
             if not self._enabled:
                 log.info(
@@ -239,6 +319,139 @@ class MaterialClassifier:
         self._cache[cache_key] = decisions
         return self._apply_decisions(keyword_matches, decisions)
 
+    def assess_battery_industry_relevance(
+        self,
+        text: str,
+        policy_type_names: Optional[list[str]] = None,
+    ) -> tuple[bool, float, str]:
+        """Ask Haiku whether ``text`` is in scope for EV-battery / critical-
+        minerals analysis.
+
+        Used as a final gate for events where keyword scan + tech basket
+        produced zero candidate materials.  The IEA Policy Tracker calls this
+        when it's about to write an event with ``needs_material_review=true``
+        — events that fail this gate are dropped as off-scope rather than
+        polluting the review queue with agriculture-circular-economy,
+        forced-labor-due-diligence, or non-battery-mining noise.
+
+        Args:
+            text:                title + description of the event, truncated
+                                 to ``_MAX_TEXT_CHARS`` inside this method.
+            policy_type_names:   optional list of policy-type strings (e.g.
+                                 ``["Strategic plans", "Financing"]``).
+                                 Forwarded to Haiku as additional context.
+
+        Returns:
+            ``(is_relevant, confidence, reason)``.  When the classifier is
+            disabled (no ``ANTHROPIC_API_KEY``), text too thin, or the Haiku
+            call fails for any reason, returns ``(True, 0.5, "haiku_unavailable")``
+            — the conservative default is to PRESERVE the event so the
+            analyst can decide.  Callers can compare ``confidence`` against
+            a threshold (e.g. only drop when ``not is_relevant and conf >=
+            0.5``) but the simpler usage is to trust the boolean.
+        """
+        if not self._enabled:
+            return (True, 0.5, "haiku_unavailable")
+        if not text or len(text) < _MIN_TEXT_CHARS:
+            return (True, 0.5, "text_too_short")
+
+        # Cache the verdict per (text, policy_type_set) so we don't re-ask
+        # Haiku within a single ingest run.
+        policy_key = ",".join(sorted(policy_type_names or []))
+        cache_key = _content_key(text[:_MAX_TEXT_CHARS], [policy_key])
+        cached = self._relevance_cache.get(cache_key) if hasattr(self, "_relevance_cache") else None
+        if cached is not None:
+            return cached
+
+        try:
+            verdict = self._call_haiku_relevance(
+                text[:_MAX_TEXT_CHARS], policy_type_names or []
+            )
+        except Exception:  # noqa: BLE001 — log + fall back, never crash ingest
+            log.warning(
+                "material_classifier.relevance_call_failed",
+                policy_type_names=policy_type_names,
+                exc_info=True,
+            )
+            return (True, 0.5, "haiku_call_failed")
+
+        if not hasattr(self, "_relevance_cache"):
+            self._relevance_cache: dict[str, tuple[bool, float, str]] = {}
+        self._relevance_cache[cache_key] = verdict
+        return verdict
+
+    def _call_haiku_relevance(
+        self,
+        text: str,
+        policy_type_names: list[str],
+    ) -> tuple[bool, float, str]:
+        """Make the Anthropic API call for the relevance assessment.
+
+        Raises on any failure — caller catches.
+        """
+        if self._client is None:
+            from anthropic import Anthropic  # type: ignore
+
+            try:
+                from dotenv import load_dotenv  # type: ignore
+                load_dotenv()
+            except ImportError:
+                pass
+
+            self._client = Anthropic(timeout=_REQUEST_TIMEOUT_S)
+
+        policy_block = (
+            "\n".join(f"  - {n}" for n in policy_type_names)
+            if policy_type_names
+            else "  (none provided)"
+        )
+        user_text = (
+            "Source text:\n"
+            "---\n"
+            f"{text}\n"
+            "---\n\n"
+            "Policy type tags (curated by the source):\n"
+            f"{policy_block}\n\n"
+            "Call assess_battery_industry_relevance with your verdict."
+        )
+
+        response = self._client.messages.create(
+            model=_MODEL,
+            max_tokens=_MAX_OUTPUT_TOKENS,
+            system=_RELEVANCE_SYSTEM_PROMPT,
+            tools=[_RELEVANCE_TOOL_SCHEMA],
+            tool_choice={
+                "type": "tool",
+                "name": "assess_battery_industry_relevance",
+            },
+            messages=[{"role": "user", "content": user_text}],
+        )
+
+        tool_block = next(
+            (b for b in response.content if getattr(b, "type", None) == "tool_use"),
+            None,
+        )
+        if tool_block is None:
+            raise RuntimeError(
+                "Haiku response missing assess_battery_industry_relevance tool_use"
+            )
+        payload = tool_block.input
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+
+        is_rel = bool(payload.get("is_relevant"))
+        conf = float(payload.get("confidence") or 0.0)
+        conf = max(0.0, min(1.0, conf))
+        reason = (payload.get("reason") or "")[:200]
+
+        log.debug(
+            "material_classifier.relevance_verdict",
+            is_relevant=is_rel,
+            confidence=conf,
+            reason=reason,
+        )
+        return (is_rel, conf, reason)
+
     def _apply_decisions(
         self,
         keyword_matches: list[tuple[int, float, str, int | None]],
@@ -258,11 +471,19 @@ class MaterialClassifier:
             new_relevance = max(0.0, min(1.0, relevance * mult))
             # Prepend an "llm:" tag to match_reason so downstream callers
             # can distinguish keyword-only matches from Haiku-confirmed ones.
+            # match_reason DB columns are VARCHAR(64) across all junction
+            # tables.  "llm_confirmed:" prefix eats 14 chars; that leaves
+            # 50 for the suffix.  When a caller has already pre-prefixed
+            # the keyword (IEA prepends "keyword_scan:" → up to 13 chars
+            # before the actual keyword), the chain "llm_confirmed:keyword_scan:..."
+            # is already at 27 chars, so we have ~37 chars left for keyword
+            # + separator + evidence.  Tight budget — truncate aggressively
+            # and cap the final string at 64 to honour the column.
             if evidence:
-                kw_label = f"llm_confirmed:{matched_kw[:32]}|{evidence[:40]}"
+                kw_label = f"llm_confirmed:{matched_kw[:24]}|{evidence[:24]}"
             else:
                 kw_label = f"llm_confirmed:{matched_kw[:48]}"
-            refined.append((mid, new_relevance, kw_label[:96], hs_id))
+            refined.append((mid, new_relevance, kw_label[:64], hs_id))
         return refined
 
     def _call_haiku(
@@ -339,11 +560,26 @@ class MaterialClassifier:
             evidence = (c.get("evidence") or "").strip()
             # Translate to a multiplier on the keyword relevance:
             #   - is_material=True  → conf (scales keyword relevance up or down)
-            #   - is_material=False with high confidence (≥0.5) → 0.0 (drop)
-            #   - is_material=False with low confidence → keep at 0.5 (uncertain)
+            #   - is_material=False with high confidence (≥0.7) → 0.0 (drop)
+            #   - is_material=False with lower confidence → keep at 0.5 (uncertain)
+            #
+            # 2026-05-12 calibration: rejection threshold raised from 0.5
+            # to 0.7 after the first Haiku-enabled IEA run produced 47%
+            # false-negative rejections — mainly sovereign critical-
+            # minerals strategy documents (Morocco Mines Plan, Nigeria
+            # Strategic Minerals List, Indonesia decree, etc.) where the
+            # text designates materials as strategic without per-mineral
+            # supply discussion.  Combined with the prompt refinement
+            # (see _TOOL_SCHEMA description) that explicitly tells Haiku
+            # to count designation/listing as 'materially about', the
+            # threshold raise gives a safety net: even when Haiku's
+            # specific-mineral discussion read is technically valid,
+            # uncertain rejections (conf < 0.7) keep the attribution at
+            # half-weight rather than dropping it.
+            _HAIKU_REJECT_THRESHOLD = 0.7
             if is_mat:
                 multiplier = conf
-            elif conf >= 0.5:
+            elif conf >= _HAIKU_REJECT_THRESHOLD:
                 multiplier = 0.0
             else:
                 multiplier = 0.5

@@ -105,7 +105,28 @@ class MaterialGeographyRiskScore(Base):
     # ---- metadata ----
     event_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0,
-        comment="Total events consumed in this scoring run"
+        comment=(
+            "Total events consumed in this scoring run — the UNION of "
+            "RiskEventMaterial (this material, any country) and "
+            "RiskEventGeography (this country, any material) consumed by "
+            "the pillar sub-input derivation.  Preserves the audit trail "
+            "of what was fed into the score.  For the UI 'this country has "
+            "exposure to this material' read use ``event_count_geo_specific`` "
+            "instead — see migration 042 docstring."
+        ),
+    )
+    event_count_geo_specific: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+        default=None,
+        comment=(
+            "Count of events at the INTERSECTION of RiskEventMaterial "
+            "and RiskEventGeography for this (material, country) pair, "
+            "within each category's lookback window.  This is what the "
+            "UI 'Events' column displays and what country-exposure "
+            "filters key off.  NULL on rows produced before migration "
+            "042 — re-run POST /market/rescore to populate."
+        ),
     )
     rationale_json: Mapped[Optional[Any]] = mapped_column(
         JSONB, comment="Sub-inputs, top evidence IDs, criticality signal source, weights used"

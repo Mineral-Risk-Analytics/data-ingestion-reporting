@@ -27,8 +27,9 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
+from app.models.facility import Facility, FacilityMaterialLink
 from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
-from app.models.supply import Material
+from app.models.supply import Material, MaterialProductionShare
 from app.schemas.common import PaginatedResponse
 from app.schemas.market_scores import (
     MaterialGeographyScoreDetail,
@@ -133,10 +134,65 @@ def list_material_market_scores(
     _user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[MaterialGeographyScoreRead]:
-    """Return the latest score per geography for this material."""
+    """Return the latest score per geography for this material.
+
+    Enriched (2026-05-11) with per-country ``production_share_pct`` (latest
+    ``reference_year`` from ``material_production_shares``) and
+    ``facility_count`` (rows in ``facility_material_links`` joined to
+    facilities located in that country).  The frontend uses these to filter
+    the Country Scores table down to countries the material has real exposure
+    to, rather than rendering every geography that was scored.
+    """
     _ensure_material_exists(db, material_id)
     rows = db.scalars(_latest_per_geography_for_material(material_id)).all()
-    return [MaterialGeographyScoreRead.model_validate(r) for r in rows]
+
+    # --- Production shares: country_code -> pct (latest reference_year only) ---
+    latest_year_row = db.execute(
+        select(func.max(MaterialProductionShare.reference_year)).where(
+            MaterialProductionShare.material_id == material_id
+        )
+    ).first()
+    latest_year = latest_year_row[0] if latest_year_row else None
+
+    share_pct_by_country: dict[str, int] = {}
+    if latest_year is not None:
+        share_rows = db.execute(
+            select(
+                MaterialProductionShare.country_code,
+                MaterialProductionShare.production_share,
+            ).where(
+                MaterialProductionShare.material_id == material_id,
+                MaterialProductionShare.reference_year == latest_year,
+            )
+        ).all()
+        for cc, share in share_rows:
+            if cc is None or share is None:
+                continue
+            # production_share is a 0.0–1.0 fraction; surface as integer percent
+            # so the UI can render "12%" without further math.  Round to nearest
+            # integer; values < 0.5% will display as 0% (acceptable — those
+            # countries aren't material exposure anyway).
+            share_pct_by_country[cc.upper()] = int(round(share * 100))
+
+    # --- Facility counts: country (ISO2) -> count of FacilityMaterialLink rows ---
+    facility_count_rows = db.execute(
+        select(Facility.country, func.count(FacilityMaterialLink.id))
+        .join(FacilityMaterialLink, FacilityMaterialLink.facility_id == Facility.id)
+        .where(FacilityMaterialLink.material_id == material_id)
+        .group_by(Facility.country)
+    ).all()
+    facility_count_by_country: dict[str, int] = {
+        country.upper(): count for country, count in facility_count_rows if country
+    }
+
+    out: list[MaterialGeographyScoreRead] = []
+    for r in rows:
+        item = MaterialGeographyScoreRead.model_validate(r)
+        cc = (r.geography_code or "").upper()
+        item.production_share_pct = share_pct_by_country.get(cc)
+        item.facility_count = facility_count_by_country.get(cc, 0)
+        out.append(item)
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -43,6 +43,7 @@ def main() -> int:
 
     from app.db.base import Base
     from app.models.documents import SourceDocument
+    from app.models.facility import Facility, FacilityMaterialLink
     from app.models.regulatory import RiskEvent, RiskEventMaterial
     from app.models.scoring import MaterialGlobalRiskScore
     from app.models.source import Source
@@ -66,6 +67,8 @@ def main() -> int:
             RiskEvent.__table__,
             RiskEventMaterial.__table__,
             MaterialGlobalRiskScore.__table__,
+            Facility.__table__,
+            FacilityMaterialLink.__table__,
         ],
     )
 
@@ -188,6 +191,30 @@ def main() -> int:
         _ev(doc_a, LONG_AGO, materials_by_name["Lithium"].id, content_hash="li-ancient")
         s.commit()
 
+        # ── Seed facilities for materials we expect to pass the gap check.
+        # Lithium / Natural Graphite / Copper get a facility with
+        # annual_capacity_tpy set so they survive the no_facility_coverage
+        # check.  Cobalt / Nickel / Manganese / Aluminum / Phosphate / Iron
+        # Ore / REE intentionally get nothing → no_facility_coverage flag
+        # fires on whichever of them is in the materials table.  Phosphate
+        # in particular is the launch-blocker case we explicitly want to
+        # verify.
+        for name in ("Lithium", "Natural Graphite", "Copper"):
+            fac = Facility(
+                facility_type="mine",
+                name=f"{name} test facility",
+                country="AU",
+                status="operating",
+            )
+            s.add(fac); s.flush()
+            s.add(FacilityMaterialLink(
+                facility_id=fac.id,
+                material_id=materials_by_name[name].id,
+                supply_chain_stage="ore",
+                annual_capacity_tpy=10_000.0,
+            ))
+        s.commit()
+
         # ── K.1: core_minerals_scored ────────────────────────────────────
         print("Test K.1: _compute_core_minerals_scored")
         result = _compute_core_minerals_scored(s)
@@ -231,25 +258,27 @@ def main() -> int:
         print("\nTest K.3: _compute_coverage_gaps")
         result3 = _compute_coverage_gaps(s, now=NOW)
         # Expected gaps per material:
-        #   Lithium:          no gap (fresh score, 5 pillars, 10 events) → NOT in result
-        #   Cobalt:           thin_events (3 < 5) → IN result
-        #   Nickel:           thin_pillars (2 < 3) → IN result
-        #   Manganese:        stale_score (45 days > 30) → IN result
-        #   Natural Graphite: no gap (fresh, 3 pillars, 6 events) → NOT in result
-        #   Phosphate:        material_row_missing (not seeded) → IN result
+        #   Lithium:          no gap (fresh score, 5 pillars, 10 events,
+        #                     facility seeded) → NOT in result
+        #   Cobalt:           thin_events + no_facility_coverage → IN result
+        #   Nickel:           thin_pillars + no_facility_coverage → IN result
+        #   Manganese:        stale_score + no_facility_coverage → IN result
+        #   Natural Graphite: no gap (fresh + facility) → NOT in result
+        #   Phosphate:        material_row_missing (not seeded; the
+        #                     launch-blocker case) → IN result
         #   Iron Ore:         material_row_missing → IN result
-        #   Copper:           no gap → NOT in result
-        #   Aluminum:         no_global_score (NULL overall_risk_score) → IN result
+        #   Copper:           no gap (fresh + facility) → NOT in result
+        #   Aluminum:         no_global_score + no_facility_coverage → IN result
         #   REE:              material_row_missing → IN result
         # Total: 7 gap items
         gap_names = {m.canonical_name: m.reasons for m in result3.materials}
         if result3.count != 7:
             failures.append(f"gap count={result3.count}, expected 7. Got: {gap_names}")
         for name, expected_reasons_subset in [
-            ("Cobalt", {"thin_events"}),
-            ("Nickel", {"thin_pillars"}),
-            ("Manganese", {"stale_score"}),
-            ("Aluminum", {"no_global_score"}),
+            ("Cobalt", {"thin_events", "no_facility_coverage"}),
+            ("Nickel", {"thin_pillars", "no_facility_coverage"}),
+            ("Manganese", {"stale_score", "no_facility_coverage"}),
+            ("Aluminum", {"no_global_score", "no_facility_coverage"}),
             ("Phosphate (Battery Grade)", {"material_row_missing"}),
             ("Iron Ore (LFP Grade)", {"material_row_missing"}),
             ("Rare Earth Elements", {"material_row_missing"}),

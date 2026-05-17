@@ -7,7 +7,8 @@ Provides the top-of-screen KPIs and two distribution charts for the
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import and_, case, func, or_, select
@@ -16,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db
 from app.models.company import Company, CompanyScore
 from app.models.documents import SourceDocument
+from app.models.facility import FacilityMaterialLink
 from app.models.regulatory import RiskEvent, RiskEventMaterial
 from app.models.reporting import AnalystNote
 from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
@@ -26,7 +28,12 @@ from app.schemas.dashboard import (
     CoreMineralsScored,
     CoverageGapItem,
     CoverageGaps,
+    CoverageMatrix,
+    CoverageMatrixPillar,
+    CoverageMatrixRow,
+    CoverageMatrixSourceCount,
     DashboardOverview,
+    PillarCoverageStat,
     PillarProgress,
     ProductionCountryItem,
     RecentNoteItem,
@@ -263,6 +270,80 @@ def dashboard_overview(
                         )
                     )
 
+        # ── Risk-score trend per top material (2026-05-11; option C) ───
+        # Compare each material's latest MaterialGlobalRiskScore.overall
+        # to the most recent prior snapshot at least 7 days older.
+        # Calibration shared with Materials detail Overview (see
+        # ``_compute_score_trend`` in ``app/api/routes/materials.py``).
+        from app.api.routes.materials import (
+            _compute_score_trend as _mat_score_trend,
+            _SCORE_TREND_LOOKBACK_DAYS as _mat_lookback_days,
+            _SCORE_TREND_MAX_LOOKBACK_DAYS as _mat_max_lookback_days,
+        )
+
+        score_trend_by_mat: dict[int, Optional[str]] = {}
+        if top_mat_ids:
+            # Build a current_score / current_as_of_date map from
+            # top_rows; we already have these in memory.
+            cur_score_by_mat: dict[int, tuple[float, date]] = {
+                r.material_id: (r.overall_risk_score, r.as_of_date)
+                for r in top_rows
+            }
+            # One query: for each material, the most recent score
+            # at least _mat_lookback_days older than the current
+            # snapshot AND not older than _mat_max_lookback_days.
+            #
+            # Composite where-clause is per-row but expressed via
+            # row_number() ranking so we get exactly one row per
+            # material when there is one.
+            prior_subq = (
+                select(
+                    MaterialGlobalRiskScore.material_id,
+                    MaterialGlobalRiskScore.overall_risk_score,
+                    MaterialGlobalRiskScore.as_of_date,
+                    func.row_number()
+                    .over(
+                        partition_by=MaterialGlobalRiskScore.material_id,
+                        order_by=MaterialGlobalRiskScore.as_of_date.desc(),
+                    )
+                    .label("rn"),
+                )
+                .where(
+                    MaterialGlobalRiskScore.material_id.in_(top_mat_ids),
+                    MaterialGlobalRiskScore.overall_risk_score.isnot(None),
+                )
+                .subquery()
+            )
+            prior_rows_q = db.execute(
+                select(
+                    prior_subq.c.material_id,
+                    prior_subq.c.overall_risk_score,
+                    prior_subq.c.as_of_date,
+                )
+            ).all()
+            # Bucket all snapshots per material; we'll pick the right
+            # prior in Python because the SQL constraint (≥7 days older
+            # than the per-material current) varies row-by-row.
+            snapshots_by_mat: dict[int, list[tuple[float, date]]] = {}
+            for row in prior_rows_q:
+                snapshots_by_mat.setdefault(row.material_id, []).append(
+                    (row.overall_risk_score, row.as_of_date),
+                )
+
+            for mid, (cur_score, cur_as_of) in cur_score_by_mat.items():
+                snaps = snapshots_by_mat.get(mid, [])
+                # Find the most recent snapshot at least _mat_lookback_days
+                # before cur_as_of but not more than _mat_max_lookback_days
+                # before either.  Snaps are sorted DESC by as_of_date.
+                target_max = cur_as_of - timedelta(days=_mat_lookback_days)
+                target_min = cur_as_of - timedelta(days=_mat_max_lookback_days)
+                prior_score: Optional[float] = None
+                for snap_score, snap_date in snaps:
+                    if target_min <= snap_date <= target_max:
+                        prior_score = snap_score
+                        break
+                score_trend_by_mat[mid] = _mat_score_trend(cur_score, prior_score)
+
         for r in top_rows:
             top_materials.append(
                 TopMaterialRisk(
@@ -272,7 +353,7 @@ def dashboard_overview(
                     category=r.category,
                     overall_risk_score=round(r.overall_risk_score, 1),
                     top_countries=prod_shares.get(r.material_id, []),
-                    trend=r.patent_occurrence_trend,
+                    trend=score_trend_by_mat.get(r.material_id),
                     as_of_date=r.as_of_date.isoformat() if r.as_of_date else "",
                 )
             )
@@ -523,17 +604,30 @@ def _compute_recent_risk_events_30d(
 def _compute_coverage_gaps(db: Session, *, now: datetime) -> CoverageGaps:
     """Identify launch-list materials failing any quality bar.
 
-    Four reasons a mineral can be flagged:
+    Five reasons a mineral can be flagged:
 
-      ``no_global_score``  No ``MaterialGlobalRiskScore`` row exists at all.
-      ``stale_score``      Latest score's ``as_of_date`` is older than
-                           ``_GAP_STALE_DAYS`` (30 days).
-      ``thin_events``      Fewer than ``_GAP_THIN_EVENTS_MIN`` (5) risk
-                           events in the last ``_GAP_THIN_EVENTS_WINDOW_DAYS``
-                           (90 days).
-      ``thin_pillars``     Fewer than ``_GAP_THIN_PILLARS_MIN`` (3) of the
-                           five pillar columns have score > 0 at the
-                           latest ``MaterialGlobalRiskScore`` row.
+      ``no_global_score``      No ``MaterialGlobalRiskScore`` row exists.
+      ``material_row_missing`` Material isn't in the DB at all (sentinel
+                               material_id=-1 is returned).
+      ``stale_score``          Latest score's ``as_of_date`` is older than
+                               ``_GAP_STALE_DAYS`` (30 days).
+      ``thin_events``          Fewer than ``_GAP_THIN_EVENTS_MIN`` (5) risk
+                               events in the last
+                               ``_GAP_THIN_EVENTS_WINDOW_DAYS`` (90 days).
+      ``thin_pillars``         Fewer than ``_GAP_THIN_PILLARS_MIN`` (3) of
+                               the five pillar columns have score > 0 at
+                               the latest ``MaterialGlobalRiskScore`` row.
+      ``no_facility_coverage`` Zero ``FacilityMaterialLink`` rows of any
+                               shape for this material.  Captures the
+                               launch-blocker case (Phosphate, today)
+                               where the analyst opens the per-mineral
+                               page and sees "no facilities" — the
+                               operational pillar has no structural data
+                               to work with at all.  Loosened from the
+                               original capacity-strict check because
+                               MRDS-sourced links typically have NULL
+                               capacity, so the strict version flagged
+                               every material with MRDS-only coverage.
 
     A single material can carry multiple reasons (each one is appended).
     The dashboard KPI card uses the count for the headline; drill-down
@@ -593,6 +687,33 @@ def _compute_coverage_gaps(db: Session, *, now: datetime) -> CoverageGaps:
     ).all()
     event_count_by_mat = {row.material_id: int(row.n) for row in event_count_rows}
 
+    # Facility coverage per launch-list material — counts any
+    # FacilityMaterialLink row regardless of whether annual_capacity_tpy
+    # is set.  Originally this filtered on capacity-not-null because
+    # that's what the G5 operational sub-score formula consumes, but in
+    # practice MRDS-sourced links rarely have capacity (the USGS data
+    # ships facility names but not throughput) so the strict check flags
+    # every launch-list material with MRDS-only coverage — including
+    # materials where the analyst can see facilities in the table.
+    #
+    # Loosened 2026-05-11 to count any link.  A separate launch-blocker
+    # check ("facility_capacity_thin" — links exist but none with
+    # capacity) could be added later if the partner data lands enough
+    # capacity-bearing rows to make that signal useful.  Today it's not.
+    facility_count_rows = db.execute(
+        select(
+            FacilityMaterialLink.material_id,
+            func.count(FacilityMaterialLink.id).label("n"),
+        )
+        .where(
+            FacilityMaterialLink.material_id.in_(materials_by_name.values()),
+        )
+        .group_by(FacilityMaterialLink.material_id)
+    ).all()
+    facility_count_by_mat = {
+        row.material_id: int(row.n) for row in facility_count_rows
+    }
+
     gap_items: list[CoverageGapItem] = []
     # Iterate in launch-list order so the output is presentation-stable
     for name in LAUNCH_LIST_CANONICAL_NAMES:
@@ -636,6 +757,16 @@ def _compute_coverage_gaps(db: Session, *, now: datetime) -> CoverageGaps:
         if events_in_window < _GAP_THIN_EVENTS_MIN:
             reasons.append("thin_events")
 
+        # Facility-coverage check — the actual launch-blocker condition
+        # for Phosphate today.  A material can pass every score-side
+        # check (has score, fresh, 3+ pillars, enough events) and still
+        # be operationally invisible because no facilities are seeded.
+        # We flag that case separately so the gap is surfaced even after
+        # a rescore.
+        facilities_with_capacity = facility_count_by_mat.get(material_id, 0)
+        if facilities_with_capacity == 0:
+            reasons.append("no_facility_coverage")
+
         if reasons:
             gap_items.append(CoverageGapItem(
                 material_id=material_id,
@@ -644,3 +775,199 @@ def _compute_coverage_gaps(db: Session, *, now: datetime) -> CoverageGaps:
             ))
 
     return CoverageGaps(count=len(gap_items), materials=gap_items)
+
+
+# ---------------------------------------------------------------------------
+# Coverage matrix endpoint (2026-05-11)
+# ---------------------------------------------------------------------------
+# Returns a per-launch-list-material view across two column groups:
+#
+#   Sources   — count of RiskEvents created in the last 90 days, grouped
+#               by Source.name.  Drives the "where is signal coming from
+#               for this mineral?" half of the matrix.
+#   Pillars   — latest MaterialGlobalRiskScore for each of the 5 pillar
+#               columns, with a has_signal flag (score > 0).  Subsumes
+#               the prior Score-run progress card at per-material
+#               granularity.
+#
+# 90-day window matches the thin_events gap threshold so the matrix and
+# the Coverage Gaps KPI tell a consistent story.
+
+_COVERAGE_MATRIX_WINDOW_DAYS = 90
+
+
+@router.get("/coverage-matrix", response_model=CoverageMatrix)
+def coverage_matrix(
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CoverageMatrix:
+    """Coverage matrix: launch-list materials × sources × pillars.
+
+    Separate endpoint from `/overview` so the dashboard can refresh the
+    matrix independently (the matrix is cheap to compute and the analyst
+    might want to re-query it after kicking off a new ingest, without
+    re-running every overview computation).
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=_COVERAGE_MATRIX_WINDOW_DAYS)
+
+    # Launch-list materials in canonical order
+    mat_rows = db.execute(
+        select(Material.id, Material.canonical_name).where(
+            Material.canonical_name.in_(LAUNCH_LIST_CANONICAL_NAMES),
+        )
+    ).all()
+    materials_by_name = {row.canonical_name: row.id for row in mat_rows}
+    all_mat_ids = list(materials_by_name.values())
+
+    # ── Sources × materials grid ──────────────────────────────────────
+    # One query joins risk_event_materials → risk_events → source_documents → sources,
+    # filters to launch-list materials in the window, groups by both axes.
+    source_grid_rows = db.execute(
+        select(
+            RiskEventMaterial.material_id,
+            Source.name.label("source_name"),
+            func.count(RiskEvent.id).label("n"),
+        )
+        .join(RiskEvent, RiskEvent.id == RiskEventMaterial.risk_event_id)
+        .join(SourceDocument, SourceDocument.id == RiskEvent.source_document_id)
+        .join(Source, Source.id == SourceDocument.source_id)
+        .where(
+            RiskEventMaterial.material_id.in_(all_mat_ids or [-1]),
+            RiskEvent.created_at >= cutoff,
+        )
+        .group_by(RiskEventMaterial.material_id, Source.name)
+    ).all() if all_mat_ids else []
+
+    # Index by (material_id, source_name) for O(1) lookup when building rows
+    cell_counts: dict[tuple[int, str], int] = {
+        (row.material_id, row.source_name): int(row.n)
+        for row in source_grid_rows
+    }
+
+    # Total per source — used to order columns by descending volume so the
+    # most-active sources land on the left of the matrix.
+    source_totals: dict[str, int] = {}
+    for (_, source_name), count in cell_counts.items():
+        source_totals[source_name] = source_totals.get(source_name, 0) + count
+    sources_in_order = sorted(
+        source_totals.keys(), key=lambda s: (-source_totals[s], s),
+    )
+
+    # ── Pillars × materials grid ──────────────────────────────────────
+    # Latest MaterialGlobalRiskScore per material — same DISTINCT ON pattern
+    # used elsewhere.  We need both the score value and a has_signal flag
+    # per pillar column.
+    latest_global_subq = (
+        select(MaterialGlobalRiskScore)
+        .distinct(MaterialGlobalRiskScore.material_id)
+        .order_by(
+            MaterialGlobalRiskScore.material_id,
+            MaterialGlobalRiskScore.as_of_date.desc(),
+            MaterialGlobalRiskScore.id.desc(),
+        )
+    ).subquery()
+
+    latest_rows = db.execute(
+        select(
+            latest_global_subq.c.material_id,
+            latest_global_subq.c.material_concentration_score,
+            latest_global_subq.c.geopolitical_trade_score,
+            latest_global_subq.c.regulatory_compliance_score,
+            latest_global_subq.c.operational_score,
+            latest_global_subq.c.financial_pressure_score,
+        ).where(
+            latest_global_subq.c.material_id.in_(all_mat_ids or [-1]),
+        )
+    ).all() if all_mat_ids else []
+    latest_by_mat = {row.material_id: row for row in latest_rows}
+
+    pillar_columns = [label for _, label in _PILLARS]
+
+    # ── Compose rows in canonical launch-list order ───────────────────
+    rows: list[CoverageMatrixRow] = []
+    for name in LAUNCH_LIST_CANONICAL_NAMES:
+        material_id = materials_by_name.get(name)
+        if material_id is None:
+            # Material not in DB at all (sentinel row).  Empty cells.
+            rows.append(CoverageMatrixRow(
+                material_id=-1,
+                canonical_name=name,
+                sources=[
+                    CoverageMatrixSourceCount(source_name=s, event_count_90d=0)
+                    for s in sources_in_order
+                ],
+                pillars=[
+                    CoverageMatrixPillar(
+                        name=col_name, label=col_label,
+                        score=None, has_signal=False,
+                    )
+                    for col_name, col_label in _PILLARS
+                ],
+            ))
+            continue
+
+        source_cells = [
+            CoverageMatrixSourceCount(
+                source_name=s,
+                event_count_90d=cell_counts.get((material_id, s), 0),
+            )
+            for s in sources_in_order
+        ]
+
+        latest = latest_by_mat.get(material_id)
+        pillar_cells: list[CoverageMatrixPillar] = []
+        for col_name, col_label in _PILLARS:
+            score_val: Optional[float] = None
+            if latest is not None:
+                score_val = getattr(latest, col_name, None)
+            pillar_cells.append(CoverageMatrixPillar(
+                name=col_name,
+                label=col_label,
+                score=score_val,
+                has_signal=bool(score_val and score_val > 0),
+            ))
+
+        rows.append(CoverageMatrixRow(
+            material_id=material_id,
+            canonical_name=name,
+            sources=source_cells,
+            pillars=pillar_cells,
+        ))
+
+    # Pillar-coverage aggregate — derived from the just-computed rows.
+    # Counts launch-list materials (excluding sentinel rows) that have
+    # signal (>0) or any score at all (not null) per pillar.  Drives the
+    # dedicated Pillar Coverage card on the dashboard.
+    total_real_rows = sum(1 for r in rows if r.material_id != -1)
+    pillar_coverage: list[PillarCoverageStat] = []
+    for col_name, col_label in _PILLARS:
+        with_signal = 0
+        with_score = 0
+        for r in rows:
+            if r.material_id == -1:
+                continue
+            # Find this pillar's cell on the row (preserves order semantics
+            # without making them positional).
+            cell = next((p for p in r.pillars if p.name == col_name), None)
+            if cell is None:
+                continue
+            if cell.score is not None:
+                with_score += 1
+            if cell.has_signal:
+                with_signal += 1
+        pillar_coverage.append(PillarCoverageStat(
+            name=col_name,
+            label=col_label,
+            materials_with_signal=with_signal,
+            materials_with_score=with_score,
+            total=total_real_rows,
+        ))
+
+    return CoverageMatrix(
+        window_days=_COVERAGE_MATRIX_WINDOW_DAYS,
+        sources_in_order=sources_in_order,
+        pillar_columns=pillar_columns,
+        rows=rows,
+        pillar_coverage=pillar_coverage,
+    )

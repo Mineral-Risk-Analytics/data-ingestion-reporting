@@ -68,6 +68,8 @@ from app.models.regulatory import (
     RiskEventMaterial,
 )
 from app.models.source import Source
+from app.models.supply import Material
+from app.services.ingestion.material_classifier import MaterialClassifier
 from app.services.ingestion.normalizers.material_resolver import MaterialCache, MaterialResolver
 
 log = structlog.get_logger(__name__)
@@ -99,6 +101,86 @@ _SEVERITY_BY_STATUS: dict[str, float] = {
     "under review": 0.10,
 }
 _DEFAULT_SEVERITY = 0.15
+
+# Relevance applied to tech-basket-derived material attribution.
+#
+# 2026-05-12 (Step 2 audit follow-up): dropped from 0.85 to 0.40 because the
+# basket path is a CATEGORY-LEVEL INFERENCE — when IEA tags a policy
+# "Battery technologies" the basket auto-attributes 5 minerals
+# (Li/Co/Ni/Graphite/Mn) with no evidence those specific materials appear
+# in the policy's title or description.  Treating that as 0.85 confidence
+# (same level as a direct canonical-name keyword match) inflated the
+# basket's downstream contribution to per-material scoring.  0.40 still
+# preserves the signal — a battery-policy event will appear in graphite's
+# event feed — but at roughly half the weight a direct mention would
+# carry.  See the IEA Policy Tracker audit (2026-05-12) for the data.
+#
+# Followup work tracked in #71 (Haiku classifier integration) will refine
+# this further by using the LLM to filter the basket candidates against
+# the actual policy text.
+_TECH_BASKET_RELEVANCE = 0.40
+
+# Battery-industry relevance gate for events with NO material attribution.
+#
+# 2026-05-12: when an IEA event produces no candidate materials (neither
+# the tech basket nor the keyword scan resolve a single mineral), we
+# previously dropped it.  Per partner direction we now preserve such
+# events for analyst review, BUT only when there's a plausible signal
+# that the policy is in scope for the EV-battery / critical-minerals
+# industry.  Without a gate we'd preserve agriculture circular-economy
+# policies, generic forced-labor due-diligence laws, and historical
+# decrees that happen to live in the IEA tracker.
+#
+# Gate-1 (cheap, deterministic): substring search for any of these
+# keywords in title + description.  Calibrated from the 2026-05-12 dropped-
+# event probe — 48.7% of empty-candidate events pass.
+_BATTERY_RELEVANCE_KEYWORDS: tuple[str, ...] = (
+    "battery", "batteries",
+    "ev ", " ev,", " ev.",  # bare "ev" with word-boundary surrogates
+    "electric vehicle", "electric vehicles",
+    "critical mineral", "critical minerals",
+    "critical raw material", "critical raw materials",
+    "strategic mineral", "strategic raw material",
+    "lithium-ion", "li-ion",
+    "anode", "cathode", "electrolyte",
+    "energy storage",
+    # Bare mineral names — picks up "lithium-bearing rocks" / "cobalt mining"
+    # mentions in events that didn't trigger MaterialCache.detect (often
+    # because Tier 1.3's list_threshold suppressed them as "generic CRM
+    # lists").  Acceptable cross-fire: an agriculture policy mentioning
+    # "potassium phosphate fertilizers" would now pass the gate; analyst
+    # review catches it.
+    "cobalt", "lithium", "nickel", "manganese", "graphite",
+    "phosphate", "copper", "aluminum", "rare earth",
+)
+
+# Gate-2 (deterministic): policyType field carries CRM-categorical tags
+# that guarantee battery-industry relevance even when title/description
+# doesn't contain a keyword.
+_BATTERY_RELEVANCE_POLICY_TYPES: frozenset[str] = frozenset({
+    "Strategic mineral lists",
+    "Stockpiling mechanisms",
+    "Export controls and restrictions",
+})
+
+
+def _has_battery_relevance(rec: dict[str, Any]) -> bool:
+    """Cheap deterministic battery-industry relevance check.
+
+    Used to gate empty-candidate IEA events before they go to the
+    review queue.  Passes when EITHER the title+description text
+    contains a battery/CRM keyword, OR the policyType list includes a
+    CRM-categorical tag.  Returns True when either gate triggers.
+    """
+    blob = (
+        (rec.get("title") or "") + " " + (rec.get("description") or "")
+    ).lower()
+    if any(kw in blob for kw in _BATTERY_RELEVANCE_KEYWORDS):
+        return True
+    for pt in rec.get("policy_type_names") or []:
+        if pt in _BATTERY_RELEVANCE_POLICY_TYPES:
+            return True
+    return False
 
 # Policy family/name keywords → risk category
 _CATEGORY_MAP: dict[str, str] = {
@@ -625,9 +707,34 @@ def ingest_policy_tracker(
 
     mat_resolver = MaterialResolver(session)
 
+    # Haiku classifier (2026-05-12, Tier-3-pattern integration for IEA).
+    # When ANTHROPIC_API_KEY is set, the classifier refines candidate
+    # material attributions against the actual policy text — rejecting
+    # incidental keyword hits and broad tech-basket fan-out when the
+    # text doesn't substantively discuss those materials.  When the key
+    # is absent (CI, isolated tests, partner not yet provisioned), the
+    # classifier is a no-op pass-through and we fall back to the prior
+    # Tier 1.1 logic (basket primary, keyword scan as fallback only).
+    # No is_active filter — the Material model has no soft-delete column and
+    # the table is curated reference data (every row is a real material).
+    materials_by_id: dict[int, str] = {
+        m.id: m.canonical_name
+        for m in session.scalars(select(Material)).all()
+    }
+    classifier = MaterialClassifier(materials_by_id=materials_by_id)
+
     inserted = 0
     skipped = 0
-    skipped_no_material = 0    # added 2026-05-06 (per partner direction)
+    # Replaced 2026-05-12: previously skipped_no_material / skipped_haiku_rejected
+    # silently dropped events with no resolvable material.  Per partner
+    # direction, those events are now preserved with needs_material_review
+    # =True so an analyst can triage later.  Two distinct counters
+    # distinguish the two paths.  Off-scope events (failing the
+    # battery-relevance gate) are still dropped — counted separately.
+    inserted_no_candidates_for_review = 0
+    inserted_haiku_rejected_for_review = 0
+    skipped_off_scope = 0           # failed deterministic keyword gate
+    skipped_off_scope_haiku = 0     # passed keyword gate but Haiku said off-scope
     failed = 0
     material_links = 0
     hs_mapping_links = 0
@@ -646,45 +753,173 @@ def ingest_policy_tracker(
                 skipped += 1
                 continue
 
-            # ── Pre-resolve material attribution: structured first, keyword fallback ──
-            # 2026-05-09 (Tier 1.1 audit fix): the IEA Policy Tracker rows carry
-            # a partner-curated ``tech_basket_minerals`` field that already
-            # enumerates which materials a policy covers.  When that field
-            # resolves to one-or-more materials, we treat it as authoritative
-            # and SKIP the keyword scan — running both paths concurrently
-            # over-attributed events to incidental mentions (e.g. a cobalt
-            # policy that name-drops lithium in the description).  Keyword
-            # scan remains the fallback when the structured field comes
-            # back empty (rare: IEA doesn't always populate technologies).
+            # ── Pre-resolve material attribution ─────────────────────────────
+            # Three-stage attribution (2026-05-12, Haiku integration on top
+            # of Tier 1.1 structured-field-first logic).
             #
-            # Gating policy unchanged: skip the row when BOTH paths come up
-            # empty so we don't bloat the events table with un-attributable
-            # rows.
+            #   Stage 1: tech basket — partner-curated category→material map.
+            #            Broad signal (a "Battery technologies" policy auto-
+            #            attributes 5 minerals).
+            #   Stage 2: keyword scan — MaterialCache.detect() over the
+            #            title + description text.  Direct text evidence.
+            #   Stage 3: Haiku confirmation — when ANTHROPIC_API_KEY is set,
+            #            send candidates + text to Claude Haiku and filter
+            #            attributions that the LLM rejects as incidental.
+            #
+            # Without Haiku, we fall back to Tier 1.1 semantics (basket
+            # primary, keyword scan only when basket empty) — running both
+            # paths concurrently without LLM mediation over-attributes
+            # incidental mentions, which is the case Tier 1.1 was designed
+            # to prevent.  With Haiku, we CAN run both paths because Haiku
+            # filters the merged candidate set against the actual text.
 
-            # Path 1 (primary): tech basket → canonical-name resolution.
+            search_text = f"{rec['title']}\n\n{rec['description']}"
+
+            # Stage 1: tech basket → canonical-name resolution.
             tech_basket_resolved: list[int] = []
             for canonical_name in rec["tech_basket_minerals"]:
                 mat = mat_resolver.resolve_by_canonical_name(canonical_name)
                 if mat is not None and mat.id not in tech_basket_resolved:
                     tech_basket_resolved.append(mat.id)
 
-            # Path 2 (fallback only): keyword scan over title + description.
-            # Skipped entirely when Path 1 produced results.
-            if tech_basket_resolved:
-                keyword_hits: list[tuple[int, float, str, int | None]] = []
-            else:
-                search_text = f"{rec['title']} {rec['description']}"
-                keyword_hits = material_cache.detect(search_text)
-
-            # Gate: skip event when neither path yields a resolvable material.
-            if not tech_basket_resolved and not keyword_hits:
-                skipped_no_material += 1
-                log.debug(
-                    "iea_policy_tracker.skipped_no_material",
-                    title=rec["title"],
-                    countries_raw=rec["countries_raw"],
+            # Stage 2: keyword scan.  Always runs when Haiku is enabled
+            # (Haiku will reconcile); falls back to Tier 1.1 (basket-empty-
+            # gated) when Haiku is disabled to preserve the pre-LLM accuracy
+            # profile.
+            #
+            # 2026-05-12: we override Tier 1.3 caps for IEA specifically.
+            # Industry-wide policies (Critical Raw Materials Act, etc.)
+            # legitimately span 10+ minerals; the default list_threshold=5
+            # was suppressing 39+ events that mention bare "lithium" / "nickel"
+            # / "cobalt" etc. in the same paragraph.  Pass list_threshold=
+            # None and max_materials=20 so detect() returns the full set;
+            # Haiku (when enabled) filters down, and the review-queue gate
+            # catches the rest.
+            _IEA_DETECT_LIST_THRESHOLD = 999  # effectively no cap
+            _IEA_DETECT_MAX_MATERIALS = 20
+            keyword_hits: list[tuple[int, float, str, int | None]]
+            if classifier.enabled:
+                keyword_hits = material_cache.detect(
+                    search_text,
+                    list_threshold=_IEA_DETECT_LIST_THRESHOLD,
+                    max_materials=_IEA_DETECT_MAX_MATERIALS,
                 )
-                continue
+            else:
+                # Without Haiku, keep the Tier-1.1 fallback shape but still
+                # relax the caps so events with many real mineral mentions
+                # land in the review queue rather than getting Tier-1.3-
+                # suppressed.  The off-scope keyword gate below filters
+                # the false positives.
+                keyword_hits = (
+                    material_cache.detect(
+                        search_text,
+                        list_threshold=_IEA_DETECT_LIST_THRESHOLD,
+                        max_materials=_IEA_DETECT_MAX_MATERIALS,
+                    )
+                    if not tech_basket_resolved
+                    else []
+                )
+
+            # Track whether ANY candidate ever existed.  Distinguishes
+            # "scan returned nothing" from "scan found candidates but
+            # Haiku rejected them all" downstream.
+            initial_candidates_existed = bool(tech_basket_resolved or keyword_hits)
+
+            # ── Merge into a unified candidate list for Haiku ──────────────
+            # Tuple shape matches what MaterialCache.detect returns:
+            #   (material_id, relevance, matched_keyword, hs_mapping_id|None)
+            # Tech-basket entries get hs_mapping_id=None (basket carries no
+            # HS-stage attribution).  When a material appears in BOTH paths,
+            # we prefer the keyword-hit version since it preserves a real
+            # hs_mapping_id (more precise stage attribution) and the higher
+            # of the two relevances.
+            unified_candidates: list[tuple[int, float, str, int | None]] = []
+            cand_index: dict[int, int] = {}
+            for mat_id in tech_basket_resolved:
+                if mat_id in cand_index:
+                    continue
+                cand_index[mat_id] = len(unified_candidates)
+                unified_candidates.append(
+                    (mat_id, _TECH_BASKET_RELEVANCE, "technology_basket", None)
+                )
+            for kh_mat_id, kh_rel, kh_kw, kh_hs in keyword_hits:
+                if kh_mat_id in cand_index:
+                    # Material already in basket — upgrade entry, preferring
+                    # keyword-scan's hs_mapping_id when present.
+                    i = cand_index[kh_mat_id]
+                    existing = unified_candidates[i]
+                    upgraded_rel = max(existing[1], kh_rel)
+                    upgraded_hs = kh_hs if kh_hs is not None else existing[3]
+                    unified_candidates[i] = (
+                        kh_mat_id,
+                        upgraded_rel,
+                        f"keyword_scan:{kh_kw[:48]}",
+                        upgraded_hs,
+                    )
+                else:
+                    cand_index[kh_mat_id] = len(unified_candidates)
+                    unified_candidates.append(
+                        (kh_mat_id, kh_rel, f"keyword_scan:{kh_kw[:48]}", kh_hs)
+                    )
+
+            # Stage 3: Haiku refinement.  No-op when key not set or text too
+            # thin (_MIN_TEXT_CHARS = 200 in the classifier).  Returns the
+            # unified candidate list with relevance scaled by Haiku's
+            # confidence and rejected materials dropped entirely.
+            refined_candidates = classifier.classify(search_text, unified_candidates)
+
+            # ── Empty-candidate review path ─────────────────────────────────
+            # Two distinct cases produce empty refined_candidates:
+            #   (a) initial_candidates_existed=False — nothing matched at
+            #       all (basket + keyword both empty).
+            #   (b) initial_candidates_existed=True  — Haiku rejected every
+            #       candidate as incidental.
+            # In both cases the event has no confident material attribution,
+            # but it may still be an industry-wide policy worth preserving
+            # for analyst review (Critical Raw Materials Act, National
+            # Resource Strategy, etc.).  We apply two layered gates:
+            #   Gate-1 (cheap, deterministic): keyword/policyType check.
+            #   Gate-2 (Haiku, when enabled):  ask the LLM "is this in
+            #     scope for EV-battery / critical minerals?"
+            # Events that fail either gate are dropped as off_scope.
+            # Events that pass both are written WITHOUT RiskEventMaterial
+            # rows but with metadata_json["needs_material_review"]=true.
+            needs_material_review = False
+            review_reason: Optional[str] = None
+            if not refined_candidates:
+                if not _has_battery_relevance(rec):
+                    skipped_off_scope += 1
+                    log.debug(
+                        "iea_policy_tracker.skipped_off_scope_keyword",
+                        title=rec["title"],
+                    )
+                    continue
+                if classifier.enabled:
+                    is_relevant, conf, hk_reason = (
+                        classifier.assess_battery_industry_relevance(
+                            search_text,
+                            policy_type_names=rec.get("policy_type_names") or [],
+                        )
+                    )
+                    if not is_relevant and conf >= 0.5:
+                        skipped_off_scope_haiku += 1
+                        log.debug(
+                            "iea_policy_tracker.skipped_off_scope_haiku",
+                            title=rec["title"],
+                            confidence=conf,
+                            reason=hk_reason,
+                        )
+                        continue
+                needs_material_review = True
+                review_reason = (
+                    "haiku_rejected_all"
+                    if initial_candidates_existed
+                    else "no_candidates"
+                )
+                if review_reason == "no_candidates":
+                    inserted_no_candidates_for_review += 1
+                else:
+                    inserted_haiku_rejected_for_review += 1
 
             policy_type_names = rec["policy_type_names"]
             event_type = _derive_event_type(policy_type_names)
@@ -731,6 +966,12 @@ def ingest_policy_tracker(
                     "countries_raw": rec["countries_raw"],
                     "run_id": run_id,
                     "positive_policy": True,
+                    # 2026-05-12: events with no confident material
+                    # attribution are preserved with these flags so an
+                    # analyst can triage them later in a dedicated review
+                    # queue.  False / None for fully-attributed events.
+                    "needs_material_review": needs_material_review,
+                    "review_reason": review_reason,
                     "note": (
                         "Low-severity positive-policy event. Contributes minimally to risk "
                         "scores; primary value is rationale context."
@@ -756,55 +997,63 @@ def ingest_policy_tracker(
                     countries_raw=rec["countries_raw"],
                 )
 
-            # ── Material + HS junction rows (using pre-resolved data) ─────────
-            # No defensive existence-check queries: we just inserted the
-            # RiskEvent above, so there can't be any junction rows for it
-            # yet.  Within-event dedup is handled by the seen_* sets below.
-            seen_material_ids: set[int] = set()
+            # ── Material + HS junction rows ───────────────────────────────────
+            # Iterate the refined candidate list — already deduped via
+            # cand_index above, already passed through Haiku (or no-op
+            # passed-through when Haiku is disabled).  Each entry's
+            # match_reason carries either "technology_basket" or
+            # "keyword_scan:<kw>"; if Haiku ran, the classifier prepends
+            # "llm_confirmed:" so we can tell LLM-verified attributions
+            # apart from raw ones in downstream queries.
             seen_hs_mapping_ids: set[int] = set()
-
-            # Path 1: tech basket — RiskEventMaterial only (no HS attribution).
-            for mat_id in tech_basket_resolved:
-                if mat_id in seen_material_ids:
-                    continue
+            for mat_id, relevance, matched_kw, hs_mapping_id in refined_candidates:
                 session.add(RiskEventMaterial(
                     risk_event_id=event.id,
                     material_id=mat_id,
-                    relevance_score=0.85,
-                    match_reason="technology_basket",
+                    relevance_score=relevance,
+                    match_reason=matched_kw[:64],
                 ))
                 material_links += 1
-                seen_material_ids.add(mat_id)
 
-            # Path 2: keyword scan — RiskEventMaterial + RiskEventHsMapping.
-            for mat_id, relevance, matched_kw, hs_mapping_id in keyword_hits:
-                if mat_id not in seen_material_ids:
-                    session.add(RiskEventMaterial(
-                        risk_event_id=event.id,
-                        material_id=mat_id,
-                        relevance_score=relevance,
-                        match_reason=f"keyword_scan:{matched_kw[:48]}",
-                    ))
-                    material_links += 1
-                    seen_material_ids.add(mat_id)
-
-                if hs_mapping_id is not None and hs_mapping_id not in seen_hs_mapping_ids:
+                if (
+                    hs_mapping_id is not None
+                    and hs_mapping_id not in seen_hs_mapping_ids
+                ):
                     session.add(RiskEventHsMapping(
                         risk_event_id=event.id,
                         hs_mapping_id=hs_mapping_id,
                         relevance_score=relevance,
-                        match_reason=f"keyword_scan:{matched_kw[:48]}",
+                        match_reason=matched_kw[:64],
                     ))
                     hs_mapping_links += 1
                     seen_hs_mapping_ids.add(hs_mapping_id)
 
-            inserted += 1
+            # ``inserted`` counts events that made it to RiskEvent WITH at
+            # least one RiskEventMaterial.  Review-path events were already
+            # counted under inserted_no_candidates_for_review /
+            # inserted_haiku_rejected_for_review above; they DON'T contribute
+            # to ``inserted`` so the result-dict sanity sum
+            # (inserted + review-counters + skip-counters + duplicate +
+            # failed = total_rows) balances.
+            if not needs_material_review:
+                inserted += 1
+            total_written = (
+                inserted
+                + inserted_no_candidates_for_review
+                + inserted_haiku_rejected_for_review
+            )
 
-            if inserted % _FLUSH_EVERY == 0:
+            if total_written % _FLUSH_EVERY == 0:
                 session.flush()
                 log.info(
                     "iea_policy_tracker.progress",
-                    inserted=inserted, skipped=skipped, total=len(records),
+                    inserted=inserted,
+                    review_queue=(
+                        inserted_no_candidates_for_review
+                        + inserted_haiku_rejected_for_review
+                    ),
+                    skipped=skipped,
+                    total=len(records),
                 )
 
         except Exception:
@@ -821,10 +1070,19 @@ def ingest_policy_tracker(
         "total_rows": len(records),
         "inserted": inserted,
         "skipped_duplicate": skipped,
-        "skipped_no_material": skipped_no_material,
+        # Review-queue counters (replace prior skipped_no_material /
+        # skipped_haiku_rejected — same events, now preserved instead of
+        # dropped).  Sum of these two equals the size of the review queue
+        # from this run.
+        "inserted_no_candidates_for_review": inserted_no_candidates_for_review,
+        "inserted_haiku_rejected_for_review": inserted_haiku_rejected_for_review,
+        # Genuinely off-scope events (failed the relevance gates).
+        "skipped_off_scope": skipped_off_scope,
+        "skipped_off_scope_haiku": skipped_off_scope_haiku,
         "failed": failed,
         "material_links": material_links,
         "hs_mapping_links": hs_mapping_links,
+        "haiku_enabled": classifier.enabled,
     }
     log.info("iea_policy_tracker.done", **result)
     return result

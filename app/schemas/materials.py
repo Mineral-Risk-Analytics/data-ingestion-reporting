@@ -174,6 +174,25 @@ class ChemistryUseRead(BaseModel):
     is_substitutable: bool
 
 
+class CountryShareItem(BaseModel):
+    """One country's share of world production for a material."""
+    code: str
+    share_pct: int  # rounded integer percentage, e.g. 47
+
+
+class MaterialListPillarScore(BaseModel):
+    """One pillar's score for the Materials list row.
+
+    Drives the 5-dot pillar coverage indicator on the Materials page.  A
+    dot is colored when ``has_signal`` is True (score > 0); rendered gray
+    when the score is 0 (fallback) or null (no score row).
+    """
+    name: str                # e.g. "material_concentration_score"
+    label: str               # e.g. "Material Concentration"
+    score: Optional[float] = None
+    has_signal: bool = False
+
+
 class MaterialListItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -185,19 +204,37 @@ class MaterialListItem(BaseModel):
     is_ira_critical_mineral: bool
     is_eu_crma_critical: bool
     data_availability: Optional[str] = None
+    # ``hs_mapping_count`` and ``mapping_mismatch_count`` retained for
+    # backwards-compat with any external consumers; the Materials page
+    # no longer renders them (mismatch UI retired 2026-05-11).  Backend
+    # still populates ``hs_mapping_count`` but reports
+    # ``mapping_mismatch_count = 0`` everywhere.
     hs_mapping_count: int = 0
     mapping_mismatch_count: int = 0
     verified: bool = False
-    # Top producing countries — sourced from the JSONB column on Material.
+    # Top producing countries — legacy ISO-code-only list, retained for
+    # backwards-compat with any other consumers of this schema.
     primary_producing_countries: Optional[List[str]] = None
     # Latest global composite risk score (0–100). Populated by route handler via subquery.
     latest_overall_risk_score: Optional[float] = None
 
-
-class CountryShareItem(BaseModel):
-    """One country's share of world production for a material."""
-    code: str
-    share_pct: int  # rounded integer percentage, e.g. 47
+    # 2026-05-11 analyst-view extensions
+    is_launch_list: bool = False
+    """Whether the material is in the launch-list (the core 10 minerals
+    the v1 product focuses on).  Drives the leading ★ marker on the
+    Materials page and the default filter scope."""
+    top_producer_shares: List["CountryShareItem"] = Field(default_factory=list)
+    """Top producing countries with their share % of global production.
+    Up to 3 entries, sorted by share descending.  Empty if no
+    MaterialProductionShare data exists for this material."""
+    pillar_scores: List[MaterialListPillarScore] = Field(default_factory=list)
+    """Latest per-pillar scores for the 5 risk pillars, in canonical order.
+    Drives the 5-dot pillar coverage indicator.  Empty list if no
+    MaterialGlobalRiskScore row exists at all."""
+    recent_event_count_90d: int = 0
+    """Count of RiskEvent rows created in the last 90 days that map to
+    this material via RiskEventMaterial.  Matches the coverage matrix
+    and Coverage Gaps KPI window for consistency."""
 
 
 class MaterialDetail(BaseModel):
@@ -231,6 +268,33 @@ class MaterialDetail(BaseModel):
             missing_description=0, chapter_mismatch=0, cross_mapped=0,
         )
     )
+
+    # 2026-05-11 analyst-view extensions for the Materials detail Overview
+    # tab.  Both are computed by the route handler.  Defaults preserve
+    # backwards-compat for older clients reading this schema shape.
+    recent_event_count_90d: int = 0
+    """Count of RiskEvent rows created in the last 90 days that map to
+    this material via RiskEventMaterial.  Matches the same window used
+    on the dashboard's coverage matrix + Coverage Gaps KPI."""
+    facility_count: int = 0
+    """Count of FacilityMaterialLink rows (any stage, any capacity) for
+    this material.  Tells the analyst how much structural data backs the
+    operational pillar.  0 means launch-blocker for that pillar."""
+    score_trend_7d: Optional[str] = None
+    """``"rising"`` | ``"stable"`` | ``"declining"`` | None.
+
+    Trend in the material's overall composite risk score — comparing the
+    latest MaterialGlobalRiskScore.overall_risk_score to the most recent
+    snapshot at least 7 days older.  Rising = score went UP (risk
+    increased); declining = score went DOWN (risk improved); stable =
+    moved by ≤5 points on the 0–100 scale.  None when there's no prior
+    snapshot or the prior is more than 30 days stale.
+
+    Sourced from actual scoring output rather than event count so the
+    indicator answers "is risk going up?" semantically — not "are there
+    more events flowing through?" which could include constructive
+    signals (IEA investment pledges).  Calibration owned by
+    ``_compute_score_trend`` in ``app/api/routes/materials.py``."""
 
 
 class HsMismatchItem(BaseModel):

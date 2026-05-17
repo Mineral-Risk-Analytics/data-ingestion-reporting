@@ -109,10 +109,14 @@ class CoverageGapItem(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     """Plain-English reasons this mineral is flagged.  Composed from any
     combination of: ``"no_global_score"`` (no MaterialGlobalRiskScore),
-    ``"stale_score"`` (latest as_of_date > 30 days old), ``"thin_events"``
-    (fewer than 5 risk events in last 90 days), ``"thin_pillars"`` (fewer
-    than 3 pillars have non-fallback signal at latest score).  Multiple
-    reasons can apply."""
+    ``"material_row_missing"`` (material not in Materials table at all,
+    sentinel material_id=-1), ``"stale_score"`` (latest as_of_date > 30
+    days old), ``"thin_events"`` (fewer than 5 risk events in last 90
+    days), ``"thin_pillars"`` (fewer than 3 pillars have non-fallback
+    signal at latest score), ``"no_facility_coverage"`` (zero
+    facility_material_links rows of any shape — the launch-blocker
+    case where the operational pillar has no structural data at all).
+    Multiple reasons can apply."""
 
 
 class CoverageGaps(BaseModel):
@@ -122,6 +126,78 @@ class CoverageGaps(BaseModel):
     materials: list[CoverageGapItem] = Field(default_factory=list)
     """Per-gap detail rows.  The KPI card uses the count for the headline
     number; click-through views render the full list."""
+
+
+class CoverageMatrixPillar(BaseModel):
+    """Pillar coverage state for one material in the matrix.
+
+    ``score`` is the latest ``MaterialGlobalRiskScore`` pillar value.
+    ``has_signal`` is True when score > 0 (real data driving the pillar);
+    False when score is 0 or null (fallback / no data).  These two flags
+    capture the same information as the prior Score-run progress card's
+    ``signal_pct`` / ``computed_pct`` axes, but at per-material granularity
+    rather than aggregate.
+    """
+
+    name: str                              # e.g. "material_concentration_score"
+    label: str                             # e.g. "Material Concentration"
+    score: Optional[float] = None
+    has_signal: bool = False
+
+
+class CoverageMatrixSourceCount(BaseModel):
+    """One (material, source) cell in the matrix."""
+
+    source_name: str
+    event_count_90d: int
+
+
+class CoverageMatrixRow(BaseModel):
+    """One material's coverage view across all data sources and pillars."""
+
+    material_id: int                       # -1 sentinel if material isn't in the DB
+    canonical_name: str
+    sources: list[CoverageMatrixSourceCount] = Field(default_factory=list)
+    pillars: list[CoverageMatrixPillar] = Field(default_factory=list)
+
+
+class PillarCoverageStat(BaseModel):
+    """Aggregate coverage of one pillar across the launch list.
+
+    Used by the dedicated Pillar Coverage card on the dashboard — a
+    horizontal bar per pillar showing what fraction of launch-list
+    materials have credible signal vs. fallback floor vs. nothing.
+    """
+
+    name: str                              # column attr, e.g. "operational_score"
+    label: str                             # display label, e.g. "Operational"
+    materials_with_signal: int             # count of launch-list materials where pillar > 0
+    materials_with_score: int              # count where pillar score is not null (includes 0)
+    total: int                             # launch-list size (10 today)
+
+
+class CoverageMatrix(BaseModel):
+    """Per launch-list material × per source × per pillar coverage snapshot.
+
+    Backs the dashboard's coverage matrix view (2026-05-11).  Window is
+    90 days of risk events to match the ``thin_events`` gap threshold —
+    same calibration choice across the analyst-view dashboard.
+    """
+
+    window_days: int = 90                  # documented in the response so callers can adjust
+    sources_in_order: list[str] = Field(default_factory=list)
+    """All sources that produced any event in the window, ordered by
+    descending total event count.  Drives the column order client-side
+    so the highest-signal sources land on the left."""
+    pillar_columns: list[str] = Field(default_factory=list)
+    """Pillar column display labels in canonical order."""
+    rows: list[CoverageMatrixRow] = Field(default_factory=list)
+    """One row per launch-list material, in canonical launch-list order."""
+    pillar_coverage: list[PillarCoverageStat] = Field(default_factory=list)
+    """Per-pillar aggregate stats over the launch list.  Derived from
+    ``rows`` (same data, different shape) so the dashboard can render a
+    summary card without re-aggregating client-side.  Pillars appear in
+    the same canonical order as ``pillar_columns``."""
 
 
 class DashboardOverview(BaseModel):

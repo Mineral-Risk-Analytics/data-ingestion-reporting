@@ -325,6 +325,21 @@ _SUMMARY_MAX = 500
 # Flush every N inserts to keep the SQLAlchemy unit-of-work compact.
 _FLUSH_EVERY = 100
 
+# Note (2026-05-12): an earlier draft of this module included a
+# ``_should_attribute_via_hs`` classifier that gated RiskEventMaterial /
+# RiskEventHsMapping writes for ~63% of GTA events based on mast_chapter
+# / eligible_firm / intervention_subtype.  That classifier was reverted
+# after an empirical distribution audit showed it was over-aggressive —
+# the "fake breadth" premise was a misread of a small outlier cluster,
+# not the actual data shape.  See the Step-3 ticket in
+# Automotive Data Solutions/github_issues_event_attribution.md for the
+# full reasoning trail.  We still capture mast_chapter / eligible_firm /
+# affected_sectors into metadata_json (useful for future analysis) but
+# no longer act on them at ingest time.  The existing
+# _INTERVENTION_SUBTYPE_MAP correctly routes subsidies to the
+# EXPORT_SUBSIDY event_subtype, which feeds a different scoring
+# sub-input than restrictions do.
+
 
 # ---------------------------------------------------------------------------
 # CSV download
@@ -417,6 +432,40 @@ _COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
     "is_horizontal": (
         "is_horizontal",
         "horizontal",
+    ),
+    # ── Added 2026-05-12 (attribution density audit, Step 3) ─────────────
+    # Three more structural fields from the curated CSV, captured into
+    # metadata_json for future analysis.  An earlier draft also used them
+    # to gate HS-based material attribution; that gating was reverted
+    # after the distribution audit (see the revert note near the top of
+    # this module).  These columns remain useful as queryable metadata
+    # — e.g., to slice events by mast_chapter for ad-hoc analysis — even
+    # though we no longer act on them at ingest time.
+    #
+    # ``mast_chapter`` — MAST high-level classification (e.g., "Tariff
+    # measures", "L: Subsidies", "P: Export-related measures").  Distri-
+    # bution in interventions_batteries.csv: 59% L: Subsidies, 16% P,
+    # 16% Tariff, remainder spread across 11 other chapters.  Curated CSV
+    # column "Mast Chapter".
+    "mast_chapter": (
+        "mast_chapter",
+        "mast chapter",
+    ),
+    # ``eligible_firm`` — who the intervention applies to.  Values like
+    # SMEs / firm-specific / sector-specific indicate a targeted financial
+    # program rather than a broad product policy.  Curated CSV column
+    # "Eligible Firm".
+    "eligible_firm": (
+        "eligible_firm",
+        "eligible firm",
+    ),
+    # ``affected_sectors`` — CPC sector codes (comma-separated).  Not used
+    # by the classifier today but captured into metadata_json for future
+    # debugging and possible per-sector filters.  Curated CSV column
+    # "Affected Sectors".
+    "affected_sectors": (
+        "affected_sectors",
+        "affected sectors",
     ),
 }
 
@@ -782,6 +831,17 @@ def parse_gta_csv(
         if "is_horizontal" in col:
             is_horizontal = _to_bool(row.get(col["is_horizontal"]))
 
+        # ── Structural fields for the 2026-05-12 attribution classifier ──
+        mast_chapter: Optional[str] = None
+        if "mast_chapter" in col:
+            mast_chapter = (row.get(col["mast_chapter"]) or "").strip() or None
+        eligible_firm: Optional[str] = None
+        if "eligible_firm" in col:
+            eligible_firm = (row.get(col["eligible_firm"]) or "").strip() or None
+        affected_sectors_raw: Optional[str] = None
+        if "affected_sectors" in col:
+            affected_sectors_raw = (row.get(col["affected_sectors"]) or "").strip() or None
+
         # Date announced — already parsed above for the event_date fallback.
         # Re-parse here so the policy_proximity_adjustment can use it as a
         # forward-looking effective date when distinct from date_implemented.
@@ -803,6 +863,10 @@ def parse_gta_csv(
                 "implementation_level":  implementation_level,
                 "is_horizontal":         is_horizontal,
                 "date_announced":        date_announced,
+                # 2026-05-12 attribution-classifier additions:
+                "mast_chapter":          mast_chapter,
+                "eligible_firm":         eligible_firm,
+                "affected_sectors_raw":  affected_sectors_raw,
                 "raw_row": dict(row),
             }
         )
@@ -1137,6 +1201,12 @@ def ingest_gta(
         implementation_level = intervention.get("implementation_level")
         is_horizontal = bool(intervention.get("is_horizontal"))
         date_announced = intervention.get("date_announced")
+        # 2026-05-12 attribution-classifier inputs (None when the curated
+        # CSV doesn't carry the column — keeps the classifier permissive
+        # for older exports rather than breaking ingest).
+        mast_chapter = intervention.get("mast_chapter")
+        eligible_firm = intervention.get("eligible_firm")
+        affected_sectors_raw = intervention.get("affected_sectors_raw")
 
         ch = _content_hash(title, summary, event_date)
         if _existing_event_id(session, content_hash=ch, gta_id=gta_id) is not None:
@@ -1205,6 +1275,16 @@ def ingest_gta(
             "source_url": url,
             "implementation_level": implementation_level,
             "is_horizontal": is_horizontal,
+            # 2026-05-12 structural fields — captured even when None so
+            # admin queries can inspect what the CSV exposed.  An earlier
+            # draft of this code also used these to gate HS-based material
+            # attribution; that gating was reverted after the distribution
+            # audit (see the Step-3 ticket).  Capturing them is still
+            # useful for future analysis even though we don't act on them
+            # at ingest time.
+            "mast_chapter": mast_chapter,
+            "eligible_firm": eligible_firm,
+            "affected_sectors_raw": affected_sectors_raw,
         }
         if event_subtype:
             # event_subtype kept in metadata_json for one release cycle

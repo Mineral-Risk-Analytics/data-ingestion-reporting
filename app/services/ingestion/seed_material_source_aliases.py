@@ -534,6 +534,11 @@ _MRDS: list[_AliasRow] = [
     ("mrds", "Phosphorite",            "Phosphate (Battery Grade)"),
     ("mrds", "Phosphate rock",         "Phosphate (Battery Grade)"),
     ("mrds", "P",                      "Phosphate (Battery Grade)"),
+    # USGS MRDS uses this hyphenated string for every phosphate-bearing
+    # row — discovered 2026-05-12 when the dev DB had 0 phosphate facility
+    # links despite ~3,100 MRDS rows mentioning phosphate.  See parallel
+    # entry in MRDS_COMMODITY_MAP in mrds.py.
+    ("mrds", "Phosphorus-Phosphates",  "Phosphate (Battery Grade)"),
 
     # ── Chromium (incl. chromite ore alias) ──────────────────────────────
     ("mrds", "Chromium",               "Chromium"),

@@ -331,6 +331,34 @@ class MaterialCache:
             # Frequency-adjustment skipped: canonicals are 1-per-material.
             _add(canonical_name, mat_id, cls._CANONICAL_RELEVANCE, None)
 
+            # 2026-05-12: also register a parenthetical-stripped form so a
+            # plain "phosphate" mention in text matches "Phosphate (Battery
+            # Grade)".  Unblocks keyword scan for launch-list materials whose
+            # canonical names carry a grade qualifier — Phosphate (Battery
+            # Grade), Iron Ore (LFP Grade), Silicon (Anode Grade).
+            #
+            # NOTE: this path BYPASSES the _add()-internal _NOISE_KEYWORDS /
+            # _SYMBOL_STOPLIST filters.  Those filters exist to drop generic
+            # stage/chemical-group words harvested from keywords_json (e.g.
+            # bare "ore", "oxide", "phosphate") — but when "Phosphate" is a
+            # partner-curated canonical material name, it should remain
+            # detectable.  Otherwise the fix above silently drops Phosphate
+            # at line 286 because "phosphate" happens to be in _NOISE_KEYWORDS
+            # for the unrelated keyword-array case.  Same bypass applies if a
+            # future canonical's stripped form collides (e.g. "Oxide
+            # (Cathode Grade)" → "Oxide" — which is in _NOISE_KEYWORDS today).
+            stripped = cls._strip_parenthetical_suffix(canonical_name)
+            if stripped:
+                stripped_lower = stripped.lower().strip()
+                if (
+                    stripped_lower
+                    and stripped_lower != canonical_name.lower().strip()
+                    and len(stripped_lower) >= 3
+                ):
+                    entries.append(
+                        (stripped_lower, mat_id, cls._CANONICAL_RELEVANCE, None)
+                    )
+
             # symbol (e.g. "Li", "Co") → fixed 0.50; short symbols risk false positives.
             if symbol_or_code and len(symbol_or_code) >= 2:
                 _add(symbol_or_code, mat_id, cls._SYMBOL_RELEVANCE, None)
@@ -346,10 +374,42 @@ class MaterialCache:
             )
         for mat_id, canonical_name, symbol_or_code in session.execute(fallback_stmt).all():
             _add(canonical_name, mat_id, cls._CANONICAL_RELEVANCE, None)
+            # Same parenthetical-stripped registration applied to the fallback
+            # path, with the same noise-filter bypass (see the primary loop
+            # for the full rationale).
+            stripped = cls._strip_parenthetical_suffix(canonical_name)
+            if stripped:
+                stripped_lower = stripped.lower().strip()
+                if (
+                    stripped_lower
+                    and stripped_lower != canonical_name.lower().strip()
+                    and len(stripped_lower) >= 3
+                ):
+                    entries.append(
+                        (stripped_lower, mat_id, cls._CANONICAL_RELEVANCE, None)
+                    )
             if symbol_or_code and len(symbol_or_code) >= 2:
                 _add(symbol_or_code, mat_id, cls._SYMBOL_RELEVANCE, None)
 
         return cls(entries)
+
+    @staticmethod
+    def _strip_parenthetical_suffix(name: str) -> str:
+        """Strip a trailing ``" (...)"`` qualifier from a canonical name.
+
+        Examples (input → output):
+            "Phosphate (Battery Grade)"  → "Phosphate"
+            "Iron Ore (LFP Grade)"       → "Iron Ore"
+            "Silicon (Anode Grade)"      → "Silicon"
+            "Lithium"                    → "Lithium"   (unchanged)
+            "(Header) name with (suffix)"→ "(Header) name with"  (only trailing)
+
+        Only strips a parenthetical at the END of the name to avoid breaking
+        names like "(beta) phase" that might appear in research literature.
+        """
+        import re
+
+        return re.sub(r"\s*\([^)]*\)\s*$", "", name or "").strip()
 
     def detect(
         self,

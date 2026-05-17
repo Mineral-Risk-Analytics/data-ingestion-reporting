@@ -1301,6 +1301,18 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
     ("2504", "Natural Graphite"): [
         "natural graphite",
         "flake graphite",
+        # 2026-05-12: added bare "graphite" so IEA / Federal Register /
+        # GTA text scans catch policies that use the unmodified word
+        # (cross-cutting critical-minerals lists do this constantly —
+        # "cobalt, nickel, lithium, copper, and graphite" patterns
+        # previously matched every other co-listed material but skipped
+        # graphite).  If a Synthetic Graphite material is added later,
+        # register "graphite" under both — the inverse-frequency weight
+        # in MaterialCache.build() automatically damps the keyword's
+        # relevance to handle the ambiguity, and the more-specific
+        # "natural graphite" / "synthetic graphite" keywords still take
+        # precedence when present.
+        "graphite",
     ],
     ("250410", "Natural Graphite"): [
         "natural graphite, powder",
@@ -1370,6 +1382,14 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "rare earth ore",
         "monazite",
         "bastnasite",
+        # 2026-05-12: bare-form keywords — same shape as the Graphite fix.
+        # Critical-minerals lists routinely write "rare earth" / "rare earths"
+        # alongside other minerals without the full "rare earth elements"
+        # phrase.  Probe found 15 unattributed IEA events using these forms.
+        # Highly specific to the minerals domain — no false-positive risk
+        # from common English.
+        "rare earth",
+        "rare earths",
     ],
     ("280530", "Rare Earth Elements"): [
         "rare earth metal",
@@ -1393,6 +1413,24 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "Dy2O3",
         "terbium oxide",
         "rare earth carbonate",
+    ],
+
+    # ── Platinum-Group Metals ────────────────────────────────────────────
+    # 2026-05-12: added per the qualifier-canonical sweep.  The canonical
+    # name "Platinum-Group Metals" gets registered via MaterialCache's
+    # canonical-name path at relevance 0.85, but its hyphenated form means
+    # source text using the unhyphenated phrasing ("platinum group metals",
+    # "platinum group elements", "pgms") doesn't match.  Probe found 5
+    # unattributed IEA events using these forms.
+    ("7110", "Platinum-Group Metals"): [
+        "platinum group metals",
+        "platinum group elements",
+        "platinum group minerals",
+        "pgms",
+    ],
+    ("2616", "Platinum-Group Metals"): [
+        "platinum group ore",
+        "platinum group bearing ore",
     ],
 
     # ── Titanium ─────────────────────────────────────────────────────────
