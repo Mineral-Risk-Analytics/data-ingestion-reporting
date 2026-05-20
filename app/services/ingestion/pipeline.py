@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 import structlog
 import httpx
@@ -31,6 +31,7 @@ from app.models.enums import DocumentType, ImplementationPhase, IngestionStatus,
 from app.services.ingestion.adapters import ADAPTER_BY_TYPE
 from app.services.ingestion.adapters.news import NewsAdapter
 from app.services.ingestion.base import FetchBundle
+from app.services.ingestion import feature_flags
 from app.services.ingestion.entity_resolution import (
     CachedCompanyInfo,
     build_company_cache,
@@ -97,8 +98,16 @@ class IngestionPipeline:
         run = self._tracker.start(source.id, merged)
         self._db.flush()
 
-        # Cache all companies once per run to avoid N+1 queries during entity resolution.
-        company_cache: list[CachedCompanyInfo] = build_company_cache(self._db)
+        # Cache all companies once per run to avoid N+1 queries during entity
+        # resolution.  Gated by feature_flags.LINK_EVENTS_TO_COMPANIES — when
+        # the flag is False (Foundation phase 3 default), skip the cache build
+        # entirely.  ``company_cache`` becomes None and the per-event
+        # _link_companies path short-circuits accordingly.
+        company_cache: Optional[list[CachedCompanyInfo]] = (
+            build_company_cache(self._db)
+            if feature_flags.LINK_EVENTS_TO_COMPANIES
+            else None
+        )
 
         try:
             if adapter_cls is NewsAdapter:
@@ -565,7 +574,7 @@ class IngestionPipeline:
         self,
         doc: SourceDocument,
         draft: RiskEventDraft,
-        company_cache: list[CachedCompanyInfo],
+        company_cache: Optional[list[CachedCompanyInfo]],
         *,
         material_id: int | None = None,
         hs_mapping_id: int | None = None,
@@ -675,7 +684,12 @@ class IngestionPipeline:
                 )
             )
 
-        matches = resolve_companies_for_event(self._db, ev, company_cache)
-        persist_company_links(self._db, ev, matches)
+        # Gated by feature_flags.LINK_EVENTS_TO_COMPANIES (default False —
+        # Foundation phase 3).  When the flag is off, ``company_cache`` is
+        # None and we skip the resolver loop entirely rather than running
+        # it and discarding the result inside persist_company_links.
+        if feature_flags.LINK_EVENTS_TO_COMPANIES and company_cache is not None:
+            matches = resolve_companies_for_event(self._db, ev, company_cache)
+            persist_company_links(self._db, ev, matches)
 
         return ev

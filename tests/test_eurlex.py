@@ -29,6 +29,7 @@ from app.models.regulatory import (
     RegulationMaterialScope,
     RegulationSourceAlias,
     RiskEvent,
+    RiskEventGeography,
     RiskEventMaterial,
     RiskEventRegulation,
 )
@@ -88,6 +89,7 @@ _EURLEX_TABLES = (
     RiskEvent.__table__,
     RiskEventRegulation.__table__,
     RiskEventMaterial.__table__,
+    RiskEventGeography.__table__,
 )
 
 
@@ -207,8 +209,12 @@ class TestFetchEurlexSummary:
         called_url = m.call_args.args[0]
         assert "CELEX:32023R1542" in called_url
 
-    def test_truncates_to_800_chars(self):
-        long_paragraph = "a" * 5000
+    def test_truncates_to_summary_max_chars(self):
+        # 2026-05-17: cap bumped 800 → 2500.  Test imports the constant
+        # instead of hardcoding the value so future bumps don't break it.
+        from app.services.ingestion.eurlex import _SUMMARY_MAX_CHARS
+
+        long_paragraph = "a" * (_SUMMARY_MAX_CHARS * 2)
         html_body = f"<p>{long_paragraph}</p>"
         mock_response = MagicMock(spec=httpx.Response)
         mock_response.text = html_body
@@ -218,7 +224,7 @@ class TestFetchEurlexSummary:
             summary = fetch_eurlex_summary("32023R1542")
 
         assert summary is not None
-        assert len(summary) == 800
+        assert len(summary) == _SUMMARY_MAX_CHARS
 
     def test_returns_none_on_request_error(self):
         with patch(
@@ -437,13 +443,22 @@ class TestIngestEurlexRiskEvents:
 
         events = session.scalars(select(RiskEvent)).all()
         for ev in events:
-            assert ev.event_type == "REGULATORY_IMPLEMENTATION"
+            # 2026-05-17: event_type renamed REGULATORY_IMPLEMENTATION
+            # → eurlex_regulation for consistency with other parsers'
+            # lowercase mechanism-based naming.
+            assert ev.event_type == "eurlex_regulation"
             assert ev.event_date is None
-            assert ev.confidence_score == 1.0
+            # 2026-05-17: confidence recalibrated 1.0 → 0.9 to reflect
+            # that the soft side of regulation-event confidence is our
+            # interpretation of scope (materials, geography), not the
+            # existence of the regulation itself.
+            assert ev.confidence_score == 0.9
             assert ev.verified is True
             assert ev.risk_categories_json == ["regulatory_compliance"]
             assert ev.severity_score is not None
-            assert 0.0 < ev.severity_score <= 1.0
+            # 0.0 allowed because superseded status maps to severity 0.0
+            # (the fixture doesn't use superseded but we accept it).
+            assert 0.0 <= ev.severity_score <= 1.0
             assert ev.content_hash is not None and len(ev.content_hash) == 64
             assert ev.metadata_json is not None
             assert "regulation_key" in ev.metadata_json
@@ -468,9 +483,13 @@ class TestIngestEurlexRiskEvents:
 
         for junction in junctions:
             assert junction.relevance_score == pytest.approx(1.0)
-            assert junction.match_reason == "regulation_enacted"
             reg = session.get(Regulation, junction.regulation_id)
             assert reg is not None
+            # 2026-05-17: match_reason now varies by status —
+            # "regulation_effective" / "regulation_enacted" /
+            # "regulation_proposed" / "regulation_superseded".  Verify
+            # the value matches the regulation's own status.
+            assert junction.match_reason == f"regulation_{reg.status}"
             ev = session.get(RiskEvent, junction.risk_event_id)
             assert ev is not None
 

@@ -668,6 +668,112 @@ _MRDS: list[_AliasRow] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Source: Federal Register controlled-vocabulary topics (federal_register_topic)
+#
+# Federal Register documents carry a curated ``topics`` array (controlled
+# vocabulary maintained by the Office of the Federal Register).  This
+# table replaces the prior hardcoded ``_TOPIC_MATERIAL_MAP`` dict that
+# lived in ``ingest_federal_register.py``.
+#
+# Storage convention: source_name stored verbatim in FR's lower-case form
+# (the resolver normalises via ``lower(btrim(source_name))`` so casing
+# variations in the source data still resolve correctly).
+#
+# Editorial skip-list:
+#   FR exposes broad topical tags ("critical materials", "imports",
+#   "exports", "tariff") that DO appear on battery-relevant documents but
+#   are too generic to attribute to a specific material.  We list them as
+#   explicit skips so:
+#     (a) the resolver returns status="skipped" rather than "unknown" —
+#         no CLI warning noise; AND
+#     (b) the audit trail of "we considered this and chose not to
+#         attribute" is preserved here in one place rather than in a code
+#         comment.
+#
+# Migrated 2026-05-14 from ingest_federal_register._TOPIC_MATERIAL_MAP.
+# ---------------------------------------------------------------------------
+
+_FEDERAL_REGISTER_TOPICS: list[_AliasRow] = [
+    # ── Direct material topics ───────────────────────────────────────────
+    ("federal_register_topic", "lithium",     "Lithium"),
+    ("federal_register_topic", "cobalt",      "Cobalt"),
+    ("federal_register_topic", "nickel",      "Nickel"),
+    ("federal_register_topic", "manganese",   "Manganese"),
+    ("federal_register_topic", "graphite",    "Natural Graphite"),
+    ("federal_register_topic", "copper",      "Copper"),
+    ("federal_register_topic", "tungsten",    "Tungsten"),
+
+    # Spelling variants — both forms appear in FR's vocabulary.
+    ("federal_register_topic", "aluminum",    "Aluminum"),
+    ("federal_register_topic", "aluminium",   "Aluminum"),
+
+    # Generic→specific: FR uses the generic mineral name; we resolve to
+    # our battery-grade canonical (the only one in the materials roster).
+    ("federal_register_topic", "iron",        "Iron Ore (LFP Grade)"),
+    ("federal_register_topic", "iron ore",    "Iron Ore (LFP Grade)"),
+    ("federal_register_topic", "phosphate",   "Phosphate (Battery Grade)"),
+
+    # REE spelling variants — FR uses all three forms across documents.
+    ("federal_register_topic", "rare earth",   "Rare Earth Elements"),
+    ("federal_register_topic", "rare earths",  "Rare Earth Elements"),
+    ("federal_register_topic", "rare-earth",   "Rare Earth Elements"),
+
+    # ── Editorial skip-list ──────────────────────────────────────────────
+    # Topics that DO appear on battery-relevant FR documents but are too
+    # broad / event-typed to attribute to a specific material.  Listed
+    # explicitly so the resolver returns "skipped" (silent) rather than
+    # "unknown" (CLI warns).  See module-level comment for rationale.
+    ("federal_register_topic", "critical materials", None,
+     "Topic too broad to attribute reliably — name-specific topics + the title-keyword scan handle the actual material when the doc names one."),
+    ("federal_register_topic", "critical minerals", None,
+     "Topic too broad to attribute reliably — name-specific topics + the title-keyword scan handle the actual material when the doc names one."),
+    ("federal_register_topic", "strategic minerals", None,
+     "Topic too broad to attribute reliably — name-specific topics + the title-keyword scan handle the actual material when the doc names one."),
+    ("federal_register_topic", "minerals", None,
+     "Topic too broad to attribute reliably (covers everything from coal to gemstones)."),
+    ("federal_register_topic", "mining", None,
+     "Event-type topic, not material-attributable."),
+    # Trade-event topics — these flag a trade action, not a material.
+    # The query.event_subtype already captures the regulatory category.
+    ("federal_register_topic", "imports", None,
+     "Event-type topic, not material-attributable — event_subtype carries the trade-action category."),
+    ("federal_register_topic", "exports", None,
+     "Event-type topic, not material-attributable — event_subtype carries the trade-action category."),
+    ("federal_register_topic", "tariff", None,
+     "Event-type topic, not material-attributable — event_subtype carries the trade-action category."),
+    ("federal_register_topic", "tariffs", None,
+     "Event-type topic, not material-attributable — event_subtype carries the trade-action category."),
+    ("federal_register_topic", "trade agreements", None,
+     "Event-type topic, not material-attributable."),
+    ("federal_register_topic", "trade adjustment assistance", None,
+     "Event-type topic, not material-attributable."),
+    ("federal_register_topic", "trade restraints", None,
+     "Event-type topic, not material-attributable."),
+    ("federal_register_topic", "trade practices", None,
+     "Event-type topic, not material-attributable."),
+    ("federal_register_topic", "customs duties and inspection", None,
+     "Event-type topic, not material-attributable."),
+    ("federal_register_topic", "antidumping", None,
+     "Event-type topic, not material-attributable — title regex handles the commodity wording."),
+    ("federal_register_topic", "countervailing duties", None,
+     "Event-type topic, not material-attributable — title regex handles the commodity wording."),
+    # Geographic-only topics — country attribution is handled by
+    # GeographyCache.detect; these don't carry material information.
+    ("federal_register_topic", "china", None,
+     "Geographic topic — handled by GeographyCache, not material-attributable."),
+    ("federal_register_topic", "russia", None,
+     "Geographic topic — handled by GeographyCache, not material-attributable."),
+    # Other broad topics that show up on FR's mineral-adjacent docs.
+    ("federal_register_topic", "natural resources", None,
+     "Topic too broad to attribute reliably."),
+    ("federal_register_topic", "public lands-mineral resources", None,
+     "Permitting/land topic — not material-attributable on its own."),
+    ("federal_register_topic", "mineral royalties", None,
+     "Royalty/permitting topic — not material-attributable on its own."),
+]
+
+
 # Aggregate of all alias rows.  Order of definition above doesn't matter
 # at write time but matters for readability when editing this file.
 _ALIASES: list[_AliasRow] = [
@@ -677,6 +783,7 @@ _ALIASES: list[_AliasRow] = [
     *_FIG10_PRICES,
     *_WORLDBANK_PINKSHEET,
     *_MRDS,
+    *_FEDERAL_REGISTER_TOPICS,
 ]
 
 

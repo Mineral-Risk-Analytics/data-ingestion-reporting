@@ -7,6 +7,71 @@ All inputs must already be validated to their stated ranges before calling.
 
 from __future__ import annotations
 
+from typing import Optional
+
+
+# Per-material severity multiplier driven by the regulation's
+# ``RegulationMaterialScope.scope_type`` value that was propagated onto the
+# ``RiskEventMaterial`` junction at ingest time.
+#
+# Rationale — widen per-material differentiation inside a single regulation
+# from the current ~16% spread (driven only by relevance_score variance) to
+# ~3× by amplifying severity for stronger designations and attenuating it
+# for weaker ones.  A ``banned`` listing represents an outright prohibition
+# and deserves a higher post-multiplier severity; a ``disclosure_required``
+# listing is the lowest-bite designation a material can carry and is
+# correspondingly attenuated.
+#
+#   banned                  1.50  Outright prohibition (e.g. import or use ban).
+#                                 Highest-bite designation.
+#   restricted              1.10  Active restrictions short of outright ban
+#                                 (e.g. REACH SVHC authorisation).
+#   strategic_raw_material  1.00  Pass-through neutral — CRMA Annex II
+#                                 binding 2030 benchmarks are already
+#                                 captured by the underlying event severity.
+#   covered                 0.80  Indirect coverage (e.g. CBAM carbon
+#                                 certificate) — less direct enforcement
+#                                 exposure than a restriction.
+#   disclosure_required     0.50  Standard disclosure / due-diligence mandate
+#                                 — the lowest-bite designation, attenuated.
+#
+# Severities are clamped to ``[0.0, 1.0]`` after multiplication so the
+# downstream ``compute_event_impact`` validator does not raise.  An unknown
+# or ``None`` scope_type is a passthrough (severity unchanged) so
+# pre-migration rows and non-regulation events behave exactly as they did
+# before this multiplier landed.
+SCOPE_SEVERITY_MULTIPLIER: dict[str, float] = {
+    "banned":                  1.50,
+    "restricted":              1.10,
+    "strategic_raw_material":  1.00,
+    "covered":                 0.80,
+    "disclosure_required":     0.50,
+}
+
+
+def apply_scope_severity_multiplier(
+    severity: float, scope_type: Optional[str]
+) -> float:
+    """Multiply ``severity`` by the scope-derived factor and clamp to 1.0.
+
+    ``scope_type`` is the value propagated from
+    ``RegulationMaterialScope.scope_type`` onto the ``RiskEventMaterial``
+    junction row.  When it is ``None`` (non-regulation event, pre-migration
+    row, or content-derived attribution) or not in
+    :data:`SCOPE_SEVERITY_MULTIPLIER` (typo / unrecognised value),
+    ``severity`` is returned unchanged so backwards compatibility holds.
+
+    The clamp at 1.0 means a ``banned`` event with severity 0.70 lands at
+    1.0 rather than 1.05 — keeping the input within the range
+    :func:`compute_event_impact` validates against.
+    """
+    if scope_type is None:
+        return severity
+    multiplier = SCOPE_SEVERITY_MULTIPLIER.get(scope_type)
+    if multiplier is None:
+        return severity
+    return min(1.0, severity * multiplier)
+
 
 def compute_effective_confidence(severity: float, confidence: float) -> float:
     """

@@ -116,10 +116,21 @@ class EventWithRelevance:
     Pairs a RiskEvent with its per-company (or per-material) relevance score
     from the relevant junction table.
     relevance_score maps to the relevance_multiplier input of compute_event_impact().
+
+    ``scope_type`` carries the regulation designation
+    (``banned`` / ``restricted`` / ``strategic_raw_material`` /
+    ``covered`` / ``disclosure_required``) when the row originated from a
+    ``RiskEventMaterial`` populated by the EUR-Lex ingester.  Consumed by
+    :func:`app.services.scoring.evidence_aggregator._impact` to widen
+    per-material severity spread inside a single regulation.  ``None`` for
+    company-anchored / geography-anchored events and for pre-migration
+    junction rows — the multiplier is a passthrough in that case so
+    backwards compatibility holds.
     """
 
     event: RiskEvent
     relevance_score: float  # 0.70–1.00
+    scope_type: Optional[str] = None
 
 
 @dataclass
@@ -158,6 +169,27 @@ def _dedup_event_rows(rows) -> list[EventWithRelevance]:
         existing = by_id.get(ev.id)
         if existing is None or float(rel) > existing.relevance_score:
             by_id[ev.id] = EventWithRelevance(event=ev, relevance_score=float(rel))
+    return list(by_id.values())
+
+
+def _dedup_material_event_rows(rows) -> list[EventWithRelevance]:
+    """3-tuple variant of :func:`_dedup_event_rows` for material queries.
+
+    Rows are ``(event, relevance_score, scope_type)``.  When the same event
+    is tagged to multiple materials in the query set, the row with the
+    highest ``relevance_score`` wins; its ``scope_type`` is the one carried
+    onto the resulting :class:`EventWithRelevance`.  This is the correct
+    semantics because the scope-severity multiplier is then derived from
+    the dominant material's designation.
+    """
+    by_id: dict[int, EventWithRelevance] = {}
+    for ev, rel, scope_type in rows:
+        rel_f = float(rel)
+        existing = by_id.get(ev.id)
+        if existing is None or rel_f > existing.relevance_score:
+            by_id[ev.id] = EventWithRelevance(
+                event=ev, relevance_score=rel_f, scope_type=scope_type
+            )
     return list(by_id.values())
 
 
@@ -261,26 +293,52 @@ def get_active_compliance_obligations(
     """
     Return active compliance obligations as (regulation_key, weight_multiplier) tuples.
 
-    The weight_multiplier reflects compliance severity:
-      non_compliant → 1.00  (confirmed violation; full uplift)
-      unknown       → 0.50  (unassessed; conservative mid-weight)
-      partial       → 0.40  (in transition; partial uplift)
+    The weight_multiplier reflects compliance severity.  Two tiers of
+    status weights, selected per regulation based on whether the
+    regulation has a rebuttable-presumption structure:
+
+      Standard (most regulations):
+        non_compliant → 1.00  (confirmed violation; full uplift)
+        unknown       → 0.50  (unassessed; conservative mid-weight)
+        partial       → 0.40  (in transition; partial uplift)
+
+      Rebuttable-presumption regulations (e.g., UFLPA — Idea A,
+      2026-05-17, gated by regulation.metadata_json["rebuttable_presumption"]
+      = True):
+        non_compliant → 1.00  (unchanged — confirmed violation)
+        unknown       → 0.85  (the regulation puts burden of proof
+                                on importer; absence of evidence is
+                                much closer to presumption of violation)
+        partial       → 0.70  (good-faith due-diligence partial
+                                effort still doesn't satisfy the
+                                rebuttable presumption)
 
     Primary source: company_regulation_exposure joined to regulations.
     Fallback: text-scan of recent regulatory events (worst-case weight assumed).
 
-    Returns e.g. [("IRA_DOMESTIC", 1.0), ("UFLPA", 0.40)]
+    Returns e.g. [("IRA_DOMESTIC", 1.0), ("UFLPA", 0.85)]
     """
     _STATUS_WEIGHT: dict[str, float] = {
         "non_compliant": 1.00,
         "unknown":       0.50,
         "partial":       0.40,
     }
+    _STATUS_WEIGHT_REBUTTABLE: dict[str, float] = {
+        "non_compliant": 1.00,
+        "unknown":       0.85,
+        "partial":       0.70,
+    }
 
     # ``verified=True`` filter: only seeded regulations contribute uplift.
     # See ``get_events_for_regulations`` below for the same rule.
+    # Also pulls metadata_json so we can detect rebuttable_presumption
+    # without a second query.
     stmt = (
-        select(Regulation.regulation_key, CompanyRegulationExposure.compliance_status)
+        select(
+            Regulation.regulation_key,
+            CompanyRegulationExposure.compliance_status,
+            Regulation.metadata_json,
+        )
         .join(
             CompanyRegulationExposure,
             CompanyRegulationExposure.regulation_id == Regulation.id,
@@ -298,13 +356,21 @@ def get_active_compliance_obligations(
 
     rows = db.execute(stmt).all()
     if rows:
-        return sorted(
-            [
-                (key, _STATUS_WEIGHT.get(status, 0.40))
-                for key, status in rows
-            ],
-            key=lambda t: t[0],
-        )
+        result: list[tuple[str, float]] = []
+        for key, status, metadata in rows:
+            # Per-regulation rebuttable_presumption override (Idea A).
+            # When the regulation's metadata_json carries
+            # rebuttable_presumption=True, unknown/partial status
+            # weights are elevated to reflect the burden-of-proof
+            # structure.  See _STATUS_WEIGHT_REBUTTABLE above for the
+            # rationale.
+            rebuttable = (
+                isinstance(metadata, dict)
+                and bool(metadata.get("rebuttable_presumption", False))
+            )
+            weight_table = _STATUS_WEIGHT_REBUTTABLE if rebuttable else _STATUS_WEIGHT
+            result.append((key, weight_table.get(status, 0.40)))
+        return sorted(result, key=lambda t: t[0])
 
     # Hardcoded fallback for companies with zero company_regulation_exposure
     # rows — text-scans event titles for known regulation keywords.  Mapped
@@ -440,6 +506,7 @@ def _apply_hs_confidence_multiplier(
             EventWithRelevance(
                 event=r.event,
                 relevance_score=round(r.relevance_score * multiplier, 4),
+                scope_type=r.scope_type,
             )
         )
     return adjusted
@@ -468,7 +535,11 @@ def get_events_for_material(
     cutoff = _category_window_cutoff(category, as_of_date)
 
     stmt = (
-        select(RiskEvent, RiskEventMaterial.relevance_score)
+        select(
+            RiskEvent,
+            RiskEventMaterial.relevance_score,
+            RiskEventMaterial.scope_type,
+        )
         .join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
         .where(
             RiskEventMaterial.material_id == material_id,
@@ -487,7 +558,7 @@ def get_events_for_material(
         ).where(RiskEventGeography.country_code.in_(scope.country_codes))
 
     rows = db.execute(stmt).all()
-    results = _dedup_event_rows(rows)
+    results = _dedup_material_event_rows(rows)
     results = _apply_hs_confidence_multiplier(db, material_id, results)
 
     log.debug(
@@ -620,6 +691,7 @@ def _apply_hs_confidence_multiplier_batch(
             EventWithRelevance(
                 event=r.event,
                 relevance_score=round(r.relevance_score * multiplier, 4),
+                scope_type=r.scope_type,
             )
         )
     return adjusted
@@ -649,7 +721,11 @@ def get_events_for_materials(
 
     cutoff = _category_window_cutoff(category, as_of_date)
     stmt = (
-        select(RiskEvent, RiskEventMaterial.relevance_score)
+        select(
+            RiskEvent,
+            RiskEventMaterial.relevance_score,
+            RiskEventMaterial.scope_type,
+        )
         .join(
             RiskEventMaterial,
             RiskEventMaterial.risk_event_id == RiskEvent.id,
@@ -665,7 +741,7 @@ def get_events_for_materials(
             (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
         )
     rows = db.execute(stmt).all()
-    results = _dedup_event_rows(rows)
+    results = _dedup_material_event_rows(rows)
     results = _apply_hs_confidence_multiplier_batch(db, material_ids, results)
 
     log.debug(
@@ -879,6 +955,49 @@ def get_events_for_regulations(
         )
     rows = db.execute(stmt).all()
     return _dedup_event_rows(rows)
+
+
+def get_targeted_countries_for_events(
+    db: Session,
+    event_ids: set[int],
+) -> dict[int, set[str]]:
+    """Map ``event_id -> set of ISO2 country codes`` for regulation
+    ``targeted_country`` scopes reachable via the event's regulation links.
+
+    Used by :func:`derive_regulatory_inputs` to apply the conditional scope
+    intersection downweight (Option C from EUR-Lex Section 5). An event whose
+    linked regulation declares one or more ``targeted_country`` geography
+    scopes (e.g. UFLPA → CN for Xinjiang, OFAC → CN/RU/KP/IR) returns a
+    non-empty set; all other events are absent from the result (treated as
+    "no targeted scope — no downweight").
+
+    Two SQL statements at most: one join over the junction tables for the
+    given event ids; one collection-build step in Python. No N+1.
+    """
+    if not event_ids:
+        return {}
+
+    stmt = (
+        select(
+            RiskEventRegulation.risk_event_id,
+            RegulationGeographyScope.country_code,
+        )
+        .join(
+            RegulationGeographyScope,
+            RegulationGeographyScope.regulation_id
+            == RiskEventRegulation.regulation_id,
+        )
+        .where(
+            RiskEventRegulation.risk_event_id.in_(event_ids),
+            RegulationGeographyScope.scope_type == "targeted_country",
+        )
+    )
+    out: dict[int, set[str]] = {}
+    for event_id, country_code in db.execute(stmt).all():
+        if not country_code:
+            continue
+        out.setdefault(event_id, set()).add(country_code.upper())
+    return out
 
 
 # ---------------------------------------------------------------------------

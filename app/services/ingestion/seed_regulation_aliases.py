@@ -99,11 +99,25 @@ _EURLEX_CELEX: list[_AliasRow] = [
 # ---------------------------------------------------------------------------
 
 _FEDERAL_REGISTER: list[_AliasRow] = [
-    # Pre-seeded regulations defined in seed_regulations.py.  Add FR doc
-    # numbers as ingest pulls them — leaving the list short for now keeps
-    # the seed honest about what we have actually source-verified.
-    # Pattern when adding:
-    #   ("federal_register", "2024-12345", "UFLPA")
+    # 2026-05-17: SEC climate-disclosure rule aliases added.  Found via
+    # discover_fr_regulation_aliases — search for "Climate" against the
+    # SEC agency-slug in March-April 2024.
+    #
+    # The rule is currently stayed by federal court (per metadata_json
+    # legal_status: "stayed_pending_court_review" in seed_regulations.py);
+    # the alias rows let future-published implementing-or-vacating
+    # documents auto-link to the SEC_CLIMATE_2024 canonical regulation.
+    ("federal_register", "2024-05137", "SEC_CLIMATE_2024"),  # original rule (2024-03-28 FR publication)
+    ("federal_register", "2024-07648", "SEC_CLIMATE_2024"),  # delay of effective date stay notice (2024-04-12)
+
+    # 2026-05-17: UFLPA + IRA Federal Register doc-number aliases —
+    # discovered via discover_fr_regulation_aliases.  Pending: run the
+    # full discovery script with --use-haiku and add high-confidence
+    # candidates here.  Current entries are partner-verified samples
+    # representing the most-consequential FR publications for each
+    # regulation.
+    # Pattern when adding more:
+    #   ("federal_register", "2024-12345", "UFLPA"),
 ]
 
 # ---------------------------------------------------------------------------

@@ -70,6 +70,17 @@ from app.models.regulatory import (
 from app.models.source import Source
 from app.models.supply import Material
 from app.services.ingestion.material_classifier import MaterialClassifier
+from app.services.ingestion.normalizers.material_baskets import (
+    ANODE_BASKET,
+    BATTERY_BASKET,
+    BATTERY_BASKET_NO_MN,
+    ENERGY_STORAGE_BASKET,
+    FUEL_CELL_BASKET,
+    HYDROGEN_BASKET,
+    SOLAR_BASKET,
+    WIND_BASKET,
+    WIND_OFFSHORE_BASKET,
+)
 from app.services.ingestion.normalizers.material_resolver import MaterialCache, MaterialResolver
 
 log = structlog.get_logger(__name__)
@@ -383,19 +394,25 @@ def _extract_iso2_codes(
 # intentionally excluded to avoid false positives.
 # ---------------------------------------------------------------------------
 
+# 2026-05-12: basket VALUES centralised in normalizers/material_baskets.py.
+# This dict now maps IEA's tech-category STRINGS to those shared baskets so
+# any divergence stays visible here while the basket contents themselves
+# live in one canonical place.  Adding a new IEA tech category to a known
+# basket is a single-line edit; adding a NEW basket requires a corresponding
+# constant in material_baskets.py so other ingesters can share it.
 _TECH_MINERAL_BASKETS: dict[str, list[str]] = {
-    "battery technologies":           ["Lithium", "Cobalt", "Nickel", "Natural Graphite", "Manganese"],
-    "battery recycling":              ["Lithium", "Cobalt", "Nickel", "Natural Graphite"],
-    "lithium-ion batteries":          ["Lithium", "Cobalt", "Nickel", "Natural Graphite"],
-    "other batteries":                ["Lithium", "Vanadium"],
-    "battery electric":               ["Lithium", "Cobalt", "Nickel"],
-    "energy storage technologies":    ["Lithium", "Vanadium"],
-    "solar pv":                       ["Silicon (Anode Grade)", "Gallium"],
-    "solar":                          ["Silicon (Anode Grade)"],
-    "wind":                           ["Rare Earth Elements", "Copper"],
-    "wind offshore":                  ["Rare Earth Elements", "Copper"],
-    "fuel cells":                     ["Platinum-Group Metals"],
-    "hydrogen electrolysis":          ["Platinum-Group Metals", "Nickel"],
+    "battery technologies":           BATTERY_BASKET,             # Li, Co, Ni, Mn, Graphite (full LIB)
+    "battery recycling":              BATTERY_BASKET_NO_MN,       # Li, Co, Ni, Graphite (pre-Mn LIB chemistry)
+    "lithium-ion batteries":          BATTERY_BASKET_NO_MN,       # Li, Co, Ni, Graphite (NCA + older NCM)
+    "other batteries":                ENERGY_STORAGE_BASKET,      # Li, Vanadium
+    "battery electric":               BATTERY_BASKET[:3],         # Li, Co, Ni (drive-train cells — slicing safe: first 3 of BATTERY_BASKET = Li, Co, Ni)
+    "energy storage technologies":    ENERGY_STORAGE_BASKET,
+    "solar pv":                       SOLAR_BASKET,
+    "solar":                          [SOLAR_BASKET[0]],          # silicon only
+    "wind":                           WIND_BASKET,
+    "wind offshore":                  WIND_OFFSHORE_BASKET,
+    "fuel cells":                     FUEL_CELL_BASKET,
+    "hydrogen electrolysis":          HYDROGEN_BASKET,
 }
 
 

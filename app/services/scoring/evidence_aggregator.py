@@ -5,9 +5,13 @@ inputs each component scoring function expects.
 All outputs are on the 0-1.0 scale unless the function explicitly uses a
 different range (financial_pressure sub-components use 0-40/0-30/0-30).
 
-No DB reads live here — all inputs arrive as pre-fetched ORM objects from
-evidence_query.py.  No scoring results are persisted here — that is the
-orchestrator's job.
+DB reads are confined to a single carve-out: ``derive_regulatory_inputs``
+optionally accepts a SQLAlchemy session so it can query verified regulations
+with a ``single_country_cap_pct`` metadata flag and emit synthetic
+threshold-violation impacts when the company's geo concentration breaches
+the cap.  All other aggregator inputs continue to arrive as pre-fetched
+ORM objects from ``evidence_query.py``.  No scoring results are persisted
+here — that is the orchestrator's job.
 
 Scoring v3.0 additions:
 
@@ -45,6 +49,7 @@ import structlog
 from app.models.company import CompanyMaterialExposure, CompanyScore
 from app.services.scoring.decay import RiskCategory, compute_recency_multiplier
 from app.services.scoring.event_impact import (
+    apply_scope_severity_multiplier,
     compute_event_impact,
     relevance_score_to_multiplier,
 )
@@ -60,6 +65,67 @@ _MAX_EVENT_IMPACT = 1.56
 # active chemistry uses get this fractional weight rather than zero. Keeps
 # legacy / non-battery exposures visible without dominating the pillar.
 _CHEMISTRY_BASELINE_UNMATCHED = 0.10
+
+# Downweight applied to a regulation event's impact when the regulation
+# declares one or more ``targeted_country`` geography scopes (e.g. UFLPA → CN
+# for Xinjiang, EU Conflict Minerals → CD for DRC, OFAC → CN/RU/KP/IR) and
+# the company's source-geography set (material source countries ∪ facility
+# countries) has NO overlap with those targeted countries.
+#
+# Rationale: a country-targeted regulation primarily bites companies that
+# actually source from (or operate in) the targeted jurisdiction. A company
+# with no exposure there still has residual tier-2 / due-diligence
+# compliance burden, so the event is NOT zeroed out — it is attenuated to
+# 30% of its nominal impact. Regulations with no ``targeted_country`` scope
+# (the common case — most non-sanctions instruments) are unaffected.
+#
+# Referenced by the methodology doc as the "conditional scope intersection"
+# factor (EUR-Lex Section 5 Option C).
+_CONDITIONAL_SCOPE_DOWNWEIGHT = 0.30
+
+
+# ---------------------------------------------------------------------------
+# Single-country-cap synthetic event trigger (Idea B, 2026-05-19)
+# ---------------------------------------------------------------------------
+#
+# Regulations that declare a quantitative single-country concentration cap
+# (e.g., CRMA_2024's 65% no-single-third-country rule for strategic raw
+# materials) opt in to the synthetic-event path by setting
+# ``metadata_json["single_country_cap_pct"]`` on the Regulation row. When
+# a company's source-geography mix violates that cap for a material in the
+# regulation's scope, the regulatory pillar receives an additional synthetic
+# event_impact alongside its real event_impacts. This makes a passive
+# obligation (CRMA contributes obligation_uplift) actively reactive to the
+# company's actual concentration profile.
+#
+# Synthetic-impact composition (matches ``compute_event_impact`` semantics):
+#   severity * confidence * recency_multiplier * relevance_multiplier
+#     - severity:    regulation_severity_weight(reg) if importable,
+#                    else _DEFAULT_REG_SEVERITY_FOR_SYNTHETIC
+#     - confidence:  0.9  (partner-curated cap value, near-certain)
+#     - recency:     1.0  (synthetic events are present-tense — the
+#                    violation IS the present state, no decay applies)
+#     - relevance:   1.30 (max — partner-curated scope, highest
+#                    attribution mechanism in the calibration band)
+# Upper bound: 0.70 * 0.9 * 1.0 * 1.30 = 0.819 per violation.
+_THRESHOLD_VIOLATION_CONFIDENCE = 0.9
+_THRESHOLD_VIOLATION_RECENCY = 1.0
+_THRESHOLD_VIOLATION_RELEVANCE = 1.30
+_DEFAULT_REG_SEVERITY_FOR_SYNTHETIC = 0.70  # matches SEVERITY_BY_STATUS["effective"]
+
+# EU member states (+ "EU" itself as a bloc identifier) — used to identify
+# "EU-side" sourcing that should be EXCLUDED from CRMA-style single-third-
+# country cap checks. A company sourcing 80% of its lithium from within the
+# EU is NOT violating CRMA's single-non-EU-country cap; the regulation
+# targets dependency on a single THIRD country. The seed uses "EU" as a
+# single ISO code for the regulation's jurisdiction scope, but
+# RegulationGeographyScope.country_code is permitted to carry individual
+# ISO2 codes too, so we treat both forms as EU-side.
+_EU_MEMBER_STATES = frozenset({
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR",
+    "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL",
+    "PL", "PT", "RO", "SK", "SI", "ES", "SE", "EU",
+})
 
 
 def _event_date_as_date(ew: EventWithRelevance, fallback: date) -> date:
@@ -98,8 +164,19 @@ def _impact(
     recency = compute_recency_multiplier(
         category, ev_date, as_of_date, effective_date=effective_date
     )
+    # Apply the scope-type severity multiplier BEFORE calling
+    # ``compute_event_impact``.  When ``ew.scope_type`` is one of the
+    # designations in ``SCOPE_SEVERITY_MULTIPLIER`` (set by the EUR-Lex
+    # ingester from ``RegulationMaterialScope.scope_type``), severity is
+    # scaled — ``banned`` 1.50× through ``disclosure_required`` 0.50×,
+    # clamped to 1.0.  When it is ``None`` (non-regulation events, geography
+    # and company anchored queries, pre-migration rows), severity is
+    # unchanged so backwards compatibility holds.
+    severity = apply_scope_severity_multiplier(
+        _safe_severity(ew), ew.scope_type
+    )
     return compute_event_impact(
-        severity=_safe_severity(ew),
+        severity=severity,
         confidence=_safe_confidence(ew),
         recency_multiplier=recency,
         # ew.relevance_score is on [0, 1]; map to the [0.70, 1.30]
@@ -312,6 +389,181 @@ def derive_geopolitical_inputs(
     )
 
 
+def _compute_threshold_violation_impacts(
+    db,
+    exposures: list[CompanyMaterialExposure],
+    as_of_date: date,
+) -> list[float]:
+    """Compute synthetic event_impacts for single-country-cap breaches.
+
+    Scans verified regulations with ``metadata_json["single_country_cap_pct"]``
+    set (currently CRMA_2024 at 65). For each such regulation, for each
+    material in the regulation's ``RegulationMaterialScope``, the helper:
+
+      1. Sums the company's exposure across all source-geography values for
+         that material to get a denominator.
+      2. Excludes "EU-side" sourcing (countries in :data:`_EU_MEMBER_STATES`
+         or ``"EU"`` itself) for any regulation whose jurisdiction-scope
+         country_codes intersect the EU block — CRMA's cap targets
+         dependency on a single THIRD country, not on the EU itself.
+         Non-EU-jurisdiction regulations that opt into the cap mechanism
+         use a generic "exclude jurisdiction countries" rule.
+      3. For each remaining country, computes share = country_exposure /
+         total_exposure and emits a synthetic impact when share exceeds
+         ``cap_pct / 100``.
+
+    Severity uses ``regulation_severity_weight(reg)`` when importable so
+    partner-curated per-regulation severity overrides flow through; falls
+    back to :data:`_DEFAULT_REG_SEVERITY_FOR_SYNTHETIC` (0.70 = effective
+    default) otherwise.
+
+    Edge cases:
+      * empty ``exposures``                         → []
+      * no regulations with single_country_cap_pct  → []
+      * company sourcing only from EU-side          → no violations possible
+      * cap_pct value not coercible to float        → regulation skipped
+      * material with zero total exposure           → skipped (no denominator)
+    """
+    if not exposures:
+        return []
+
+    # Local imports keep evidence_aggregator import-time light and avoid
+    # cycles (eurlex.py pulls in heavy ingestion dependencies).
+    from sqlalchemy.orm import selectinload
+
+    from app.models.regulatory import (
+        Regulation,
+        RegulationGeographyScope,
+        RegulationMaterialScope,
+    )
+
+    try:
+        from app.services.ingestion.eurlex import regulation_severity_weight
+    except Exception:  # pragma: no cover - defensive
+        regulation_severity_weight = None  # type: ignore[assignment]
+
+    from sqlalchemy import select
+
+    stmt = (
+        select(Regulation)
+        .where(Regulation.verified.is_(True))
+        .options(
+            selectinload(Regulation.material_scopes),
+            selectinload(Regulation.geography_scopes),
+        )
+    )
+    regs = list(db.execute(stmt).scalars().all())
+
+    # Filter to regulations carrying a single_country_cap_pct flag.
+    capped: list[tuple[Regulation, float, set[int], set[str]]] = []
+    for reg in regs:
+        meta = reg.metadata_json or {}
+        if not isinstance(meta, dict):
+            continue
+        raw_cap = meta.get("single_country_cap_pct")
+        if raw_cap is None:
+            continue
+        try:
+            cap_pct = float(raw_cap)
+        except (TypeError, ValueError):
+            log.warning(
+                "evidence_aggregator.invalid_single_country_cap",
+                regulation_key=reg.regulation_key,
+                raw_value=raw_cap,
+            )
+            continue
+
+        scoped_material_ids: set[int] = {
+            ms.material_id for ms in reg.material_scopes
+        }
+        # Excluded countries = ISO2 codes from this regulation's
+        # ``jurisdiction``-typed geography scopes. For CRMA the seed sets
+        # one row with country_code="EU", which we expand to the full EU
+        # member set via _EU_MEMBER_STATES below.
+        jurisdiction_codes: set[str] = {
+            (gs.country_code or "").upper()
+            for gs in reg.geography_scopes
+            if gs.scope_type == "jurisdiction" and gs.country_code
+        }
+        excluded: set[str] = set(jurisdiction_codes)
+        # If the jurisdiction is "EU" (or any EU member), expand to the
+        # full EU bloc so individual member-state source rows are also
+        # treated as EU-side.
+        if jurisdiction_codes & _EU_MEMBER_STATES:
+            excluded |= _EU_MEMBER_STATES
+        capped.append((reg, cap_pct, scoped_material_ids, excluded))
+
+    if not capped:
+        return []
+
+    # Index exposures by material_id for O(M+E) scanning.
+    by_material: dict[int, list[CompanyMaterialExposure]] = {}
+    for e in exposures:
+        by_material.setdefault(e.material_id, []).append(e)
+
+    impacts: list[float] = []
+    for reg, cap_pct, scoped_material_ids, excluded in capped:
+        if regulation_severity_weight is not None:
+            try:
+                severity = regulation_severity_weight(reg)
+            except Exception:  # pragma: no cover - defensive
+                severity = _DEFAULT_REG_SEVERITY_FOR_SYNTHETIC
+        else:
+            severity = _DEFAULT_REG_SEVERITY_FOR_SYNTHETIC
+
+        threshold = cap_pct / 100.0
+        for material_id in scoped_material_ids:
+            mat_exposures = by_material.get(material_id)
+            if not mat_exposures:
+                continue
+
+            # Total exposure denominator across ALL source-geographies for
+            # this material (including EU-side rows — CRMA is a concentration
+            # ratio, so the EU-side contribution sits in the denominator
+            # but cannot itself be flagged as the violating share).
+            per_country: dict[str, float] = {}
+            total = 0.0
+            for ex in mat_exposures:
+                geo = (ex.source_geography or "").upper()
+                if not geo:
+                    # Unattributed exposures contribute to the denominator
+                    # but cannot trigger a violation on their own.
+                    total += float(ex.exposure_score)
+                    continue
+                per_country[geo] = per_country.get(geo, 0.0) + float(
+                    ex.exposure_score
+                )
+                total += float(ex.exposure_score)
+
+            if total <= 0:
+                continue
+
+            for country, country_exp in per_country.items():
+                if country in excluded:
+                    continue
+                share = country_exp / total
+                if share > threshold:
+                    impact = (
+                        severity
+                        * _THRESHOLD_VIOLATION_CONFIDENCE
+                        * _THRESHOLD_VIOLATION_RECENCY
+                        * _THRESHOLD_VIOLATION_RELEVANCE
+                    )
+                    impacts.append(impact)
+                    log.debug(
+                        "evidence_aggregator.threshold_violation",
+                        regulation_key=reg.regulation_key,
+                        material_id=material_id,
+                        country_code=country,
+                        observed_share=round(share, 4),
+                        cap_pct=cap_pct,
+                        severity=round(severity, 3),
+                        synthetic_impact=round(impact, 4),
+                    )
+
+    return impacts
+
+
 def derive_regulatory_inputs(
     regulatory_events: list[EventWithRelevance],
     active_obligations: list[tuple[str, float]],
@@ -319,6 +571,10 @@ def derive_regulatory_inputs(
     *,
     scope_obligations: Optional[list[tuple[str, float]]] = None,
     regulation_events: Optional[list[EventWithRelevance]] = None,
+    event_targeted_countries: Optional[dict[int, set[str]]] = None,
+    company_country_set: Optional[set[str]] = None,
+    db=None,
+    exposures: Optional[list[CompanyMaterialExposure]] = None,
 ) -> tuple[list[float], list[tuple[str, float]], float]:
     """
     Returns (top_event_impacts, active_obligations, policy_proximity_adjustment).
@@ -332,9 +588,31 @@ def derive_regulatory_inputs(
         Computed event_impact for each regulatory event (company-tagged ∪
         regulation-tagged). regulatory_risk.py consumes the top-3 internally.
 
+        Conditional scope intersection (Option C from EUR-Lex Section 5):
+        when an event is tagged to a regulation that declares one or more
+        ``targeted_country`` geography scopes (sanctions-style: UFLPA → CN,
+        EU Conflict Minerals → CD, OFAC → CN/RU/KP/IR) and the company's
+        ``country_set`` (material source-geographies ∪ facility countries)
+        has NO overlap with those targeted countries, the event's impact is
+        scaled by :data:`_CONDITIONAL_SCOPE_DOWNWEIGHT` (0.30). Regulations
+        without any ``targeted_country`` scope are unaffected. An empty
+        ``company_country_set`` is treated as "no overlap" — companies with
+        no recorded geographies receive the downweighted impact.
+
     policy_proximity_adjustment:
         1.15 if any event has an effective_date within 90 days of as_of_date.
         1.0 otherwise.
+
+    Single-country-cap synthetic events (Idea B, 2026-05-19):
+        When ``db`` and ``exposures`` are both supplied, the function also
+        queries verified regulations carrying
+        ``metadata_json["single_country_cap_pct"]`` and appends one
+        synthetic event_impact per material × non-jurisdiction country
+        whose share exceeds the cap.  See
+        :func:`_compute_threshold_violation_impacts` for the formula.
+        Synthetic impacts are concatenated to ``top_event_impacts`` and
+        flow through the existing top-3 averaging in
+        :mod:`app.services.scoring.regulatory_risk`.
     """
     # Merge obligations (max weight per key)
     merged: dict[str, float] = {}
@@ -345,6 +623,18 @@ def derive_regulatory_inputs(
     final_obligations = sorted(merged.items())
 
     all_reg = _dedup_events(regulatory_events, regulation_events or [])
+
+    # Normalise the company country set to uppercase ISO2 for comparison
+    # parity with RegulationGeographyScope.country_code (which the seed and
+    # EUR-Lex ingest both store uppercase).
+    if company_country_set:
+        company_countries_norm: set[str] = {
+            c.upper() for c in company_country_set if c
+        }
+    else:
+        company_countries_norm = set()
+
+    event_targeted_countries = event_targeted_countries or {}
 
     top_event_impacts: list[float] = []
     policy_proximity_adjustment = 1.0
@@ -368,7 +658,40 @@ def derive_regulatory_inputs(
         impact = _impact(
             ew, RiskCategory.REGULATORY_COMPLIANCE, as_of_date, effective_date
         )
+
+        # Conditional scope intersection: downweight when the regulation
+        # targets specific producer countries the company has no exposure to.
+        targeted = event_targeted_countries.get(ew.event.id)
+        if targeted:
+            # Comparison is uppercase on both sides; the helper that builds
+            # event_targeted_countries normalises country_code as well.
+            if not (company_countries_norm & targeted):
+                log.debug(
+                    "evidence_aggregator.regulation_geo_no_overlap",
+                    event_id=ew.event.id,
+                    targeted_countries=sorted(targeted),
+                    company_country_set=sorted(company_countries_norm),
+                )
+                impact *= _CONDITIONAL_SCOPE_DOWNWEIGHT
+
         top_event_impacts.append(impact)
+
+    # Single-country-cap synthetic events (Idea B). Appended AFTER real
+    # event impacts so the existing top-3 averaging in
+    # ``regulatory_risk.score_regulatory_profile`` treats them as
+    # first-class peers — a high-severity violation can displace a weaker
+    # real event from the top-3.
+    if db is not None and exposures:
+        synthetic = _compute_threshold_violation_impacts(
+            db, exposures, as_of_date
+        )
+        if synthetic:
+            log.info(
+                "evidence_aggregator.threshold_violations_detected",
+                count=len(synthetic),
+                max_impact=round(max(synthetic), 4),
+            )
+            top_event_impacts.extend(synthetic)
 
     return top_event_impacts, final_obligations, policy_proximity_adjustment
 

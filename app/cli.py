@@ -1941,6 +1941,204 @@ def ingest_eurlex_cmd(
         s.close()
 
 
+@app.command("list-regulation-status-changes")
+def list_regulation_status_changes_cmd() -> None:
+    """List regulations whose EUR-Lex bibliographic notice suggests the
+    status has changed since seed time.
+
+    \b
+    Reads ``Regulation.metadata_json["status_review_pending"]`` entries,
+    populated by ``ingest-eurlex``.  Surfaces each one for partner
+    confirmation: detected_status, current_status, observed dates +
+    repealed-by reference, and the next-step hint for clearing it.
+
+    \b
+    The ingester never auto-mutates ``Regulation.status`` — partner is
+    the authoritative source of truth and must confirm any detected
+    change by editing ``seed_regulations.py`` and re-running
+    ``seed-regulations``.
+
+    \b
+    Example output:
+      {
+        "regulation_key": "EU_REACH_COBALT",
+        "celex": "32006R1907",
+        "current_status": "effective",
+        "detected_status": "superseded",
+        "detected_at": "2026-05-17T12:34:56+00:00",
+        "observed": {
+          "date_of_end_of_validity": "2025-12-31",
+          "repealed_by_celex": "32025R1234"
+        },
+        "next_step": "Confirm whether status='superseded' is correct..."
+      }
+    """
+    from app.services.ingestion.eurlex import list_pending_status_changes
+
+    s = _session()
+    try:
+        pending = list_pending_status_changes(s)
+        typer.echo(json.dumps({
+            "ok": True,
+            "pending_count": len(pending),
+            "pending": pending,
+        }, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("list-suggested-regulations")
+def list_suggested_regulations_cmd() -> None:
+    """List auto-staged regulations awaiting partner review.
+
+    \b
+    When an ingester encounters a regulation external identifier
+    (CELEX, FR document number, etc.) that isn't in our curated
+    regulation roster, the resolver can auto-create a placeholder
+    Regulation row with verified=False.  These rows are invisible to
+    scoring (verified=True filter) but tracked in this review queue.
+
+    \b
+    Partner workflow:
+      1. Run this command to see the queue.  Most-observed
+         suggestions appear first (they're the most likely to matter).
+      2. For each suggestion, decide approve / reject / merge:
+         - Approve: add a proper Regulation row to seed_regulations.py
+           with the same regulation_key, plus full material/geography
+           scopes.  Re-seed; the seed function will upgrade the
+           existing row to verified=True.
+         - Reject: mark the alias is_skipped=True with a skip_reason
+           in seed_regulation_aliases.py.  Re-seed; the suggested
+           Regulation row remains as audit trail (verified=False so
+           still invisible to scoring).
+         - Merge with existing: rename the regulation_key on the
+           suggested row to match an existing canonical regulation,
+           then re-link the alias.
+
+    \b
+    Output is sorted by observation_count descending (most-observed
+    first).  Each entry includes the external identifier, where it
+    was first observed, how many times we've encountered it, and a
+    short sample-context snippet for triage.
+    """
+    from app.services.ingestion.regulation_resolver import list_suggested_regulations
+
+    s = _session()
+    try:
+        queue = list_suggested_regulations(s)
+        typer.echo(json.dumps({
+            "ok": True,
+            "pending_count": len(queue),
+            "pending": queue,
+        }, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("discover-fr-regulation-aliases")
+def discover_fr_regulation_aliases_cmd(
+    regulations: Optional[str] = typer.Option(
+        None,
+        "--regulations",
+        help=(
+            "Comma-separated regulation_keys to search.  Default: all "
+            "configured (UFLPA, IRA_DOMESTIC, SEC_CLIMATE_2024)."
+        ),
+    ),
+    max_pages: int = typer.Option(
+        5,
+        "--max-pages",
+        help="Max pages to fetch per query (100 docs/page).  Default 5.",
+    ),
+    use_haiku: bool = typer.Option(
+        False,
+        "--use-haiku",
+        help=(
+            "Classify each candidate via Haiku to filter tangential "
+            "mentions.  Costs roughly $1-8 per full run; off by default."
+        ),
+    ),
+    min_confidence: float = typer.Option(
+        0.0,
+        "--min-confidence",
+        help=(
+            "Filter the formatted seed_tuples output by minimum "
+            "confidence (0.0-1.0).  Default 0.0 = include all."
+        ),
+    ),
+    format_seed: bool = typer.Option(
+        False,
+        "--format-seed",
+        help=(
+            "Output as Python tuple literals ready to paste into "
+            "seed_regulation_aliases.py:_FEDERAL_REGISTER.  Default JSON."
+        ),
+    ),
+) -> None:
+    """Discover Federal Register doc numbers for tracked regulations.
+
+    \b
+    Surfaces FR documents that should be added to
+    seed_regulation_aliases.py:_FEDERAL_REGISTER so RiskEvents
+    auto-link to canonical Regulation rows for UFLPA, IRA_DOMESTIC,
+    SEC_CLIMATE_2024.
+
+    \b
+    Each regulation has multiple search configurations (agency + term
+    + doc_type combinations).  Results are deduplicated across
+    queries.  When --use-haiku is set, Haiku classifies each
+    candidate to filter tangential mentions; otherwise all candidates
+    are returned for manual partner review.
+
+    \b
+    Examples:
+      bdi-ingest discover-fr-regulation-aliases
+      bdi-ingest discover-fr-regulation-aliases --regulations SEC_CLIMATE_2024
+      bdi-ingest discover-fr-regulation-aliases --use-haiku --min-confidence 0.85 --format-seed
+    """
+    from app.services.ingestion.discover_fr_regulation_aliases import (
+        discover_fr_regulation_aliases,
+        format_seed_tuples,
+    )
+
+    reg_keys: Optional[list[str]] = None
+    if regulations:
+        reg_keys = [k.strip() for k in regulations.split(",") if k.strip()]
+
+    try:
+        results = discover_fr_regulation_aliases(
+            regulation_keys=reg_keys,
+            max_pages=max_pages,
+            use_haiku=use_haiku,
+        )
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+
+    if format_seed:
+        typer.echo(format_seed_tuples(results, min_confidence=min_confidence))
+        return
+
+    summary = {
+        "ok": True,
+        "total_candidates": sum(len(v) for v in results.values()),
+        "by_regulation": {
+            k: {
+                "count": len(v),
+                "candidates": [s.to_dict() for s in v if s.confidence >= min_confidence],
+            }
+            for k, v in results.items()
+        },
+    }
+    typer.echo(json.dumps(summary, indent=2))
+
+
 @app.command("ingest-gta")
 def ingest_gta_cmd(
     since_year: int = typer.Option(

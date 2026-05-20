@@ -387,6 +387,13 @@ class RiskEventMaterial(Base):
     relevance_score: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     match_reason: Mapped[Optional[str]] = mapped_column(String(64))
     # named_material | hs_code | keyword_match
+    # Copied from RegulationMaterialScope.scope_type when the junction is
+    # written by the EUR-Lex ingester.  Consumed downstream by
+    # evidence_aggregator._impact via apply_scope_severity_multiplier so the
+    # event's severity is amplified (banned 1.50×) or attenuated
+    # (disclosure_required 0.50×) per-material.  Nullable: non-regulation
+    # events and pre-migration rows have no scope_type recorded.
+    scope_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

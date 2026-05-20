@@ -53,6 +53,7 @@ from app.models import (
     SourceDocument,
 )
 from app.models.enums import DocumentType, ImplementationPhase, SourceType
+from app.services.ingestion import feature_flags
 from app.services.ingestion.entity_resolution import (
     build_company_cache,
     persist_company_links,
@@ -287,7 +288,15 @@ def ingest_sec_edgar(
 
     source = _get_or_create_source(session)
     material_cache = MaterialCache.build(session)
-    company_cache = build_company_cache(session)
+    # Gated by feature_flags.LINK_EVENTS_TO_COMPANIES — when False (the
+    # Foundation phase 3 default), persist_company_links no-ops, so there
+    # is no value in paying for the cache build or the per-event resolver
+    # loop.  Setting to None makes the per-event flow short-circuit.
+    company_cache = (
+        build_company_cache(session)
+        if feature_flags.LINK_EVENTS_TO_COMPANIES
+        else None
+    )
 
     # ── Optional Haiku classifier refinement layer (Tier 3 audit, 2026-05-09) ──
     # Auto-enabled when ANTHROPIC_API_KEY is present; falls back gracefully
@@ -405,11 +414,17 @@ def ingest_sec_edgar(
                     hs_links_total += hs_w
 
                 # ── 4. Company linkage via existing entity_resolution ──────
-                matches = resolve_companies_for_event(
-                    session, event, company_cache
-                )
-                persist_company_links(session, event, matches)
-                company_links_total += len(matches)
+                # Gated by feature_flags.LINK_EVENTS_TO_COMPANIES (default
+                # False — Foundation phase 3).  Skip the resolver loop
+                # entirely when the flag is off; persist_company_links
+                # would no-op anyway, and the resolver cost is a per-event
+                # scan over every Company row.
+                if feature_flags.LINK_EVENTS_TO_COMPANIES and company_cache is not None:
+                    matches = resolve_companies_for_event(
+                        session, event, company_cache
+                    )
+                    persist_company_links(session, event, matches)
+                    company_links_total += len(matches)
 
         session.commit()
 
