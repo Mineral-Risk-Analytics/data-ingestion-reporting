@@ -35,11 +35,45 @@ def seed_cmd() -> None:
         s.close()
 
 
+@app.command("seed-countries")
+def seed_countries_cmd() -> None:
+    """Upsert the countries reference table.
+
+    Inserts or updates all rows in the ``countries`` table — ISO2 codes,
+    canonical names, Comtrade numeric reporter codes, common-name aliases
+    (used for name→ISO2 resolution in GTA and other ingesters), and
+    ``is_major_producer`` / ``is_major_consumer`` flags (used by
+    ingest-comtrade to select reporter country sets).
+
+    Idempotent: re-running refreshes all columns without touching
+    ``created_at``.  Safe to run after adding or renaming entries.
+
+    Run this before ingest-gta and ingest-comtrade.
+
+    \b
+    Examples:
+      bdi-ingest seed-countries
+    """
+    from app.services.ingestion.seed_countries import seed_countries
+
+    s = _session()
+    try:
+        result = seed_countries(s)
+        s.commit()
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("ingest")
 def ingest_cmd(
     source: str = typer.Argument(
         ...,
-        help="federal-register | census-trade | sec-edgar | news",
+        help="federal-register | census-trade | news",
     ),
     extra_json: Optional[str] = typer.Option(
         None,
@@ -47,16 +81,29 @@ def ingest_cmd(
         help='JSON object merged into source config, e.g. \'{"per_page":5}\'',
     ),
 ) -> None:
-    """Run a Phase 1 ingestion pipeline by source alias."""
+    """Run a Phase 1 ingestion pipeline by source alias.
+
+    Note: ``sec-edgar`` was removed from this mapping in the May 2026
+    refactor — use the dedicated ``bdi-ingest ingest-sec-edgar`` command
+    instead, which routes through the new ``ingest_sec_edgar`` module
+    with full material attribution.  ``federal-register`` is also
+    preferentially served by ``bdi-ingest ingest-federal-register`` for
+    the same reason; this generic command is kept as a fallback debugging
+    entry point for the remaining pipeline-served sources (census-trade,
+    news) until they get dedicated modules of their own.
+    """
     mapping = {
         "federal-register": SourceType.FEDERAL_REGISTER.value,
         "census-trade": SourceType.CENSUS_TRADE.value,
-        "sec-edgar": SourceType.SEC_EDGAR.value,
         "news": SourceType.NEWS.value,
     }
     st = mapping.get(source.replace("_", "-"))
     if not st:
-        typer.echo(f"Unknown source {source!r}. Choose from {list(mapping.keys())}", err=True)
+        typer.echo(
+            f"Unknown source {source!r}. Choose from {list(mapping.keys())}.\n"
+            f"For sec-edgar use the dedicated `bdi-ingest ingest-sec-edgar` command.",
+            err=True,
+        )
         raise typer.Exit(code=1)
 
     params = json.loads(extra_json) if extra_json else None
@@ -77,110 +124,685 @@ def ingest_cmd(
 def ingest_usgs_cmd(
     filepath: str = typer.Argument(
         ...,
-        help="Path to MCS2025_World_Data.csv downloaded from https://pubs.usgs.gov/publication/mcs2025",
+        help=(
+            "Path to MCS world data CSV. Either MCS2025_World_Data.csv (wide "
+            "format, country×year columns) or MCS2026_Commodities_Data.csv "
+            "(long format, one row per chapter×country×stat×year). Format "
+            "is auto-detected from headers unless --csv-format is set."
+        ),
     ),
     force: bool = typer.Option(
         False,
         "--force",
         help="Upsert: update existing materials even if they already exist.",
     ),
-    mcs_year: int = typer.Option(
-        2025,
+    mcs_year: Optional[int] = typer.Option(
+        None,
         "--mcs-year",
-        help="Publication year of the MCS file (used as reference_year in material_criticality_signals).",
+        help=(
+            "Publication year of the MCS file (used as reference_year in "
+            "material_criticality_signals).  Defaults to 2025 for the wide "
+            "format and 2026 for the long format."
+        ),
+    ),
+    csv_format: str = typer.Option(
+        "auto",
+        "--csv-format",
+        help="CSV format: auto | 2025 | 2026.  Auto-detects from column headers.",
     ),
 ) -> None:
     """Ingest USGS Mineral Commodity Summaries data from the official CSV.
 
-    Derives primary_producing_countries (ranked by mine production) and
-    criticality_score (normalised HHI) directly from USGS data.
-    No synthetic values. Re-run annually when USGS publishes a new MCS.
+    Phase B refactor (May 2026): canonical-name resolution now goes
+    through ``material_source_aliases``.  Materials must already exist
+    in the ``materials`` table (run ``seed-materials`` first); this
+    command writes signals only — it does NOT create materials.
 
-    Also writes source=usgs_mcs rows into material_criticality_signals and
-    syncs the denormalized materials.patent_occurrence_trend cache.
+    Skipped chapters (e.g. ABRASIVES, ARSENIC) are silently dropped per
+    the alias table's ``is_skipped=true`` rows.  Unknown chapters log a
+    warning so partner can decide whether to add an alias or a skip row.
+
+    For the 2026 long-format CSV: additionally writes per-HS-node
+    production shares for sub-typed materials (Silicon ferrosilicon vs
+    metal, Copper mine vs refinery) AND US import-source shares (with
+    market_scope='us') from the 'Import Sources' section.
     """
-    import sqlalchemy as sa
     from pathlib import Path
     from app.models.criticality_signal import MaterialCriticalitySignal
-    from app.models.supply import Material
     from app.services.ingestion.seeds.usgs_mcs_parser import parse_usgs_csv
+    from app.services.ingestion.seeds.mcs2026_parser import parse_mcs2026_csv
+    from app.services.ingestion.material_resolver import MaterialAliasResolver
 
     path = Path(filepath)
     if not path.exists():
         typer.echo(f"File not found: {filepath}", err=True)
         raise typer.Exit(code=1)
 
-    materials = parse_usgs_csv(path)
-    if not materials:
-        typer.echo("No materials parsed — check the file format.", err=True)
+    # ── Format detection ──────────────────────────────────────────────────
+    # 2026 long format: header includes "MCS chapter" as the first column.
+    # 2025 wide format: header has "Commodity" + per-year columns like
+    # "World mine production 2024".  We sniff the first line in cp1252
+    # (handles em-dashes that appear in 2026; harmless for 2025).
+    detected = csv_format
+    if csv_format == "auto":
+        with open(path, encoding="cp1252", errors="replace") as f:
+            first_line = f.readline()
+        if "MCS chapter" in first_line:
+            detected = "2026"
+        else:
+            detected = "2025"
+        typer.echo(f"  [info] auto-detected MCS CSV format: {detected}", err=True)
+    elif csv_format not in ("2025", "2026"):
+        typer.echo(
+            f"Invalid --csv-format {csv_format!r}; must be auto|2025|2026.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Default mcs_year per format if the user didn't pass --mcs-year.
+    if mcs_year is None:
+        mcs_year = 2026 if detected == "2026" else 2025
+
+    if detected == "2026":
+        records = parse_mcs2026_csv(path)
+    else:
+        records = parse_usgs_csv(path)
+    if not records:
+        typer.echo("No records parsed — check the file format.", err=True)
         raise typer.Exit(code=1)
 
     s = _session()
     try:
-        existing_count = s.scalar(
-            select(sa.func.count()).select_from(Material)
-        ) or 0
+        from app.models.supply import (
+            HsCodeMaterialMapping,
+            HsCodeProductionShare,
+            MaterialProductionShare,
+        )
 
-        if existing_count > 0 and not force:
-            typer.echo(json.dumps({
-                "ok": False,
-                "reason": f"materials table already has {existing_count} rows. Use --force to upsert.",
-            }, indent=2))
-            raise typer.Exit(code=1)
+        resolver = MaterialAliasResolver(s)
+        signals_written = 0
+        shares_written = 0
+        hs_shares_written = 0
+        hs_shares_skipped_no_mapping = 0
+        us_import_shares_written = 0
+        us_import_shares_skipped_no_mapping = 0
+        resolved_canonicals: list[str] = []
+        skipped_aliases: list[str] = []
+        unknown_aliases: list[str] = []
 
-        inserted = updated = signals_written = 0
-        for m in materials:
-            # Separate the internal _hhi_score key before creating ORM objects.
-            hhi_score = m.pop("_hhi_score", None)
+        for rec in records:
+            source_system = rec.pop("source_system", None)
+            source_name = rec.pop("source_name", None)
+            if not (source_system and source_name):
+                continue
 
-            row = s.scalar(select(Material).where(Material.canonical_name == m["canonical_name"]))
-            if row is None:
-                row = Material(**m)
-                s.add(row)
-                s.flush()
-                inserted += 1
-            elif force:
-                for k, v in m.items():
-                    if k != "canonical_name":
-                        setattr(row, k, v)
-                s.flush()
-                updated += 1
-
-            # Write / upsert a material_criticality_signals row for this material.
-            # Idempotent: if the row exists, update criticality_score and hhi_score.
-            existing_signal = s.scalar(
-                select(MaterialCriticalitySignal).where(
-                    MaterialCriticalitySignal.material_id == row.id,
-                    MaterialCriticalitySignal.source == "usgs_mcs",
-                    MaterialCriticalitySignal.reference_year == mcs_year,
+            result = resolver.resolve(source_system, source_name)
+            if result.status == "skipped":
+                skipped_aliases.append(source_name)
+                continue
+            if result.status == "unknown":
+                unknown_aliases.append(source_name)
+                typer.echo(
+                    f"  [unknown] no alias for ({source_system!r}, "
+                    f"{source_name!r}) — add a row to "
+                    f"seed_material_source_aliases.py and re-run "
+                    f"`seed-material-aliases --force-update`.",
+                    err=True,
                 )
-            )
-            trend = m.get("patent_occurrence_trend")
-            if existing_signal is None:
-                s.add(MaterialCriticalitySignal(
-                    material_id=row.id,
-                    source="usgs_mcs",
-                    reference_year=mcs_year,
-                    criticality_score=row.criticality_score,
-                    trend_direction=trend,
-                    hhi_score=hhi_score,
-                    metadata_json={"mcs_publication_year": mcs_year},
-                ))
-                signals_written += 1
-            elif force:
-                existing_signal.criticality_score = row.criticality_score
-                existing_signal.hhi_score = hhi_score
-                existing_signal.trend_direction = trend
-                signals_written += 1
+                continue
+            material = result.material
+            assert material is not None  # status == "ok"
+            # Secondary chapters (e.g. BAUXITE AND ALUMINA → Aluminum)
+            # share a canonical with a primary chapter; only the primary
+            # writes material-level signals.  Secondary still contributes
+            # per-HS-prefix shares so its country distributions land in
+            # hs_code_production_shares.
+            writes_material_signals = result.writes_material_signals
+            if writes_material_signals:
+                resolved_canonicals.append(material.canonical_name)
+            else:
+                resolved_canonicals.append(
+                    f"{material.canonical_name} (secondary: {source_name!r})"
+                )
+
+            # ── Pull signal fields out of the record ──────────────────────
+            criticality_score = rec.get("criticality_score")
+            hhi_score = rec.get("hhi_score")
+            reserve_hhi_score = rec.get("reserve_hhi_score")
+            reserve_life_index = rec.get("reserve_life_index")
+            production_yoy_pct = rec.get("production_yoy_pct")
+            capacity_utilization = rec.get("capacity_utilization")
+            production_shares = rec.get("production_shares") or []
+            hs_production_shares = rec.get("hs_production_shares") or []
+            us_import_sources = rec.get("us_import_sources") or []
+            us_net_import_reliance = rec.get("us_net_import_reliance")
+            apparent_consumption = rec.get("apparent_consumption")
+            price_unit_usgs = rec.get("price_unit_usgs")
+
+            # ── Material-level writes: skip for secondary chapters ────────
+            # Secondary chapters share a canonical with a primary sibling
+            # (e.g. BAUXITE AND ALUMINA → Aluminum, where ALUMINUM is the
+            # primary).  Writing material-level signals from the secondary
+            # would overwrite the primary's values via the unique key
+            # (material_id, source, reference_year).  Per-HS-prefix shares
+            # below are still written because they route to distinct HS
+            # prefixes (bauxite to 2606, aluminum to 7601 — no collision).
+            if writes_material_signals:
+                # USGS-derived price_unit: only write when material.price_unit
+                # is currently NULL.  Protects partner-set values (e.g. Sodium
+                # "per_mt", REE "per_kg") from being overwritten.
+                if price_unit_usgs is not None and material.price_unit is None:
+                    material.price_unit = price_unit_usgs
+
+                # Back-sync the materials.criticality_score cache.
+                if criticality_score is not None:
+                    material.criticality_score = criticality_score
+
+                # ── material_criticality_signals upsert ───────────────────
+                existing_signal = s.scalar(
+                    select(MaterialCriticalitySignal).where(
+                        MaterialCriticalitySignal.material_id == material.id,
+                        MaterialCriticalitySignal.source == "usgs_mcs",
+                        MaterialCriticalitySignal.reference_year == mcs_year,
+                    )
+                )
+                # us_net_import_reliance / apparent_consumption now live in
+                # typed columns (migration 038) — write directly there.
+                # metadata_json keeps lighter-weight extras only
+                # (mcs_publication_year, fig10_source_rows etc.).
+                signal_meta: dict = {"mcs_publication_year": mcs_year}
+
+                if existing_signal is None:
+                    s.add(MaterialCriticalitySignal(
+                        material_id=material.id,
+                        source="usgs_mcs",
+                        reference_year=mcs_year,
+                        criticality_score=criticality_score,
+                        hhi_score=hhi_score,
+                        reserve_hhi_score=reserve_hhi_score,
+                        reserve_life_index=reserve_life_index,
+                        production_yoy_pct=production_yoy_pct,
+                        capacity_utilization=capacity_utilization,
+                        us_net_import_reliance_pct=us_net_import_reliance,
+                        us_apparent_consumption=apparent_consumption,
+                        metadata_json=signal_meta,
+                    ))
+                    signals_written += 1
+                elif force:
+                    existing_signal.criticality_score = criticality_score
+                    existing_signal.hhi_score = hhi_score
+                    existing_signal.reserve_hhi_score = reserve_hhi_score
+                    existing_signal.reserve_life_index = reserve_life_index
+                    existing_signal.production_yoy_pct = production_yoy_pct
+                    existing_signal.capacity_utilization = capacity_utilization
+                    existing_signal.us_net_import_reliance_pct = us_net_import_reliance
+                    existing_signal.us_apparent_consumption = apparent_consumption
+                    merged = dict(existing_signal.metadata_json or {})
+                    merged.update(signal_meta)
+                    existing_signal.metadata_json = merged
+                    signals_written += 1
+
+                # ── material_production_shares upsert ─────────────────────
+                for share in production_shares:
+                    existing_share = s.scalar(
+                        select(MaterialProductionShare).where(
+                            MaterialProductionShare.material_id == material.id,
+                            MaterialProductionShare.country_code == share["country_code"],
+                            MaterialProductionShare.reference_year == mcs_year,
+                        )
+                    )
+                    if existing_share is None:
+                        s.add(MaterialProductionShare(
+                            material_id=material.id,
+                            country_code=share["country_code"],
+                            reference_year=mcs_year,
+                            production_volume=share["production_volume"],
+                            production_share=share["production_share"],
+                            unit_of_measure=share.get("unit_of_measure"),
+                            data_source="usgs_mcs",
+                        ))
+                        shares_written += 1
+                    elif force:
+                        existing_share.production_volume = share["production_volume"]
+                        existing_share.production_share = share["production_share"]
+                        existing_share.unit_of_measure = share.get("unit_of_measure")
+                        shares_written += 1
+
+            # ── Per-HS-node global production shares ─────────────────────
+            # Two lookup modes (refactored 2026-05-09):
+            #
+            #   Stage-based: parser emits ``stage`` and empty ``hs_code_prefix``.
+            #     Looks up by (material_id, supply_chain_stage, scope=global)
+            #     preferring the lowest digit_count (most general HS prefix
+            #     for that stage).  Used for auto-detected mine/smelter/
+            #     refinery/alumina rows — the bulk of MCS data.
+            #
+            #   Prefix-based: parser emits explicit ``hs_code_prefix``.
+            #     Looks up by (material_id, prefix, scope=global).  Used for
+            #     sub-type overrides where multiple HS prefixes share a stage
+            #     (Silicon ferrosilicon vs silicon metal — both refined).
+            for hs_share in hs_production_shares:
+                hs_prefix = hs_share.get("hs_code_prefix") or ""
+                stage = hs_share.get("stage")
+                hs_mapping = None
+                if hs_prefix:
+                    hs_mapping = s.scalar(
+                        select(HsCodeMaterialMapping).where(
+                            HsCodeMaterialMapping.material_id == material.id,
+                            HsCodeMaterialMapping.hs_code_prefix == hs_prefix,
+                            HsCodeMaterialMapping.market_scope == "global",
+                        )
+                    )
+                elif stage:
+                    # Stage-based: prefer the lowest digit_count (most
+                    # general 4-digit prefix) so production data lands on
+                    # the canonical stage prefix rather than a sub-prefix.
+                    hs_mapping = s.scalar(
+                        select(HsCodeMaterialMapping).where(
+                            HsCodeMaterialMapping.material_id == material.id,
+                            HsCodeMaterialMapping.supply_chain_stage == stage,
+                            HsCodeMaterialMapping.market_scope == "global",
+                        )
+                        .order_by(HsCodeMaterialMapping.digit_count.asc())
+                        .limit(1)
+                    )
+                if hs_mapping is None:
+                    hs_shares_skipped_no_mapping += 1
+                    qualifier = (
+                        f"prefix={hs_prefix!r}" if hs_prefix
+                        else f"stage={stage!r}"
+                    )
+                    typer.echo(
+                        f"  [skip] no hs_code_material_mappings row for "
+                        f"({material.canonical_name!r}, {qualifier}, global) — "
+                        f"run seed-hs-mappings first",
+                        err=True,
+                    )
+                    continue
+                existing_hs_share = s.scalar(
+                    select(HsCodeProductionShare).where(
+                        HsCodeProductionShare.hs_mapping_id == hs_mapping.id,
+                        HsCodeProductionShare.country_code == hs_share["country_code"],
+                        HsCodeProductionShare.reference_year == mcs_year,
+                        HsCodeProductionShare.market_scope == "global",
+                        HsCodeProductionShare.source == "usgs_mcs",
+                    )
+                )
+                if existing_hs_share is None:
+                    s.add(HsCodeProductionShare(
+                        hs_mapping_id=hs_mapping.id,
+                        country_code=hs_share["country_code"],
+                        reference_year=mcs_year,
+                        production_share=hs_share["production_share"],
+                        production_volume=hs_share["production_volume"],
+                        market_scope="global",
+                        source="usgs_mcs",
+                        notes=(
+                            f"CSV sub-type: {hs_share['type_substring']!r} — "
+                            f"derived from MCS {mcs_year} World Data CSV"
+                        ),
+                    ))
+                    hs_shares_written += 1
+                elif force:
+                    existing_hs_share.production_share = hs_share["production_share"]
+                    existing_hs_share.production_volume = hs_share["production_volume"]
+                    hs_shares_written += 1
+
+            # ── US import-source rows (market_scope='us', 2026 only) ──────
+            # Each Import Sources row tells us what fraction of US imports
+            # of a given sub-type came from a given country.  Stored with
+            # market_scope='us' so global HHI computations aren't
+            # contaminated.
+            #
+            # Sub-type → HS-prefix resolution happens in three layers
+            # (May 2026):
+            #   1. Parser-internal _DETAIL_TO_HS_PREFIX  (Silicon ferrosilicon
+            #      vs metal, Copper mine vs refinery — explicit per-chapter rules)
+            #   2. Keyword-based DB lookup  — match the sub-type substring
+            #      against partner-curated keywords on this material's HS
+            #      mappings (e.g. "oxide" → 282580 for Antimony).  Covers
+            #      ~55 of the 60 collision cases observed in MCS 2026.
+            #   3. Fall back to material.hs_codes[0]  — last-resort default.
+            # The dedup pass below handles any remaining collisions.
+            material_primary_prefix = ""
+            if material.hs_codes:
+                material_primary_prefix = material.hs_codes[0].replace(".", "")
+
+            # Build keyword lookup once per material: list of
+            # (hs_prefix, [lowercase_keywords]).  Used by the keyword-
+            # resolution step below.
+            kw_rows = s.execute(
+                select(
+                    HsCodeMaterialMapping.hs_code_prefix,
+                    HsCodeMaterialMapping.keywords,
+                ).where(
+                    HsCodeMaterialMapping.material_id == material.id,
+                    HsCodeMaterialMapping.market_scope == "global",
+                    HsCodeMaterialMapping.keywords.is_not(None),
+                )
+            ).all()
+            kw_lookup: list[tuple[str, list[str]]] = []
+            for prefix, kws in kw_rows:
+                if not kws:
+                    continue
+                kw_lookup.append((prefix, [str(k).lower() for k in kws]))
+
+            def _resolve_via_keywords(detail: str) -> Optional[str]:
+                """Match an MCS sub-type against partner-curated keywords.
+
+                Substring match in either direction (keyword in detail OR
+                detail in keyword).  When multiple HS prefixes match, the
+                LONGEST keyword wins — encodes specificity ("ferrochromium,
+                low-carbon" > "ferrochromium" > "metal").
+                """
+                sub_low = (detail or "").lower().strip()
+                if not sub_low:
+                    return None
+                matches: list[tuple[int, str]] = []
+                for prefix, kws in kw_lookup:
+                    for kw in kws:
+                        if kw in sub_low or sub_low in kw:
+                            matches.append((len(kw), prefix))
+                            break  # one match per prefix is enough
+                if not matches:
+                    return None
+                matches.sort(reverse=True)
+                return matches[0][1]
+
+            # Many MCS chapters publish multiple Import Sources sub-types
+            # (e.g. Antimony: 'oxide' / 'unwrought metal' / 'total metal
+            # and oxide').  After keyword resolution, sub-types that
+            # didn't match a keyword fall back to material.hs_codes[0]
+            # and may collide on the unique key.  The dedup pass keeps
+            # one row per (prefix, country), preferring the row whose
+            # sub-type label contains 'total' / 'all forms' / etc.; ties
+            # broken by largest share.  All collapsed sub-types are
+            # recorded in the notes field so the audit trail survives.
+            _TOTAL_SUBSTRINGS = ("total", "all forms", "all imports", "all countries")
+
+            def _is_total_subtype(s: str) -> bool:
+                low = (s or "").lower()
+                return any(t in low for t in _TOTAL_SUBSTRINGS)
+
+            deduped: dict[tuple[str, str], dict] = {}
+            for src in us_import_sources:
+                # Resolve hs_code_prefix in priority order:
+                # parser-routed → keyword-resolved → primary-fallback
+                hs_prefix = src.get("hs_code_prefix")
+                if not hs_prefix:
+                    hs_prefix = _resolve_via_keywords(src.get("type_substring", ""))
+                if not hs_prefix:
+                    hs_prefix = material_primary_prefix
+                if not hs_prefix:
+                    us_import_shares_skipped_no_mapping += 1
+                    continue
+                key = (hs_prefix, src["country_code"])
+                cand_total = _is_total_subtype(src.get("type_substring", ""))
+                if key not in deduped:
+                    deduped[key] = {
+                        "src": src,
+                        "is_total": cand_total,
+                        "subtypes": [src.get("type_substring", "") or "(unspecified)"],
+                        "hs_prefix": hs_prefix,
+                    }
+                    continue
+                existing = deduped[key]
+                existing["subtypes"].append(
+                    src.get("type_substring", "") or "(unspecified)",
+                )
+                # Decide whether to swap.  Keep existing unless the
+                # candidate strictly outranks it.
+                if cand_total and not existing["is_total"]:
+                    existing["src"] = src
+                    existing["is_total"] = True
+                elif cand_total == existing["is_total"]:
+                    if src.get("production_share", 0) > existing["src"].get("production_share", 0):
+                        existing["src"] = src
+                # else: existing wins (it's a 'total' row, candidate isn't)
+
+            for (hs_prefix, country_code), entry in deduped.items():
+                src = entry["src"]
+                subtypes = entry["subtypes"]
+                hs_mapping = s.scalar(
+                    select(HsCodeMaterialMapping).where(
+                        HsCodeMaterialMapping.material_id == material.id,
+                        HsCodeMaterialMapping.hs_code_prefix == hs_prefix,
+                        HsCodeMaterialMapping.market_scope == "global",
+                    )
+                )
+                if hs_mapping is None:
+                    us_import_shares_skipped_no_mapping += 1
+                    typer.echo(
+                        f"  [skip-us] no hs_code_material_mappings row for "
+                        f"({material.canonical_name!r}, {hs_prefix!r}, global) — "
+                        f"run seed-hs-mappings first",
+                        err=True,
+                    )
+                    continue
+                # Build the notes — flag when multiple sub-types collapsed.
+                if len(subtypes) == 1:
+                    notes_text = (
+                        f"US import source: {subtypes[0]!r} "
+                        f"({src.get('reference_year_range', '')}) — "
+                        f"derived from MCS {mcs_year} Import Sources section"
+                    )
+                else:
+                    chosen = src.get("type_substring", "") or "(unspecified)"
+                    notes_text = (
+                        f"US import source: {chosen!r} chosen from "
+                        f"{len(subtypes)} sub-types {subtypes} "
+                        f"({src.get('reference_year_range', '')}) — "
+                        f"derived from MCS {mcs_year} Import Sources section. "
+                        f"Multi-sub-type collapse — see hs_code_production_shares "
+                        f"notes for the chosen-row provenance."
+                    )
+
+                existing_us_share = s.scalar(
+                    select(HsCodeProductionShare).where(
+                        HsCodeProductionShare.hs_mapping_id == hs_mapping.id,
+                        HsCodeProductionShare.country_code == country_code,
+                        HsCodeProductionShare.reference_year == mcs_year,
+                        HsCodeProductionShare.market_scope == "us",
+                        HsCodeProductionShare.source == "usgs_mcs",
+                    )
+                )
+                if existing_us_share is None:
+                    s.add(HsCodeProductionShare(
+                        hs_mapping_id=hs_mapping.id,
+                        country_code=country_code,
+                        reference_year=mcs_year,
+                        production_share=src["production_share"],
+                        production_volume=None,
+                        market_scope="us",
+                        source="usgs_mcs",
+                        notes=notes_text,
+                    ))
+                    us_import_shares_written += 1
+                elif force:
+                    existing_us_share.production_share = src["production_share"]
+                    existing_us_share.notes = notes_text
+                    us_import_shares_written += 1
 
         s.commit()
         typer.echo(json.dumps({
             "ok": True,
             "source": f"USGS Mineral Commodity Summaries {mcs_year}",
-            "inserted": inserted,
-            "updated": updated,
+            "csv_format": detected,
+            "records_resolved": len(resolved_canonicals),
+            "records_skipped_via_alias": len(skipped_aliases),
+            "records_unknown": len(unknown_aliases),
             "signals_written": signals_written,
-            "materials": [m["canonical_name"] for m in materials],
+            "shares_written": shares_written,
+            "hs_shares_written": hs_shares_written,
+            "hs_shares_skipped_no_mapping": hs_shares_skipped_no_mapping,
+            "us_import_shares_written": us_import_shares_written,
+            "us_import_shares_skipped_no_mapping": us_import_shares_skipped_no_mapping,
+            "materials": sorted(set(resolved_canonicals)),
+            "skipped_via_alias": sorted(set(skipped_aliases)),
+            "unknown_source_names": sorted(set(unknown_aliases)),
+        }, indent=2))
+    finally:
+        s.close()
+
+
+@app.command("ingest-mcs-prices")
+def ingest_mcs_prices_cmd(
+    filepath: str = typer.Argument(
+        ...,
+        help=(
+            "Path to MCS Fig 10 price growth CSV (e.g. "
+            "data/usgs/2026/MCS2026_Fig10_Price_Growth_Rates.csv)."
+        ),
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Update price columns even if already populated for this material+year.",
+    ),
+    mcs_year: int = typer.Option(
+        2026,
+        "--mcs-year",
+        help=(
+            "Publication year of the MCS file (joins to the same "
+            "material_criticality_signals row written by ingest-usgs)."
+        ),
+    ),
+) -> None:
+    """Ingest USGS MCS Fig 10 price-growth rates into material_criticality_signals.
+
+    Reads the supplementary Fig 10 CSV and writes price_yoy_pct and
+    price_cagr_5yr_pct onto the existing usgs_mcs signal row for each
+    material (creating the row if it doesn't exist yet — useful for
+    materials in seed_materials but not in the main MCS chapter map,
+    e.g. individual REEs).
+
+    Run after ingest-usgs so the signal row already exists; otherwise
+    this command will create skeleton rows with only price metrics
+    populated.
+
+    Idempotent without --force: skips rows where price_yoy_pct is
+    already non-null.  --force overwrites.
+    """
+    from collections import defaultdict
+    from pathlib import Path
+    from app.models.criticality_signal import MaterialCriticalitySignal
+    from app.services.ingestion.seeds.mcs2026_fig10_parser import (
+        parse_mcs2026_fig10_csv,
+    )
+    from app.services.ingestion.material_resolver import MaterialAliasResolver
+
+    path = Path(filepath)
+    if not path.exists():
+        typer.echo(f"File not found: {filepath}", err=True)
+        raise typer.Exit(code=1)
+
+    raw_rows = parse_mcs2026_fig10_csv(path)
+    if not raw_rows:
+        typer.echo("No price rows parsed — check the file format.", err=True)
+        raise typer.Exit(code=1)
+
+    s = _session()
+    try:
+        resolver = MaterialAliasResolver(s)
+
+        # ── Resolve each raw row, then aggregate by canonical material ────
+        # Multiple Fig 10 rows can map to the same canonical (e.g. both
+        # Fluorspar grades → "Fluorspar"; 10 individual REE oxides →
+        # "Rare Earth Elements"); we average the metrics across them.
+        # arithmetic mean is the simplest defensible aggregation given
+        # Fig 10 carries no volume weights.
+        bucket: dict[int, dict] = defaultdict(
+            lambda: {"yoy": [], "cagr": [], "sources": [], "material": None}
+        )
+        skipped_aliases: list[str] = []
+        unknown_aliases: list[str] = []
+
+        for r in raw_rows:
+            result = resolver.resolve(r["source_system"], r["source_name"])
+            material, status = result.material, result.status
+            if status == "skipped":
+                skipped_aliases.append(r["source_name"])
+                continue
+            if status == "unknown":
+                unknown_aliases.append(r["source_name"])
+                typer.echo(
+                    f"  [unknown] no alias for ('fig10_prices', "
+                    f"{r['source_name']!r}) — add a row to "
+                    f"seed_material_source_aliases.py.",
+                    err=True,
+                )
+                continue
+            assert material is not None
+            b = bucket[material.id]
+            b["material"] = material
+            if r["price_yoy_pct"] is not None:
+                b["yoy"].append(r["price_yoy_pct"])
+            if r["price_cagr_5yr_pct"] is not None:
+                b["cagr"].append(r["price_cagr_5yr_pct"])
+            b["sources"].append(r["source_name"])
+
+        rows_inserted = 0
+        rows_updated = 0
+        rows_skipped_existing = 0
+
+        for mat_id, b in bucket.items():
+            material = b["material"]
+            avg_yoy = (
+                round(sum(b["yoy"]) / len(b["yoy"]), 4) if b["yoy"] else None
+            )
+            avg_cagr = (
+                round(sum(b["cagr"]) / len(b["cagr"]), 4) if b["cagr"] else None
+            )
+            sources = b["sources"]
+
+            signal = s.scalar(
+                select(MaterialCriticalitySignal).where(
+                    MaterialCriticalitySignal.material_id == mat_id,
+                    MaterialCriticalitySignal.source == "usgs_mcs",
+                    MaterialCriticalitySignal.reference_year == mcs_year,
+                )
+            )
+            if signal is None:
+                # Create a skeleton signal row.  Other supply metrics
+                # (HHI, production_yoy_pct etc.) stay NULL until
+                # ingest-usgs runs for this material.
+                signal = MaterialCriticalitySignal(
+                    material_id=mat_id,
+                    source="usgs_mcs",
+                    reference_year=mcs_year,
+                    price_yoy_pct=avg_yoy,
+                    price_cagr_5yr_pct=avg_cagr,
+                    metadata_json={
+                        "mcs_publication_year": mcs_year,
+                        "fig10_source_rows": sources,
+                    },
+                )
+                s.add(signal)
+                rows_inserted += 1
+                continue
+
+            if signal.price_yoy_pct is not None and not force:
+                rows_skipped_existing += 1
+                continue
+
+            signal.price_yoy_pct = avg_yoy
+            signal.price_cagr_5yr_pct = avg_cagr
+            meta = dict(signal.metadata_json or {})
+            meta["fig10_source_rows"] = sources
+            signal.metadata_json = meta
+            rows_updated += 1
+
+        s.commit()
+        typer.echo(json.dumps({
+            "ok": True,
+            "source": f"USGS MCS {mcs_year} Fig 10 — Price Growth Rates",
+            "rows_in_csv": len(raw_rows),
+            "materials_resolved": len(bucket),
+            "rows_inserted": rows_inserted,
+            "rows_updated": rows_updated,
+            "rows_skipped_existing_use_force": rows_skipped_existing,
+            "skipped_via_alias": sorted(set(skipped_aliases)),
+            "unknown_source_names": sorted(set(unknown_aliases)),
         }, indent=2))
     finally:
         s.close()
@@ -209,38 +831,127 @@ def seed_materials_cmd() -> None:
         s.close()
 
 
+@app.command("seed-material-aliases")
+def seed_material_aliases_cmd(
+    force_update: bool = typer.Option(
+        False,
+        "--force-update",
+        help=(
+            "Update existing alias rows (canonical mapping, is_skipped, "
+            "skip_reason) when re-seeding.  Use after editing the alias "
+            "lists in seed_material_source_aliases.py."
+        ),
+    ),
+) -> None:
+    """Seed the material_source_aliases reference table.
+
+    Translates external commodity names (USGS MCS chapters, Fig 10
+    commodity rows, MCS PDF headings, etc.) to canonical material rows.
+    Replaces the four legacy Python dicts (``_CHAPTER_TO_MATERIAL``,
+    ``_PRICE_NAME_TO_MATERIAL``, ``_MCS_COMMODITY_MAP``,
+    ``_COMMODITY_CONFIG``) with one DB-backed register.
+
+    Run AFTER ``seed-materials`` (alias rows FK-reference materials.id).
+
+    Idempotent without --force-update: skips existing alias rows so a
+    re-seed is a no-op.  With --force-update: rewrites the canonical
+    mapping / skip flag / skip reason so partner edits propagate.
+    """
+    from app.services.ingestion.seed_material_source_aliases import run_seed
+
+    s = _session()
+    try:
+        result = run_seed(s, force_update=force_update)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("seed-regulation-aliases")
+def seed_regulation_aliases_cmd(
+    force_update: bool = typer.Option(
+        False,
+        "--force-update",
+        help=(
+            "Update existing alias rows (regulation_id mapping, is_skipped, "
+            "skip_reason) when re-seeding.  Use after editing the alias "
+            "lists in seed_regulation_aliases.py."
+        ),
+    ),
+) -> None:
+    """Seed the regulation_aliases reference table.
+
+    Translates external regulation identifiers (EUR-Lex CELEX numbers,
+    Federal Register document IDs, US Code citations, etc.) to canonical
+    regulation rows.  Mirrors seed-material-aliases for the regulations
+    schema.
+
+    Run AFTER ``seed-regulations`` (alias rows FK-reference regulations.id).
+
+    Idempotent without --force-update: skips existing alias rows so a
+    re-seed is a no-op.  With --force-update: rewrites the canonical
+    mapping / skip flag / skip reason so partner edits propagate.
+    """
+    from app.services.ingestion.seed_regulation_aliases import run_seed
+
+    s = _session()
+    try:
+        result = run_seed(s, force_update=force_update)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("seed-hs-mappings")
 def seed_hs_mappings_cmd(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Drop and re-seed all HS mappings (use after HS nomenclature update).",
+        help=(
+            "Update curated fields (description, confidence, supply_chain_stage, "
+            "stage_sequence, digit_count, keywords) on existing rows.  "
+            "Non-destructive — does NOT delete rows added by ingest-mcs-pdf "
+            "or other ingesters; preserves auto-created 6-digit stubs and "
+            "10-digit HTS rows.  Use after editing _MAPPINGS or "
+            "_HS_KEYWORDS_BY_MAPPING."
+        ),
     ),
 ) -> None:
-    """Seed the hs_code_material_mappings table from the curated reference list.
+    """Seed hs_code_material_mappings from the curated _MAPPINGS table.
 
-    Idempotent without --force: skips existing (hs_code_prefix, material_id) pairs.
-    With --force: deletes all existing rows and re-inserts from scratch.
+    Idempotent without --force: skips existing (hs_code_prefix, material_id)
+    pairs.  Inserts rows from _MAPPINGS that don't yet exist.
+
+    With --force: in-place UPDATE of curated fields on existing rows.  Does
+    NOT delete any rows — auto-added rows from ingest-mcs-pdf (6-digit stubs
+    and 10-digit HTS codes) and any partner-curated entries are preserved.
+    Pass-through to ``upsert_hs_mappings(force=True)``; also overwrites
+    keywords on rows whose ``keywords`` array is already populated.
 
     Re-run when:
-    - New materials are added to the materials table
-    - WCO updates the HS nomenclature (every 5 years)
-    - A material's HS code classification changes
+      * New materials are added to the materials table
+      * A material's HS code classification changes in _MAPPINGS
+      * Stage assignments or confidence values are corrected
+      * Keyword definitions in _HS_KEYWORDS_BY_MAPPING change
 
-    Note: materials must be seeded first (run seed-materials or ingest-usgs).
+    Note: materials must be seeded first (run seed-materials).
+
+    For a true rebuild from scratch (e.g. WCO HS nomenclature update), do
+    that as a targeted SQL migration — blanket-deleting this table
+    cascade-deletes hs_code_production_shares and SET NULLs
+    risk_events.hs_mapping_id, which is rarely what you want.
     """
-    import sqlalchemy as sa
     from app.services.ingestion.seed_hs_mappings import upsert_hs_mappings
-    from app.models.supply import HsCodeMaterialMapping
 
     s = _session()
     try:
-        if force:
-            s.execute(sa.delete(HsCodeMaterialMapping))
-            s.commit()
-            typer.echo("Cleared existing HS mappings.")
-
-        result = upsert_hs_mappings(s)
+        result = upsert_hs_mappings(s, force=force)
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
@@ -270,7 +981,10 @@ def rescore_chemistry_cmd(
     Re-run after: ingest-usgs, seed-materials, or whenever new criticality signals arrive.
     """
     import datetime
-    from app.services.scoring.chemistry_risk import rescore_all_chemistries, rescore_one_chemistry
+    from app.services.scoring.chemistry_risk import (
+        score_all_chemistries_from_rollup,
+        score_chemistry_from_rollup,
+    )
     from app.models.battery_chemistry import BatteryChemistry
 
     as_of_date = datetime.date.fromisoformat(as_of) if as_of else datetime.date.today()
@@ -282,29 +996,317 @@ def rescore_chemistry_cmd(
             if chem is None:
                 typer.echo(json.dumps({"ok": False, "error": f"Chemistry slug '{slug}' not found"}), err=True)
                 raise typer.Exit(code=1)
-            score = rescore_one_chemistry(s, chem.id, as_of_date)
+            score = score_chemistry_from_rollup(s, chem.id, as_of_date)
+            s.commit()
             typer.echo(json.dumps({
                 "ok": True,
                 "chemistry": slug,
+                "methodology_version": score.methodology_version,
                 "composite_risk_score": score.composite_risk_score,
                 "score_confidence": score.score_confidence,
             }, indent=2))
         else:
-            results = rescore_all_chemistries(s, as_of_date)
+            results = score_all_chemistries_from_rollup(s, as_of_date)
             typer.echo(json.dumps({
                 "ok": True,
                 "rescored": len(results),
                 "scores": [
                     {
                         "chemistry": r["slug"],
+                        "methodology_version": "2.0",
                         "composite_risk_score": r["composite_risk_score"],
                         "score_confidence": r["score_confidence"],
+                        "materials_scored": r.get("materials_scored"),
+                        "materials_missing": r.get("materials_missing"),
                     }
                     for r in results
                 ],
             }, indent=2))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("rescore-hs-nodes")
+def rescore_hs_nodes_cmd(
+    as_of: Optional[str] = typer.Option(
+        None,
+        "--as-of",
+        help="Point-in-time date for scoring (YYYY-MM-DD). Default: today.",
+    ),
+    market_scope: str = typer.Option(
+        "global",
+        "--market-scope",
+        help="'global' (default) or 'us'. Must match the scope of the production share data.",
+    ),
+) -> None:
+    """Compute and persist Level-0 HS node geography scores.
+
+    Scores every (hs_mapping_id × country) pair that has production share data
+    in hs_code_production_shares.  Results feed into the stage-weighted Material
+    Concentration rollup in rescore-market.
+
+    Run this BEFORE rescore-market to ensure Level-0 rows are available.
+
+    \b
+    Examples:
+      bdi-ingest rescore-hs-nodes
+      bdi-ingest rescore-hs-nodes --as-of 2025-01-01
+      bdi-ingest rescore-hs-nodes --market-scope us
+
+    Pipeline order:
+      bdi-ingest rescore-hs-nodes    ← Level 0 (this command)
+      bdi-ingest rescore-market      ← Level 1
+      bdi-ingest rescore-chemistry   ← Level 3
+    """
+    import datetime
+
+    from app.services.scoring.hs_node_scorer import score_all_hs_nodes
+
+    as_of_date = datetime.date.fromisoformat(as_of) if as_of else datetime.date.today()
+    s = _session()
+    try:
+        typer.echo(f"Scoring HS nodes as of {as_of_date} (market_scope={market_scope}) ...")
+        result = score_all_hs_nodes(s, as_of_date, market_scope=market_scope)
+        typer.echo(
+            f"Done. pairs_scored={result['pairs_scored']}, "
+            f"pairs_skipped={result['pairs_skipped']}, "
+            f"nodes_processed={result['nodes_processed']}"
+        )
+    finally:
+        s.close()
+
+
+@app.command("rescore-market")
+def rescore_market_cmd(
+    as_of: Optional[str] = typer.Option(
+        None,
+        "--as-of",
+        help="Point-in-time date for scoring (YYYY-MM-DD). Default: today.",
+    ),
+    material_id: Optional[int] = typer.Option(
+        None,
+        "--material-id",
+        help=(
+            "Score only this material across its primary producing countries "
+            "(plus any geography that has events for it). "
+            "Default: all active materials."
+        ),
+    ),
+    geographies: Optional[str] = typer.Option(
+        None,
+        "--geographies",
+        help=(
+            "Comma-separated ISO2 country codes to score against (e.g. 'CN,CL,AU'). "
+            "Default: derived from each material's material_production_shares plus "
+            "any country with linked risk events."
+        ),
+    ),
+) -> None:
+    """Compute and persist material_geography_risk_scores rows.
+
+    Runs the market-level (company-agnostic) scoring engine across all active
+    materials and their associated geographies. Safe to re-run — results are
+    upserted by (material_id, geography_code, as_of_date).
+
+    Run this AFTER ingest-worldbank and ingest-comtrade so that commodity
+    price and trade-flow signals are available to the scoring engine.
+
+    \b
+    Examples:
+      bdi-ingest rescore-market
+      bdi-ingest rescore-market --as-of 2025-01-01
+      bdi-ingest rescore-market --material-id 3
+      bdi-ingest rescore-market --geographies CN,CL,AU
+
+    Intended usage order after ingestion:
+
+    \b
+      bdi-ingest ingest-worldbank --since-year 2015
+      bdi-ingest ingest-comtrade --years 2021,2022,2023
+      bdi-ingest rescore-market
+    """
+    import datetime
+    import uuid
+
+    from app.models.regulatory import RiskEventGeography, RiskEventMaterial
+    from app.models.supply import Material, MaterialProductionShare
+    from app.services.scoring.market_aggregator import (
+        score_all_active_materials,
+        score_material_geography,
+    )
+
+    as_of_date = datetime.date.fromisoformat(as_of) if as_of else datetime.date.today()
+    geo_filter = (
+        [g.strip().upper() for g in geographies.split(",") if g.strip()]
+        if geographies
+        else None
+    )
+
+    s = _session()
+    try:
+        if material_id is not None:
+            # Single-material path. ``score_all_active_materials`` does not
+            # currently support a material filter, so derive the geography
+            # set the same way it would and call ``score_material_geography``
+            # per pair, committing per pair to mirror the batch function's
+            # transaction discipline.
+            mat = s.get(Material, material_id)
+            if mat is None:
+                typer.echo(
+                    f"rescore-market failed: no material with id={material_id}",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+
+            if geo_filter is not None:
+                geos: list[str] = list(geo_filter)
+            else:
+                # primary_producing_countries removed in migration 023; query
+                # material_production_shares as the authoritative geo seed.
+                prod_share_geos = list(s.scalars(
+                    select(MaterialProductionShare.country_code)
+                    .where(
+                        MaterialProductionShare.material_id == mat.id,
+                        MaterialProductionShare.production_share > 0,
+                    )
+                    .distinct()
+                ).all())
+                geos = [g.upper() for g in prod_share_geos]
+                event_geo_rows = s.execute(
+                    select(RiskEventGeography.country_code)
+                    .join(
+                        RiskEventMaterial,
+                        RiskEventMaterial.risk_event_id == RiskEventGeography.risk_event_id,
+                    )
+                    .where(RiskEventMaterial.material_id == mat.id)
+                    .distinct()
+                ).all()
+                geos = sorted({*geos, *(row[0] for row in event_geo_rows if row[0])})
+
+            if not geos:
+                typer.echo(
+                    f"rescore-market: no geographies derivable for material "
+                    f"id={material_id} ({mat.canonical_name}). Nothing to score.",
+                )
+                return
+
+            run_id = f"cli-{uuid.uuid4()}"
+            scored = 0
+            for geo in geos:
+                try:
+                    score_material_geography(
+                        s,
+                        mat.id,
+                        geo,
+                        as_of_date,
+                        run_id=f"{run_id}-{mat.id}-{geo}",
+                        persist=True,
+                    )
+                    s.commit()
+                    scored += 1
+                except Exception as inner_exc:
+                    s.rollback()
+                    typer.echo(
+                        f"  - skipped {mat.canonical_name} × {geo}: {inner_exc}",
+                        err=True,
+                    )
+
+            typer.echo(
+                f"rescore-market complete: {scored} (material, geography) pair(s) "
+                f"scored for {mat.canonical_name} (id={mat.id}) at {as_of_date}"
+            )
+        else:
+            results = score_all_active_materials(
+                s,
+                as_of_date,
+                geography_codes=geo_filter,
+            )
+            scored = len(results)
+            typer.echo(
+                f"rescore-market complete: {scored} (material, geography) pair(s) "
+                f"scored for {as_of_date}"
+            )
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        typer.echo(f"rescore-market failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("rescore-global-rollups")
+def rescore_global_rollups_cmd(
+    as_of: Optional[str] = typer.Option(
+        None,
+        "--as-of",
+        help="Point-in-time date for rollup scoring (YYYY-MM-DD). Default: today.",
+    ),
+    material_id: Optional[int] = typer.Option(
+        None,
+        "--material-id",
+        help=(
+            "Roll up only this material_id into material_global_risk_scores. "
+            "Default: all materials that have geo scores."
+        ),
+    ),
+) -> None:
+    """Compute and persist material_global_risk_scores rows.
+
+    This is step 2 in the market scoring chain:
+      1) rescore-market (material × geography)
+      2) rescore-global-rollups (material-only global rollup)
+    """
+    import datetime
+    import uuid
+
+    from app.models.supply import Material
+    from app.services.scoring.global_rollup import (
+        score_all_material_global_rollups,
+        score_material_global_rollup,
+    )
+
+    as_of_date = datetime.date.fromisoformat(as_of) if as_of else datetime.date.today()
+
+    s = _session()
+    try:
+        if material_id is not None:
+            mat = s.get(Material, material_id)
+            if mat is None:
+                typer.echo(
+                    f"rescore-global-rollups failed: no material with id={material_id}",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+
+            run_id = f"global-cli-{uuid.uuid4()}"
+            score = score_material_global_rollup(
+                s,
+                material_id=mat.id,
+                as_of_date=as_of_date,
+                run_id=f"{run_id}-{mat.id}",
+                persist=True,
+            )
+            s.commit()
+            typer.echo(
+                "rescore-global-rollups complete: "
+                f"{mat.canonical_name} (id={mat.id}) overall={score.overall_risk_score} "
+                f"as_of={as_of_date}"
+            )
+        else:
+            results = score_all_material_global_rollups(s, as_of_date=as_of_date)
+            typer.echo(
+                "rescore-global-rollups complete: "
+                f"{len(results)} material(s) rolled up for {as_of_date}"
+            )
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        s.rollback()
+        typer.echo(f"rescore-global-rollups failed: {exc}", err=True)
         raise typer.Exit(code=1)
     finally:
         s.close()
@@ -320,33 +1322,62 @@ def ingest_comtrade_cmd(
     reporters: Optional[str] = typer.Option(
         None,
         "--reporters",
-        help="Comma-separated ISO2 reporter codes to limit scope (e.g. 'CN,CL,AU'). Default: all 14 configured reporters.",
+        help=(
+            "Comma-separated ISO2 reporter codes to limit scope (e.g. 'CN,CL,AU'). "
+            "Default: REPORTER_COUNTRIES for exports, CONSUMER_COUNTRIES for imports."
+        ),
     ),
     hs_prefixes: Optional[str] = typer.Option(
         None,
         "--hs-prefixes",
-        help="Comma-separated HS prefixes to query (e.g. '2604,2602'). Default: reads from supply_chain_contexts.",
+        help=(
+            "Comma-separated HS prefixes to query (e.g. '2604,2602'). "
+            "Default: derives from hs_code_material_mappings (run "
+            "`bdi-ingest seed-hs-mappings` first); falls back to "
+            "supply_chain_contexts when the mappings table is empty."
+        ),
+    ),
+    flow_code: str = typer.Option(
+        "X",
+        "--flow-code",
+        help="'X' for exports (default) or 'M' for imports.",
     ),
 ) -> None:
-    """Ingest UN Comtrade annual export trade flows for battery-critical HS codes.
+    """Ingest UN Comtrade annual trade flows for battery-critical HS codes.
 
-    Fetches export data (flowCode=X) for configured reporter countries × HS prefixes × years.
-    Idempotent: skips reporter/HS/year combinations already present in source_documents.
-    Re-run annually when a new data year becomes available (typically ~3-month lag).
+    Run with --flow-code X (default) to capture supply-side concentration from
+    producing countries. Run with --flow-code M to capture demand-side dependency
+    from consuming countries (US, JP, KR, DE, FR, GB, BE, IN).
 
-    API call count = len(reporters) × len(hs_prefixes) × len(years).
-    With defaults (14 reporters × 6 HS codes × 3 years = 252 calls).
-    Paid tier handles this comfortably; free tier (500/day) handles it in one run.
+    Both runs are idempotent. Re-run annually when new data becomes available
+    (~3-month lag from Comtrade). Run build-trade-signals after both runs to
+    generate EXPORT_DROP and IMPORT_DROP risk events.
+
+    \b
+    Examples:
+      bdi-ingest ingest-comtrade --years 2021,2022,2023
+      bdi-ingest ingest-comtrade --years 2021,2022,2023 --flow-code M
+      bdi-ingest ingest-comtrade --years 2023 --flow-code M --reporters US,JP,KR,DE
     """
-    from app.services.ingestion.comtrade import REPORTER_COUNTRIES, ingest_comtrade
+    from app.services.ingestion.comtrade import (
+        CONSUMER_COUNTRIES,
+        REPORTER_COUNTRIES,
+        ComtradeRateLimitExhausted,
+        ingest_comtrade,
+    )
 
     year_list = [int(y.strip()) for y in years.split(",")]
+    flow = flow_code.strip().upper()
+    if flow not in ("X", "M"):
+        typer.echo("--flow-code must be 'X' (exports) or 'M' (imports).", err=True)
+        raise typer.Exit(code=1)
 
     reporter_filter = None
     if reporters:
+        all_countries = {**REPORTER_COUNTRIES, **CONSUMER_COUNTRIES}
         codes = [r.strip().upper() for r in reporters.split(",")]
-        reporter_filter = {k: v for k, v in REPORTER_COUNTRIES.items() if k in codes}
-        unknown = set(codes) - set(REPORTER_COUNTRIES.keys())
+        reporter_filter = {k: v for k, v in all_countries.items() if k in codes}
+        unknown = set(codes) - set(all_countries.keys())
         if unknown:
             typer.echo(f"Warning: unknown reporter codes ignored: {unknown}", err=True)
 
@@ -359,8 +1390,181 @@ def ingest_comtrade_cmd(
             years=year_list,
             reporters=reporter_filter,
             hs_prefixes=hs_list,
+            flow_code=flow,
         )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except ComtradeRateLimitExhausted as exc:
+        # Distinct exit path so the user sees a clear "rate-limited, try
+        # again later" message instead of a stack trace.  Rows fetched
+        # before the breaker tripped are already committed; re-running
+        # will skip them via the source-document dedup.
+        typer.echo(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                    "rate_limited": True,
+                    "hint": (
+                        "Comtrade free tier caps at ~500 calls/day. "
+                        "Re-run after the quota resets — already-ingested "
+                        "(reporter × prefix × year) combinations will be skipped."
+                    ),
+                },
+                indent=2,
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("backfill-trade-flow-hs-mappings")
+def backfill_trade_flow_hs_mappings_cmd(
+    batch_size: int = typer.Option(
+        2000,
+        "--batch-size",
+        help="Number of TradeFlow rows to fetch and update per pass.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "If set, count rows that WOULD be updated without modifying any "
+            "data.  Pass --no-dry-run (default) to actually write."
+        ),
+    ),
+) -> None:
+    """Populate ``TradeFlow.hs_mapping_id`` for rows missing it.
+
+    Migration 027 added the ``hs_mapping_id`` column but rows ingested
+    before then have it set to NULL.  After the 2026-05-09 confidence-
+    weighting changes those NULL rows fall through at confidence=1.0 via
+    ``COALESCE``, masking the very signal the weighting exists to expose.
+
+    This command re-resolves each affected row's HS code against the
+    current ``hs_code_material_mappings`` and:
+
+      * Updates ``hs_mapping_id`` when the resolved material matches the
+        row's stored ``material_id``.
+      * Logs (does NOT touch) rows where the resolved material differs
+        from the stored one — that's mapping drift, surfaced for review.
+      * Logs and skips rows whose HS code no longer resolves at all.
+
+    Idempotent: re-running after a successful pass is a no-op because the
+    filter excludes rows that already have ``hs_mapping_id`` set.
+
+    Use ``--dry-run`` to see how many rows would change without writing.
+    """
+    from app.services.ingestion.comtrade import backfill_trade_flow_hs_mappings
+    from app.models.supply import TradeFlow
+    from sqlalchemy import select, func as sqlfunc
+
+    s = _session()
+    try:
+        if dry_run:
+            # Count without mutating: same filter the backfill uses.
+            null_rows = s.scalar(
+                select(sqlfunc.count())
+                .select_from(TradeFlow)
+                .where(
+                    TradeFlow.hs_mapping_id.is_(None),
+                    TradeFlow.material_id.is_not(None),
+                )
+            )
+            typer.echo(json.dumps({
+                "ok": True,
+                "dry_run": True,
+                "candidate_rows": int(null_rows or 0),
+                "hint": "drop --dry-run to actually write",
+            }, indent=2))
+            return
+
+        result = backfill_trade_flow_hs_mappings(s, batch_size=batch_size)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2, default=str))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("reattribute-unmapped-trade-flows")
+def reattribute_unmapped_trade_flows_cmd(
+    batch_size: int = typer.Option(
+        2000,
+        "--batch-size",
+        help="Number of TradeFlow rows to fetch and update per pass.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "If set, count rows that WOULD be examined without modifying "
+            "any data.  Pass --no-dry-run (default) to actually write."
+        ),
+    ),
+) -> None:
+    """Re-resolve TradeFlow rows whose ``material_id`` is NULL.
+
+    Use this after expanding ``hs_code_material_mappings`` (via
+    ``bdi-ingest seed-hs-mappings --force``) to pick up the new mappings
+    against historical TradeFlow rows that were previously unresolvable.
+
+    Sister command to ``backfill-trade-flow-hs-mappings``:
+
+      backfill-trade-flow-hs-mappings
+        Fills in ``hs_mapping_id`` for rows that already have
+        ``material_id`` set.  Conservative — never overwrites attribution.
+
+      reattribute-unmapped-trade-flows (this command)
+        Writes BOTH ``material_id`` and ``hs_mapping_id`` for rows where
+        the previous resolution produced None and the current seed gives
+        a valid answer.  Safe — only adds attribution to previously-
+        unattributed rows; nothing existing gets overwritten.  Logged at
+        WARNING per row so the data trail is discoverable.
+
+    Idempotent.  After running, the rows that now have ``material_id``
+    set fall off the NULL filter.  Genuinely unresolvable rows (HS code
+    still doesn't map to anything) are re-examined on subsequent runs
+    but produce zero updates.
+
+    Re-run scoring after this completes (``rescore-market``,
+    ``rescore-global-rollups``) so the new attribution flows through.
+
+    Use ``--dry-run`` to see how many rows would be examined.
+    """
+    from app.services.ingestion.comtrade import (
+        reattribute_unmapped_trade_flows,
+    )
+    from app.models.supply import TradeFlow
+    from sqlalchemy import select, func as sqlfunc
+
+    s = _session()
+    try:
+        if dry_run:
+            null_rows = s.scalar(
+                select(sqlfunc.count())
+                .select_from(TradeFlow)
+                .where(TradeFlow.material_id.is_(None))
+            )
+            typer.echo(json.dumps({
+                "ok": True,
+                "dry_run": True,
+                "candidate_rows": int(null_rows or 0),
+                "hint": (
+                    "drop --dry-run to actually re-resolve.  Some of these "
+                    "may still be unresolvable after running — that's "
+                    "expected for HS prefixes the seed doesn't cover."
+                ),
+            }, indent=2))
+            return
+
+        result = reattribute_unmapped_trade_flows(s, batch_size=batch_size)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2, default=str))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
         raise typer.Exit(code=1)
@@ -380,13 +1584,19 @@ def ingest_opensanctions_cmd(
         "--geos",
         help='Comma-separated ISO2 high-concentration geo codes. Default: "CN,CD,RU,IR,KP"',
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Skip the interval gate and run regardless of when the last ingest occurred.",
+    ),
 ) -> None:
     """Match companies against OpenSanctions consolidated sanctions lists.
 
     Downloads the free daily bulk export (no API key required).
     Creates RiskEvent rows for company name matches and geography-level signals.
     Idempotent: skips events whose content_hash already exists.
-    Re-run daily or weekly to catch new listings.
+
+    Skips the download if the last run was within 6 days. Use --force to override.
     """
     from app.services.ingestion.opensanctions import OPENSANCTIONS_CSV_URL, ingest_opensanctions
 
@@ -398,6 +1608,7 @@ def ingest_opensanctions_cmd(
             session=s,
             url=url or OPENSANCTIONS_CSV_URL,
             high_concentration_geos=geo_list,
+            min_interval_days=0 if force else 6,
         )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
@@ -448,6 +1659,129 @@ def seed_facilities_cmd() -> None:
         s.close()
 
 
+@app.command("seed-facilities-partner")
+def seed_facilities_partner_cmd(
+    xlsx_path: str = typer.Argument(
+        ...,
+        help="Path to the partner-curated facility XLSX template "
+             "(see facility_seed_template.xlsx).",
+    ),
+    sheet: str = typer.Option(
+        "Facility Seed", "--sheet",
+        help="Sheet name within the workbook.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Validate + report without committing any changes.",
+    ),
+    include_examples: bool = typer.Option(
+        False, "--include-examples",
+        help="Load the Albemarle/Mineral Resources example rows. "
+             "Off by default so partners can keep them as documentation.",
+    ),
+) -> None:
+    """Load a partner-curated facility seed spreadsheet (G4c).
+
+    Reads ``Facility Seed`` sheet from the provided XLSX and upserts:
+        companies → facilities → company_facilities → facility_material_links
+
+    Idempotent: re-running on the same file is a no-op for unchanged rows.
+    JV facilities (multiple companies on the same site) are captured by
+    repeating the facility row for each owner with their respective
+    ownership_pct.
+
+    \b
+    Run order to close the operational pillar:
+      bdi-ingest seed-materials                       # canonical materials
+      bdi-ingest seed-hs-mappings                     # HS code mappings
+      bdi-ingest seed-facilities-partner <file.xlsx>  # this command
+      bdi-ingest rescore-hs-nodes                     # picks up new facilities
+      bdi-ingest rescore-market                       # operational pillar refresh
+    """
+    from app.services.ingestion.seed_facilities_partner import (
+        load_partner_facility_seed,
+    )
+
+    s = _session()
+    try:
+        report = load_partner_facility_seed(
+            session=s,
+            xlsx_path=xlsx_path,
+            sheet=sheet,
+            dry_run=dry_run,
+            include_examples=include_examples,
+        )
+        out = report.to_dict()
+        out["dry_run"] = dry_run
+        typer.echo(json.dumps({"ok": True, **out}, indent=2, default=str))
+        if report.errors:
+            # Non-zero exit when there were per-row failures so CI / cron
+            # picks up partial-load issues.
+            raise typer.Exit(code=2)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("ingest-mrds")
+def ingest_mrds_cmd(
+    local_file: Optional[str] = typer.Option(
+        None,
+        "--local-file",
+        help=(
+            "Path to a locally-downloaded MRDS CSV or ZIP file. "
+            "Download from: https://mrdata.usgs.gov/mrds/mrds-csv.zip "
+            "If omitted, the ingester downloads directly from USGS."
+        ),
+    ),
+) -> None:
+    """Ingest USGS MRDS mine data into facilities + facility_material_links.
+
+    Populates mining and processing facility records for battery-critical minerals
+    (Lithium, Cobalt, Nickel, Manganese, Natural Graphite, Copper, REE) from the
+    USGS Mineral Resources Data System (~300k global mine records). Feeds the
+    operational scoring pillar with real facility status data.
+
+    Deduplication: existing facilities matched by mrds_dep_id are updated in-place.
+    New facilities are inserted. Records no longer in MRDS are NOT automatically removed.
+
+    MRDS does not publish annual capacity figures — annual_capacity_tpy will be NULL
+    for all MRDS-sourced rows. The operational pillar falls back to event-derived
+    structural_dependency when no capacity data is available.
+
+    \b
+    Run order:
+      bdi-ingest seed-companies        # companies must exist (for company_facility links)
+      bdi-ingest ingest-mrds           # live download, or pass --local-file
+      bdi-ingest rescore-market        # picks up updated facility data in operational pillar
+
+    \b
+    Notes:
+      - Cell factories, pack plants, and recycling facilities are NOT in MRDS.
+        Keep running seed-facilities for those types.
+      - MRDS covers mines (surface/underground/brine) and processing (mills/smelters).
+      - Re-run periodically — MRDS is updated irregularly, not on a fixed schedule.
+    """
+    from app.services.ingestion.mrds import ingest_mrds
+
+    s = _session()
+    try:
+        # ingest_mrds commits in batches internally — already-committed rows
+        # are NOT rolled back if an error occurs partway through, so re-running
+        # after a failure will skip rows already persisted (dep_id dedup).
+        result = ingest_mrds(session=s, local_file=local_file)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("seed-supply-relationships")
 def seed_supply_relationships_cmd() -> None:
     """Seed confirmed buyer-supplier relationships across the battery supply chain."""
@@ -457,127 +1791,68 @@ def seed_supply_relationships_cmd() -> None:
         result = seed_supply_relationships(s)
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
 
-
-@app.command("scrape-ev-database")
-def scrape_ev_database_cmd(
-    limit: Optional[int] = typer.Option(
+@app.command("ingest-vpic")
+def ingest_vpic_cmd(
+    companies: Optional[str] = typer.Option(
         None,
-        "--limit",
-        help="Cap the number of variants processed (after brand filtering). Useful for smoke tests.",
-    ),
-    brands: Optional[str] = typer.Option(
-        None,
-        "--brands",
+        "--companies",
         help=(
-            "Comma-separated brand prefixes to keep (case-insensitive). "
-            "Example: 'Tesla,BYD,Hyundai'. Default: all brands."
+            "Comma-separated canonical company names to process. "
+            "Defaults to all OEMs in OEM_MAKE_MAP. "
+            "Example: 'Tesla,Rivian Automotive,Lucid Group'."
         ),
+    ),
+    year_start: int = typer.Option(
+        2010,
+        "--year-start",
+        help="First model year to scan (inclusive).",
+    ),
+    year_end: Optional[int] = typer.Option(
+        None,
+        "--year-end",
+        help="Last model year to scan (inclusive). Defaults to the current year.",
     ),
     rate_limit_delay: float = typer.Option(
-        3.0,
+        0.5,
         "--rate-limit-delay",
-        help=(
-            "Seconds to sleep BEFORE every detail-page request (be polite — "
-            "ev-database aggressively rate-limits). 3s ~ 20 req/min; bump to "
-            "5-10s if you're still seeing 429s. Sleep applies after errors too."
-        ),
-    ),
-    skip_existing: bool = typer.Option(
-        True,
-        "--skip-existing/--no-skip-existing",
-        help=(
-            "Skip variants whose ev_database_id was already persisted by a "
-            "previous run. Default ON makes the scrape resumable across "
-            "sessions: rerun after a 429 abort and only missing variants are "
-            "fetched. Use --no-skip-existing to refresh every variant."
-        ),
+        help="Seconds to sleep between every vPIC API call. Increase if you see 429s.",
     ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
         help="Fetch and parse, but do NOT write any rows.",
     ),
-    user_agent: str = typer.Option(
-        "battery-data-intelligence-engine/0.1 (research; contact via repo)",
-        "--user-agent",
-        help="HTTP User-Agent header to send with every request.",
-    ),
-    max_retries: int = typer.Option(
-        4,
-        "--max-retries",
-        help="Per-URL retry attempts on HTTP 429 before giving up on that URL.",
-    ),
-    backoff_base: float = typer.Option(
-        30.0,
-        "--backoff-base",
-        help="Base seconds for exponential 429 backoff (used when no Retry-After header).",
-    ),
-    backoff_cap: float = typer.Option(
-        300.0,
-        "--backoff-cap",
-        help="Hard cap on a single 429 sleep, in seconds.",
-    ),
-    abort_after_consecutive_429: int = typer.Option(
-        3,
-        "--abort-after-consecutive-429",
-        help=(
-            "Abort the run after this many URLs in a row exhaust their 429 "
-            "retries. Set to 0 to disable the abort guard."
-        ),
-    ),
 ) -> None:
-    """Scrape ev-database.org and seed company_vehicle_models + vehicle_model_chemistries.
+    """Populate company_vehicle_models from the NHTSA vPIC API.
 
-    Discovers every variant from the cheatsheet page, fetches each detail page
-    to extract battery chemistry and model-year window, and idempotently
-    upserts rows. Variants whose brand has no matching Company are skipped
-    (no new Company rows are created here).
+    Fetches officially registered make/model names per model year and upserts
+    rows keyed on (company_id, model_name, model_year_start). Battery chemistry
+    data is NOT available in vPIC; vehicle_model_chemistries rows are not
+    written by this command.
 
-    Production volume is intentionally NULL — ev-database does not expose it.
-    Downstream scoring weights variants uniformly when volume is absent.
-
-    Rate-limit behavior: --rate-limit-delay is slept BEFORE every detail
-    fetch. On HTTP 429 the request is retried with exponential backoff
-    (honoring Retry-After when present). After --abort-after-consecutive-429
-    URLs in a row exhaust retries the run aborts cleanly so a long run does
-    not burn hours sleeping; if you see this, wait an hour or two before
-    retrying. Output JSON includes rate_limit_hits, rate_limit_aborted,
-    remaining_after_abort, and already_stored_skipped.
-
-    Resumable workflow: --skip-existing (default ON) prunes variants whose
-    ev_database_id was already persisted, so a typical scrape looks like:
-
-    \b
-      bdi-ingest scrape-ev-database          # gets some, hits 429, aborts
-      # ... wait an hour or two ...
-      bdi-ingest scrape-ev-database          # picks up where it left off
-      # ... repeat until remaining_after_abort is 0 ...
+    OEM companies are mapped to their registered vPIC make names
+    (e.g. "Volkswagen Group" covers VOLKSWAGEN, AUDI, and PORSCHE). Geely
+    Auto Group and Zeekr are not registered in vPIC and are skipped.
 
     \b
     Run order:
-      bdi-ingest seed-companies          # brands must exist first
-      bdi-ingest seed-materials          # chemistry-intensity FKs target materials
-      bdi-ingest scrape-ev-database      # this command — feeds chemistry-aware Material pillar
-      bdi-ingest rescore-all
+      bdi-ingest seed-companies    # companies must exist first
+      bdi-ingest ingest-vpic       # this command
+      bdi-ingest rescore-all       # picks up new vehicle model data
     """
-    from app.services.ingestion.scrape_ev_database import run as scrape_run
+    from app.services.ingestion.ingest_vpic import run as vpic_run
 
-    brand_list = [b.strip() for b in brands.split(",")] if brands else None
+    company_list = [c.strip() for c in companies.split(",")] if companies else None
 
     s = _session()
     try:
-        result = scrape_run(
+        result = vpic_run(
             s,
-            limit=limit,
-            brands=brand_list,
-            rate_limit_delay=rate_limit_delay,
+            companies=company_list,
+            year_start=year_start,
+            year_end=year_end,
             dry_run=dry_run,
-            user_agent=user_agent,
-            max_retries=max_retries,
-            backoff_base=backoff_base,
-            backoff_cap=backoff_cap,
-            abort_after_consecutive_429=abort_after_consecutive_429,
-            skip_existing=skip_existing,
+            rate_limit_delay=rate_limit_delay,
         )
         typer.echo(json.dumps({"ok": True, "dry_run": dry_run, **result}, indent=2))
     except Exception as exc:
@@ -595,7 +1870,7 @@ def seed_regulations_cmd() -> None:
     regulation_geography_scope, and company_regulation_exposure.
 
     This unblocks the regulatory pillar (20% of company score). The three scored
-    obligations are UFLPA (25 pts), EU_BATTERY_REG (20 pts), IRA_DOMESTIC (15 pts).
+    obligations are UFLPA (25 pts), EU_BATTERY_REG_2023 (20 pts), IRA_DOMESTIC (15 pts).
     Only non_compliant / partial / unknown rows generate scoring uplift.
 
     Idempotent: safe to re-run after updating compliance statuses in the seed file.
@@ -610,6 +1885,352 @@ def seed_regulations_cmd() -> None:
     s = _session()
     try:
         result = seed_regulations(s)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("ingest-eurlex")
+def ingest_eurlex_cmd(
+    no_fetch: bool = typer.Option(
+        False,
+        "--no-fetch",
+        help="Skip fetching summary text from EUR-Lex (faster, no network required).",
+    ),
+) -> None:
+    """Refresh EUR-Lex regulation summaries and create regulatory risk events.
+
+    Iterates every active CELEX number in ``regulation_aliases``
+    (source_system='eurlex_celex') and:
+      * Backfills ``Regulation.summary`` from EUR-Lex HTML when NULL.
+      * Bumps ``metadata_json.last_seen`` for freshness tracking.
+      * Attaches ``source_document_id`` if not yet set.
+      * Creates one ``RiskEvent`` + ``RiskEventRegulation`` junction
+        per regulation (idempotent).
+
+    Does NOT create regulations.  CELEX numbers without an alias row
+    are surfaced as warnings — to track a new EU regulation, add it to
+    ``seed_regulations.py:_REGULATIONS`` and ``seed_regulation_aliases.py:_EURLEX_CELEX``,
+    then re-run ``seed-regulations`` and ``seed-regulation-aliases``.
+
+    Idempotent: re-runs only refresh mutable fields and never duplicate
+    risk events.  Pass ``--no-fetch`` to skip the HTTP fetch entirely
+    (faster, no network required).
+
+    Run order on a fresh DB:
+
+    \b
+      bdi-ingest seed-materials
+      bdi-ingest seed-regulations
+      bdi-ingest seed-regulation-aliases
+      bdi-ingest ingest-eurlex
+    """
+    from app.services.ingestion.eurlex import ingest_eurlex
+
+    s = _session()
+    try:
+        result = ingest_eurlex(session=s, fetch_summaries=not no_fetch)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("list-regulation-status-changes")
+def list_regulation_status_changes_cmd() -> None:
+    """List regulations whose EUR-Lex bibliographic notice suggests the
+    status has changed since seed time.
+
+    \b
+    Reads ``Regulation.metadata_json["status_review_pending"]`` entries,
+    populated by ``ingest-eurlex``.  Surfaces each one for partner
+    confirmation: detected_status, current_status, observed dates +
+    repealed-by reference, and the next-step hint for clearing it.
+
+    \b
+    The ingester never auto-mutates ``Regulation.status`` — partner is
+    the authoritative source of truth and must confirm any detected
+    change by editing ``seed_regulations.py`` and re-running
+    ``seed-regulations``.
+
+    \b
+    Example output:
+      {
+        "regulation_key": "EU_REACH_COBALT",
+        "celex": "32006R1907",
+        "current_status": "effective",
+        "detected_status": "superseded",
+        "detected_at": "2026-05-17T12:34:56+00:00",
+        "observed": {
+          "date_of_end_of_validity": "2025-12-31",
+          "repealed_by_celex": "32025R1234"
+        },
+        "next_step": "Confirm whether status='superseded' is correct..."
+      }
+    """
+    from app.services.ingestion.eurlex import list_pending_status_changes
+
+    s = _session()
+    try:
+        pending = list_pending_status_changes(s)
+        typer.echo(json.dumps({
+            "ok": True,
+            "pending_count": len(pending),
+            "pending": pending,
+        }, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("list-suggested-regulations")
+def list_suggested_regulations_cmd() -> None:
+    """List auto-staged regulations awaiting partner review.
+
+    \b
+    When an ingester encounters a regulation external identifier
+    (CELEX, FR document number, etc.) that isn't in our curated
+    regulation roster, the resolver can auto-create a placeholder
+    Regulation row with verified=False.  These rows are invisible to
+    scoring (verified=True filter) but tracked in this review queue.
+
+    \b
+    Partner workflow:
+      1. Run this command to see the queue.  Most-observed
+         suggestions appear first (they're the most likely to matter).
+      2. For each suggestion, decide approve / reject / merge:
+         - Approve: add a proper Regulation row to seed_regulations.py
+           with the same regulation_key, plus full material/geography
+           scopes.  Re-seed; the seed function will upgrade the
+           existing row to verified=True.
+         - Reject: mark the alias is_skipped=True with a skip_reason
+           in seed_regulation_aliases.py.  Re-seed; the suggested
+           Regulation row remains as audit trail (verified=False so
+           still invisible to scoring).
+         - Merge with existing: rename the regulation_key on the
+           suggested row to match an existing canonical regulation,
+           then re-link the alias.
+
+    \b
+    Output is sorted by observation_count descending (most-observed
+    first).  Each entry includes the external identifier, where it
+    was first observed, how many times we've encountered it, and a
+    short sample-context snippet for triage.
+    """
+    from app.services.ingestion.regulation_resolver import list_suggested_regulations
+
+    s = _session()
+    try:
+        queue = list_suggested_regulations(s)
+        typer.echo(json.dumps({
+            "ok": True,
+            "pending_count": len(queue),
+            "pending": queue,
+        }, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("discover-fr-regulation-aliases")
+def discover_fr_regulation_aliases_cmd(
+    regulations: Optional[str] = typer.Option(
+        None,
+        "--regulations",
+        help=(
+            "Comma-separated regulation_keys to search.  Default: all "
+            "configured (UFLPA, IRA_DOMESTIC, SEC_CLIMATE_2024)."
+        ),
+    ),
+    max_pages: int = typer.Option(
+        5,
+        "--max-pages",
+        help="Max pages to fetch per query (100 docs/page).  Default 5.",
+    ),
+    use_haiku: bool = typer.Option(
+        False,
+        "--use-haiku",
+        help=(
+            "Classify each candidate via Haiku to filter tangential "
+            "mentions.  Costs roughly $1-8 per full run; off by default."
+        ),
+    ),
+    min_confidence: float = typer.Option(
+        0.0,
+        "--min-confidence",
+        help=(
+            "Filter the formatted seed_tuples output by minimum "
+            "confidence (0.0-1.0).  Default 0.0 = include all."
+        ),
+    ),
+    format_seed: bool = typer.Option(
+        False,
+        "--format-seed",
+        help=(
+            "Output as Python tuple literals ready to paste into "
+            "seed_regulation_aliases.py:_FEDERAL_REGISTER.  Default JSON."
+        ),
+    ),
+) -> None:
+    """Discover Federal Register doc numbers for tracked regulations.
+
+    \b
+    Surfaces FR documents that should be added to
+    seed_regulation_aliases.py:_FEDERAL_REGISTER so RiskEvents
+    auto-link to canonical Regulation rows for UFLPA, IRA_DOMESTIC,
+    SEC_CLIMATE_2024.
+
+    \b
+    Each regulation has multiple search configurations (agency + term
+    + doc_type combinations).  Results are deduplicated across
+    queries.  When --use-haiku is set, Haiku classifies each
+    candidate to filter tangential mentions; otherwise all candidates
+    are returned for manual partner review.
+
+    \b
+    Examples:
+      bdi-ingest discover-fr-regulation-aliases
+      bdi-ingest discover-fr-regulation-aliases --regulations SEC_CLIMATE_2024
+      bdi-ingest discover-fr-regulation-aliases --use-haiku --min-confidence 0.85 --format-seed
+    """
+    from app.services.ingestion.discover_fr_regulation_aliases import (
+        discover_fr_regulation_aliases,
+        format_seed_tuples,
+    )
+
+    reg_keys: Optional[list[str]] = None
+    if regulations:
+        reg_keys = [k.strip() for k in regulations.split(",") if k.strip()]
+
+    try:
+        results = discover_fr_regulation_aliases(
+            regulation_keys=reg_keys,
+            max_pages=max_pages,
+            use_haiku=use_haiku,
+        )
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+
+    if format_seed:
+        typer.echo(format_seed_tuples(results, min_confidence=min_confidence))
+        return
+
+    summary = {
+        "ok": True,
+        "total_candidates": sum(len(v) for v in results.values()),
+        "by_regulation": {
+            k: {
+                "count": len(v),
+                "candidates": [s.to_dict() for s in v if s.confidence >= min_confidence],
+            }
+            for k, v in results.items()
+        },
+    }
+    typer.echo(json.dumps(summary, indent=2))
+
+
+@app.command("ingest-gta")
+def ingest_gta_cmd(
+    since_year: int = typer.Option(
+        2018,
+        "--since-year",
+        help="Only ingest interventions from this year onward. Default: 2018.",
+    ),
+    url: Optional[str] = typer.Option(
+        None,
+        "--url",
+        help="Override the GTA CSV download URL.",
+    ),
+    local_file: Optional[str] = typer.Option(
+        None,
+        "--local-file",
+        help=(
+            "Path to a locally-downloaded GTA CSV file. Skips the HTTP download. "
+            "Use this when the bulk download requires authentication — download "
+            "manually from https://globaltradealert.org/data-center and pass the path here."
+        ),
+    ),
+    hs_prefixes: Optional[str] = typer.Option(
+        None,
+        "--hs-prefixes",
+        help=(
+            "Comma-separated HS prefixes to filter (e.g. '2604,2602'). "
+            "Default: all battery-material prefixes."
+        ),
+    ),
+    skip_hs_filter: bool = typer.Option(
+        False,
+        "--skip-hs-filter",
+        help=(
+            "Skip the HS code prefix filter. Use this when ingesting a pre-filtered "
+            "curated export from the GTA data center (e.g. 'Harmful Trade Policy "
+            "Interventions: Batteries') where GTA has already applied product-level "
+            "filtering using its own internal classification codes rather than HS codes."
+        ),
+    ),
+) -> None:
+    """Ingest Global Trade Alert harmful trade interventions into risk_events.
+
+    GTA now requires registration for bulk data access. Two modes:
+
+    \b
+    1. Local file (recommended — download from GTA data center):
+         bdi-ingest ingest-gta --local-file /path/to/gta_state_acts.csv
+
+    \b
+    2. Pre-filtered curated export (e.g. "Batteries" dataset):
+         bdi-ingest ingest-gta --local-file /path/to/interventions.csv --skip-hs-filter
+
+    \b
+    3. Direct download (only if GTA restores public bulk access):
+         bdi-ingest ingest-gta --since-year 2018
+
+    Ingests Red (harmful) interventions whose affected HS codes match
+    battery-critical materials. All events inserted with verified=False.
+
+    \b
+      bdi-ingest seed-materials
+      bdi-ingest seed-hs-mappings
+      bdi-ingest ingest-gta --local-file /path/to/gta_state_acts.csv
+    """
+    from app.services.ingestion.gta import (
+        BATTERY_HS_PREFIXES,  # noqa: F401  - re-exported for users running --help
+        GTA_DOWNLOAD_URL,
+        ingest_gta,
+    )
+
+    if local_file is None and url is None:
+        typer.echo(
+            "Warning: no --local-file provided. Attempting direct download — "
+            "this may fail. Download manually from "
+            "https://globaltradealert.org/data-center and use --local-file.",
+            err=True,
+        )
+
+    hs_list = (
+        [h.strip() for h in hs_prefixes.split(",") if h.strip()] if hs_prefixes else None
+    )
+
+    s = _session()
+    try:
+        result = ingest_gta(
+            session=s,
+            url=url or GTA_DOWNLOAD_URL,
+            since_year=since_year,
+            hs_prefixes=hs_list,
+            local_file=local_file,
+            skip_hs_filter=skip_hs_filter,
+        )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
@@ -684,10 +2305,11 @@ def ingest_sec_edgar_cmd(
         bdi-ingest ingest-sec-edgar --companies "Tesla,General Motors,Ford Motor Company"
         bdi-ingest ingest-sec-edgar --max-filings 20
     """
-    import sqlalchemy as sa
-    from app.models import Source
-    from app.models.enums import ImplementationPhase, SourceType
-    from app.services.ingestion.pipeline import IngestionPipeline
+    # 2026-05-06 refactor: switched from generic IngestionPipeline to a
+    # dedicated ingester module so SEC filings get MaterialCache-driven
+    # material attribution + event_subtype='FINANCIAL_PRESSURE' (typed
+    # column from migration 040).  See app/services/ingestion/ingest_sec_edgar.py.
+    from app.services.ingestion.ingest_sec_edgar import ingest_sec_edgar
 
     # ── CIK map ─────────────────────────────────────────────────────────────
     # Maps canonical_name (must match seed_companies.py) → zero-padded CIK.
@@ -737,30 +2359,10 @@ def ingest_sec_edgar_cmd(
 
     s = _session()
     try:
-        # Find or create the SEC EDGAR source row.
-        source = s.scalar(
-            select(Source).where(
-                Source.source_type == SourceType.SEC_EDGAR.value,
-                Source.is_active == True,
-            ).limit(1)
+        result = ingest_sec_edgar(
+            s, cik_list=cik_list, max_filings=max_filings
         )
-        if source is None:
-            source = Source(
-                name="SEC EDGAR — battery supply chain filers",
-                source_type=SourceType.SEC_EDGAR.value,
-                phase=ImplementationPhase.PHASE_1.value,
-                is_active=True,
-                config_json={"ciks": cik_list, "max_filings": max_filings},
-            )
-            s.add(source)
-            s.flush()
-            typer.echo("Created new SEC EDGAR source row.")
-
-        run_id = IngestionPipeline(s).run(
-            source.id,
-            params={"ciks": cik_list, "max_filings": max_filings},
-        )
-        typer.echo(json.dumps({"ok": True, "ingestion_run_id": run_id, "ciks_processed": len(cik_list)}, indent=2))
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
         raise typer.Exit(code=1)
@@ -833,12 +2435,19 @@ def ingest_worldbank_cmd(
         "--url",
         help="Override the Pink Sheet download URL (default: current World Bank URL).",
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Skip the interval gate and run regardless of when the last ingest occurred.",
+    ),
 ) -> None:
     """Download the World Bank Pink Sheet and ingest commodity prices.
 
     Fetches CMO-Historical-Data-Monthly.xlsx directly from the World Bank.
     Idempotent: skips rows that already exist in commodity_prices.
-    Re-run monthly after World Bank publishes an update (usually first week of month).
+
+    Skips the download if the most recent price row is less than 25 days old.
+    Use --force to override (e.g. if the World Bank re-publishes a correction).
     """
     from app.services.ingestion.worldbank_pinksheet import PINK_SHEET_URL, ingest_pink_sheet
 
@@ -848,6 +2457,7 @@ def ingest_worldbank_cmd(
             session=s,
             url=url or PINK_SHEET_URL,
             since_year=since_year,
+            min_interval_days=0 if force else 25,
         )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
@@ -1013,6 +2623,143 @@ def ingest_federal_register_cmd(
             queries=query_filter,
         )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("patch-fr-events")
+def patch_fr_events_cmd(
+    fix_uflpa_routing: bool = typer.Option(
+        True,
+        "--fix-uflpa-routing/--no-fix-uflpa-routing",
+        help=(
+            "Add OPERATIONAL to risk_categories_json for all UFLPA-query events. "
+            "Pure DB update — no API calls. Default: enabled."
+        ),
+    ),
+    fix_effective_dates: bool = typer.Option(
+        True,
+        "--fix-effective-dates/--no-fix-effective-dates",
+        help=(
+            "Re-fetch effective_on from the FR API and update event_date for "
+            "final rules, executive orders, and presidential documents where "
+            "publication date and effective date differ. Default: enabled."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Compute and report changes without writing anything to the DB.",
+    ),
+) -> None:
+    """Retroactively fix two data quality gaps in existing FR events.
+
+    \b
+    Fix 1 — UFLPA operational routing:
+      Existing UFLPA events were tagged REGULATORY_COMPLIANCE only. UFLPA
+      Entity List additions also disrupt supplier/mine continuity (operational
+      risk). This adds OPERATIONAL to their risk_categories_json so they feed
+      the operational scoring pillar. Pure DB update, no API calls.
+
+    \b
+    Fix 2 — effective_on dates:
+      Existing FR events use publication_date as event_date. For final rules
+      and executive orders, the effective date may be weeks or months later,
+      causing time-weighting to treat active regulations as older than they
+      are. Re-fetches effective_on from the FR API in batches and updates
+      event_date where they differ. Only targets rule/exec-order doc types.
+
+    \b
+    Examples:
+      bdi-ingest patch-fr-events --dry-run
+      bdi-ingest patch-fr-events
+      bdi-ingest patch-fr-events --no-fix-effective-dates
+      bdi-ingest patch-fr-events --no-fix-uflpa-routing
+    """
+    from app.services.ingestion.ingest_federal_register import patch_fr_events
+
+    typer.echo(
+        f"Patching FR events"
+        f"{' [DRY RUN]' if dry_run else ''}"
+        f" — uflpa_routing={'yes' if fix_uflpa_routing else 'no'}"
+        f", effective_dates={'yes' if fix_effective_dates else 'no'}…"
+    )
+
+    s = _session()
+    try:
+        result = patch_fr_events(
+            s,
+            fix_uflpa_routing=fix_uflpa_routing,
+            fix_effective_dates=fix_effective_dates,
+            dry_run=dry_run,
+        )
+        typer.echo(json.dumps({"ok": True, "dry_run": dry_run, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("backfill-fr-links")
+def backfill_fr_links_cmd(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Re-scan ALL FR events, including those that already have links. "
+            "The per-row uniqueness constraint prevents duplicates, so this is "
+            "safe to run after adding new material aliases or geography patterns."
+        ),
+    ),
+    batch_size: int = typer.Option(
+        100,
+        "--batch-size",
+        help="Number of events to process before each DB commit. Default: 100.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Detect and report counts, but do NOT write or commit any rows.",
+    ),
+) -> None:
+    """Retroactively tag existing FR events with material and geography links.
+
+    Federal Register events ingested before material/geography detection was added
+    have no RiskEventMaterial or RiskEventGeography rows, making them invisible to
+    get_events_for_material() and geography-filtered queries. This command scans
+    all historical FR events and fills in the missing junction rows.
+
+    Idempotent: re-runs skip pairs that already exist. Use --force to re-scan
+    fully-tagged events after updating hs_code_material_mappings.keywords or _GEO_PATTERNS.
+
+    \b
+    Examples:
+      bdi-ingest backfill-fr-links
+      bdi-ingest backfill-fr-links --dry-run
+      bdi-ingest backfill-fr-links --force
+      bdi-ingest backfill-fr-links --batch-size 50
+    """
+    from app.services.ingestion.ingest_federal_register import backfill_fr_links
+
+    typer.echo(
+        f"Backfilling FR event links"
+        f"{' [DRY RUN — no writes]' if dry_run else ''}"
+        f"{' [--force: re-scanning all events]' if force else ''}…"
+    )
+
+    s = _session()
+    try:
+        result = backfill_fr_links(
+            s,
+            force=force,
+            batch_size=batch_size,
+            dry_run=dry_run,
+        )
+        typer.echo(json.dumps({"ok": True, "dry_run": dry_run, **result}, indent=2))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
         raise typer.Exit(code=1)
@@ -1530,6 +3277,948 @@ def _format_review_markdown(result, *, dry_run: bool) -> str:
                 )
             lines.append("")
     return "\n".join(lines)
+
+
+@app.command("ingest-iea-policy-tracker")
+def ingest_iea_policy_tracker_cmd(
+    file_path: str = typer.Option(
+        "data/iea/policy_tracker.csv",
+        "--file-path",
+        help=(
+            "Path to the downloaded IEA Policy Tracker CSV (or XLSX). "
+            "Download from https://www.iea.org/data-and-statistics/data-tools/"
+            "critical-minerals-policy-tracker"
+        ),
+    ),
+    run_id: Optional[str] = typer.Option(
+        None,
+        "--run-id",
+        help="Optional identifier for this ingestion run (logged in metadata_json).",
+    ),
+) -> None:
+    """Ingest IEA Critical Minerals Policy Tracker into risk_events.
+
+    Parses the downloadable CSV export from IEA's Policy and Measures database.
+    Creates low-severity RiskEvent rows (POLICY_MILESTONE | INVESTMENT_PLEDGE)
+    for positive-policy signals: investment pledges, recycling mandates,
+    domestic-content milestones, and strategic reserve announcements.
+
+    These are constructive signals, not risk events — severity is capped at 0.20
+    so they contribute minimally to scores.  Their primary value is rationale
+    context: explaining why a geography scores lower than raw supply-concentration
+    data alone would suggest.
+
+    Idempotent: rows are deduplicated by content_hash (title + countries + year).
+
+    \b
+    Run order:
+      bdi-ingest seed-materials    # material lookups must exist
+      bdi-ingest ingest-iea-policy-tracker --file-path data/iea_policy_tracker.csv
+      bdi-ingest rescore-market    # picks up new policy events
+    """
+    from app.services.ingestion.iea_policy_tracker import ingest_policy_tracker
+
+    s = _session()
+    try:
+        result = ingest_policy_tracker(s, xls_path=file_path, run_id=run_id)
+        s.commit()
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("setup-all")
+def setup_all_cmd(
+    usgs_file: Optional[str] = typer.Option(
+        None,
+        "--usgs-file",
+        help=(
+            "Path to MCS world data CSV (e.g. MCS2025_World_Data.csv or "
+            "MCS2026_Commodities_Data.csv). "
+            "Download from https://pubs.usgs.gov/publication/mcs<year>. "
+            "If omitted, the USGS step is skipped and must be run separately "
+            "with: bdi-ingest ingest-usgs <path>"
+        ),
+    ),
+    mcs_year: int = typer.Option(
+        2025,
+        "--mcs-year",
+        help="MCS publication year (forwarded to ingest-usgs / ingest-mcs-pdf / ingest-mcs-prices).",
+    ),
+    mcs_pdf_file: Optional[str] = typer.Option(
+        None,
+        "--mcs-pdf-file",
+        help=(
+            "Path to the USGS Mineral Commodity Summaries PDF (e.g. mcs2025.pdf). "
+            "Populates hs_code_production_shares (global + US) and appends salient "
+            "notes to material_criticality_signals.  Must run after seed-hs-mappings. "
+            "If omitted, the PDF step is skipped and must be run separately with: "
+            "bdi-ingest ingest-mcs-pdf <path> --year <year>"
+        ),
+    ),
+    mcs_prices_file: Optional[str] = typer.Option(
+        None,
+        "--mcs-prices-file",
+        help=(
+            "Path to the USGS MCS Fig 10 Price Growth Rates CSV "
+            "(e.g. MCS2026_Fig10_Price_Growth_Rates.csv).  Writes "
+            "price_yoy_pct and price_cagr_5yr_pct onto the same "
+            "material_criticality_signals row written by ingest-usgs.  "
+            "If omitted, the Fig 10 step is skipped and must be run "
+            "separately with: bdi-ingest ingest-mcs-prices <path>"
+        ),
+    ),
+    mrds_file: str = typer.Option(
+        "/data/facilities/mrds.csv",
+        "--mrds-file",
+        help=(
+            "Path to the local MRDS CSV file for facility ingestion. "
+            "Defaults to /data/facilities/mrds.csv. "
+            "Override with a different path or pass --skip-mrds to skip entirely."
+        ),
+    ),
+    skip_gleif: bool = typer.Option(
+        False,
+        "--skip-gleif",
+        help="Skip GLEIF enrichment (useful when offline or rate-limited).",
+    ),
+    skip_mrds: bool = typer.Option(
+        False,
+        "--skip-mrds",
+        help="Skip MRDS facility ingest.",
+    ),
+) -> None:
+    """One-shot first-time environment bootstrap.
+
+    Runs every seed and reference-data ingest command in dependency order so
+    you don't have to remember the sequence.  Safe to re-run — all steps are
+    idempotent.
+
+    \b
+    Execution order (Phase B / May 2026 — alias-resolver based):
+      1.  seed-countries           ISO country reference table (Comtrade codes, name aliases)
+      2.  seed                     sources, reference aliases
+      3.  seed-materials           39 canonical materials + battery chemistry junctions
+      4.  seed-material-aliases    external commodity name → canonical material lookup
+      5.  ingest-usgs              USGS MCS world data CSV  (requires --usgs-file)
+      6.  seed-hs-mappings         curated HS code → material lookup table
+      7.  ingest-mcs-pdf           HS-stage production shares + US import shares (requires --mcs-pdf-file)
+      8.  seed-hs-mappings --force backfill curated fields onto rows added by ingest-mcs-pdf
+      9.  ingest-mcs-prices        Fig 10 price-growth rates → criticality signals (requires --mcs-prices-file)
+      10. seed-companies           curated supply-chain company list
+      11. ingest-mrds              mine/processing facilities from local MRDS CSV
+      12. seed-supply-relationships  upstream/downstream supplier graph
+      13. seed-material-exposures    company × material exposure weights
+      14. seed-regulations         curated regulatory seed rows
+      15. ingest-gleif             LEI enrichment for company entities
+
+    \b
+    Dependency notes:
+      * ingest-usgs / ingest-mcs-pdf / ingest-mcs-prices all use the
+        MaterialAliasResolver, so seed-materials AND seed-material-aliases
+        must run first (steps 3–4).  Without aliases, every chapter
+        resolves to "unknown" and is silently skipped.
+      * ingest-mcs-pdf (step 7) writes hs_code_production_shares rows that
+        FK to hs_code_material_mappings, so seed-hs-mappings (step 6) must
+        run first.
+      * The seed-hs-mappings --force pass at step 8 is non-destructive: it
+        UPDATEs curated fields (description, confidence, stage, keywords)
+        onto rows added by ingest-mcs-pdf (6-digit stubs, 10-digit HTS).
+        It does NOT delete any rows.
+      * ingest-mcs-prices (step 9) joins to the same material_criticality_signals
+        row that ingest-usgs created at step 5; running it without ingest-usgs
+        leaves the supply-side metric columns NULL.
+
+    \b
+    Step 11 (ingest-mrds) reads from /data/facilities/mrds.csv by default.
+    Override with --mrds-file.  Facility type → supply_chain_stage is mapped
+    automatically (mine→ore, refinery→intermediate).  hs_mapping_id is set
+    NULL and requires manual confirmation post-ingest.
+
+    \b
+    After setup-all, run the periodic ingestion commands (ingest-comtrade,
+    ingest-federal-register, etc.) and then full-score to compute scores.
+
+    \b
+    Examples:
+      bdi-ingest setup-all --usgs-file ~/Downloads/MCS2026_Commodities_Data.csv \\
+                           --mcs-pdf-file ~/Downloads/mcs2026.pdf \\
+                           --mcs-prices-file ~/Downloads/MCS2026_Fig10_Price_Growth_Rates.csv \\
+                           --mcs-year 2026
+      bdi-ingest setup-all --usgs-file path/to/MCS.csv --mcs-pdf-file path/to/mcs.pdf --skip-gleif
+      bdi-ingest setup-all --skip-mrds   # skip facility ingest entirely
+    """
+    import sys
+    import subprocess
+
+    def _run(step_name: str, args: list[str]) -> None:
+        typer.echo(f"\n{'='*60}")
+        typer.echo(f"  setup-all  ▶  {step_name}")
+        typer.echo(f"{'='*60}")
+        result = subprocess.run(
+            [sys.executable, "-m", "app.cli"] + args,
+            check=False,
+        )
+        if result.returncode != 0:
+            typer.echo(
+                f"\n✗  setup-all aborted: '{step_name}' exited with code {result.returncode}.",
+                err=True,
+            )
+            raise typer.Exit(code=result.returncode)
+
+    # Steps 1–2: reference tables
+    _run("seed-countries", ["seed-countries"])
+    _run("seed", ["seed"])
+
+    # Steps 3–4: materials + alias resolver inputs.  MUST run before any
+    # ingester that uses MaterialAliasResolver (ingest-usgs, ingest-mcs-pdf,
+    # ingest-mcs-prices).  Without these, every external chapter / commodity
+    # name resolves to "unknown" and gets dropped.
+    _run("seed-materials", ["seed-materials"])
+    _run("seed-material-aliases", ["seed-material-aliases"])
+
+    # Step 5: USGS MCS CSV → material_criticality_signals + production_shares
+    if usgs_file:
+        _run("ingest-usgs", ["ingest-usgs", usgs_file, "--mcs-year", str(mcs_year), "--force"])
+    else:
+        typer.echo(
+            "\n⚠  Skipping ingest-usgs (no --usgs-file provided). "
+            "Run 'bdi-ingest ingest-usgs <path>' manually before scoring.",
+            err=True,
+        )
+
+    # Step 6: curated HS code → material mappings (depends on seed-materials)
+    _run("seed-hs-mappings", ["seed-hs-mappings"])
+
+    # Step 7: MCS PDF → hs_code_production_shares (global + US) + 6-digit
+    # stubs + 10-digit HTS rows.  Must follow seed-hs-mappings so curated
+    # parents exist for the FK to land on.
+    if mcs_pdf_file:
+        _run(
+            "ingest-mcs-pdf",
+            ["ingest-mcs-pdf", mcs_pdf_file, "--year", str(mcs_year), "--force"],
+        )
+    else:
+        typer.echo(
+            "\n⚠  Skipping ingest-mcs-pdf (no --mcs-pdf-file provided). "
+            "Run 'bdi-ingest ingest-mcs-pdf <path> --year <year>' manually. "
+            "Without this, Level-0 HS node scoring falls back to equal-weighting.",
+            err=True,
+        )
+
+    # Step 8: non-destructive backfill.  --force here UPDATEs curated fields
+    # (description / confidence / stage / stage_sequence / digit_count /
+    # keywords) on rows added by ingest-mcs-pdf at step 7.  It does NOT
+    # delete any rows — auto-added 6-digit stubs and 10-digit HTS rows are
+    # preserved.
+    _run("seed-hs-mappings (backfill)", ["seed-hs-mappings", "--force"])
+
+    # Step 9: USGS MCS Fig 10 prices → price_yoy_pct + price_cagr_5yr_pct
+    # on the same material_criticality_signals row written at step 5.
+    if mcs_prices_file:
+        _run(
+            "ingest-mcs-prices",
+            ["ingest-mcs-prices", mcs_prices_file, "--mcs-year", str(mcs_year), "--force"],
+        )
+    else:
+        typer.echo(
+            "\n⚠  Skipping ingest-mcs-prices (no --mcs-prices-file provided). "
+            "Run 'bdi-ingest ingest-mcs-prices <path> --mcs-year <year>' manually. "
+            "Without this, Financial Pressure Tier 1.5 (price-growth) signals "
+            "are absent and scoring falls back to Pink Sheet alone.",
+            err=True,
+        )
+
+    # Steps 10–11: company + facility data
+    _run("seed-companies", ["seed-companies"])
+
+    if not skip_mrds:
+        _run(
+            "ingest-mrds",
+            ["ingest-mrds", "--local-file", mrds_file],
+        )
+    else:
+        typer.echo("\n⚠  Skipping ingest-mrds (--skip-mrds set).")
+
+    # Steps 12–14: relationship and regulatory seeds
+    _run("seed-supply-relationships", ["seed-supply-relationships"])
+    _run("seed-material-exposures", ["seed-material-exposures"])
+    _run("seed-regulations", ["seed-regulations"])
+    # External regulation IDs (CELEX, FR doc number, etc.) → regulation_key.
+    # MUST run after seed-regulations (FK references regulations.id) and
+    # BEFORE eurlex.py / federal-register / any future regulation-attaching
+    # ingester so they can resolve external IDs through the alias table.
+    _run("seed-regulation-aliases", ["seed-regulation-aliases"])
+
+    # Step 15: LEI enrichment
+    if not skip_gleif:
+        _run("ingest-gleif", ["ingest-gleif"])
+    else:
+        typer.echo("\n⚠  Skipping ingest-gleif (--skip-gleif set).")
+
+    typer.echo("\n✓  setup-all complete.")
+    typer.echo(
+        "\nNext steps:\n"
+        "  bdi-ingest ingest-comtrade --years <years>           # export flows (runs daily via Inngest)\n"
+        "  bdi-ingest ingest-comtrade --flow-code M --years <years>  # import flows\n"
+        "  bdi-ingest ingest-federal-register\n"
+        "  bdi-ingest ingest-gta\n"
+        "  bdi-ingest ingest-opensanctions\n"
+        "  bdi-ingest ingest-eurlex\n"
+        "  bdi-ingest ingest-iea-policy-tracker\n"
+        "  bdi-ingest full-score\n"
+    )
+
+
+@app.command("ingest-mcs-pdf")
+def ingest_mcs_pdf_cmd(
+    path: str = typer.Argument(
+        ...,
+        help="Path to the USGS Mineral Commodity Summaries PDF (e.g. mcs2026.pdf).",
+    ),
+    year: int = typer.Option(
+        ...,
+        "--year",
+        help=(
+            "MCS publication year (e.g. 2026).  Used as the reference_year for "
+            "production share rows where an explicit year cannot be parsed from the PDF. "
+            "Actual data years in the production tables are typically year-1."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Parse the PDF and log what would be inserted, without writing to the DB.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Suppress the confirmation prompt and proceed immediately.",
+    ),
+    use_llm_sections: bool = typer.Option(
+        True,
+        "--use-llm-sections/--no-llm-sections",
+        help=(
+            "When True (default), use the Anthropic LLM locator to identify "
+            "commodity chapter bounds.  More robust to MCS layout variants "
+            "(footnoted headings, multi-page chapters).  Requires "
+            "ANTHROPIC_API_KEY and the `anthropic` package; result is cached "
+            "at data/mcs<year>_locator_result.json so re-runs skip the LLM "
+            "call.  When False, falls back to regex heading detection."
+        ),
+    ),
+) -> None:
+    """Seed hs_code_material_mappings and hs_code_production_shares from a USGS MCS PDF.
+
+    Parses the annual USGS Mineral Commodity Summaries PDF using pdfplumber and:
+
+    \b
+      1. Inserts 10-digit US HTS rows into hs_code_material_mappings (market_scope='us')
+      2. Derives and inserts 6-digit global rows (market_scope='global', ON CONFLICT DO NOTHING)
+      3. Inserts world production shares into hs_code_production_shares (market_scope='global')
+      4. Inserts US import source shares into hs_code_production_shares (market_scope='us')
+      5. Appends salient notes to MaterialCriticalitySignal.metadata_json
+
+    All inserts are idempotent: re-running with the same PDF updates production share values
+    without duplicating mapping rows.
+
+    Prerequisites:
+
+    \b
+      - alembic upgrade head  (migrations 022–028 must be applied)
+      - bdi-ingest seed-countries  (country ISO-2 codes must exist for name resolution)
+      - bdi-ingest seed  (materials must exist for FK linkage)
+
+    \b
+    Examples:
+      bdi-ingest ingest-mcs-pdf mcs2026.pdf --year 2026
+      bdi-ingest ingest-mcs-pdf mcs2026.pdf --year 2026 --dry-run
+    """
+    from pathlib import Path as _Path
+    from app.services.ingestion.mcs_pdf_parser import MCSPdfParser
+
+    pdf_path = _Path(path)
+    if not pdf_path.exists():
+        typer.echo(f"File not found: {path}", err=True)
+        raise typer.Exit(code=1)
+
+    if not dry_run and not force:
+        typer.confirm(
+            f"This will seed hs_code_material_mappings and hs_code_production_shares "
+            f"from {pdf_path.name} (year={year}).  Continue?",
+            abort=True,
+        )
+
+    s = _session()
+    try:
+        # Construct the parser with a resolver so the regex fallback path
+        # can translate PDF headings via the alias table.  The LLM path
+        # doesn't need it (canonical names come from the materials list
+        # passed into ``seed_to_db``).
+        from app.services.ingestion.material_resolver import MaterialAliasResolver
+        resolver = MaterialAliasResolver(s)
+        parser = MCSPdfParser(pdf_path, reference_year=year, resolver=resolver)
+
+        stats = parser.seed_to_db(
+            s, dry_run=dry_run, use_llm_sections=use_llm_sections,
+        )
+        if not dry_run:
+            s.commit()
+
+        total_us = sum(v["us_rows_inserted"] for v in stats.values())
+        total_global = sum(v["global_rows_inserted"] for v in stats.values())
+        total_prod = sum(v["production_shares_inserted"] for v in stats.values())
+        total_imp = sum(v["import_source_shares_inserted"] for v in stats.values())
+
+        typer.echo(json.dumps({
+            "ok": True,
+            "dry_run": dry_run,
+            "commodities_processed": len(stats),
+            "us_mapping_rows": total_us,
+            "global_mapping_rows": total_global,
+            "production_share_rows": total_prod,
+            "import_source_rows": total_imp,
+            "by_commodity": stats,
+        }, indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("full-score")
+def full_score_cmd(
+    as_of: Optional[str] = typer.Option(
+        None,
+        "--as-of",
+        help="Point-in-time date for all scoring steps (YYYY-MM-DD). Default: today.",
+    ),
+    skip_trade_signals: bool = typer.Option(
+        False,
+        "--skip-trade-signals",
+        help="Skip build-trade-signals (use when trade_flows has not changed).",
+    ),
+) -> None:
+    """Run the full scoring pipeline from trade signals through company scores.
+
+    Executes all scoring steps in dependency order.  Two passes of rescore-all
+    are intentional: the first pass scores each company independently; the second
+    pass picks up supply-chain propagation scores that depend on upstream results
+    from the first pass.
+
+    \b
+    Execution order:
+      1.  build-trade-signals     derive GEOPOLITICAL_TRADE events from trade_flows
+      2.  rescore-market          material × geography risk scores
+      3.  rescore-global-rollups  material-level global rollup from geo scores
+      4.  rescore-chemistry       chemistry risk from material rollups
+      5.  rescore-all  (pass 1)   company six-pillar scores
+      6.  rescore-all  (pass 2)   re-score with propagation scores now available
+
+    \b
+    Prerequisites: setup-all must have run, plus at minimum:
+      bdi-ingest ingest-comtrade  (for trade signals + market scoring)
+      bdi-ingest ingest-worldbank (for commodity price signal)
+
+    \b
+    Examples:
+      bdi-ingest full-score
+      bdi-ingest full-score --as-of 2025-01-01
+      bdi-ingest full-score --skip-trade-signals
+    """
+    import sys
+    import subprocess
+
+    def _run(step_name: str, args: list[str]) -> None:
+        typer.echo(f"\n{'='*60}")
+        typer.echo(f"  full-score  ▶  {step_name}")
+        typer.echo(f"{'='*60}")
+        result = subprocess.run(
+            [sys.executable, "-m", "app.cli"] + args,
+            check=False,
+        )
+        if result.returncode != 0:
+            typer.echo(
+                f"\n✗  full-score aborted: '{step_name}' exited with code {result.returncode}.",
+                err=True,
+            )
+            raise typer.Exit(code=result.returncode)
+
+    as_of_args = ["--as-of", as_of] if as_of else []
+
+    if not skip_trade_signals:
+        _run("build-trade-signals", ["build-trade-signals"])
+    else:
+        typer.echo("\n⚠  Skipping build-trade-signals (--skip-trade-signals set).")
+
+    _run("rescore-market", ["rescore-market"] + as_of_args)
+    _run("rescore-global-rollups", ["rescore-global-rollups"] + as_of_args)
+    _run("rescore-chemistry", ["rescore-chemistry"] + as_of_args)
+
+    typer.echo("\n  rescore-all pass 1 of 2 (individual company scores)…")
+    _run("rescore-all (pass 1)", ["rescore-all", "--skip-existing"] + as_of_args)
+
+    typer.echo("\n  rescore-all pass 2 of 2 (propagation)…")
+    _run("rescore-all (pass 2)", ["rescore-all"] + as_of_args)
+
+    typer.echo("\n✓  full-score complete.")
+
+
+@app.command("reset-events")
+def reset_events_cmd(
+    confirm: bool = typer.Option(
+        False,
+        "--yes",
+        help=(
+            "Required confirmation flag. Without --yes the command prints the "
+            "row counts that WOULD be deleted and exits without touching data."
+        ),
+    ),
+    keep_source_documents: bool = typer.Option(
+        True,
+        "--keep-source-documents/--purge-source-documents",
+        help=(
+            "Default keeps source_documents so re-ingest can reuse cached "
+            "payloads (SEC EDGAR / Federal Register) and skip the fetch. "
+            "Pass --purge-source-documents only if you actually want to "
+            "re-download every source — slower and costs API quota."
+        ),
+    ),
+    source: Optional[str] = typer.Option(
+        None,
+        "--source",
+        help=(
+            "Restrict the reset to a single source.  Matches sources.name "
+            "or sources.source_type, case-insensitive.  Examples: 'gta', "
+            "'Global Trade Alert', 'opensanctions', 'eur-lex', "
+            "'federal_register'.  Without this flag the reset clears every "
+            "RiskEvent across all sources.  Useful when one ingester's "
+            "attribution logic changed (e.g. the GTA structural classifier "
+            "from 2026-05-12) and you want to re-ingest only that source's "
+            "events without re-running every other ingester."
+        ),
+    ),
+) -> None:
+    """Truncate the risk_events + junction tables in FK-safe order.
+
+    Use this when:
+      * Attribution logic changed (e.g. Tier 1.x audits, GTA Scope 2 fixes,
+        EUR-Lex material-junction wiring) and the existing rows reflect
+        the OLD logic — re-ingest is the only way to apply the new rules
+        to historical events.
+      * You want a clean slate before partner / customer review.
+
+    Does NOT touch:
+      * Reference data (materials, hs_code_material_mappings, regulations,
+        regulation_material_scope, regulation_geography_scope, facilities,
+        material_production_shares, commodity_prices, companies, etc.)
+      * Trade flows — the confidence weighting from the 2026-05-09 fix
+        applies at query time via JOIN, so existing TradeFlow rows do
+        not need re-ingest.
+      * Scoring outputs (run rescore-* commands separately after re-ingest).
+
+    Order matters: junction tables are truncated before risk_events to
+    avoid FK violations.  RiskEventGeography, RiskEventCompany,
+    RiskEventMaterial, RiskEventHsMapping, RiskEventRegulation, then
+    risk_events.
+
+    Idempotency notes for re-ingest after a reset:
+      * GTA          — title/summary/event_date come straight from CSV
+                       columns; Scope 2 added metadata only, content_hash
+                       inputs unchanged.  Safe.
+      * IEA          — content_hash(title, countries_raw, year).  Safe.
+      * Federal Reg  — content_hash(document_number, publication_date). Safe.
+      * SEC EDGAR    — dedup via source_document_id existence check. Safe.
+      * EUR-Lex      — dedup via RiskEventRegulation existence check. Safe.
+      * OpenSanctions geo events — title contains entity COUNT; post-
+                       Tier-1.2 the count drops sharply (topic filter),
+                       so re-ingest produces a different content_hash
+                       from any pre-existing rows.  Cleared rows mean
+                       no duplicates; do NOT re-run a second time
+                       without clearing again.
+      * trade_signal_builder — title contains the percentage; Tier 1.4
+                       confidence weighting changes the percentage.
+                       Same rule: cleared rows mean no duplicates;
+                       don't re-run on top.
+      * Census trade — pipeline.py._add_risk_event currently does NOT
+                       set content_hash and has NO dedup check.  Every
+                       re-run inserts duplicates regardless of clears.
+                       Separate fix needed; tracked.
+    """
+    from sqlalchemy import text
+
+    # Order is FK-safe: child junctions first, then risk_events.
+    # We use raw DELETE rather than TRUNCATE because (a) TRUNCATE in
+    # Postgres requires the privilege and (b) on SQLite (used in tests)
+    # TRUNCATE doesn't exist.  Postgres can re-use the same physical
+    # pages after the DELETE so the storage cost is the same.
+    junction_tables = [
+        "risk_event_companies",
+        "risk_event_materials",
+        "risk_event_hs_mappings",
+        "risk_event_geographies",
+        "risk_event_regulations",
+    ]
+    tables_in_order = junction_tables + ["risk_events"]
+
+    s = _session()
+    try:
+        # ── Resolve --source to a source_id (when supplied) ───────────────
+        # Matches either sources.name (e.g. "Global Trade Alert") or
+        # sources.source_type (e.g. "gta") case-insensitively so callers
+        # don't need to know which one is canonical.  Returns a single
+        # row; an ambiguous match (very unlikely — name and source_type
+        # are both stored as distinct strings) takes the first hit.
+        source_id: Optional[int] = None
+        source_name: Optional[str] = None
+        if source is not None:
+            src_row = s.execute(
+                text(
+                    """
+                    SELECT id, name FROM sources
+                    WHERE LOWER(name) = LOWER(:s)
+                       OR LOWER(source_type) = LOWER(:s)
+                    LIMIT 1
+                    """
+                ),
+                {"s": source.strip()},
+            ).first()
+            if src_row is None:
+                typer.echo(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": (
+                                f"No source matched '{source}'.  Check the "
+                                "sources table — match is case-insensitive "
+                                "against name OR source_type."
+                            ),
+                        }
+                    ),
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            source_id, source_name = src_row[0], src_row[1]
+
+        # Filter clauses for the count/delete queries.  When source_id is
+        # None we touch every row (legacy behavior).  When set, we use a
+        # subquery on source_documents → risk_events so junction deletes
+        # only hit rows belonging to the named source.  The subquery
+        # approach works on both Postgres and SQLite without array params.
+        if source_id is None:
+            risk_events_where = ""
+            junction_where = ""
+            params: dict = {}
+        else:
+            risk_events_where = (
+                "WHERE source_document_id IN "
+                "(SELECT id FROM source_documents WHERE source_id = :sid)"
+            )
+            junction_where = (
+                "WHERE risk_event_id IN ("
+                "SELECT id FROM risk_events "
+                "WHERE source_document_id IN "
+                "(SELECT id FROM source_documents WHERE source_id = :sid)"
+                ")"
+            )
+            params = {"sid": source_id}
+
+        # Snapshot row counts up-front so the dry-run print and the
+        # actual-run print look identical.
+        counts: dict[str, int] = {}
+        for tbl in junction_tables:
+            counts[tbl] = s.execute(
+                text(f"SELECT COUNT(*) FROM {tbl} {junction_where}"),
+                params,
+            ).scalar_one()
+        counts["risk_events"] = s.execute(
+            text(f"SELECT COUNT(*) FROM risk_events {risk_events_where}"),
+            params,
+        ).scalar_one()
+
+        scope = (
+            f"source='{source_name}' (id={source_id})"
+            if source_id is not None
+            else "all sources"
+        )
+
+        if not confirm:
+            typer.echo(json.dumps({
+                "ok": True,
+                "dry_run": True,
+                "scope": scope,
+                "would_delete": counts,
+                "hint": "re-run with --yes to actually delete",
+            }, indent=2))
+            return
+
+        # Execute the deletes in order — junctions first, then events.
+        deleted: dict[str, int] = {}
+        for tbl in junction_tables:
+            result = s.execute(text(f"DELETE FROM {tbl} {junction_where}"), params)
+            deleted[tbl] = result.rowcount or 0
+        result = s.execute(
+            text(f"DELETE FROM risk_events {risk_events_where}"),
+            params,
+        )
+        deleted["risk_events"] = result.rowcount or 0
+        s.commit()
+
+        # Optionally also purge source_documents (NOT recommended).
+        # When --source is set we restrict the purge to that source so a
+        # scoped reset can also clear its cached payloads if requested.
+        sd_deleted: Optional[int] = None
+        if not keep_source_documents:
+            if source_id is None:
+                sd_result = s.execute(text("DELETE FROM source_documents"))
+            else:
+                sd_result = s.execute(
+                    text("DELETE FROM source_documents WHERE source_id = :sid"),
+                    {"sid": source_id},
+                )
+            sd_deleted = sd_result.rowcount or 0
+            s.commit()
+
+        typer.echo(json.dumps({
+            "ok": True,
+            "dry_run": False,
+            "scope": scope,
+            "deleted": deleted,
+            "source_documents_deleted": sd_deleted,
+        }, indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("reingest-all-events")
+def reingest_all_events_cmd(
+    reset: bool = typer.Option(
+        False,
+        "--reset",
+        help=(
+            "Run `reset-events --yes` first to clear all RiskEvent rows + "
+            "junctions before re-ingesting.  Source documents are preserved "
+            "so ingesters reuse cached payloads where possible."
+        ),
+    ),
+    gta_file: Optional[str] = typer.Option(
+        None,
+        "--gta-file",
+        help=(
+            "Path to a locally-downloaded GTA CSV file.  GTA requires "
+            "registration for bulk access, so the file path must be passed "
+            "explicitly.  If omitted, the GTA step is skipped with a warning."
+        ),
+    ),
+    iea_file: Optional[str] = typer.Option(
+        None,
+        "--iea-file",
+        help=(
+            "Path to the downloaded IEA Critical Minerals Policy Tracker "
+            "CSV/XLSX.  If omitted, the IEA step is skipped with a warning."
+        ),
+    ),
+    federal_register_since: Optional[str] = typer.Option(
+        None,
+        "--fr-since",
+        help=(
+            "Federal Register --since date (YYYY-MM-DD).  Default keeps the "
+            "ingester's own default (90 days).  Pass '2020-01-01' for a "
+            "full historical backfill."
+        ),
+    ),
+    skip: Optional[str] = typer.Option(
+        None,
+        "--skip",
+        help=(
+            "Comma-separated step names to skip.  Valid names: "
+            "eurlex, gta, iea, opensanctions, federal-register, sec-edgar, "
+            "trade-signals."
+        ),
+    ),
+    continue_on_error: bool = typer.Option(
+        False,
+        "--continue-on-error",
+        help=(
+            "Continue running subsequent steps if one fails.  Default "
+            "aborts on first failure (matching `full-score` semantics)."
+        ),
+    ),
+) -> None:
+    """Re-ingest every risk-event-producing source in dependency order.
+
+    Use this after a logic change that invalidates existing RiskEvent rows
+    (e.g., Tier 1.x audits, GTA Scope 2 fix, EUR-Lex material-junction
+    wiring, content_hash format changes).  Combine with --reset to start
+    from a clean slate.
+
+    \b
+    Execution order:
+      1.  reset-events           (only when --reset is set)
+      2.  ingest-eurlex          regulatory standing obligations
+      3.  ingest-gta             trade interventions (requires --gta-file)
+      4.  ingest-iea-policy-tracker
+                                 positive-policy signals (requires --iea-file)
+      5.  ingest-opensanctions   sanctions matches (--force used to bypass
+                                 the 6-day interval gate)
+      6.  ingest-federal-register
+                                 US export-control / tariff / UFLPA notices
+      7.  ingest-sec-edgar       10-K / 10-Q / 8-K material discussion
+      8.  build-trade-signals    derives TRADE_CONCENTRATION / EXPORT_DROP
+                                 from trade_flows (does not re-fetch
+                                 Comtrade itself)
+
+    \b
+    Deliberately NOT included:
+      ingest-comtrade            confidence-weighting applies at query time
+                                 via JOIN, so existing TradeFlow rows do
+                                 not need re-fetching.  Re-run separately
+                                 if you actually need fresh trade volume
+                                 data — costs API quota.
+
+    \b
+    Examples:
+      # Clean reset + full re-ingest (typical scoring-engine fix workflow):
+      bdi-ingest reingest-all-events --reset --gta-file ./data/gta.csv \\
+          --iea-file ./data/iea_policy_tracker.csv
+
+      # Re-run only what doesn't need local files:
+      bdi-ingest reingest-all-events --skip gta,iea
+
+      # Refresh after a Federal Register parser change, skip the rest:
+      bdi-ingest reingest-all-events \\
+          --skip eurlex,gta,iea,opensanctions,sec-edgar,trade-signals
+
+    After completion, run `bdi-ingest full-score` so the new events flow
+    through to material / chemistry / company scores.
+    """
+    import sys
+    import subprocess
+
+    skip_set = {s.strip().lower() for s in (skip or "").split(",") if s.strip()}
+    failures: list[str] = []
+    completed: list[str] = []
+    skipped: list[str] = []
+
+    def _run(step_name: str, args: list[str]) -> bool:
+        """Run a sub-command. Returns True on success, False on failure.
+
+        Honors --continue-on-error: when set, failures are recorded but
+        execution continues to the next step.  When unset, the first
+        failure aborts the whole orchestrator with the sub-command's
+        exit code (mirroring full-score semantics).
+        """
+        typer.echo(f"\n{'='*60}")
+        typer.echo(f"  reingest-all-events  ▶  {step_name}")
+        typer.echo(f"{'='*60}")
+        result = subprocess.run(
+            [sys.executable, "-m", "app.cli"] + args,
+            check=False,
+        )
+        if result.returncode != 0:
+            msg = f"'{step_name}' exited with code {result.returncode}"
+            failures.append(msg)
+            if continue_on_error:
+                typer.echo(
+                    f"\n⚠  {msg} — continuing because --continue-on-error is set.",
+                    err=True,
+                )
+                return False
+            typer.echo(
+                f"\n✗  reingest-all-events aborted: {msg}.",
+                err=True,
+            )
+            raise typer.Exit(code=result.returncode)
+        completed.append(step_name)
+        return True
+
+    def _maybe_skip(name: str, reason: Optional[str] = None) -> bool:
+        """Return True if this step should be skipped."""
+        if name in skip_set:
+            typer.echo(f"\n⊘  Skipping {name} (--skip)")
+            skipped.append(f"{name} (--skip)")
+            return True
+        if reason:
+            typer.echo(f"\n⊘  Skipping {name}: {reason}")
+            skipped.append(f"{name} ({reason})")
+            return True
+        return False
+
+    # ── 1. Optional reset ────────────────────────────────────────────────
+    if reset:
+        _run("reset-events --yes", ["reset-events", "--yes"])
+    else:
+        typer.echo(
+            "\nℹ  --reset not set; existing RiskEvent rows preserved. "
+            "Re-ingest dedups via content_hash so this is safe but means "
+            "rows produced under old logic stay in the table.",
+        )
+
+    # ── 2. EUR-Lex ───────────────────────────────────────────────────────
+    if not _maybe_skip("eurlex"):
+        _run("ingest-eurlex", ["ingest-eurlex"])
+
+    # ── 3. GTA (requires --gta-file) ─────────────────────────────────────
+    if not _maybe_skip(
+        "gta",
+        reason="--gta-file not provided" if not gta_file else None,
+    ):
+        _run("ingest-gta", ["ingest-gta", "--local-file", gta_file])
+
+    # ── 4. IEA Policy Tracker (requires --iea-file) ──────────────────────
+    if not _maybe_skip(
+        "iea",
+        reason="--iea-file not provided" if not iea_file else None,
+    ):
+        _run(
+            "ingest-iea-policy-tracker",
+            ["ingest-iea-policy-tracker", "--file-path", iea_file],
+        )
+
+    # ── 5. OpenSanctions (--force bypasses the 6-day interval gate) ──────
+    if not _maybe_skip("opensanctions"):
+        _run("ingest-opensanctions", ["ingest-opensanctions", "--force"])
+
+    # ── 6. Federal Register ──────────────────────────────────────────────
+    if not _maybe_skip("federal-register"):
+        fr_args = ["ingest-federal-register"]
+        if federal_register_since:
+            fr_args.extend(["--since", federal_register_since])
+        _run("ingest-federal-register", fr_args)
+
+    # ── 7. SEC EDGAR ─────────────────────────────────────────────────────
+    if not _maybe_skip("sec-edgar"):
+        _run("ingest-sec-edgar", ["ingest-sec-edgar"])
+
+    # ── 8. Trade signals (NOT a Comtrade re-fetch — only derives events) ─
+    if not _maybe_skip("trade-signals"):
+        _run("build-trade-signals", ["build-trade-signals"])
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    typer.echo(f"\n{'='*60}")
+    typer.echo("  reingest-all-events  ▶  summary")
+    typer.echo(f"{'='*60}")
+    typer.echo(json.dumps({
+        "ok": len(failures) == 0,
+        "reset": reset,
+        "completed": completed,
+        "skipped": skipped,
+        "failures": failures,
+        "next_step": (
+            "Run `bdi-ingest full-score` to push the new events through "
+            "to material / chemistry / company scoring."
+        ),
+    }, indent=2))
 
 
 def main() -> None:

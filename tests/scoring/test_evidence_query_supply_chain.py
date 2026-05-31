@@ -20,7 +20,7 @@ from app.models.company import (
     CompanyScore,
     CompanySupplyRelationship,
 )
-from app.models.facility import Facility
+from app.models.facility import CompanyFacility, Facility
 from app.models.regulatory import (
     CompanyRegulationExposure,
     Regulation,
@@ -200,9 +200,16 @@ class TestGetLatestCompanyScores:
 class TestGetFacilitiesForCompany:
     def test_returns_facilities_owned_by_company(self, sqlite_session):
         c = _make_company(sqlite_session, "FacCo")
-        f1 = Facility(company_id=c.id, facility_type="mine", country="CN")
-        f2 = Facility(company_id=c.id, facility_type="refinery", country="US")
+        f1 = Facility(facility_type="mine", country="CN")
+        f2 = Facility(facility_type="refinery", country="US")
         sqlite_session.add_all([f1, f2])
+        sqlite_session.flush()
+        sqlite_session.add_all(
+            [
+                CompanyFacility(company_id=c.id, facility_id=f1.id),
+                CompanyFacility(company_id=c.id, facility_id=f2.id),
+            ]
+        )
         sqlite_session.flush()
 
         facs = get_facilities_for_company(sqlite_session, c.id)
@@ -210,10 +217,14 @@ class TestGetFacilitiesForCompany:
 
     def test_scope_country_filter(self, sqlite_session):
         c = _make_company(sqlite_session, "FacCo")
+        f_cn = Facility(facility_type="mine", country="CN")
+        f_us = Facility(facility_type="refinery", country="US")
+        sqlite_session.add_all([f_cn, f_us])
+        sqlite_session.flush()
         sqlite_session.add_all(
             [
-                Facility(company_id=c.id, facility_type="mine", country="CN"),
-                Facility(company_id=c.id, facility_type="refinery", country="US"),
+                CompanyFacility(company_id=c.id, facility_id=f_cn.id),
+                CompanyFacility(company_id=c.id, facility_id=f_us.id),
             ]
         )
         sqlite_session.flush()
@@ -237,11 +248,17 @@ class TestGetRegulationsScopingCompany:
         session.flush()
 
         # Reg 1: structured exposure (status weighting)
-        r1 = Regulation(regulation_key="UFLPA-test", title="UFLPA")
+        r1 = Regulation(
+            regulation_key="UFLPA-test", title="UFLPA", verified=True,
+        )
         # Reg 2: material-scope only
-        r2 = Regulation(regulation_key="LI-RULE", title="Lithium rule")
+        r2 = Regulation(
+            regulation_key="LI-RULE", title="Lithium rule", verified=True,
+        )
         # Reg 3: geography-scope only
-        r3 = Regulation(regulation_key="CN-RULE", title="China origin rule")
+        r3 = Regulation(
+            regulation_key="CN-RULE", title="China origin rule", verified=True,
+        )
         session.add_all([r1, r2, r3])
         session.flush()
 
@@ -270,7 +287,7 @@ class TestGetRegulationsScopingCompany:
             )
         )
         assert out["UFLPA-test"] == 1.0    # non_compliant
-        assert out["LI-RULE"] == 0.5       # material-scope only
+        assert out["LI-RULE"] == 0.4       # material-scope ``covered`` → _SCOPE_TYPE_WEIGHT
         assert out["CN-RULE"] == 0.5       # geography-scope only
 
     def test_dedup_keeps_max_weight(self, sqlite_session):
@@ -280,7 +297,7 @@ class TestGetRegulationsScopingCompany:
         m = Material(canonical_name="Nickel-test")
         sqlite_session.add(m)
         sqlite_session.flush()
-        r = Regulation(regulation_key="NI-RULE", title="Nickel rule")
+        r = Regulation(regulation_key="NI-RULE", title="Nickel rule", verified=True)
         sqlite_session.add(r)
         sqlite_session.flush()
         sqlite_session.add(

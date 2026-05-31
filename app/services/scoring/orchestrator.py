@@ -84,6 +84,7 @@ from app.services.scoring.evidence_query import (
     get_latest_company_scores,
     get_regulations_scoping_company,
     get_supplier_chain,
+    get_targeted_countries_for_events,
 )
 from app.services.scoring.types import (
     ChemistryMixContribution,
@@ -233,12 +234,36 @@ def rescore_company(
         facilities=facilities,
         geo_events=geo_events_trade,
     )
+    # Conditional scope intersection (Option C, EUR-Lex Section 5):
+    # batch-load targeted_country geography scopes for any event in the
+    # regulatory pool so derive_regulatory_inputs can downweight events
+    # whose targeted producer countries the company has no exposure to.
+    reg_event_ids: set[int] = {
+        ew.event.id for ew in regulatory_events
+    } | {ew.event.id for ew in regulation_events}
+    event_targeted_countries = get_targeted_countries_for_events(
+        db, reg_event_ids
+    )
+    # Track the count of "real" event impacts so we can report how many
+    # synthetic single-country-cap violations were appended (Idea B).
+    # ``derive_regulatory_inputs`` dedups the two event lists by event.id
+    # internally, so we mirror that here for an accurate baseline.
+    _real_event_impact_count = len({
+        ew.event.id for ew in (list(regulatory_events) + list(regulation_events))
+    })
     top_impacts, obligations, prox = derive_regulatory_inputs(
         regulatory_events,
         active_obligations,
         as_of_date,
         scope_obligations=scope_obligations,
         regulation_events=regulation_events,
+        event_targeted_countries=event_targeted_countries,
+        company_country_set=country_set,
+        db=db,
+        exposures=material_exposures,
+    )
+    threshold_violations_detected = max(
+        0, len(top_impacts) - _real_event_impact_count
     )
     struct_dep, op_impacts = derive_operational_inputs(
         operational_events,
@@ -304,6 +329,7 @@ def rescore_company(
         "supplier_chain_size":      len(supplier_chain),
         "supplier_scores_used":     len(propagation_inputs),
         "chemistries_weighted":     len(chemistry_mix or {}),
+        "threshold_violations_detected": threshold_violations_detected,
     }
     if propagation_skipped_due_to_scope:
         signals_used["propagation_skipped_due_to_scope"] = True

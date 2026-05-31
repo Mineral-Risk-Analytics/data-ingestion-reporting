@@ -1,8 +1,11 @@
-"""Explainable rule-based risk scoring (v2, five-pillar framework).
+"""Explainable rule-based risk scoring — v3.0 six-pillar framework.
 
-Removed in v2: macro_context_score — its demand_index input feeds
-score_material_exposure(trade_volatility=...) and its infrastructure_stress_index
-input feeds score_geopolitical_trade(country_concentration=...).
+Pillars: material exposure, geopolitical trade, regulatory profile,
+operational risk, financial pressure, supply-chain propagation.
+
+Pure-function pillar scorers re-exported here for convenience. The
+per-company orchestrator lives in ``orchestrator.py``; the market-level
+aggregator lives in ``market_aggregator.py``.
 """
 
 from app.services.scoring.decay import compute_recency_multiplier

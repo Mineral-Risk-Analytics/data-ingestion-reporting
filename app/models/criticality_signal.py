@@ -31,14 +31,18 @@ class MaterialCriticalitySignal(Base):
     """
     One row per (material, source, reference_year). Captures criticality scores
     from multiple independent sources so the chemistry risk scorer can prefer
-    more authoritative signals (eu_crma, iea_report) over baseline USGS data.
+    more authoritative signals (eu_crma) over baseline USGS data.
 
-    Source hierarchy used by chemistry_risk.score_chemistry():
+    Source hierarchy used by chemistry_risk.score_chemistry_from_rollup():
         1. eu_crma      — EU Critical Raw Materials Act assessments
-        2. iea_report   — IEA Critical Minerals annual reports
-        3. usgs_mcs     — USGS Mineral Commodity Summaries (default baseline)
-        4. manual       — hand-entered data for materials without other sources
-        5. patstat      — EPO PATSTAT (future phase)
+        2. usgs_mcs     — USGS Mineral Commodity Summaries (default baseline)
+        3. manual       — hand-entered data for materials without other sources
+        4. patstat      — EPO PATSTAT (future phase)
+
+    Removed 2026-05-06: ``iea_report`` source.  The iea_reports.py ingester
+    was deleted because it overlapped with usgs_mcs and used heuristic
+    keyword matching (deficit/surplus/challenge → 0.30/0.65/0.80) that
+    didn't add reliable signal beyond USGS's structured HHI/RLI data.
 
     hhi_score stores the raw Herfindahl-Hirschman Index (Σ share_i²) in 0–1
     range (this codebase uses fractional shares, not percentages). The traditional
@@ -60,7 +64,7 @@ class MaterialCriticalitySignal(Base):
     )
     source: Mapped[str] = mapped_column(
         String(32), nullable=False,
-        comment="usgs_mcs | eu_crma | iea_report | patstat | manual",
+        comment="usgs_mcs | eu_crma | patstat | manual",
     )
     reference_year: Mapped[int] = mapped_column(
         Integer, nullable=False,
@@ -77,7 +81,67 @@ class MaterialCriticalitySignal(Base):
     )
     hhi_score: Mapped[Optional[float]] = mapped_column(
         Float, nullable=True,
-        comment="Raw HHI 0.0–1.0 (Σ share_i²). Stored for methodological transparency.",
+        comment="Raw HHI 0.0–1.0 (Σ share_i²) on mine production. Stored for methodological transparency.",
+    )
+    # ── Supply metrics promoted from USGS MCS CSV (migration 019) ─────────────
+    reserve_hhi_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "HHI of reserve distribution by country (0–1). Forward-looking "
+            "concentration signal independent of production HHI."
+        ),
+    )
+    reserve_life_index: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "World reserves / world annual production (years). "
+            "Lower = nearer-term scarcity risk."
+        ),
+    )
+    production_yoy_pct: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "YoY change in world mine production as a signed fraction "
+            "(e.g. -0.05 = -5%). Negative = contracting supply."
+        ),
+    )
+    capacity_utilization: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "World mine production / world mine capacity (0–1). "
+            "High = tight market with little buffer."
+        ),
+    )
+    # ── Price-trend metrics from USGS MCS 2026 Fig 10 (migration 036) ─────────
+    price_yoy_pct: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "YoY price change as signed fraction (e.g. 1.44 = +144%). "
+            "Positive = supply-side stress; negative = market easing. "
+            "Sourced from USGS MCS Fig 10 Price Growth Rates."
+        ),
+    )
+    price_cagr_5yr_pct: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "5-year compound annual growth rate of price as signed fraction "
+            "(e.g. 0.47 = +47% CAGR). Smoother trend signal than yoy."
+        ),
+    )
+    # ── US-dependency metrics promoted from metadata_json (migration 038) ─────
+    us_net_import_reliance_pct: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "USGS Net Import Reliance percentage (0–100). Bounded "
+            "estimates ('<50', '>50') stored as midpoint values."
+        ),
+    )
+    us_apparent_consumption: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "US apparent consumption volume (latest year, source unit). "
+            "Sourced from MCS Salient Statistics."
+        ),
     )
     metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

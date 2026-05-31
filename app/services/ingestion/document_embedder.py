@@ -1,3 +1,7 @@
+# PHASE 2 — NOT YET WIRED
+# This module is part of the planned RAG/vector pipeline (commit 0618294).
+# It has no callers in the live ingestion path. Enable by calling
+# embed_document() from IngestionPipeline after source documents are persisted.
 """
 Pipeline step: chunk a source document's text, generate embeddings, and
 persist ``DocumentChunk`` rows with their vector embeddings.

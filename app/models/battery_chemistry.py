@@ -54,6 +54,7 @@ class BatteryChemistry(Base):
         comment="Required when current_market_share_pct is set.",
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -135,17 +136,35 @@ class ChemistryRiskScore(Base):
 
     metadata_json structure (required for auditability):
     {
-      "signal_sources":          {"Gallium": "manual", "Lithium": "usgs_mcs"},
-      "geo_coverage":            {"Lithium": 0.85, "Gallium": null},
-      "materials_missing_hs":    ["Gallium", "Germanium"],
-      "patent_modifiers_applied": {"Gallium": 1.15, "Cobalt": 0.85},
-      "trade_flows_vintage":     "2023",
-      "no_benchmark_materials":  ["Gallium"],
-      "score_confidence":        0.72
+      "signal_sources":               {"Gallium": "manual", "Lithium": "usgs_mcs"},
+      "geo_coverage":                 {"Lithium": 0.85, "Gallium": null},
+      "materials_missing_hs":         ["Gallium", "Germanium"],
+      "patent_modifiers_applied":     {"Gallium": 1.15, "Cobalt": 0.85},
+      "trade_flows_vintage":          "2023",
+      "no_benchmark_materials":       ["Gallium"],
+      "score_confidence":             0.72,
+      "trade_volatility_by_material": {"Lithium": 0.41, "Cobalt": 0.30},
+      "trade_event_counts":           {"Lithium": 7, "Cobalt": 0}
     }
+
+    ``trade_volatility_by_material`` records the per-material trade-volatility
+    sub-input fed into ``score_material_exposure()``. Derived from the average
+    normalised impact of GEOPOLITICAL_TRADE events tagged to the material via
+    ``risk_event_materials``. When no events exist the value falls back to
+    ``_DEFAULT_TRADE_VOLATILITY`` (0.3) so the absence of news reads as
+    "neutral", not zero risk. ``trade_event_counts`` mirrors the per-material
+    event counts so analysts can see why a value is at the neutral default.
     """
 
     __tablename__ = "chemistry_risk_scores"
+    __table_args__ = (
+        UniqueConstraint(
+            "battery_chemistry_id",
+            "as_of_date",
+            "methodology_version",
+            name="uq_chemistry_risk_score_key",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     battery_chemistry_id: Mapped[int] = mapped_column(
@@ -169,6 +188,27 @@ class ChemistryRiskScore(Base):
     geopolitical_score: Mapped[Optional[float]] = mapped_column(
         Float, nullable=True,
         comment="Intensity-weighted geopolitical concentration sub-score 0–100.",
+    )
+    regulatory_compliance_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "Intensity-weighted regulatory compliance sub-score 0–100. "
+            "NULL for rows written by methodology_version < 2.0."
+        ),
+    )
+    operational_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "Intensity-weighted operational sub-score 0–100. "
+            "NULL for rows written by methodology_version < 2.0."
+        ),
+    )
+    financial_pressure_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "Intensity-weighted financial pressure sub-score 0–100. "
+            "NULL for rows written by methodology_version < 2.0."
+        ),
     )
     composite_risk_score: Mapped[Optional[float]] = mapped_column(
         Float, nullable=True,

@@ -12,7 +12,7 @@ import uuid
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from app.models.company import Company
     from app.models.documents import SourceDocument
     from app.models.facility import Facility
-    from app.models.supply import Material
+    from app.models.supply import HsCodeMaterialMapping, Material
 
 
 class Regulation(Base):
@@ -53,6 +53,17 @@ class Regulation(Base):
     effective_date: Mapped[Optional[date]] = mapped_column(Date)
     summary: Mapped[Optional[str]] = mapped_column(Text)
     metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB)
+    geography_compliance_weights: Mapped[Optional[Any]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment=(
+            "Per-geography compliance risk weights (0.0–1.0). "
+            "Keys: ISO2 country codes or 'DEFAULT'. "
+            "1.0 = highest risk (targeted/non-compliant); 0.0 = exempt. "
+            "NULL = use 0.50 universal default (no curation)."
+        ),
+    )
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -67,6 +78,9 @@ class Regulation(Base):
         back_populates="regulation", cascade="all, delete-orphan"
     )
     geography_scopes: Mapped[list["RegulationGeographyScope"]] = relationship(
+        back_populates="regulation", cascade="all, delete-orphan"
+    )
+    source_aliases: Mapped[list["RegulationSourceAlias"]] = relationship(
         back_populates="regulation", cascade="all, delete-orphan"
     )
     company_exposures: Mapped[list["CompanyRegulationExposure"]] = relationship(
@@ -122,6 +136,58 @@ class RegulationGeographyScope(Base):
     regulation: Mapped["Regulation"] = relationship(back_populates="geography_scopes")
 
 
+class RegulationSourceAlias(Base):
+    """
+    Reference table mapping external source identifiers to canonical regulations.
+
+    Each row says: when source_system X publishes source_key Y, it means
+    regulation_id Z (or, if is_skipped=True, the row was deliberately not
+    ingested — preserving the audit trail of considered-and-rejected
+    external IDs).
+
+    Mirrors ``MaterialSourceAlias`` so that the alias-resolver pattern is
+    uniform across reference data.  Each ingester translates its own
+    external IDs (CELEX, Federal Register doc number, US Code citation,
+    OFAC SDN entity ID, GTA case ID, etc.) to ``regulation_id`` via this
+    table — no auto-creation of regulations from arbitrary inputs.
+
+    Lookup pattern: ``(source_system, lower(btrim(source_key)))`` is unique
+    per the partial expression index in migration 039.  The
+    ``RegulationAliasResolver`` helper handles the normalisation.
+
+    See migration 039 for column comments.
+    """
+
+    __tablename__ = "regulation_aliases"
+    __table_args__ = (
+        # Unique constraint enforced by the expression index in the
+        # migration; SQLAlchemy can't model the lower(btrim(...)) expression
+        # cleanly here.  Insertions go through PG ON CONFLICT DO UPDATE on
+        # that index.
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_system: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    regulation_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("regulations.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    is_skipped: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    skip_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+    regulation: Mapped[Optional["Regulation"]] = relationship(
+        back_populates="source_aliases"
+    )
+
+
 class CompanyRegulationExposure(Base):
     """
     A company's exposure to a specific regulation, with compliance status.
@@ -148,6 +214,7 @@ class CompanyRegulationExposure(Base):
     # compliant | non_compliant | partial | unknown
     exposure_reason: Mapped[Optional[str]] = mapped_column(Text)
     assessed_at: Mapped[Optional[date]] = mapped_column(Date)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -184,6 +251,20 @@ class RiskEvent(Base):
         ForeignKey("source_documents.id", ondelete="SET NULL"), index=True
     )
     event_type: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    # Precise event classification, distinct from the ingester-specific
+    # ``event_type``.  Read by ``hs_node_scorer`` (tariff_exposure /
+    # export_restriction sub-scores) and the geopolitical / regulatory
+    # aggregators.  Canonical values (May 2026 — extend in
+    # alembic/versions/040 docstring before adding new ones):
+    #     TARIFF                — duties / tariff increases / threats
+    #     EXPORT_RESTRICTION    — export bans, quotas, licensing, taxes
+    #     IMPORT_DISRUPTION     — import tariffs / quotas / bans (demand-side)
+    #     TRADE_CONCENTRATION   — derived from trade flow concentration
+    #     REGULATORY_COMPLIANCE — compliance / due-diligence regulations
+    #     TRADE_POLICY          — general trade policy without a specific measure
+    event_subtype: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, index=True,
+    )
     event_date: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), index=True
     )
@@ -198,8 +279,20 @@ class RiskEvent(Base):
     content_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     # SHA-256 of (title + summary + event_date) — used for deduplication
     metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+    # Refreshed on every ORM-mediated UPDATE.  Used by ingesters that
+    # switched to parameter-stable content_hash + UPSERT semantics
+    # (trade_signal_builder, opensanctions company + geo events,
+    # 2026-05-11) so operators can query for rows touched in a recent
+    # re-ingest pass.  See migration 041 for backfill details.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )
 
     source_document: Mapped[Optional["SourceDocument"]] = relationship(
@@ -218,6 +311,9 @@ class RiskEvent(Base):
         back_populates="risk_event", cascade="all, delete-orphan"
     )
     facility_links: Mapped[list["RiskEventFacility"]] = relationship(
+        back_populates="risk_event", cascade="all, delete-orphan"
+    )
+    hs_mapping_links: Mapped[list["RiskEventHsMapping"]] = relationship(
         back_populates="risk_event", cascade="all, delete-orphan"
     )
 
@@ -254,6 +350,13 @@ class RiskEventCompany(Base):
     relevance_score: Mapped[float] = mapped_column(Float, nullable=False)
     match_reason: Mapped[Optional[str]] = mapped_column(String(64))
     # named_company | geography | material_hs | category_broad
+    review_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="pending", index=True
+    )
+    # pending | confirmed | excluded
+    # pending/confirmed both count toward score; excluded is filtered out by
+    # evidence_query.get_events_for_company() and get_filing_signals().
+    review_note: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -284,6 +387,13 @@ class RiskEventMaterial(Base):
     relevance_score: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     match_reason: Mapped[Optional[str]] = mapped_column(String(64))
     # named_material | hs_code | keyword_match
+    # Copied from RegulationMaterialScope.scope_type when the junction is
+    # written by the EUR-Lex ingester.  Consumed downstream by
+    # evidence_aggregator._impact via apply_scope_severity_multiplier so the
+    # event's severity is amplified (banned 1.50×) or attenuated
+    # (disclosure_required 0.50×) per-material.  Nullable: non-regulation
+    # events and pre-migration rows have no scope_type recorded.
+    scope_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -385,3 +495,63 @@ class RiskEventFacility(Base):
 
     risk_event: Mapped["RiskEvent"] = relationship(back_populates="facility_links")
     facility: Mapped["Facility"] = relationship()
+
+
+class RiskEventHsMapping(Base):
+    """
+    Junction: a risk event's relevance to a specific HS code mapping node.
+
+    Complements :class:`RiskEventMaterial` with stage-level granularity.
+    Both rows are written when an event has HS attribution; only
+    ``RiskEventMaterial`` is written for pre-redesign historical data and
+    keyword-only matches that lack stage resolution.
+
+    A single event may link to multiple hs_mapping rows when multiple
+    supply chain stages are mentioned (e.g. an article that covers both
+    cobalt mining disruption and battery-grade cobalt sulfate shortages).
+
+    relevance_score convention mirrors risk_event_materials:
+      1.00 — direct HS code match (HS prefix found in document text)
+      0.85 — keyword match with stage disambiguation via mappings table
+
+    This table is the primary input for stage-level evidence scoring in
+    ``evidence_query.get_events_for_material()`` and the trade signal
+    builder's stage attribution logic.
+    """
+
+    __tablename__ = "risk_event_hs_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "risk_event_id", "hs_mapping_id", name="uq_risk_event_hs_mapping"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    risk_event_id: Mapped[int] = mapped_column(
+        ForeignKey("risk_events.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    hs_mapping_id: Mapped[int] = mapped_column(
+        ForeignKey("hs_code_material_mappings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    relevance_score: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        default=1.0,
+        comment=(
+            "1.00 = direct HS code match; 0.85 = keyword match with stage "
+            "disambiguation.  Mirrors risk_event_materials convention."
+        ),
+    )
+    match_reason: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="hs_code_match | keyword_match | trade_flow_match",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    risk_event: Mapped["RiskEvent"] = relationship(back_populates="hs_mapping_links")
+    hs_mapping: Mapped["HsCodeMaterialMapping"] = relationship()

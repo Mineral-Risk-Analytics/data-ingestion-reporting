@@ -6,8 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Source
-from app.models.company import Company, CompanyAlias
-from app.models.enums import ImplementationPhase, SourceType, SupplyChainStage
+from app.models.enums import ImplementationPhase, SourceType
 
 
 def seed_if_empty(session: Session) -> dict[str, int]:
@@ -15,35 +14,9 @@ def seed_if_empty(session: Session) -> dict[str, int]:
     stats: dict[str, int] = {}
 
     # Materials are seeded via: uv run bdi-ingest ingest-usgs <path/to/MCS2025_World_Data.csv>
-    # Do not seed materials here — data must come from the official USGS CSV.
-
-    if session.scalar(select(Company).limit(1)) is None:
-        tesla = Company(
-            canonical_name="Tesla Inc.",
-            supply_chain_stage=SupplyChainStage.OEM.value,
-            headquarters_country="US",
-            public_ticker="TSLA",
-            is_public=True,
-            notes="Seed OEM for SEC demo CIK",
-        )
-        alb = Company(
-            canonical_name="Albemarle Corporation",
-            supply_chain_stage=SupplyChainStage.MINER.value,
-            headquarters_country="US",
-            public_ticker="ALB",
-            is_public=True,
-            notes="Lithium producer (alias demo)",
-        )
-        session.add_all([tesla, alb])
-        session.flush()
-        session.add_all(
-            [
-                CompanyAlias(company_id=tesla.id, alias="Tesla Motors Inc", alias_type="aka"),
-                CompanyAlias(company_id=alb.id, alias="Albemarle Corp.", alias_type="legal"),
-            ]
-        )
-        stats["companies"] = 2
-        stats["company_aliases"] = 2
+    # Companies are seeded via: bdi-ingest seed-companies
+    # Countries are seeded via: bdi-ingest seed-countries
+    # Do not seed materials, companies, or countries here.
 
     if session.scalar(select(Source).limit(1)) is None:
         session.add_all(
@@ -62,7 +35,7 @@ def seed_if_empty(session: Session) -> dict[str, int]:
                     is_active=True,
                     config_json={
                         "dataset_path": "imports/hs",
-                        "time": "2024-11",
+                        "time": "latest",
                         "get": "CTY_CODE,CTY_NAME,I_COMMODITY,I_COMMODITY_LDESC,GEN_VAL_MO",
                     },
                 ),

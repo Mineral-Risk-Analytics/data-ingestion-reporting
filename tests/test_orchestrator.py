@@ -18,12 +18,6 @@ the SQLite in-memory DB can be used for the CompanyScore persistence assertions.
 
 from __future__ import annotations
 
-import importlib
-import inspect
-import pkgutil
-import textwrap
-import types
-import uuid
 from datetime import date
 from unittest.mock import MagicMock, patch
 
@@ -232,51 +226,10 @@ def test_rescore_append_only(sqlite_session: Session, fixture_company: Company) 
 
 
 # ---------------------------------------------------------------------------
-# Completion check 3: scoring failure must not block ingestion commit
+# Completion check 3 (removed): pipeline no longer has an inline rescore loop.
+# Rescoring is handled by the Inngest weekly cron (scoring_jobs.py). See B2 in
+# docs/deprecation-audit.md for the architectural rationale.
 # ---------------------------------------------------------------------------
-
-def test_scoring_failure_does_not_block_ingestion(
-    sqlite_session: Session, fixture_company: Company
-) -> None:
-    """
-    When rescore_company() raises an exception for one company the pipeline
-    catches it and continues. The ingestion run (and any persisted events) must
-    not be rolled back.
-
-    Simulated by calling the rescore loop logic directly with a mock that raises.
-    """
-    touched_company_ids: set[uuid.UUID] = {fixture_company.id}
-
-    def failing_rescore(db, cid, run_id, **kw):
-        raise RuntimeError("DB timeout — simulated failure")
-
-    errors: list[str] = []
-
-    # Replicate the pipeline's try/except rescore loop inline
-    with patch("app.services.scoring.orchestrator.rescore_company", side_effect=failing_rescore):
-        from app.services.scoring.orchestrator import rescore_company as _rc  # get the mock
-
-        for cid in touched_company_ids:
-            try:
-                _rc(sqlite_session, cid, run_id="ing-run-1")
-            except Exception as exc:
-                errors.append(str(exc))
-
-    # The loop must have caught the error
-    assert len(errors) == 1
-    assert "simulated failure" in errors[0]
-
-    # The session must still be usable (no transaction corruption)
-    new_row = CompanyScore(
-        company_id=fixture_company.id,
-        as_of_date=date.today(),
-        overall_risk_score=42.0,
-        scoring_version="2.0",
-    )
-    sqlite_session.add(new_row)
-    sqlite_session.flush()
-    assert new_row.id is not None, "Session must remain usable after a caught scoring failure"
-
 
 # ---------------------------------------------------------------------------
 # Completion check 4: aggregate_supplier_risk() not called outside orchestrator
@@ -333,6 +286,7 @@ class TestDeriveFinancialInputs:
         ev.severity_score = severity
         ev.confidence_score = confidence
         ev.event_date = None
+        ev.event_subtype = subtype
         ev.metadata_json = {"event_subtype": subtype}
         ev.title = title
         return EventWithRelevance(event=ev, relevance_score=0.80)
@@ -383,6 +337,7 @@ class TestDeriveOperationalInputs:
         ev.severity_score = severity
         ev.confidence_score = 0.6
         ev.event_date = None
+        ev.event_subtype = subtype
         ev.metadata_json = {"event_subtype": subtype}
         ev.title = ""
         return EventWithRelevance(event=ev, relevance_score=0.80)

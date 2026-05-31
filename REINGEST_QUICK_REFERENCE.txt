@@ -1,0 +1,197 @@
+================================================================================
+BATTERY SUPPLY CHAIN RISK SCORING — REINGEST QUICK REFERENCE
+================================================================================
+
+MIGRATION CHAIN (all applied, 001 → 034):
+  001 baseline → 002 battery_chemistry → 003 hs_mappings → 004 supply_volume
+  → 005 seed_review → 006 supply_rollup → 007 company_vehicles → 008 verified
+  → 009 event_review → 010 company_facilities → 011 mat_geo_scores
+  → 012 insight_posts → 013 facility_material → 014 material_production
+  → 015 material_global → 016 chem_five_pillars → 017 reg_geo_weights
+  → 018 chem_upsert_key → 019 criticality_supply → 020 countries
+  → 021 drop_legacy → 022 hs_expand → 023 hs_production → 024 hs_geo
+  → 025 geo_rollup_annotations → 027 trade_flows_hs → 028 hs_event
+  → 029 facility_stage → 030 commodity_prices → 031 country_detection
+  → 034 hs_stage_sequence
+
+(Note: 026 & 032/033 renumbered; see full playbook for details)
+
+================================================================================
+QUICK DELETE ORDER (FK dependency depth, leaf → parent)
+================================================================================
+
+DEPTH 0: raw_api_payloads, document_chunks, usage_events, seed_review_* ingestion_runs
+DEPTH 1: company_aliases, company_vehicle_models, company_supply_relationships,
+         company_material_exposures, company_facilities, company_regulation_exposure,
+         company_scores, facility_material_links, risk_event_*, source_documents
+DEPTH 2: regulation_*_scope, material_criticality_signals, material_production_shares,
+         hs_code_production_shares, commodity_prices, battery_chemistry_materials
+DEPTH 3: *_geography_risk_scores, chemistry_risk_scores, insight_posts, report_*,
+         supply_chain_contexts
+DEPTH 4: risk_events, regulations, hs_code_material_mappings, facilities, companies
+DEPTH 5: materials, battery_chemistries, countries, sources, (PRESERVE trade_flows)
+
+================================================================================
+EXECUTION CHECKLIST
+================================================================================
+
+□ Step 1:  alembic upgrade head
+           (Apply migrations 028-034)
+
+□ Step 2:  SQL TRUNCATE CASCADE (or Python loop) — see full playbook
+           Clear all ingested data; preserve reference tables & trade_flows
+
+□ Step 3:  Seed reference data
+           bdi-ingest seed-countries
+           bdi-ingest seed-materials
+           bdi-ingest seed
+           bdi-ingest seed-hs-mappings
+           bdi-ingest seed-companies
+           bdi-ingest seed-facilities
+           bdi-ingest seed-supply-relationships
+           bdi-ingest seed-material-exposures
+           bdi-ingest seed-regulations
+
+□ Step 4:  Ingest supply chain (order matters; F/G parallelizable)
+           A. bdi-ingest ingest-usgs --filepath ./MCS2025_World_Data.csv --force --mcs-year 2025
+           B. bdi-ingest ingest-mrds
+           C. bdi-ingest ingest-comtrade --months 12 --as-of-date 2026-04-30
+           D. bdi-ingest ingest-mcs-pdf --filepath ./MCS2025.pdf
+           E. bdi-ingest ingest-sec-edgar --years 2024,2025
+           F. bdi-ingest ingest-vpic --year 2025
+           G. bdi-ingest ingest-gleif
+
+□ Step 5:  Ingest risk events (can parallelize after build-trade-signals)
+           bdi-ingest build-trade-signals
+           bdi-ingest ingest-federal-register --days 365
+           [optional: bdi-ingest patch-fr-events --start-date 2025-05-01 --end-date 2026-05-02]
+           bdi-ingest backfill-fr-links
+           bdi-ingest ingest-gta
+           bdi-ingest ingest-opensanctions
+           bdi-ingest ingest-eurlex
+           bdi-ingest ingest-iea-policy-tracker
+           bdi-ingest ingest-iea-reports
+
+□ Step 6:  Run scoring (4-tier pipeline in order)
+           Automated: bdi-ingest full-score --as-of-date 2026-05-02
+           Or manual:
+             bdi-ingest rescore-hs-nodes --as-of-date 2026-05-02
+             bdi-ingest rescore-market --as-of-date 2026-05-02
+             bdi-ingest rescore-global-rollups --as-of-date 2026-05-02
+             bdi-ingest rescore-chemistry --as-of-date 2026-05-02
+
+================================================================================
+SCORING PIPELINE (4 TIERS IN ORDER)
+================================================================================
+
+TIER 0 (Level-0 node scores):
+  Command: rescore-hs-nodes
+  Inngest: rescore-hs-nodes (Mon 01:00 UTC)
+  Input:   hs_code_production_shares
+  Output:  hs_code_geometry_risk_scores
+  Notes:   Must complete before Tier 1 reads from it
+
+TIER 1 (Geo-level market scores):
+  Command: rescore-market
+  Inngest: rescore-market-scores (Mon 02:00 UTC)
+  Input:   materials, risk_events, hs_code_geometry_risk_scores,
+           material_production_shares, material_criticality_signals
+  Output:  material_geography_risk_scores (5 pillars, 0-100 per material×geography)
+  Notes:   Per-material Inngest steps enable recovery on failure
+
+TIER 2 (Global material rollups):
+  Command: rescore-global-rollups
+  Inngest: rescore-global-rollups (Mon 03:00 UTC)
+  Input:   material_geography_risk_scores, trade_flows
+  Output:  material_global_risk_scores (trade-weighted global per material)
+  Notes:   Must complete before Tier 3
+
+TIER 3 (Chemistry scores):
+  Command: rescore-chemistry
+  Inngest: rescore-all-chemistries (Mon 04:00 UTC)
+  Input:   material_global_risk_scores, battery_chemistry_materials
+  Output:  chemistry_risk_scores (intensity-weighted per chemistry)
+  Notes:   Runs as single step (pure math, no risk events)
+
+================================================================================
+INGEST COMMANDS (TABLE MAPPING)
+================================================================================
+
+MATERIAL PRODUCTION DATA:
+  ingest-usgs             → material_production_shares, material_criticality_signals, materials*
+  ingest-mcs-pdf          → hs_code_production_shares (global & us scopes)
+
+SUPPLY CHAIN STRUCTURE:
+  ingest-mrds             → facilities, facility_material_links (with stage attribution)
+  ingest-comtrade         → trade_flows*, hs_code_production_shares (market_scope=global)
+  ingest-sec-edgar        → company_material_exposures, company_supply_relationships
+  ingest-vpic             → company_vehicle_models, companies*
+  ingest-gleif            → companies (LEI updates)
+
+RISK EVENTS:
+  build-trade-signals     → risk_events, risk_event_materials, risk_event_hs_mappings, risk_event_companies
+  ingest-federal-register → risk_events, risk_event_*, with HS attribution
+  patch-fr-events         → risk_events* (manual curation)
+  backfill-fr-links       → risk_event_companies (derived from overlap)
+  ingest-gta              → risk_events, risk_event_materials, risk_event_hs_mappings, risk_event_geographies
+  ingest-opensanctions    → risk_events, risk_event_companies, risk_event_facilities, risk_event_geographies
+  ingest-eurlex           → risk_events, risk_event_regulations, risk_event_materials, risk_event_geographies
+  ingest-iea-policy-tracker → risk_events, risk_event_geographies, risk_event_materials
+  ingest-iea-reports      → risk_events, risk_event_materials
+
+(* = upsert; others = append-only)
+
+================================================================================
+TABLES TO TRUNCATE (in order, use CASCADE)
+================================================================================
+
+LEAF NODES (depth 0):
+  raw_api_payloads, document_chunks, usage_events, seed_review_findings,
+  seed_review_runs, ingestion_runs
+
+JUNCTIONS (depth 1):
+  company_aliases, company_vehicle_models, company_supply_relationships,
+  company_material_exposures, company_facilities, company_regulation_exposure,
+  company_scores, facility_material_links, risk_event_companies,
+  risk_event_materials, risk_event_regulations, risk_event_geographies,
+  risk_event_facilities, risk_event_hs_mappings
+
+DATA TABLES (depth 2):
+  source_documents [OPTIONAL: skip if preserving regulatory lineage],
+  regulation_material_scope, regulation_geometry_scope,
+  material_criticality_signals, material_production_shares,
+  hs_code_production_shares, commodity_prices, battery_chemistry_materials
+
+SCORES (depth 3):
+  hs_code_geometry_risk_scores, material_geography_risk_scores,
+  material_global_risk_scores, chemistry_risk_scores, insight_posts,
+  report_runs, report_insights, supply_chain_contexts
+
+EVENTS & MAPPINGS (depth 4):
+  risk_events, regulations, hs_code_material_mappings, facilities, companies
+
+PRESERVE (depth 5):
+  materials, battery_chemistries, countries, sources, trade_flows
+
+================================================================================
+VALIDATION QUERIES
+================================================================================
+
+SELECT COUNT(*) FROM trade_flows;                    -- Verify untouched
+SELECT COUNT(*) FROM countries;                      -- Should be ~200+
+SELECT COUNT(*) FROM materials;                      -- Should be ~30-50
+SELECT COUNT(*) FROM battery_chemistries;            -- Should be ~6-8
+SELECT COUNT(*) FROM companies;                      -- Should be 100s
+SELECT COUNT(*) FROM facilities;                     -- Should be 100s
+SELECT COUNT(*) FROM risk_events;                    -- Should be 1000s
+SELECT COUNT(*) FROM material_geography_risk_scores
+  WHERE as_of_date = '2026-05-02';                   -- Should have rows
+SELECT COUNT(*) FROM chemistry_risk_scores
+  WHERE as_of_date = '2026-05-02';                   -- Should have rows
+
+================================================================================
+TOTAL RUNTIME ESTIMATE: 60–90 minutes
+(Excluding API rate limits. Comtrade is slowest; parallelizable steps marked.)
+================================================================================
+
+See REINGEST_PLAYBOOK.md for full details, SQL, and troubleshooting.

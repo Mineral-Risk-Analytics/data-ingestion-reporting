@@ -7,9 +7,8 @@ Phase 1 implements federal register, census trade, SEC EDGAR, and news stub flow
 from __future__ import annotations
 
 import json
-import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 import structlog
 import httpx
@@ -22,6 +21,8 @@ from app.models import (
     RawApiPayload,
     Regulation,
     RiskEvent,
+    RiskEventHsMapping,
+    RiskEventMaterial,
     Source,
     SourceDocument,
     TradeFlow,
@@ -30,6 +31,7 @@ from app.models.enums import DocumentType, ImplementationPhase, IngestionStatus,
 from app.services.ingestion.adapters import ADAPTER_BY_TYPE
 from app.services.ingestion.adapters.news import NewsAdapter
 from app.services.ingestion.base import FetchBundle
+from app.services.ingestion import feature_flags
 from app.services.ingestion.entity_resolution import (
     CachedCompanyInfo,
     build_company_cache,
@@ -52,7 +54,7 @@ from app.services.ingestion.parsers import (
     parse_sec_filing,
 )
 from app.services.ingestion.run_tracker import IngestionRunTracker
-from app.utils.hashing import sha256_bytes
+from app.utils.hashing import sha256_bytes, sha256_text
 
 log = structlog.get_logger(__name__)
 from app.utils.storage import LocalFilesystemStorage, get_local_storage
@@ -96,10 +98,16 @@ class IngestionPipeline:
         run = self._tracker.start(source.id, merged)
         self._db.flush()
 
-        # Cache all companies once per run to avoid N+1 queries during entity resolution.
-        company_cache: list[CachedCompanyInfo] = build_company_cache(self._db)
-        # Accumulate company IDs (UUID) touched by new risk events for post-run rescoring.
-        touched_company_ids: set[uuid.UUID] = set()
+        # Cache all companies once per run to avoid N+1 queries during entity
+        # resolution.  Gated by feature_flags.LINK_EVENTS_TO_COMPANIES — when
+        # the flag is False (Foundation phase 3 default), skip the cache build
+        # entirely.  ``company_cache`` becomes None and the per-event
+        # _link_companies path short-circuits accordingly.
+        company_cache: Optional[list[CachedCompanyInfo]] = (
+            build_company_cache(self._db)
+            if feature_flags.LINK_EVENTS_TO_COMPANIES
+            else None
+        )
 
         try:
             if adapter_cls is NewsAdapter:
@@ -120,19 +128,19 @@ class IngestionPipeline:
 
                 if source.source_type == SourceType.FEDERAL_REGISTER.value:
                     written = self._ingest_federal_items(
-                        run, source, bundle, company_cache, touched_company_ids
+                        run, source, bundle, company_cache
                     )
                 elif source.source_type == SourceType.CENSUS_TRADE.value:
                     written = self._ingest_census_items(
-                        run, source, bundle, merged, company_cache, touched_company_ids
+                        run, source, bundle, merged, company_cache
                     )
                 elif source.source_type == SourceType.SEC_EDGAR.value:
                     written = self._ingest_sec_items(
-                        run, source, bundle, merged, company_cache, touched_company_ids
+                        run, source, bundle, merged, company_cache
                     )
                 elif source.source_type == SourceType.NEWS.value:
                     written = self._ingest_news_items(
-                        run, source, bundle, company_cache, touched_company_ids
+                        run, source, bundle, company_cache
                     )
                 else:
                     raise NotImplementedError(
@@ -142,24 +150,8 @@ class IngestionPipeline:
                 self._tracker.add_stat(run, "items_written", written)
 
             self._tracker.complete(run, IngestionStatus.SUCCESS)
-
-            # Rescore every company touched by new risk events.
-            # A scoring failure must not roll back successfully ingested events —
-            # the try/except is intentional. The next ingestion run will rescore
-            # the company when it reappears in touched_company_ids.
-            from app.services.scoring.orchestrator import rescore_company
-            for company_id in touched_company_ids:
-                try:
-                    rescore_company(self._db, company_id, run_id=str(run.id))
-                except Exception as score_exc:
-                    log.error(
-                        "pipeline.rescore_failed",
-                        company_id=str(company_id),
-                        run_id=run.id,
-                        error=str(score_exc),
-                        exc_info=True,
-                    )
-
+            # Rescoring is handled by the scheduled Inngest cron (scoring_jobs.py),
+            # not triggered inline here. See docs/ingestion-pipeline.md §Phase 3 decoupling.
             self._db.commit()
             return run.id
         except Exception as exc:
@@ -193,7 +185,6 @@ class IngestionPipeline:
         source: Source,
         bundle: FetchBundle,
         company_cache: list[CachedCompanyInfo],
-        touched_company_ids: set[uuid.UUID],
     ) -> int:
         count = 0
         for item in bundle.items:
@@ -237,9 +228,15 @@ class IngestionPipeline:
                 effective_date=parsed.effective_date,
                 summary=parsed.abstract_text,
                 extra_meta={"source_api": "federal_register"},
+                # ``reg_key`` here is a Federal Register document number
+                # (e.g. "2024-12345"), not a canonical regulation_key.  The
+                # resolver looks it up under source_system='federal_register'
+                # in regulation_aliases.  Unknown FR doc numbers are skipped
+                # with warning rather than auto-creating a regulation row.
+                source_system="federal_register",
             )
             self._add_risk_event(
-                doc, build_regulatory_risk_event(parsed), company_cache, touched_company_ids
+                doc, build_regulatory_risk_event(parsed), company_cache
             )
             count += 1
         _ = run  # reserved for future per-run metrics
@@ -252,7 +249,6 @@ class IngestionPipeline:
         bundle: FetchBundle,
         merged: dict[str, Any],
         company_cache: list[CachedCompanyInfo],
-        touched_company_ids: set[uuid.UUID],
     ) -> int:
         _ = run
         count = 0
@@ -279,9 +275,15 @@ class IngestionPipeline:
                 checksum=sha256_bytes(bundle.raw_body),
             )
             max_val = 0.0
+            # N3 audit fix (2026-05-06): track resolved (material_id,
+            # hs_mapping_id) per row so the sample-derived RiskEvent below
+            # can be tagged with the correct material/HS junction rows
+            # instead of dropping that attribution on the floor.
+            resolved_by_row: dict[int, tuple[int | None, int | None, float | None]] = {}
             for row in rows:
                 partner_iso = geo.partner_country_iso2(row.partner_code) or row.partner_code
-                mid = materials.resolve_by_hs_code(row.hs_code)
+                mid, hs_mapping_id, mapping_conf = materials.resolve_by_hs_code(row.hs_code)
+                resolved_by_row[id(row)] = (mid, hs_mapping_id, mapping_conf)
                 tf = TradeFlow(
                     source_document_id=doc.id,
                     period=row.period or period,
@@ -290,6 +292,7 @@ class IngestionPipeline:
                     hs_code=row.hs_code,
                     hs_description=row.hs_description,
                     material_id=mid,
+                    hs_mapping_id=hs_mapping_id,
                     import_export_flag=row.import_export,
                     quantity=row.quantity,
                     quantity_unit=row.quantity_unit,
@@ -305,13 +308,30 @@ class IngestionPipeline:
                 count += 1
             if rows:
                 sample = max(rows, key=lambda r: r.trade_value_usd or 0)
+                sample_mid, sample_hs_id, sample_conf = resolved_by_row.get(
+                    id(sample), (None, None, None)
+                )
                 draft = build_trade_risk_event(
                     hs_description=sample.hs_description,
                     partner=sample.partner_name or sample.partner_code,
                     trade_value_usd=max_val or sample.trade_value_usd,
                     import_export=ie,
+                    # Anchor the event to the Census reporting period so
+                    # re-running against the same payload reuses the same
+                    # content_hash via pipeline._add_risk_event dedup.
+                    # Without this, event_date=now() would shift each run
+                    # and pipeline._add_risk_event would silently insert
+                    # a duplicate.  See 2026-05-11 audit.
+                    period=sample.period or period,
                 )
-                self._add_risk_event(doc, draft, company_cache, touched_company_ids)
+                self._add_risk_event(
+                    doc,
+                    draft,
+                    company_cache,
+                    material_id=sample_mid,
+                    hs_mapping_id=sample_hs_id,
+                    mapping_confidence=sample_conf,
+                )
         self._db.flush()
         return count
 
@@ -322,7 +342,6 @@ class IngestionPipeline:
         bundle: FetchBundle,
         merged: dict[str, Any],
         company_cache: list[CachedCompanyInfo],
-        touched_company_ids: set[uuid.UUID],
     ) -> int:
         _ = merged, run
         count = 0
@@ -364,7 +383,6 @@ class IngestionPipeline:
                         narrative=pf.narrative_excerpt,
                     ),
                     company_cache,
-                    touched_company_ids,
                 )
                 count += 1
         self._db.flush()
@@ -376,7 +394,6 @@ class IngestionPipeline:
         source: Source,
         bundle: FetchBundle,
         company_cache: list[CachedCompanyInfo],
-        touched_company_ids: set[uuid.UUID],
     ) -> int:
         _ = run
         count = 0
@@ -395,7 +412,7 @@ class IngestionPipeline:
                 metadata_json={"source": article.source_name, **article.raw},
                 checksum=sha256_bytes(json.dumps(item, default=str).encode("utf-8")),
             )
-            self._add_risk_event(doc, build_news_event(article), company_cache, touched_company_ids)
+            self._add_risk_event(doc, build_news_event(article), company_cache)
             count += 1
         self._db.flush()
         return count
@@ -459,66 +476,220 @@ class IngestionPipeline:
         effective_date: Any,
         summary: str | None,
         extra_meta: dict | None,
+        source_system: str | None = None,
     ) -> None:
-        stmt = select(Regulation).where(
-            Regulation.source_document_id == doc.id,
-            Regulation.regulation_key == regulation_key,
+        """Refresh mutable fields on an existing curated regulation.
+
+        Locked-down semantics (May 2026 refactor): this method NEVER
+        creates new regulation rows.  Pipeline ingesters (Federal Register,
+        SEC EDGAR, news, Census trade) surface arbitrary external IDs that
+        often don't correspond to tracked regulations — silently auto-
+        creating a row for every such ID poisoned the regulations table
+        with partial / mis-classified records.
+
+        Resolution order:
+          1. If ``source_system`` is provided, try
+             ``RegulationAliasResolver.resolve(source_system, regulation_key)``.
+             This handles the "regulation_key is actually an external ID"
+             case (e.g. Federal Register doc number → canonical key).
+          2. Else, try a direct lookup on ``Regulation.regulation_key``.
+          3. If neither resolves: log a warning and SKIP.  The caller's
+             ``RiskEvent`` row still gets written but without a
+             ``RiskEventRegulation`` junction, which is correct — events
+             whose regulatory context we can't verify shouldn't influence
+             scoring against fabricated regulation rows.
+
+        On a successful resolve, this method updates only the *mutable*
+        side of the regulation:
+          * ``summary`` if the existing one is NULL (never overwrites
+            curated text)
+          * ``metadata_json.last_seen`` (freshness signal)
+          * ``source_document_id`` if not yet set
+        Curated fields (title, geography, policy_theme, status,
+        publication_date, effective_date) are NOT touched — those come
+        from ``seed_regulations.py``.
+        """
+        from datetime import datetime, timezone
+        from app.services.ingestion.regulation_resolver import (
+            RegulationAliasResolver,
         )
-        existing = self._db.execute(stmt).scalar_one_or_none()
-        meta = dict(extra_meta or {})
-        if existing:
-            existing.title = title
-            existing.issuing_body = issuing_body
-            existing.geography = geography
-            existing.policy_theme = policy_theme
-            existing.status = status
-            existing.publication_date = publication_date
-            existing.effective_date = effective_date
-            existing.summary = summary
-            existing.metadata_json = meta
-            self._db.add(existing)
-            return
-        self._db.add(
-            Regulation(
-                source_document_id=doc.id,
-                regulation_key=regulation_key,
-                title=title,
-                issuing_body=issuing_body,
-                geography=geography,
-                policy_theme=policy_theme,
-                status=status,
-                publication_date=publication_date,
-                effective_date=effective_date,
-                summary=summary,
-                metadata_json=meta,
+
+        regulation: Regulation | None = None
+
+        # Step 1 — alias resolver (when caller provided source context).
+        if source_system:
+            resolver = RegulationAliasResolver(self._db)
+            result = resolver.resolve(source_system, regulation_key)
+            if result.status == "skipped":
+                # Partner-curated decision not to track — skip silently.
+                return
+            if result.status == "ok":
+                regulation = result.regulation
+
+        # Step 2 — direct lookup (caller passed a canonical regulation_key).
+        if regulation is None:
+            regulation = self._db.scalar(
+                select(Regulation).where(
+                    Regulation.regulation_key == regulation_key
+                )
             )
-        )
+
+        # Step 3 — skip with warning when nothing matches.
+        if regulation is None:
+            log.warning(
+                "pipeline.unknown_regulation",
+                regulation_key=regulation_key,
+                source_system=source_system,
+                hint=(
+                    "external regulation ID not in regulation_aliases. "
+                    "Add it to seed_regulation_aliases.py (and the "
+                    "regulation itself to seed_regulations.py if it's "
+                    "battery-supply-chain-relevant), then re-run "
+                    "seed-regulations + seed-regulation-aliases. "
+                    "Event will still be written but without a "
+                    "RiskEventRegulation junction."
+                ),
+            )
+            return
+
+        # ── Mutable-field refresh on the resolved regulation ───────────
+        # Backfill summary only when missing (don't overwrite curated text).
+        if summary and not regulation.summary:
+            regulation.summary = summary
+
+        # Attach SourceDocument if not yet linked (helps trace provenance).
+        if regulation.source_document_id is None:
+            regulation.source_document_id = doc.id
+
+        # Bump last_seen + merge any extra metadata the caller provided.
+        meta = dict(regulation.metadata_json or {})
+        meta["last_seen"] = datetime.now(timezone.utc).isoformat()
+        if extra_meta:
+            for k, v in extra_meta.items():
+                # Don't overwrite curated keys (e.g. celex, seed_version).
+                meta.setdefault(k, v)
+        regulation.metadata_json = meta
 
     def _add_risk_event(
         self,
         doc: SourceDocument,
         draft: RiskEventDraft,
-        company_cache: list[CachedCompanyInfo],
-        touched_company_ids: set[uuid.UUID],
+        company_cache: Optional[list[CachedCompanyInfo]],
+        *,
+        material_id: int | None = None,
+        hs_mapping_id: int | None = None,
+        mapping_confidence: float | None = None,
     ) -> RiskEvent:
+        """Persist a RiskEvent + entity-resolution links.
+
+        Optional ``material_id`` / ``hs_mapping_id`` kwargs (added 2026-05-06
+        as the N3 audit fix) write ``RiskEventMaterial`` and
+        ``RiskEventHsMapping`` junction rows when supplied.  Used by the
+        Census-trade ingestion path which already resolves these IDs at
+        TradeFlow construction time — the resolved values used to fall on
+        the floor when the sample-derived RiskEvent was created.
+
+        ``mapping_confidence`` (added 2026-05-09, Tier 1.4 audit) is the
+        partner-curated confidence on the ``hs_code_material_mappings``
+        row used to resolve the attribution.  When supplied, the resulting
+        ``RiskEventMaterial.relevance_score`` and
+        ``RiskEventHsMapping.relevance_score`` are multiplied by this value
+        so that a low-confidence mapping (e.g. REE → HS 2617 at 0.5
+        because bastnasite/monazite share the prefix with non-REE ores)
+        produces a low-relevance attribution downstream filters can drop.
+        ``None`` preserves the legacy ``relevance_score=1.0`` for
+        backwards compatibility.
+
+        Without these kwargs the function preserves its prior behaviour
+        (no junction writes), so news / SEC EDGAR call sites are unchanged.
+        Closing those paths' attribution requires running ``MaterialCache``
+        over filing / article text — tracked separately, see audit follow-up
+        task ("SEC + news pipeline material attribution").
+
+        Idempotency (added 2026-05-09):
+          A ``content_hash`` derived from ``(title, summary, event_date)``
+          is now computed before insert and used as a dedup key.  If an
+          existing event with the same hash is found, this function
+          returns it unmodified — no new row, no duplicate junction
+          writes (they'd violate the ``uq_risk_event_material`` /
+          ``uq_risk_event_hs_mapping`` constraints anyway).  Census trade
+          re-ingest, which previously produced a fresh duplicate row on
+          every run, is now properly idempotent.
+        """
+        title = (draft.title or "")[:1024]
+        summary_str = draft.summary or ""
+        date_str = (
+            draft.event_date.isoformat() if draft.event_date is not None else ""
+        )
+        # The same shape used by gta.py / opensanctions.py / trade_signal_builder.
+        content_hash = sha256_text(f"{title}|{summary_str}|{date_str}")
+
+        existing = self._db.scalar(
+            select(RiskEvent).where(RiskEvent.content_hash == content_hash).limit(1)
+        )
+        if existing is not None:
+            # Re-running on top of existing data — return the prior event
+            # without re-adding junctions.  The unique constraints on
+            # (risk_event_id, material_id) and (risk_event_id, hs_mapping_id)
+            # would reject duplicates anyway; bailing here is the cleaner
+            # path and avoids an integrity error tickling the session.
+            log.debug(
+                "pipeline.add_risk_event.skip_existing",
+                event_id=existing.id,
+                content_hash=content_hash[:16],
+            )
+            return existing
+
         ev = RiskEvent(
             source_document_id=doc.id,
             event_type=draft.event_type,
             event_date=draft.event_date,
-            title=draft.title[:1024],
+            title=title,
             summary=draft.summary,
             severity_score=draft.severity_score,
             confidence_score=draft.confidence_score,
             risk_categories_json=draft.risk_categories,
             geography_json=draft.geography,
             metadata_json=draft.metadata,
+            content_hash=content_hash,
         )
         self._db.add(ev)
-        # Flush to obtain ev.id before entity resolution writes the FK.
+        # Flush to obtain ev.id before junction-row FKs.
         self._db.flush()
 
-        matches = resolve_companies_for_event(self._db, ev, company_cache)
-        persist_company_links(self._db, ev, matches)
-        touched_company_ids.update(company_id for company_id, _, _ in matches)
+        # Confidence-weighted relevance — clamped to [0, 1] for safety
+        # even though ``hs_code_material_mappings.confidence`` is already
+        # constrained at insert time.
+        effective_relevance = (
+            1.0 if mapping_confidence is None
+            else max(0.0, min(1.0, float(mapping_confidence)))
+        )
+
+        if material_id is not None:
+            self._db.add(
+                RiskEventMaterial(
+                    risk_event_id=ev.id,
+                    material_id=material_id,
+                    relevance_score=effective_relevance,
+                    match_reason="hs_code",
+                )
+            )
+        if hs_mapping_id is not None:
+            self._db.add(
+                RiskEventHsMapping(
+                    risk_event_id=ev.id,
+                    hs_mapping_id=hs_mapping_id,
+                    relevance_score=effective_relevance,
+                    match_reason="trade_flow_match",
+                )
+            )
+
+        # Gated by feature_flags.LINK_EVENTS_TO_COMPANIES (default False —
+        # Foundation phase 3).  When the flag is off, ``company_cache`` is
+        # None and we skip the resolver loop entirely rather than running
+        # it and discarding the result inside persist_company_links.
+        if feature_flags.LINK_EVENTS_TO_COMPANIES and company_cache is not None:
+            matches = resolve_companies_for_event(self._db, ev, company_cache)
+            persist_company_links(self._db, ev, matches)
 
         return ev

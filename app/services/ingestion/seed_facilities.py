@@ -4,13 +4,32 @@ Static reference data — not ingested or scraped. Manually verified from public
 sources (company investor relations, press releases, Benchmark Mineral Intelligence,
 Wood Mackenzie, USGS, Bloomberg NEF).
 
+Scope
+-----
+This module covers:
+  - Cell factories (gigafactories)
+  - OEM EV assembly / pack plants
+  - Recycling facilities
+  - R&D and HQ facilities
+
+It does NOT cover:
+  - Mines            ← populated by ``bdi-ingest ingest-gem``
+  - Refineries       ← populated by ``bdi-ingest ingest-gem``
+
+The mining and refinery records that previously existed in this file have been
+removed. GEM (Global Energy Monitor) provides a richer, quarterly-updated
+dataset for extraction and processing facilities with capacity data that feeds
+the operational scoring pillar. Re-adding mines/refineries here would create
+duplicates and undermine the GEM dedup logic.
+
 Idempotent: deduplicates on (company_id, facility_type, country, city). A facility
 with the same company, type, country, and city is partially updated on re-run;
 ``city=None`` entries are compared NULL-safe (two NULL cities are treated as equal).
 
 Run order:
     bdi-ingest seed-companies    # companies must exist first
-    bdi-ingest seed-facilities   # this module
+    bdi-ingest seed-facilities   # this module (cell factories, pack plants, recycling)
+    bdi-ingest ingest-gem        # separately, for mines + refineries
 """
 
 from __future__ import annotations
@@ -20,7 +39,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from app.models.company import Company
-from app.models.facility import Facility
+from app.models.facility import CompanyFacility, Facility
 
 log = structlog.get_logger(__name__)
 
@@ -184,36 +203,11 @@ _FACILITIES: list[dict] = [
     # Geely Auto Group
     {"company_canonical_name": "Geely Auto Group", "facility_type": "pack_plant", "country": "CN", "region": "Zhejiang", "city": "Hangzhou", "status": "operating", "capacity_notes": "Primary Geely EV assembly. Lynk & Co, Geometry brands. CATL and CALB cells.", "data_source": "manual"},
 
-    # ── MINING OPERATIONS ─────────────────────────────────────────────────
-
-    {"company_canonical_name": "Tenke Fungurume Mining", "facility_type": "mine", "country": "CD", "region": "Lualaba", "city": "Fungurume", "status": "operating", "capacity_notes": "~200,000 t/yr copper cathode; ~16,000 t/yr cobalt hydroxide. World-class ore grades.", "latitude": -10.5853, "longitude": 26.3024, "data_source": "manual"},
-    {"company_canonical_name": "Kisanfu Mining", "facility_type": "mine", "country": "CD", "region": "Lualaba", "city": "Kisanfu", "status": "operating", "capacity_notes": "High-grade cobalt-copper deposit. Ramp-up ongoing post-2021 acquisition.", "latitude": -10.9833, "longitude": 26.5333, "data_source": "manual"},
-    {"company_canonical_name": "Mutanda Mining", "facility_type": "mine", "country": "CD", "region": "Lualaba", "city": "Mutanda", "status": "operating", "capacity_notes": "~200,000 t/yr copper; ~20,000 t/yr cobalt. World's single largest cobalt mine. Previously on care and maintenance 2019–2021.", "latitude": -11.1231, "longitude": 26.6123, "data_source": "manual"},
-    {"company_canonical_name": "Kamoto Copper Company", "facility_type": "mine", "country": "CD", "region": "Lualaba", "city": "Kolwezi", "status": "operating", "capacity_notes": "Underground copper-cobalt mine. ~150,000 t/yr copper; ~11,000 t/yr cobalt.", "latitude": -10.7214, "longitude": 25.4733, "data_source": "manual"},
-    {"company_canonical_name": "Congo DPR Huayou Cobalt", "facility_type": "mine", "country": "CD", "region": "Lualaba", "city": "Kolwezi", "status": "operating", "capacity_notes": "Multiple concessions in Katanga/Lualaba. Subject to ASM risk and EU supply chain due diligence.", "data_source": "manual"},
-    {"company_canonical_name": "PT Freeport Indonesia", "facility_type": "mine", "country": "ID", "region": "Papua", "city": "Timika", "status": "operating", "capacity_notes": "Grasberg complex; world's largest gold and 2nd largest copper mine. ~1.7 billion lbs copper/yr. Underground transition from open pit complete.", "latitude": -4.2726, "longitude": 136.9003, "data_source": "manual"},
-    {"company_canonical_name": "Cerro Verde", "facility_type": "mine", "country": "PE", "region": "Arequipa", "city": "Arequipa", "status": "operating", "capacity_notes": "~500,000 t/yr copper concentrate. Major Freeport asset. Water usage an ongoing community issue.", "latitude": -16.5297, "longitude": -71.6637, "data_source": "manual"},
-    {"company_canonical_name": "Vale Base Metals", "facility_type": "mine", "country": "CA", "region": "Ontario", "city": "Sudbury", "status": "operating", "capacity_notes": "Sudbury Basin; ~60,000 t/yr nickel. Also copper and PGMs.", "latitude": 46.4917, "longitude": -80.9930, "data_source": "manual"},
-    {"company_canonical_name": "Vale Base Metals", "facility_type": "mine", "country": "CA", "region": "Newfoundland and Labrador", "city": "Voisey's Bay", "status": "operating", "capacity_notes": "~45,000 t/yr nickel; also cobalt and copper. Remote Labrador operation.", "latitude": 56.3333, "longitude": -62.4167, "data_source": "manual"},
-    {"company_canonical_name": "Vale Base Metals", "facility_type": "mine", "country": "ID", "region": "South Sulawesi", "city": "Sorowako", "status": "operating", "capacity_notes": "PT Vale Indonesia; ~75,000 t/yr nickel-in-matte. HPAL expansion underway.", "latitude": -2.5333, "longitude": 121.3667, "data_source": "manual"},
-    {"company_canonical_name": "BHP Nickel West", "facility_type": "mine", "country": "AU", "region": "Western Australia", "city": "Kalgoorlie", "status": "mothballed", "capacity_notes": "Mount Keith, Leinster, Cliffs operations placed on care and maintenance May 2024 due to nickel price collapse. ~80,000 t/yr capacity when operating.", "latitude": -30.7490, "longitude": 121.4660, "data_source": "manual"},
-    {"company_canonical_name": "Escondida", "facility_type": "mine", "country": "CL", "region": "Antofagasta", "city": "Antofagasta", "status": "operating", "capacity_notes": "World's largest copper mine by output; ~1.2 million t/yr copper. BHP operator (57.5%). Rio Tinto 30%.", "latitude": -24.2689, "longitude": -69.0681, "data_source": "manual"},
-    {"company_canonical_name": "Ivanhoe Mines", "facility_type": "mine", "country": "CD", "region": "Lualaba", "city": "Kolwezi", "status": "operating", "capacity_notes": "Kamoa-Kakula copper complex (Ivanhoe 39.6% / Zijin 39.6% / DRC state 20%). ~620,000 t/yr copper capacity. World's 2nd largest copper mine.", "latitude": -10.7500, "longitude": 25.5000, "data_source": "manual"},
-
-    # ── REFINING / PROCESSING FACILITIES ─────────────────────────────────
-
-    {"company_canonical_name": "Albemarle Corporation", "facility_type": "refinery", "country": "CL", "region": "Antofagasta", "city": "Salar de Atacama", "status": "operating", "capacity_notes": "Lithium brine extraction JV with SQM (CORFO). ~85,000 t/yr LCE.", "latitude": -23.5000, "longitude": -68.2500, "data_source": "manual"},
-    {"company_canonical_name": "Albemarle Corporation", "facility_type": "refinery", "country": "AU", "region": "Western Australia", "city": "Kemerton", "status": "operating", "capacity_notes": "50,000 t/yr lithium hydroxide. Feeds EV supply chain.", "latitude": -33.4040, "longitude": 115.7310, "data_source": "manual"},
-    {"company_canonical_name": "Albemarle Corporation", "facility_type": "refinery", "country": "US", "region": "North Carolina", "city": "Kings Mountain", "status": "planned", "capacity_notes": "Lithium hydroxide plant; previously operated 1983–2006. Restart announced but timeline uncertain.", "data_source": "manual"},
-    {"company_canonical_name": "SQM", "facility_type": "refinery", "country": "CL", "region": "Antofagasta", "city": "Salar de Atacama", "status": "operating", "capacity_notes": "World's lowest-cost lithium operation. ~180,000 t/yr LCE lithium carbonate and hydroxide. Long-term CORFO contract.", "latitude": -23.5000, "longitude": -68.2500, "data_source": "manual"},
-    {"company_canonical_name": "Lynas Rare Earths", "facility_type": "mine", "country": "AU", "region": "Western Australia", "city": "Laverton", "status": "operating", "capacity_notes": "Mt Weld mine; world's highest-grade REE deposit. ~18,000 t/yr REO. Ore shipped to Malaysia for processing.", "latitude": -28.6295, "longitude": 122.4037, "data_source": "manual"},
-    {"company_canonical_name": "Lynas Malaysia", "facility_type": "refinery", "country": "MY", "region": "Pahang", "city": "Kuantan", "status": "operating", "capacity_notes": "LAMP; ~15,000 t/yr NdPr oxide. Largest REE processing outside China. Licence renewal risk — political sensitivity in Malaysia.", "latitude": 3.8167, "longitude": 103.3833, "data_source": "manual"},
-    {"company_canonical_name": "MP Materials", "facility_type": "mine", "country": "US", "region": "California", "city": "Mountain Pass", "status": "operating", "capacity_notes": "Only active US rare earth mine. ~43,000 t/yr REO concentrate. Building on-site separation and metal alloying.", "latitude": 35.4786, "longitude": -115.5372, "data_source": "manual"},
-    {"company_canonical_name": "Syrah Resources", "facility_type": "refinery", "country": "US", "region": "Louisiana", "city": "Vidalia", "status": "operating", "capacity_notes": "Vidalia active anode material (AAM) plant; ~11,250 t/yr. Processes Balama graphite into battery-grade anode. DOE loan recipient.", "latitude": 31.5579, "longitude": -91.4210, "data_source": "manual"},
-    {"company_canonical_name": "Umicore", "facility_type": "refinery", "country": "BE", "region": "Antwerp", "city": "Hoboken", "status": "operating", "capacity_notes": "Largest single precious metals and cobalt recycling/refining site in world. Processes cobalt, nickel, copper.", "latitude": 51.1894, "longitude": 4.3454, "data_source": "manual"},
-    {"company_canonical_name": "BASF", "facility_type": "refinery", "country": "DE", "region": "Brandenburg", "city": "Schwarzheide", "status": "operating", "capacity_notes": "NMC cathode active material; ~100,000 t/yr capacity. Supplies European gigafactories.", "latitude": 51.4826, "longitude": 13.8636, "data_source": "manual"},
-
     # ── RECYCLER FACILITIES ───────────────────────────────────────────────
+    # NOTE: Mine and refinery records have been removed from this seed file.
+    # They are now populated by: bdi-ingest ingest-gem
+    # GEM provides quarterly-updated capacity data that feeds the operational
+    # scoring pillar. Adding mines/refineries here would create duplicates.
 
     {"company_canonical_name": "Redwood Materials", "facility_type": "recycling", "country": "US", "region": "Nevada", "city": "McCarran", "status": "operating", "capacity_notes": "Primary campus; battery recycling and cathode/anode material production. ~100 GWh/yr recycling capacity target. Ford, Panasonic, Amazon as input partners.", "latitude": 39.6101, "longitude": -119.4822, "data_source": "manual"},
     {"company_canonical_name": "Redwood Materials", "facility_type": "recycling", "country": "US", "region": "South Carolina", "city": "Charleston", "status": "under_construction", "capacity_notes": "Battery materials campus; anode copper foil production. ~100 GWh/yr planned 2025. IRA-qualifying domestic content.", "latitude": 32.7765, "longitude": -79.9311, "data_source": "manual"},
@@ -236,9 +230,15 @@ _ALLOWED_STATUSES = {
 def seed_facilities(session: Session) -> dict[str, int]:
     """Upsert all curated facilities. Idempotent.
 
-    Deduplicates on (company_id, facility_type, country, city). City comparison
-    is NULL-safe: two entries with city=None at the same company/type/country are
-    treated as duplicates.
+    Two-phase dedup:
+      1. Find or create a ``Facility`` row by (facility_type, country, city).
+         City comparison is NULL-safe.
+      2. Find or create a ``CompanyFacility`` junction row by (company_id,
+         facility_id). If the link already exists, skip it; if the facility
+         record changed, update its mutable fields.
+
+    This supports the many-to-many design: a JV facility is one ``Facility``
+    row linked to multiple companies via separate ``CompanyFacility`` rows.
 
     Returns {"inserted": int, "updated": int, "skipped": int, "companies_not_found": int}
     """
@@ -253,7 +253,7 @@ def seed_facilities(session: Session) -> dict[str, int]:
     for entry in _FACILITIES:
         canonical_name: str = entry["company_canonical_name"]
 
-        # Resolve company_id — cached after first lookup.
+        # Resolve company — cached after first lookup.
         if canonical_name not in company_cache:
             company_cache[canonical_name] = session.scalar(
                 select(Company).where(Company.canonical_name == canonical_name)
@@ -271,16 +271,17 @@ def seed_facilities(session: Session) -> dict[str, int]:
         facility_type: str = entry["facility_type"]
         country: str = entry["country"]
         city = entry.get("city")
+        ownership_type: str = entry.get("ownership_type", "operator")
 
-        # NULL-safe city comparison: treat two NULL cities as equal.
+        # ── Phase 1: find or create the Facility record ───────────────────────
+        # NULL-safe city comparison: treat two NULL cities as the same facility.
         city_cond = (
             Facility.city.is_(None) if city is None else Facility.city == city
         )
 
-        existing = session.scalar(
+        existing_facility = session.scalar(
             select(Facility).where(
                 and_(
-                    Facility.company_id == company.id,
                     Facility.facility_type == facility_type,
                     Facility.country == country,
                     city_cond,
@@ -288,60 +289,82 @@ def seed_facilities(session: Session) -> dict[str, int]:
             )
         )
 
-        if existing is not None:
-            changed_fields: list[str] = []
-            seed_values = {
-                "status": entry.get("status", "operating"),
-                "capacity_notes": entry.get("capacity_notes"),
-                "latitude": entry.get("latitude"),
-                "longitude": entry.get("longitude"),
-                "data_source": entry.get("data_source", "manual"),
-            }
-            for field, seed_value in seed_values.items():
-                if getattr(existing, field) != seed_value:
-                    setattr(existing, field, seed_value)
-                    changed_fields.append(field)
+        seed_values = {
+            "status": entry.get("status", "operating"),
+            "capacity_notes": entry.get("capacity_notes"),
+            "latitude": entry.get("latitude"),
+            "longitude": entry.get("longitude"),
+            "data_source": entry.get("data_source", "manual"),
+        }
 
-            if changed_fields:
+        if existing_facility is None:
+            existing_facility = Facility(
+                facility_type=facility_type,
+                country=country,
+                region=entry.get("region"),
+                city=city,
+                **seed_values,
+            )
+            session.add(existing_facility)
+            session.flush()  # assign id before creating junction row
+            log.info(
+                "seed_facilities.facility_inserted",
+                facility_type=facility_type,
+                country=country,
+                city=city,
+            )
+        else:
+            # Update mutable fields if the seed data changed.
+            changed = [
+                f for f, v in seed_values.items()
+                if getattr(existing_facility, f) != v
+            ]
+            for f in changed:
+                setattr(existing_facility, f, seed_values[f])
+            if changed:
                 log.info(
-                    "seed_facilities.updated",
-                    canonical_name=canonical_name,
+                    "seed_facilities.facility_updated",
                     facility_type=facility_type,
                     country=country,
                     city=city,
-                    changed_fields=changed_fields,
+                    changed_fields=changed,
                 )
-                updated += 1
-            else:
-                log.debug(
-                    "seed_facilities.skip_existing",
-                    canonical_name=canonical_name,
-                    facility_type=facility_type,
-                    country=country,
-                    city=city,
+
+        # ── Phase 2: find or create the CompanyFacility junction row ──────────
+        existing_link = session.scalar(
+            select(CompanyFacility).where(
+                and_(
+                    CompanyFacility.company_id == company.id,
+                    CompanyFacility.facility_id == existing_facility.id,
                 )
-                skipped += 1
+            )
+        )
+
+        if existing_link is not None:
+            log.debug(
+                "seed_facilities.link_exists",
+                canonical_name=canonical_name,
+                facility_type=facility_type,
+                country=country,
+                city=city,
+            )
+            skipped += 1
             continue
 
-        facility = Facility(
+        link = CompanyFacility(
             company_id=company.id,
-            facility_type=facility_type,
-            country=country,
-            region=entry.get("region"),
-            city=city,
-            status=entry.get("status", "operating"),
-            capacity_notes=entry.get("capacity_notes"),
-            latitude=entry.get("latitude"),
-            longitude=entry.get("longitude"),
-            data_source=entry.get("data_source", "manual"),
+            facility_id=existing_facility.id,
+            ownership_type=ownership_type,
+            ownership_pct=entry.get("ownership_pct"),
         )
-        session.add(facility)
+        session.add(link)
         log.info(
-            "seed_facilities.inserted",
+            "seed_facilities.link_inserted",
             canonical_name=canonical_name,
             facility_type=facility_type,
             country=country,
             city=city,
+            ownership_type=ownership_type,
         )
         inserted += 1
 

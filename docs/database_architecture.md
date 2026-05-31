@@ -1,7 +1,7 @@
 # Database Architecture
 
 ## Non-Technical Summary
-> **Last updated: April 2026 — reflects migrations 001 (baseline), 002 (battery chemistry risk layer), and 003 (HS code mappings)**
+> **Last updated: April 2026 — reflects migrations 001 (baseline) through 012 (insight posts).** Notable additions: 002 (battery chemistry risk layer), 003 (HS code mappings), 006 (supply-chain rollup tables), 007 (vehicle-model chemistries), 011 (market-level risk scores), 012 (insight posts).
 > This section is for anyone who wants to understand what the platform stores and why, without needing to know SQL or software engineering.
 
 The battery supply chain intelligence platform is built around a single question: **how risky is it to rely on a particular company for a critical component of an EV battery?**
@@ -15,15 +15,19 @@ The platform tracks companies across the EV battery supply chain — miners, ref
 Critical minerals like lithium, cobalt, nickel, and graphite power EV batteries. The database tracks which materials each company depends on, how much they depend on them, and where those materials come from. Materials flagged as critical under the US Inflation Reduction Act or the EU Critical Raw Materials Act are specifically tagged.
 
 **3. What risks are happening.**
-Every day the system ingests news, government filings, trade data, and regulatory updates. These get turned into structured "risk events" — records that say something like "on this date, in this country, something happened that poses a material supply risk, with this severity." Events are automatically linked to the companies and materials they affect.
+Every day the system ingests news, government filings, trade data, and regulatory updates. These get turned into structured "risk events" — records that say something like "on this date, in this country, something happened that poses a material supply risk, with this severity." Events are automatically linked to the materials and geographies they affect; linking events directly to specific companies is currently disabled (gated by `LINK_EVENTS_TO_COMPANIES`) and runs through a customer's configured exposure profile instead.
 
 **4. What the rules are.**
 The platform tracks major regulations — UFLPA, the EU Battery Regulation, IRA domestic content requirements — and maps which companies are exposed to each one and whether they appear to be compliant.
 
 **5. What the risk scores are.**
-All of the above feeds a scoring engine that produces a single risk score for each company, broken into five pillars: material concentration risk, geopolitical/trade risk, regulatory compliance risk, operational risk, and financial pressure. Scores are never overwritten — each run appends a new row so you can track how a company's risk profile has changed over time.
+All of the above feeds three scoring engines:
 
-The platform is multi-tenant, meaning different organisations each see their own data and reports. Users belong to a tenant (an organisation account), and usage is tracked so the platform knows who is doing what.
+- **Company risk scoring** produces a single risk score per company, broken into six pillars: material concentration risk, geopolitical/trade risk, regulatory compliance risk, operational risk, financial pressure, and supply-chain propagation. Scores are append-only so you can track how a company's risk profile changes over time.
+- **Battery-chemistry risk scoring** rates each cell chemistry (NMC, LFP, NCA, sodium-ion, etc.) on a composite of material concentration and geopolitical exposure.
+- **Market risk scoring** (added April 2026) rates the **material × geography** intersection without any company context. This is the layer that powers the public intelligence hub at `mineralriskanalytics.com`. Output: `material_geography_risk_scores`.
+
+The platform is multi-tenant, meaning different organisations each see their own data and reports. Users belong to a tenant (an organisation account), and usage is tracked so the platform knows who is doing what. Public-facing intelligence-hub articles are stored in the `insight_posts` table — a separate, manually-authored content surface from the per-customer `report_insights` rows.
 
 ---
 
@@ -48,18 +52,25 @@ The schema is organised into eleven dependency layers. Tables in later layers re
 2. Platform            tenants
 3. Domain config       supply_chain_contexts
 4. Entity tables       materials, companies, company_aliases, facilities
+                       +  company_vehicle_models         [migration 007]
+                       +  vehicle_model_chemistries      [migration 007]
 5. Ingestion pipeline  sources, ingestion_runs, raw_api_payloads
 6. Document storage    source_documents, document_chunks
 7. Risk & regulatory   regulations, risk_events
 8. Relationship layer  (10 junction / bridge tables)
-                       +  hs_code_material_mappings   [migration 003]
-9. Scoring             company_scores, material_scores, geography_scores
-                       +  material_criticality_signals [migration 002]
-                       +  battery_chemistries          [migration 002]
-                       +  battery_chemistry_materials  [migration 002]
-                       +  chemistry_risk_scores        [migration 002]
-10. Reports            report_templates, report_template_focus_entities,
+                       +  hs_code_material_mappings      [migration 003]
+                       +  risk_event_facilities          [migration 006]
+9. Scoring             company_scores
+                       +  material_geography_risk_scores [migration 011]
+                       +  material_global_risk_scores    [migration 015]
+                       +  material_criticality_signals   [migration 002]
+                       +  battery_chemistries            [migration 002]
+                       +  battery_chemistry_materials    [migration 002]
+                       +  chemistry_risk_scores          [migration 002]
+                       +  material_geography_risk_scores [migration 011]
+10. Reports & content  report_templates, report_template_focus_entities,
                        report_runs, report_insights, analyst_notes
+                       +  insight_posts                  [migration 012]
 11. Platform users     users, usage_events
 ```
 
@@ -140,7 +151,7 @@ The critical minerals and compounds tracked by the platform. As of migration 002
 | `is_ira_critical_mineral` | BOOLEAN DEFAULT false | Flagged under US Inflation Reduction Act |
 | `is_eu_crma_critical` | BOOLEAN DEFAULT false | Flagged under EU Critical Raw Materials Act 2023 |
 | `patent_occurrence_trend` | VARCHAR(16) | `rising` \| `declining` \| `stable` \| NULL. **Denormalized cache** — authoritative source is `material_criticality_signals`. Refreshed by `_sync_patent_trend()` after any signal write. *Added in migration 002.* |
-| `data_availability` | VARCHAR(32) | `commercial` \| `limited` \| `no_benchmark`. Used by `score_chemistry()` to compute `score_confidence`. *Added in migration 002.* |
+| `data_availability` | VARCHAR(32) | `commercial` \| `limited` \| `no_benchmark`. Used by `score_chemistry_from_rollup()` to compute `score_confidence`. *Added in migration 002.* |
 | `notes` | TEXT | Source methodology and production notes |
 
 **Relationships:** one `material` → many `material_criticality_signals`, many `battery_chemistry_materials` (via junction), many `hs_code_material_mappings`, many `trade_flows`, many `commodity_prices`, many `company_material_exposures`.
@@ -416,6 +427,8 @@ Which companies is a given risk event relevant to, and how relevant?
 
 **Unique constraint:** `(risk_event_id, company_id)`
 
+> **Phase 3 (April 2026):** Writes to this table are gated by `LINK_EVENTS_TO_COMPANIES` in `app/services/ingestion/feature_flags.py` (default `False`). The ingestion pipeline still resolves event ↔ company relevance but no longer materialises the rows; suppressed counts are emitted as a structured WARNING. The table, ORM model, and `persist_company_links` helper are intentionally retained for Phase 5 when company exposure profiles will drive relevance.
+
 ### `risk_event_materials`
 
 Which materials is a given risk event relevant to?
@@ -484,53 +497,23 @@ Scores are always appended — never updated in place. This preserves a full tim
 
 ### `company_scores`
 
-Risk score for a single company at a single point in time. Generated by the scoring orchestrator after each ingestion run.
+Risk score for a single company at a single point in time. Generated by the scoring orchestrator on demand (CLI / API). Phase 3 (April 2026) removed the post-ingestion auto-rescore — refresh now happens via `bdi-ingest rescore-all`, `rescore-company`, or `POST /api/v1/companies/{id}/rescore`.
 
 | Column | Type | Notes |
 |--------|------|-------|
 | `id` | SERIAL PK | — |
 | `company_id` | UUID FK → `companies.id` ON DELETE CASCADE | — |
 | `as_of_date` | DATE NOT NULL | The date this score reflects |
-| `material_concentration_risk_score` | FLOAT | 0–100, weight 30% |
-| `geopolitical_trade_risk_score` | FLOAT | 0–100, weight 20% |
-| `regulatory_risk_score` | FLOAT | 0–100, weight 20% |
-| `operational_risk_score` | FLOAT | 0–100, weight 15% |
-| `financial_pressure_score` | FLOAT | 0–100, weight 15% |
+| `material_concentration_risk_score` | FLOAT | 0–100, weight **25%** (v3.0) |
+| `geopolitical_trade_risk_score` | FLOAT | 0–100, weight **20%** |
+| `regulatory_risk_score` | FLOAT | 0–100, weight **20%** |
+| `operational_risk_score` | FLOAT | 0–100, weight **10%** |
+| `financial_pressure_score` | FLOAT | 0–100, weight **10%** |
+| `supply_chain_propagation_score` | FLOAT NULL | 0–100, weight **15%** — sixth pillar added in migration 006. Nullable; when null, weights renormalise. |
+| `propagation_depth_used` | INTEGER NULL | BFS depth that produced the propagation pillar |
 | `overall_risk_score` | FLOAT | Weighted aggregate |
-| `rationale_json` | JSONB | Full `SupplierScoreRationale` — inputs, component scores, top evidence event IDs, decay parameters, notes |
-| `scoring_version` | VARCHAR(32) DEFAULT `'2.0'` | Formula version for reproducibility |
-
-### `material_scores`
-
-Aggregate risk score for a critical material across all companies that handle it. Used for portfolio-level views.
-
-| Column | Type | Notes |
-|--------|------|-------|
-| `material_id` | INTEGER FK → `materials.id` ON DELETE CASCADE | — |
-| `as_of_date` | DATE NOT NULL | — |
-| `material_concentration_score` | FLOAT | — |
-| `geopolitical_trade_score` | FLOAT | — |
-| `regulatory_compliance_score` | FLOAT | — |
-| `operational_score` | FLOAT | — |
-| `financial_pressure_score` | FLOAT | — |
-| `overall_risk_score` | FLOAT | — |
-| `company_count` | INTEGER | Number of companies contributing to this score |
-| `event_count` | INTEGER | Number of risk events factored in |
-
-### `geography_scores`
-
-Country-level risk roll-up. Supports heat-map views and geopolitical exposure summaries.
-
-| Column | Type | Notes |
-|--------|------|-------|
-| `geography_code` | CHAR(2) NOT NULL | ISO2 country code |
-| `as_of_date` | DATE NOT NULL | — |
-| `geopolitical_trade_score` | FLOAT | — |
-| `regulatory_compliance_score` | FLOAT | — |
-| `operational_score` | FLOAT | — |
-| `overall_risk_score` | FLOAT | — |
-| `company_count` | INTEGER | — |
-| `event_count` | INTEGER | — |
+| `rationale_json` | JSONB | Full `SupplierScoreRationale` — inputs, component scores, top evidence event IDs, decay parameters, propagation chain, chemistry mix, signals_used, notes |
+| `scoring_version` | VARCHAR(32) DEFAULT `'3.0'` | Formula version for reproducibility |
 
 ---
 
@@ -592,14 +575,39 @@ Individual findings written into the report. Each insight optionally links to a 
 
 ### `analyst_notes`
 
-Free-text annotations that analysts can attach to any entity (company, material, regulation, geography) using a generic `(entity_type, entity_id)` composite reference rather than hard foreign keys.
+Free-text annotations that analysts can attach to any entity (company, material, regulation, geography, HS-mapping row, risk event, facility, chemistry) using a generic `(entity_type, entity_id)` composite reference rather than hard foreign keys. Phase 2 widened the `entity_type` enum to support reference-data flag-issue dialogs across the full admin UI.
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `entity_type` | VARCHAR(64) | e.g. `company`, `material` |
+| `entity_type` | VARCHAR(64) | `company` \| `material` \| `hs_material_mapping` \| `regulation` \| `risk_event` \| `facility` \| `battery_chemistry` |
 | `entity_id` | VARCHAR(128) | The ID of the target entity (string to accommodate both UUIDs and integers) |
-| `note_type` | VARCHAR(64) | e.g. `flag`, `context`, `override` |
+| `note_type` | VARCHAR(64) | `data_error` \| `missing_data` \| `outdated` \| `other` |
 | `note_text` | TEXT | — |
+
+### `insight_posts` (migration 012)
+
+Manually authored content for the public-facing intelligence hub at `mineralriskanalytics.com`. **Distinct from `report_insights`**, which are auto-generated findings inside per-customer report runs. The taxonomy mirrors the scoring engine dimensions exactly so future "related intelligence" surfacing alongside company and market scores is structurally possible without schema changes.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `slug` | VARCHAR(255) UNIQUE NOT NULL | URL-safe identifier, e.g. `ira-feoc-rules-cobalt-2025` |
+| `title` | VARCHAR(512) NOT NULL | — |
+| `content_type` | VARCHAR(16) NOT NULL | `analysis` \| `signal` \| `report` \| `news` |
+| `pillar` | VARCHAR(64) | `material_concentration` \| `geopolitical_trade` \| `regulatory_compliance` \| `operational` \| `financial_pressure`. NULL when a post spans pillars. |
+| `materials` | TEXT[] | Plain string array of material canonical names, e.g. `['Lithium','Cobalt']`. Not an FK so authors can tag content before a referenced material is fully seeded. |
+| `geographies` | TEXT[] | Plain string array of ISO2 country codes |
+| `summary` | TEXT | Short description shown in the feed list (1–3 sentences) |
+| `body` | TEXT | Full article content in Markdown |
+| `pdf_url` | VARCHAR(1024) | Cloudflare R2 URL for `report`-type PDFs |
+| `read_time_minutes` | INTEGER | Estimated read time, shown in feed. NULL for `signal`/`news` types. |
+| `author` | VARCHAR(255) | — |
+| `status` | VARCHAR(16) NOT NULL DEFAULT `'draft'` | `draft` → `published` → `archived`. Soft-delete via `archived` so published URLs remain resolvable (301 redirect). |
+| `published_at` | TIMESTAMPTZ | Set when status transitions to `published`. Used for feed ordering. |
+| `metadata_json` | JSONB | Freeform metadata: `external_url` for `news` type, featured flag, etc. |
+| `created_at` / `updated_at` | TIMESTAMPTZ | — |
+
+**Indexes:** `slug` (unique), `content_type`, `pillar`, `status`, `published_at`.
 
 ---
 
@@ -676,12 +684,13 @@ sources ──→ ingestion_runs ──→ raw_api_payloads
          │
          ▼
     companies ──→ company_scores (append-only)
-    materials  ──→ material_scores (append-only)
-    (country)  ──→ geography_scores (append-only)
+    materials  ──→ material_geography_risk_scores (append-only, per geo)
+               ──→ material_global_risk_scores    (append-only, trade-weighted rollup)
 
 materials ──→ hs_code_material_mappings ← trade_flows
 materials ──→ commodity_prices
 materials ──→ material_criticality_signals  (source=usgs_mcs|eu_crma|iea_report|patstat|manual)
+materials ──→ material_geography_risk_scores  (geography_code, append-only — migration 011)
 
 battery_chemistries ──→ battery_chemistry_materials ─────► materials
                                                             (valid_from/valid_to versioning)
@@ -689,6 +698,9 @@ battery_chemistries ──→ chemistry_risk_scores (append-only)
 
 companies ──→ company_aliases
 companies ──→ facilities
+companies ──→ company_vehicle_models ──→ vehicle_model_chemistries ──→ battery_chemistries
+
+insight_posts (no FKs — public intelligence hub content; tagged via materials/geographies arrays — migration 012)
 ```
 
 ---
@@ -750,7 +762,7 @@ Authoritative timeseries of per-material criticality from multiple sources. Repl
 
 **Unique constraint:** `(material_id, source, reference_year)`
 
-**Source priority** in `score_chemistry()`: `eu_crma` > `iea_report` > `usgs_mcs` > `manual` > `patstat` > `materials.criticality_score` (fallback)
+**Source priority** for criticality signal resolution: `eu_crma` > `iea_report` > `usgs_mcs` > `manual` > `patstat` > `materials.criticality_score` (fallback)
 
 ### `chemistry_risk_scores`
 
@@ -769,7 +781,38 @@ Pre-computed, append-only chemistry-level risk scores. One row per scoring run.
 | `score_confidence` | FLOAT | 0–1. Penalised by `data_availability`. Floored at 0.3. |
 | `metadata_json` | JSONB | `signal_sources`, `geo_coverage`, `materials_missing_hs`, `patent_modifiers_applied`, `trade_flows_vintage`, `no_benchmark_materials` |
 
-**CLI:** `bdi-ingest rescore-chemistry [--slug nmc] [--as-of 2024-01-01]`
+**CLI:** `bdi-ingest rescore-chemistry [--slug nmc] [--as-of 2024-01-01]`. Also runs Mondays 02:00 UTC via the Inngest cron job `rescore-all-chemistries`.
+
+---
+
+## Market Risk Scores (migration 011)
+
+### `material_geography_risk_scores`
+
+Append-only market-level risk scores at the **(material, geography)** intersection. This is the company-agnostic intelligence layer that powers the public hub at `mineralriskanalytics.com`. See [`docs/scoring.md` § Market Risk Scoring](scoring.md#market-risk-scoring) for formula details.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | SERIAL PK | — |
+| `material_id` | INTEGER FK → `materials.id` ON DELETE CASCADE | — |
+| `geography_code` | CHAR(2) NOT NULL | ISO2 country code |
+| `as_of_date` | DATE NOT NULL | Point-in-time of evidence cutoff |
+| `material_concentration_score` | FLOAT | 0–100 — material pillar (criticality + HHI + HCG uplift) |
+| `geopolitical_trade_score` | FLOAT | 0–100 — geopolitical pillar (binary HCG + classified trade events) |
+| `regulatory_compliance_score` | FLOAT | 0–100 — regulatory pillar (regulation scope unions + scoped events) |
+| `operational_score` | FLOAT | 0–100 — operational pillar |
+| `financial_pressure_score` | FLOAT | 0–100 — **reframed**: commodity price volatility + producer-stress events |
+| `overall_risk_score` | FLOAT | Weighted aggregate using `MARKET_PILLAR_WEIGHTS` (renormalised across the five active pillars; supply-chain propagation excluded) |
+| `event_count` | INTEGER | Number of distinct events used |
+| `rationale_json` | JSONB | Sub-input breakdown, pillar scores, weights used, criticality-signal source, event counts, human-readable `notes` |
+| `scoring_version` | VARCHAR(32) | `"3.0"` (matches the company-layer `SCORING_VERSION`) |
+| `computed_at` | TIMESTAMPTZ | When the row was written |
+
+**Unique constraint:** `(material_id, geography_code, as_of_date)` — prevents duplicate same-day rescore rows; re-runs upsert into the same slot.
+
+**CLI:** `bdi-ingest rescore-market [--material-id <id>] [--geographies CN,CL,...] [--as-of YYYY-MM-DD]`. Also runs Mondays 03:00 UTC via the Inngest cron job `rescore-market-scores` (one hour after the chemistry cron so the new chemistry composites are visible).
+
+**API:** `GET /api/v1/materials/{id}/market-scores`, `GET /api/v1/materials/{id}/market-scores/{geo}`, `GET /api/v1/market/scores`, `POST /api/v1/market/rescore`.
 
 ---
 
@@ -802,7 +845,7 @@ Maps 4-digit HS code prefixes to `materials.id`. Bridges trade flow data (stored
 
 ## Key Design Decisions
 
-**Append-only scores.** `company_scores`, `material_scores`, and `geography_scores` never have rows updated in place. Each scoring run inserts a new row. This gives a full historical time series for trend analysis and score-delta tracking, at the cost of more storage.
+**Append-only scores.** `company_scores`, `material_geography_risk_scores`, `material_global_risk_scores`, and `chemistry_risk_scores` never have rows updated in place. Each scoring run inserts a new row. This gives a full historical time series for trend analysis and score-delta tracking, at the cost of more storage. (Legacy tables `material_scores` and `geography_scores` were dropped in migration 021.)
 
 **UUID vs integer PKs.** Entity tables (`companies`, `tenants`, `users`, `facilities`, `report_templates`) use UUID primary keys because they need to be stable identifiers that can be created client-side or referenced across external systems. High-volume write tables (`risk_events`, `source_documents`, `ingestion_runs`, scores) use auto-increment integers for index efficiency.
 

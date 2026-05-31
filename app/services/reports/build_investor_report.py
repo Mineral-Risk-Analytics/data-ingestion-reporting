@@ -1,3 +1,5 @@
+# FUTURE: Phase 3 reporting — tied to the intelligence hub roadmap.
+# No callers in the current pipeline. See docs/deprecation-audit.md §I6.
 """Investor-oriented macro + named-supplier risk brief."""
 
 

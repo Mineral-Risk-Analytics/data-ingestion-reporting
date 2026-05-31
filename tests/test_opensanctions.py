@@ -754,12 +754,21 @@ def _make_entity(
 def _make_ingest_session(existing_event=None) -> MagicMock:
     """Mock session for ingest_opensanctions tests.
 
-    All scalar() calls return ``existing_event`` (used for content_hash checks).
-    scalars() calls (used inside match_companies) return empty lists so company
-    matching produces zero matches — we patch match_companies separately.
+    The first ``scalar()`` call is ``MAX(created_at)`` for ingest cadence
+    (``_days_since_last_run``) and must return ``None`` so tests are not
+    short-circuited as "too recent". Later calls are content-hash lookups and
+    return ``existing_event`` (or ``None`` when ``existing_event`` is unset).
     """
     session = MagicMock()
-    session.scalar.return_value = existing_event
+    _scalar_calls = {"n": 0}
+
+    def _scalar_side_effect(stmt):
+        _scalar_calls["n"] += 1
+        if _scalar_calls["n"] == 1:
+            return None
+        return existing_event
+
+    session.scalar.side_effect = _scalar_side_effect
 
     scalars_result = MagicMock()
     scalars_result.all.return_value = []

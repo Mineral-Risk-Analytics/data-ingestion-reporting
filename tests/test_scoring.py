@@ -42,13 +42,13 @@ def test_regulatory_risk_event_driven_only() -> None:
 
 
 def test_regulatory_obligation_uplift() -> None:
-    # UFLPA (25) + EU_BATTERY_REG (20) = 45 → capped at 40
-    uplift = min(40.0, COMPLIANCE_OBLIGATIONS["UFLPA"] + COMPLIANCE_OBLIGATIONS["EU_BATTERY_REG"])
+    # UFLPA (25) + EU_BATTERY_REG_2023 (20) = 45 → capped at 40
+    uplift = min(40.0, COMPLIANCE_OBLIGATIONS["UFLPA"] + COMPLIANCE_OBLIGATIONS["EU_BATTERY_REG_2023"])
     assert uplift == 40.0
 
     score = score_regulatory_profile(
         top_event_impacts=[],
-        active_obligations=[("UFLPA", 1.0), ("EU_BATTERY_REG", 1.0)],
+        active_obligations=[("UFLPA", 1.0), ("EU_BATTERY_REG_2023", 1.0)],
     )
     assert score == 40.0
 
@@ -66,7 +66,7 @@ def test_regulatory_combined_capped_at_100() -> None:
         top_event_impacts=[1.0, 1.0, 1.0],
         active_obligations=[
             ("UFLPA", 1.0),
-            ("EU_BATTERY_REG", 1.0),
+            ("EU_BATTERY_REG_2023", 1.0),
             ("IRA_DOMESTIC", 1.0),
         ],
     )

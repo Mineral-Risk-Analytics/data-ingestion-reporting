@@ -1,3 +1,5 @@
+# PHASE 2 — NOT YET WIRED
+# Used only by document_embedder.py, which is itself not called by the live pipeline.
 """
 Document chunker: split a plain-text document into overlapping windows of
 approximately ``chunk_size`` words, breaking on sentence boundaries where

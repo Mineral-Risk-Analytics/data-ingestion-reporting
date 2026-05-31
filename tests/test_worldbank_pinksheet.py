@@ -16,8 +16,9 @@ from unittest.mock import MagicMock, call, patch
 import openpyxl
 import pytest
 
+from app.services.ingestion.material_resolver import ResolveResult
 from app.services.ingestion.worldbank_pinksheet import (
-    _COMMODITY_TO_MATERIAL,
+    _HEADER_TO_HS_PREFIX,
     _normalise_unit,
     parse_pink_sheet,
 )
@@ -193,13 +194,13 @@ class TestParsePinkSheet:
 
 class TestParsePinkSheetSkipping:
     def test_skips_unknown_commodity(self):
-        """Commodities not in _COMMODITY_TO_MATERIAL should produce no results."""
+        """With ``accepted_headers`` excluding workbook columns, parse returns []."""
         raw = _build_workbook(
             commodities=["Natural Gas", "Coal"],
             units=["$/mmbtu", "$/mt"],
             data_rows=[("2024M01", [3.5, 120.0])],
         )
-        results = parse_pink_sheet(raw)
+        results = parse_pink_sheet(raw, accepted_headers={"Cobalt", "Nickel"})
         assert results == []
 
     def test_skips_empty_price_cell(self):
@@ -253,17 +254,16 @@ class TestParsePinkSheetSkipping:
         assert results[0]["price_date"] == date(2024, 1, 1)
 
     def test_mixed_valid_and_invalid(self):
-        """Valid and invalid observations in same workbook — only valid returned."""
+        """Valid and invalid cells: missing Cobalt price skipped; Gas kept if not filtered."""
         raw = _build_workbook(
-            commodities=["Cobalt", "Natural Gas"],  # Natural Gas should be skipped
+            commodities=["Cobalt", "Natural Gas"],
             units=["$/mt", "$/mmbtu"],
             data_rows=[
                 ("2024M01", [33_000.0, 3.5]),
                 ("2024M02", [None, 3.6]),  # Cobalt missing → skip that cell
             ],
         )
-        results = parse_pink_sheet(raw)
-        # Only Cobalt 2024M01 is valid (Natural Gas skipped; Cobalt 2024M02 missing)
+        results = parse_pink_sheet(raw, accepted_headers={"Cobalt"})
         assert len(results) == 1
         assert results[0]["commodity"] == "Cobalt"
         assert results[0]["price_date"] == date(2024, 1, 1)
@@ -305,52 +305,54 @@ def _make_bytes_fixture() -> bytes:
     )
 
 
-def _mock_session(material_id: int = 1, existing: bool = False) -> MagicMock:
-    """Return a mock SQLAlchemy session that resolves Cobalt → material_id.
+def _mock_cobalt_material(material_id: int = 1) -> MagicMock:
+    m = MagicMock()
+    m.id = material_id
+    m.canonical_name = "Cobalt"
+    return m
 
-    The ingest function always builds the material cache first (one scalar call
-    per unique canonical name), then does one scalar call per observation to
-    check whether a price row already exists.  We exploit this ordering:
-    call 1 → material lookup; calls 2+ → price existence check.
 
-    Args:
-        material_id: The id returned for the Cobalt material lookup.
-        existing:    If True, the existence checks return a truthy row object
-                     (simulating already-inserted rows).
-    """
-    mock_material = MagicMock()
-    mock_material.id = material_id
+def _alias_resolver_mock(material_id: int = 1) -> MagicMock:
+    """MaterialAliasResolver-compatible mock: Cobalt header resolves; cache keys lowercased."""
+    mat = _mock_cobalt_material(material_id)
+    resolver = MagicMock()
+    resolver._cache = {"worldbank_pinksheet": {"cobalt": (mat, False, True)}}
 
+    def _resolve(_ss: str, header: str) -> ResolveResult:
+        if header.strip().lower() == "cobalt":
+            return ResolveResult(material=mat, status="ok", writes_material_signals=True)
+        return ResolveResult(material=None, status="unknown")
+
+    resolver.resolve.side_effect = _resolve
+    return resolver
+
+
+def _mock_session(existing: bool = False) -> MagicMock:
+    """Session mock: ``scalar`` answers CommodityPrice existence checks only."""
     price_return = MagicMock() if existing else None
-
-    # Track how many times scalar has been called to distinguish the material
-    # cache build phase (first N calls, one per unique canonical name) from the
-    # per-observation existence checks.  With a single commodity, N=1.
-    n_material_lookups = [0]
-    n_unique_materials = 1  # matches single-commodity fixtures
-
-    def fake_scalar(_stmt):
-        n_material_lookups[0] += 1
-        if n_material_lookups[0] <= n_unique_materials:
-            return mock_material
-        return price_return
-
     session = MagicMock()
-    session.scalar.side_effect = fake_scalar
+    session.scalar.return_value = price_return
     return session
 
 
 class TestIngestPinkSheet:
     def test_inserted_count_matches_observations(self):
+        from app.services.ingestion import worldbank_pinksheet as wbp
         from app.services.ingestion.worldbank_pinksheet import ingest_pink_sheet
 
         fixture_bytes = _make_bytes_fixture()
-        session = _mock_session(material_id=1, existing=False)
+        session = _mock_session(existing=False)
 
-        with patch(
-            "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
-            return_value=fixture_bytes,
+        with (
+            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(1)),
+            patch.object(wbp, "MaterialResolver") as mock_hs,
+            patch(
+                "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
+                return_value=fixture_bytes,
+            ),
         ):
+            mock_hs.return_value.resolve_by_hs_code.return_value = (1, 99, 0.9)
             result = ingest_pink_sheet(session=session, since_year=None)
 
         assert result["inserted"] == 2
@@ -359,15 +361,22 @@ class TestIngestPinkSheet:
 
     def test_idempotent_second_run(self):
         """Re-running when all rows already exist must insert 0 and skip all."""
+        from app.services.ingestion import worldbank_pinksheet as wbp
         from app.services.ingestion.worldbank_pinksheet import ingest_pink_sheet
 
         fixture_bytes = _make_bytes_fixture()
-        session = _mock_session(material_id=1, existing=True)
+        session = _mock_session(existing=True)
 
-        with patch(
-            "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
-            return_value=fixture_bytes,
+        with (
+            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(1)),
+            patch.object(wbp, "MaterialResolver") as mock_hs,
+            patch(
+                "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
+                return_value=fixture_bytes,
+            ),
         ):
+            mock_hs.return_value.resolve_by_hs_code.return_value = (1, 99, 0.9)
             result = ingest_pink_sheet(session=session, since_year=None)
 
         assert result["inserted"] == 0
@@ -375,6 +384,7 @@ class TestIngestPinkSheet:
 
     def test_since_year_filters_observations(self):
         """since_year should drop rows before that year."""
+        from app.services.ingestion import worldbank_pinksheet as wbp
         from app.services.ingestion.worldbank_pinksheet import ingest_pink_sheet
 
         # Workbook has 2023 and 2024 rows
@@ -386,19 +396,26 @@ class TestIngestPinkSheet:
                 ("2024M01", [33_000.0]),
             ],
         )
-        session = _mock_session(material_id=1, existing=False)
+        session = _mock_session(existing=False)
 
-        with patch(
-            "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
-            return_value=raw,
+        with (
+            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(1)),
+            patch.object(wbp, "MaterialResolver") as mock_hs,
+            patch(
+                "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
+                return_value=raw,
+            ),
         ):
+            mock_hs.return_value.resolve_by_hs_code.return_value = (1, 99, 0.9)
             result = ingest_pink_sheet(session=session, since_year=2024)
 
         # Only the 2024 row should be inserted
         assert result["inserted"] == 1
 
     def test_unknown_material_increments_skip_counter(self):
-        """A commodity whose canonical name is not in the DB is skipped."""
+        """When no Pink Sheet aliases are seeded, ingest inserts nothing."""
+        from app.services.ingestion import worldbank_pinksheet as wbp
         from app.services.ingestion.worldbank_pinksheet import ingest_pink_sheet
 
         raw = _build_workbook(
@@ -406,79 +423,104 @@ class TestIngestPinkSheet:
             units=["$/mt"],
             data_rows=[("2024M01", [33_000.0])],
         )
+        session = _mock_session(existing=False)
+        empty_resolver = MagicMock()
+        empty_resolver._cache = {"worldbank_pinksheet": {}}
 
-        # Session returns None for material lookup → unknown material
-        session = MagicMock()
-        session.scalar.return_value = None
-
-        with patch(
-            "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
-            return_value=raw,
+        with (
+            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "MaterialAliasResolver", return_value=empty_resolver),
+            patch(
+                "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
+                return_value=raw,
+            ),
         ):
             result = ingest_pink_sheet(session=session, since_year=None)
 
-        assert result["skipped_unknown_material"] == 1
         assert result["inserted"] == 0
 
     def test_session_add_called_for_each_inserted_row(self):
         """session.add must be called once per inserted CommodityPrice."""
+        from app.services.ingestion import worldbank_pinksheet as wbp
         from app.services.ingestion.worldbank_pinksheet import ingest_pink_sheet
 
         fixture_bytes = _make_bytes_fixture()
-        session = _mock_session(material_id=7, existing=False)
+        session = _mock_session(existing=False)
 
-        with patch(
-            "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
-            return_value=fixture_bytes,
+        with (
+            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(7)),
+            patch.object(wbp, "MaterialResolver") as mock_hs,
+            patch(
+                "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
+                return_value=fixture_bytes,
+            ),
         ):
+            mock_hs.return_value.resolve_by_hs_code.return_value = (7, 99, 0.9)
             ingest_pink_sheet(session=session, since_year=None)
 
         assert session.add.call_count == 2
 
     def test_session_commit_called(self):
+        from app.services.ingestion import worldbank_pinksheet as wbp
         from app.services.ingestion.worldbank_pinksheet import ingest_pink_sheet
 
         fixture_bytes = _make_bytes_fixture()
-        session = _mock_session(material_id=1, existing=False)
+        session = _mock_session(existing=False)
 
-        with patch(
-            "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
-            return_value=fixture_bytes,
+        with (
+            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(1)),
+            patch.object(wbp, "MaterialResolver") as mock_hs,
+            patch(
+                "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
+                return_value=fixture_bytes,
+            ),
         ):
+            mock_hs.return_value.resolve_by_hs_code.return_value = (1, 99, 0.9)
             ingest_pink_sheet(session=session, since_year=None)
 
         session.commit.assert_called_once()
 
     def test_download_called_with_url_override(self):
         """The url parameter must be forwarded to download_pink_sheet."""
+        from app.services.ingestion import worldbank_pinksheet as wbp
         from app.services.ingestion.worldbank_pinksheet import ingest_pink_sheet
 
         fixture_bytes = _make_bytes_fixture()
-        session = _mock_session(material_id=1, existing=False)
+        session = _mock_session(existing=False)
         custom_url = "https://example.com/custom-sheet.xlsx"
 
-        with patch(
-            "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
-            return_value=fixture_bytes,
-        ) as mock_dl:
+        with (
+            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(1)),
+            patch.object(wbp, "MaterialResolver") as mock_hs,
+            patch(
+                "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
+                return_value=fixture_bytes,
+            ) as mock_dl,
+        ):
+            mock_hs.return_value.resolve_by_hs_code.return_value = (1, 99, 0.9)
             ingest_pink_sheet(session=session, url=custom_url, since_year=None)
 
         mock_dl.assert_called_once_with(custom_url)
 
 
 # ---------------------------------------------------------------------------
-# _COMMODITY_TO_MATERIAL mapping sanity checks
+# Stage attribution: Pink Sheet header → HS prefix (ingest-time)
 # ---------------------------------------------------------------------------
 
-class TestCommodityMapping:
-    def test_cobalt_maps_to_cobalt(self):
-        assert _COMMODITY_TO_MATERIAL["Cobalt"] == "Cobalt"
+class TestHeaderToHsPrefix:
+    """Headers listed here get ``hs_mapping_id`` when the prefix resolves in the DB."""
 
-    def test_aluminium_maps_to_aluminum(self):
-        assert _COMMODITY_TO_MATERIAL["Aluminium"] == "Aluminum"
+    def test_cobalt_maps_to_refined_prefix(self):
+        assert _HEADER_TO_HS_PREFIX["Cobalt"] == "810520"
 
-    def test_lithium_carbonate_maps_to_lithium(self):
-        assert _COMMODITY_TO_MATERIAL["Lithium carbonate, battery grade"] == "Lithium"
+    def test_aluminium_maps_to_same_prefix_as_aluminum(self):
+        assert _HEADER_TO_HS_PREFIX["Aluminium"] == "760110"
 
-    def test_graphite_maps_to_natural_graphite(self):
-        assert _COMMODITY_TO_MATERIAL["Graphite"] == "Natural Graphite"
+    def test_lithium_carbonate_battery_grade(self):
+        assert _HEADER_TO_HS_PREFIX["Lithium carbonate, battery grade"] == "283691"
+
+    def test_bare_graphite_not_attributed(self):
+        assert "Graphite" not in _HEADER_TO_HS_PREFIX

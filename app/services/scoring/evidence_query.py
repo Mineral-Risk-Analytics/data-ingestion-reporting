@@ -43,7 +43,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.constants import RiskCategory
@@ -57,7 +57,7 @@ from app.models.company import (
     CompanyScore,
     CompanySupplyRelationship,
 )
-from app.models.facility import Facility
+from app.models.facility import CompanyFacility, Facility
 from app.models.regulatory import (
     CompanyRegulationExposure,
     Regulation,
@@ -66,9 +66,12 @@ from app.models.regulatory import (
     RiskEvent,
     RiskEventCompany,
     RiskEventGeography,
+    RiskEventHsMapping,
     RiskEventMaterial,
     RiskEventRegulation,
 )
+from app.models.scoring import HsCodeGeographyRiskScore
+from app.models.supply import HsCodeMaterialMapping
 from app.models.vehicle import CompanyVehicleModel, VehicleModelChemistry
 from app.services.scoring.decay import EVIDENCE_WINDOWS
 from app.services.scoring.types import ScoringScope
@@ -77,6 +80,35 @@ log = structlog.get_logger(__name__)
 
 HIGH_CONCENTRATION_GEOS = frozenset({"CN", "CD", "RU"})
 
+# Weight applied to scope-only regulation hits (no CompanyRegulationExposure row)
+# keyed by RegulationMaterialScope.scope_type.
+#
+# Rationale for each tier (descending severity):
+#   banned                  0.70  Outright import / use prohibition — the strongest scope_type a
+#                                 material can carry.  Added 2026-05-06 to close a latent gap where
+#                                 ``banned`` rows fell through to the 0.50 default and scored LOWER
+#                                 than ``restricted`` (0.60).  No current seed entry uses this value;
+#                                 the weight is here so a future banned-material seed scores correctly.
+#   strategic_raw_material  0.65  CRMA Annex II: binding 2030 extraction/processing/recycling
+#                                 benchmarks; stronger enforcement obligation than disclosure alone.
+#   restricted              0.60  Active restrictions (e.g. REACH SVHC authorisation); enforcement
+#                                 is live but narrower in scope than a strategic designation.
+#   disclosure_required     0.50  Standard disclosure / due-diligence mandate; default assumption
+#                                 when no CompanyRegulationExposure status is recorded.
+#   covered                 0.40  Indirect coverage (e.g. CBAM carbon certificate); less direct
+#                                 enforcement exposure than a disclosure or restriction obligation.
+#   targeted_country        0.50  Used only on geography scopes, not material scopes; included for
+#                                 completeness in case scope_type is ever added there.
+#
+# Unknown scope_type values fall back to 0.50 (same as disclosure_required).
+_SCOPE_TYPE_WEIGHT: dict[str, float] = {
+    "banned":                 0.70,
+    "strategic_raw_material": 0.65,
+    "restricted":             0.60,
+    "disclosure_required":    0.50,
+    "covered":                0.40,
+}
+
 
 @dataclass
 class EventWithRelevance:
@@ -84,10 +116,21 @@ class EventWithRelevance:
     Pairs a RiskEvent with its per-company (or per-material) relevance score
     from the relevant junction table.
     relevance_score maps to the relevance_multiplier input of compute_event_impact().
+
+    ``scope_type`` carries the regulation designation
+    (``banned`` / ``restricted`` / ``strategic_raw_material`` /
+    ``covered`` / ``disclosure_required``) when the row originated from a
+    ``RiskEventMaterial`` populated by the EUR-Lex ingester.  Consumed by
+    :func:`app.services.scoring.evidence_aggregator._impact` to widen
+    per-material severity spread inside a single regulation.  ``None`` for
+    company-anchored / geography-anchored events and for pre-migration
+    junction rows — the multiplier is a passthrough in that case so
+    backwards compatibility holds.
     """
 
     event: RiskEvent
     relevance_score: float  # 0.70–1.00
+    scope_type: Optional[str] = None
 
 
 @dataclass
@@ -129,6 +172,27 @@ def _dedup_event_rows(rows) -> list[EventWithRelevance]:
     return list(by_id.values())
 
 
+def _dedup_material_event_rows(rows) -> list[EventWithRelevance]:
+    """3-tuple variant of :func:`_dedup_event_rows` for material queries.
+
+    Rows are ``(event, relevance_score, scope_type)``.  When the same event
+    is tagged to multiple materials in the query set, the row with the
+    highest ``relevance_score`` wins; its ``scope_type`` is the one carried
+    onto the resulting :class:`EventWithRelevance`.  This is the correct
+    semantics because the scope-severity multiplier is then derived from
+    the dominant material's designation.
+    """
+    by_id: dict[int, EventWithRelevance] = {}
+    for ev, rel, scope_type in rows:
+        rel_f = float(rel)
+        existing = by_id.get(ev.id)
+        if existing is None or rel_f > existing.relevance_score:
+            by_id[ev.id] = EventWithRelevance(
+                event=ev, relevance_score=rel_f, scope_type=scope_type
+            )
+    return list(by_id.values())
+
+
 # ---------------------------------------------------------------------------
 # Company-scoped queries
 # ---------------------------------------------------------------------------
@@ -158,6 +222,7 @@ def get_events_for_company(
         .join(RiskEventCompany, RiskEventCompany.risk_event_id == RiskEvent.id)
         .where(
             RiskEventCompany.company_id == company_id,
+            RiskEventCompany.review_status != "excluded",
             RiskEvent.risk_categories_json.contains([category.value]),
         )
         .order_by(RiskEvent.event_date.desc())
@@ -228,24 +293,52 @@ def get_active_compliance_obligations(
     """
     Return active compliance obligations as (regulation_key, weight_multiplier) tuples.
 
-    The weight_multiplier reflects compliance severity:
-      non_compliant → 1.00  (confirmed violation; full uplift)
-      unknown       → 0.50  (unassessed; conservative mid-weight)
-      partial       → 0.40  (in transition; partial uplift)
+    The weight_multiplier reflects compliance severity.  Two tiers of
+    status weights, selected per regulation based on whether the
+    regulation has a rebuttable-presumption structure:
+
+      Standard (most regulations):
+        non_compliant → 1.00  (confirmed violation; full uplift)
+        unknown       → 0.50  (unassessed; conservative mid-weight)
+        partial       → 0.40  (in transition; partial uplift)
+
+      Rebuttable-presumption regulations (e.g., UFLPA — Idea A,
+      2026-05-17, gated by regulation.metadata_json["rebuttable_presumption"]
+      = True):
+        non_compliant → 1.00  (unchanged — confirmed violation)
+        unknown       → 0.85  (the regulation puts burden of proof
+                                on importer; absence of evidence is
+                                much closer to presumption of violation)
+        partial       → 0.70  (good-faith due-diligence partial
+                                effort still doesn't satisfy the
+                                rebuttable presumption)
 
     Primary source: company_regulation_exposure joined to regulations.
     Fallback: text-scan of recent regulatory events (worst-case weight assumed).
 
-    Returns e.g. [("IRA_DOMESTIC", 1.0), ("UFLPA", 0.40)]
+    Returns e.g. [("IRA_DOMESTIC", 1.0), ("UFLPA", 0.85)]
     """
     _STATUS_WEIGHT: dict[str, float] = {
         "non_compliant": 1.00,
         "unknown":       0.50,
         "partial":       0.40,
     }
+    _STATUS_WEIGHT_REBUTTABLE: dict[str, float] = {
+        "non_compliant": 1.00,
+        "unknown":       0.85,
+        "partial":       0.70,
+    }
 
+    # ``verified=True`` filter: only seeded regulations contribute uplift.
+    # See ``get_events_for_regulations`` below for the same rule.
+    # Also pulls metadata_json so we can detect rebuttable_presumption
+    # without a second query.
     stmt = (
-        select(Regulation.regulation_key, CompanyRegulationExposure.compliance_status)
+        select(
+            Regulation.regulation_key,
+            CompanyRegulationExposure.compliance_status,
+            Regulation.metadata_json,
+        )
         .join(
             CompanyRegulationExposure,
             CompanyRegulationExposure.regulation_id == Regulation.id,
@@ -255,6 +348,7 @@ def get_active_compliance_obligations(
             CompanyRegulationExposure.compliance_status.in_(
                 ["non_compliant", "partial", "unknown"]
             ),
+            Regulation.verified.is_(True),
         )
     )
     if scope.regulation_keys is not None:
@@ -262,18 +356,30 @@ def get_active_compliance_obligations(
 
     rows = db.execute(stmt).all()
     if rows:
-        return sorted(
-            [
-                (key, _STATUS_WEIGHT.get(status, 0.40))
-                for key, status in rows
-            ],
-            key=lambda t: t[0],
-        )
+        result: list[tuple[str, float]] = []
+        for key, status, metadata in rows:
+            # Per-regulation rebuttable_presumption override (Idea A).
+            # When the regulation's metadata_json carries
+            # rebuttable_presumption=True, unknown/partial status
+            # weights are elevated to reflect the burden-of-proof
+            # structure.  See _STATUS_WEIGHT_REBUTTABLE above for the
+            # rationale.
+            rebuttable = (
+                isinstance(metadata, dict)
+                and bool(metadata.get("rebuttable_presumption", False))
+            )
+            weight_table = _STATUS_WEIGHT_REBUTTABLE if rebuttable else _STATUS_WEIGHT
+            result.append((key, weight_table.get(status, 0.40)))
+        return sorted(result, key=lambda t: t[0])
 
+    # Hardcoded fallback for companies with zero company_regulation_exposure
+    # rows — text-scans event titles for known regulation keywords.  Mapped
+    # values must match canonical regulation_key values in seed_regulations.py
+    # (post 2026-05-05: EU_BATTERY_REG → EU_BATTERY_REG_2023).
     known_obligations: dict[str, str] = {
         "uflpa":          "UFLPA",
-        "eu battery":     "EU_BATTERY_REG",
-        "eu_battery":     "EU_BATTERY_REG",
+        "eu battery":     "EU_BATTERY_REG_2023",
+        "eu_battery":     "EU_BATTERY_REG_2023",
         "ira domestic":   "IRA_DOMESTIC",
         "ira_domestic":   "IRA_DOMESTIC",
     }
@@ -320,6 +426,7 @@ def get_filing_signals(
         .join(RiskEventCompany, RiskEventCompany.risk_event_id == RiskEvent.id)
         .where(
             RiskEventCompany.company_id == company_id,
+            RiskEventCompany.review_status != "excluded",
             RiskEvent.risk_categories_json.contains(
                 [RiskCategory.FINANCIAL_PRESSURE.value]
             ),
@@ -335,6 +442,76 @@ def get_filing_signals(
 # Material-scoped queries (no company required)
 # ---------------------------------------------------------------------------
 
+# Discount applied to events without HS stage attribution.
+# Events ingested before Phase 1.5 (or keyword-only matches that lack a
+# specific HS code) have no risk_event_hs_mappings row.  They are still
+# included in scoring but down-weighted to reflect the reduced specificity.
+_NO_STAGE_ATTRIBUTION_DISCOUNT = 0.85
+
+
+def _apply_hs_confidence_multiplier(
+    db: Session,
+    material_id: int,
+    results: list[EventWithRelevance],
+) -> list[EventWithRelevance]:
+    """
+    Adjust relevance_score using hs_code_material_mappings.confidence.
+
+    For each event:
+      - If it has at least one risk_event_hs_mappings row whose hs_mapping
+        belongs to ``material_id``, the relevance is multiplied by the
+        *maximum* confidence across those mappings.  This means high-quality
+        curated mappings (confidence=0.95) amplify the relevance, while
+        lower-confidence inferred mappings (confidence=0.70) reduce it.
+      - If the event has no HS stage attribution, the relevance is multiplied
+        by ``_NO_STAGE_ATTRIBUTION_DISCOUNT`` (0.85).  Pre-Phase-1.5 events
+        and pure keyword matches fall into this bucket.
+
+    Called immediately after ``_dedup_event_rows()`` in
+    ``get_events_for_material()`` so dedup has already resolved the best
+    relevance per event before the multiplier is applied.
+    """
+    if not results:
+        return results
+
+    event_ids = [r.event.id for r in results]
+
+    # One row per event: the max confidence across all HS mappings linked to
+    # this event that belong to the requested material_id.
+    confidence_rows = db.execute(
+        select(
+            RiskEventHsMapping.risk_event_id,
+            func.max(HsCodeMaterialMapping.confidence).label("max_confidence"),
+        )
+        .join(
+            HsCodeMaterialMapping,
+            HsCodeMaterialMapping.id == RiskEventHsMapping.hs_mapping_id,
+        )
+        .where(
+            RiskEventHsMapping.risk_event_id.in_(event_ids),
+            HsCodeMaterialMapping.material_id == material_id,
+            HsCodeMaterialMapping.market_scope == "global",
+        )
+        .group_by(RiskEventHsMapping.risk_event_id)
+    ).all()
+
+    confidence_map: dict[int, float] = {
+        row.risk_event_id: row.max_confidence for row in confidence_rows
+    }
+
+    adjusted: list[EventWithRelevance] = []
+    for r in results:
+        multiplier = confidence_map.get(r.event.id, _NO_STAGE_ATTRIBUTION_DISCOUNT)
+        adjusted.append(
+            EventWithRelevance(
+                event=r.event,
+                relevance_score=round(r.relevance_score * multiplier, 4),
+                scope_type=r.scope_type,
+            )
+        )
+    return adjusted
+
+
 def get_events_for_material(
     db: Session,
     material_id: int,
@@ -346,6 +523,11 @@ def get_events_for_material(
     """
     Query risk_events tagged to a specific material via risk_event_materials.
     Enables material-anchored scoring without any company data.
+
+    Phase 1.5: relevance scores are adjusted by ``_apply_hs_confidence_multiplier``
+    after deduplication.  Events with HS stage attribution are multiplied by the
+    mapping confidence; events without are discounted by
+    ``_NO_STAGE_ATTRIBUTION_DISCOUNT`` (0.85).
     """
     if scope.material_ids is not None and material_id not in scope.material_ids:
         return []
@@ -353,7 +535,11 @@ def get_events_for_material(
     cutoff = _category_window_cutoff(category, as_of_date)
 
     stmt = (
-        select(RiskEvent, RiskEventMaterial.relevance_score)
+        select(
+            RiskEvent,
+            RiskEventMaterial.relevance_score,
+            RiskEventMaterial.scope_type,
+        )
         .join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
         .where(
             RiskEventMaterial.material_id == material_id,
@@ -372,7 +558,8 @@ def get_events_for_material(
         ).where(RiskEventGeography.country_code.in_(scope.country_codes))
 
     rows = db.execute(stmt).all()
-    results = _dedup_event_rows(rows)
+    results = _dedup_material_event_rows(rows)
+    results = _apply_hs_confidence_multiplier(db, material_id, results)
 
     log.debug(
         "evidence_query.get_events_for_material",
@@ -393,13 +580,21 @@ def get_facilities_for_company(
     *,
     scope: ScoringScope = ScoringScope.ALL,
 ) -> list[Facility]:
-    """All ``Facility`` rows owned by this company.
+    """All ``Facility`` rows linked to this company via ``company_facilities``.
 
     Used by both the geopolitical aggregator (facility countries widen
     ``country_concentration``) and the operational aggregator (planned /
     under_construction facilities lift ``structural_dependency``).
+
+    Joins through the junction table so that JV/co-owned facilities are
+    returned for every company that holds a link row, without duplicating
+    the underlying facility record.
     """
-    stmt = select(Facility).where(Facility.company_id == company_id)
+    stmt = (
+        select(Facility)
+        .join(CompanyFacility, CompanyFacility.facility_id == Facility.id)
+        .where(CompanyFacility.company_id == company_id)
+    )
     if scope.facility_ids is not None:
         stmt = stmt.where(Facility.id.in_(scope.facility_ids))
     if scope.country_codes is not None:
@@ -446,6 +641,62 @@ def get_events_for_geographies(
     return _dedup_event_rows(rows)
 
 
+def _apply_hs_confidence_multiplier_batch(
+    db: Session,
+    material_ids: set[int],
+    results: list[EventWithRelevance],
+) -> list[EventWithRelevance]:
+    """
+    Batch variant of ``_apply_hs_confidence_multiplier`` for multi-material queries.
+
+    Identical logic to the single-material version: events that have at least one
+    ``risk_event_hs_mappings`` row pointing to a mapping that belongs to *any* of
+    ``material_ids`` are multiplied by the max confidence across those mappings;
+    events with no HS stage attribution are discounted by
+    ``_NO_STAGE_ATTRIBUTION_DISCOUNT`` (0.85).
+
+    Called by ``get_events_for_materials()`` so that the batch path is consistent
+    with the per-material path in ``get_events_for_material()``.
+    """
+    if not results:
+        return results
+
+    event_ids = [r.event.id for r in results]
+
+    confidence_rows = db.execute(
+        select(
+            RiskEventHsMapping.risk_event_id,
+            func.max(HsCodeMaterialMapping.confidence).label("max_confidence"),
+        )
+        .join(
+            HsCodeMaterialMapping,
+            HsCodeMaterialMapping.id == RiskEventHsMapping.hs_mapping_id,
+        )
+        .where(
+            RiskEventHsMapping.risk_event_id.in_(event_ids),
+            HsCodeMaterialMapping.material_id.in_(material_ids),
+            HsCodeMaterialMapping.market_scope == "global",
+        )
+        .group_by(RiskEventHsMapping.risk_event_id)
+    ).all()
+
+    confidence_map: dict[int, float] = {
+        row.risk_event_id: row.max_confidence for row in confidence_rows
+    }
+
+    adjusted: list[EventWithRelevance] = []
+    for r in results:
+        multiplier = confidence_map.get(r.event.id, _NO_STAGE_ATTRIBUTION_DISCOUNT)
+        adjusted.append(
+            EventWithRelevance(
+                event=r.event,
+                relevance_score=round(r.relevance_score * multiplier, 4),
+                scope_type=r.scope_type,
+            )
+        )
+    return adjusted
+
+
 def get_events_for_materials(
     db: Session,
     material_ids: set[int],
@@ -454,7 +705,15 @@ def get_events_for_materials(
     *,
     scope: ScoringScope = ScoringScope.ALL,
 ) -> list[EventWithRelevance]:
-    """Events tagged via ``risk_event_materials`` to any of ``material_ids``."""
+    """Events tagged via ``risk_event_materials`` to any of ``material_ids``.
+
+    Phase 1.5: relevance scores are adjusted by
+    ``_apply_hs_confidence_multiplier_batch`` after deduplication, matching
+    the behaviour of the singular ``get_events_for_material()``.  Events with
+    HS stage attribution for any of the requested materials are multiplied by
+    the mapping confidence; events without are discounted by
+    ``_NO_STAGE_ATTRIBUTION_DISCOUNT`` (0.85).
+    """
     if scope.material_ids is not None:
         material_ids = set(material_ids) & set(scope.material_ids)
     if not material_ids:
@@ -462,7 +721,11 @@ def get_events_for_materials(
 
     cutoff = _category_window_cutoff(category, as_of_date)
     stmt = (
-        select(RiskEvent, RiskEventMaterial.relevance_score)
+        select(
+            RiskEvent,
+            RiskEventMaterial.relevance_score,
+            RiskEventMaterial.scope_type,
+        )
         .join(
             RiskEventMaterial,
             RiskEventMaterial.risk_event_id == RiskEvent.id,
@@ -478,7 +741,104 @@ def get_events_for_materials(
             (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
         )
     rows = db.execute(stmt).all()
-    return _dedup_event_rows(rows)
+    results = _dedup_material_event_rows(rows)
+    results = _apply_hs_confidence_multiplier_batch(db, material_ids, results)
+
+    log.debug(
+        "evidence_query.get_events_for_materials",
+        material_ids=sorted(material_ids),
+        category=category.value,
+        count=len(results),
+    )
+    return results
+
+
+def get_events_for_hs_mapping(
+    db: Session,
+    hs_mapping_id: int,
+    category: RiskCategory,
+    as_of_date: date,
+    *,
+    scope: ScoringScope = ScoringScope.ALL,
+) -> list[EventWithRelevance]:
+    """
+    Query risk_events scoped to a specific HS mapping node via
+    ``risk_event_hs_mappings``.
+
+    Intended for use by Phase 3 ``hs_node_scorer.py``, which scores at the
+    stage level (e.g., "export ban on cobalt hydroxide 282200 from China").
+    Unlike ``get_events_for_material()``, this function queries the HS junction
+    table directly, so every row returned already has confirmed stage attribution.
+    No additional confidence discount is applied.
+
+    The ``relevance_score`` returned is::
+
+        RiskEventHsMapping.relevance_score × HsCodeMaterialMapping.confidence
+
+    where ``confidence`` reflects the quality of the HS mapping itself (curated
+    rows carry 0.90–0.95; inferred rows carry 0.70–0.85).  This means a
+    keyword-matched event (relevance 0.85) on a high-confidence curated mapping
+    (confidence 0.95) scores 0.8075, while a direct HS-code-matched event
+    (relevance 0.90) on the same mapping scores 0.8550.
+
+    Deduplication is by ``event.id``, keeping the highest adjusted score.
+
+    ``scope.material_ids``:  filters to mappings whose ``material_id`` is in the
+        set — useful when the caller wants only events attributable to a specific
+        material even when querying a shared 4-digit HS chapter node.
+    ``scope.country_codes``: filters via ``risk_event_geographies`` as usual.
+    """
+    cutoff = _category_window_cutoff(category, as_of_date)
+
+    stmt = (
+        select(
+            RiskEvent,
+            RiskEventHsMapping.relevance_score,
+            HsCodeMaterialMapping.confidence,
+        )
+        .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
+        .join(
+            HsCodeMaterialMapping,
+            HsCodeMaterialMapping.id == RiskEventHsMapping.hs_mapping_id,
+        )
+        .where(
+            RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
+            RiskEvent.risk_categories_json.contains([category.value]),
+        )
+        .order_by(RiskEvent.event_date.desc())
+    )
+    if cutoff is not None:
+        stmt = stmt.where(
+            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
+        )
+    if scope.country_codes is not None:
+        stmt = stmt.join(
+            RiskEventGeography,
+            RiskEventGeography.risk_event_id == RiskEvent.id,
+        ).where(RiskEventGeography.country_code.in_(scope.country_codes))
+    if scope.material_ids is not None:
+        stmt = stmt.where(
+            HsCodeMaterialMapping.material_id.in_(scope.material_ids)
+        )
+
+    rows = db.execute(stmt).all()
+
+    # Dedup by event id; keep max adjusted score across any duplicate rows.
+    by_id: dict[int, EventWithRelevance] = {}
+    for ev, relevance, confidence in rows:
+        adjusted = round(float(relevance) * float(confidence), 4)
+        existing = by_id.get(ev.id)
+        if existing is None or adjusted > existing.relevance_score:
+            by_id[ev.id] = EventWithRelevance(event=ev, relevance_score=adjusted)
+    results = list(by_id.values())
+
+    log.debug(
+        "evidence_query.get_events_for_hs_mapping",
+        hs_mapping_id=hs_mapping_id,
+        category=category.value,
+        count=len(results),
+    )
+    return results
 
 
 def get_regulations_scoping_company(
@@ -492,38 +852,43 @@ def get_regulations_scoping_company(
     """UNION of regulations that apply to this company by exposure or scope.
 
     Three sources:
-      1. Existing ``CompanyRegulationExposure`` rows (status-weighted).
+      1. Existing ``CompanyRegulationExposure`` rows (status-weighted, highest authority).
       2. ``Regulation`` rows linked via ``RegulationMaterialScope`` to one of
-         this company's exposed materials.
+         this company's exposed materials. Weight is derived from ``scope_type``
+         via ``_SCOPE_TYPE_WEIGHT`` — ``strategic_raw_material`` (0.65) ranks
+         above ``disclosure_required`` (0.50) which ranks above ``covered`` (0.40).
       3. ``Regulation`` rows linked via ``RegulationGeographyScope`` to one of
-         this company's source-geographies / facility countries.
+         this company's source-geographies / facility countries (flat 0.50).
 
-    Scope-only hits (no exposure row) are weighted ``0.50`` — the same
-    ``unknown`` convention used by ``get_active_compliance_obligations``.
-    Dedup keeps the max weight per ``regulation_key``.
+    Dedup keeps the max weight per ``regulation_key`` across all three sources,
+    so a structured exposure row always wins over a scope-derived hit.
     """
     weights: dict[str, float] = {}
 
-    # Source 1: structured exposures (status-weighted)
+    # Source 1: structured exposures (status-weighted — highest authority)
     for key, weight in get_active_compliance_obligations(db, company_id, scope=scope):
         weights[key] = max(weights.get(key, 0.0), weight)
 
-    # Source 2: material-scoped regulations
+    # Source 2: material-scoped regulations — weight varies by scope_type
     if material_ids:
         stmt = (
-            select(Regulation.regulation_key)
+            select(Regulation.regulation_key, RegulationMaterialScope.scope_type)
             .join(
                 RegulationMaterialScope,
                 RegulationMaterialScope.regulation_id == Regulation.id,
             )
-            .where(RegulationMaterialScope.material_id.in_(material_ids))
+            .where(
+                RegulationMaterialScope.material_id.in_(material_ids),
+                Regulation.verified.is_(True),
+            )
         )
         if scope.regulation_keys is not None:
             stmt = stmt.where(Regulation.regulation_key.in_(scope.regulation_keys))
-        for (key,) in db.execute(stmt).all():
-            weights[key] = max(weights.get(key, 0.0), 0.50)
+        for key, scope_type in db.execute(stmt).all():
+            w = _SCOPE_TYPE_WEIGHT.get(scope_type or "", 0.50)
+            weights[key] = max(weights.get(key, 0.0), w)
 
-    # Source 3: geography-scoped regulations
+    # Source 3: geography-scoped regulations (flat 0.50 — no scope_type on geo rows)
     if country_codes:
         stmt = (
             select(Regulation.regulation_key)
@@ -531,7 +896,10 @@ def get_regulations_scoping_company(
                 RegulationGeographyScope,
                 RegulationGeographyScope.regulation_id == Regulation.id,
             )
-            .where(RegulationGeographyScope.country_code.in_(country_codes))
+            .where(
+                RegulationGeographyScope.country_code.in_(country_codes),
+                Regulation.verified.is_(True),
+            )
         )
         if scope.regulation_keys is not None:
             stmt = stmt.where(Regulation.regulation_key.in_(scope.regulation_keys))
@@ -557,6 +925,11 @@ def get_events_for_regulations(
     cutoff = _category_window_cutoff(
         RiskCategory.REGULATORY_COMPLIANCE, as_of_date
     )
+    # Filter to verified regulations only.  ``verified=True`` is set
+    # exclusively by ``seed_regulations.py`` (the curated source of truth);
+    # rows that other ingesters might create with ``verified=False``
+    # (legacy / partial) are excluded from scoring evidence to keep the
+    # regulatory pillar grounded in partner-reviewed instruments.
     stmt = (
         select(RiskEvent, RiskEventRegulation.relevance_score)
         .join(
@@ -569,6 +942,7 @@ def get_events_for_regulations(
         )
         .where(
             Regulation.regulation_key.in_(regulation_keys),
+            Regulation.verified.is_(True),
             RiskEvent.risk_categories_json.contains(
                 [RiskCategory.REGULATORY_COMPLIANCE.value]
             ),
@@ -581,6 +955,49 @@ def get_events_for_regulations(
         )
     rows = db.execute(stmt).all()
     return _dedup_event_rows(rows)
+
+
+def get_targeted_countries_for_events(
+    db: Session,
+    event_ids: set[int],
+) -> dict[int, set[str]]:
+    """Map ``event_id -> set of ISO2 country codes`` for regulation
+    ``targeted_country`` scopes reachable via the event's regulation links.
+
+    Used by :func:`derive_regulatory_inputs` to apply the conditional scope
+    intersection downweight (Option C from EUR-Lex Section 5). An event whose
+    linked regulation declares one or more ``targeted_country`` geography
+    scopes (e.g. UFLPA → CN for Xinjiang, OFAC → CN/RU/KP/IR) returns a
+    non-empty set; all other events are absent from the result (treated as
+    "no targeted scope — no downweight").
+
+    Two SQL statements at most: one join over the junction tables for the
+    given event ids; one collection-build step in Python. No N+1.
+    """
+    if not event_ids:
+        return {}
+
+    stmt = (
+        select(
+            RiskEventRegulation.risk_event_id,
+            RegulationGeographyScope.country_code,
+        )
+        .join(
+            RegulationGeographyScope,
+            RegulationGeographyScope.regulation_id
+            == RiskEventRegulation.regulation_id,
+        )
+        .where(
+            RiskEventRegulation.risk_event_id.in_(event_ids),
+            RegulationGeographyScope.scope_type == "targeted_country",
+        )
+    )
+    out: dict[int, set[str]] = {}
+    for event_id, country_code in db.execute(stmt).all():
+        if not country_code:
+            continue
+        out.setdefault(event_id, set()).add(country_code.upper())
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -889,6 +1306,74 @@ def get_chemistry_slugs(
     return {cid: slug for cid, slug in db.execute(stmt).all()}
 
 
+def get_hs_nodes_for_material(
+    db: Session,
+    material_id: int,
+    country_code: str,
+    as_of_date: date,
+    *,
+    market_scope: str = "global",
+) -> list[HsCodeGeographyRiskScore]:
+    """Return all Level-0 HS stage node scores for a (material × country) pair.
+
+    Used by ``market_aggregator.score_material_geography()`` to determine
+    whether the stage-weighted rollup path is available (≥2 nodes present)
+    or whether to fall back to the legacy material-level path.
+
+    Rows are ordered by ``HsCodeMaterialMapping.stage_sequence`` so the
+    caller can iterate stages in supply-chain order without sorting.
+
+    Args:
+        db:           Active SQLAlchemy session.
+        material_id:  Primary key of the material in ``materials``.
+        country_code: ISO 3166-1 alpha-2 country code.
+        as_of_date:   Evaluation date — the most recent score row on or before
+                      this date is returned for each HS mapping node.
+        market_scope: ``"global"`` (default) or ``"us"``.  Must match the
+                      ``market_scope`` value written by ``hs_node_scorer``.
+
+    Returns:
+        List of ``HsCodeGeographyRiskScore`` instances, possibly empty if
+        Level-0 scoring has not yet run for this material.
+    """
+    # Subquery: for each hs_mapping_id, find the most recent as_of_date
+    # on or before the requested date — avoids returning stale or future rows.
+    latest_subq = (
+        select(
+            HsCodeGeographyRiskScore.hs_mapping_id,
+            func.max(HsCodeGeographyRiskScore.as_of_date).label("latest_date"),
+        )
+        .where(
+            HsCodeGeographyRiskScore.country_code == country_code,
+            HsCodeGeographyRiskScore.as_of_date <= as_of_date,
+            HsCodeGeographyRiskScore.market_scope == market_scope,
+        )
+        .group_by(HsCodeGeographyRiskScore.hs_mapping_id)
+        .subquery()
+    )
+
+    stmt = (
+        select(HsCodeGeographyRiskScore)
+        .join(
+            HsCodeMaterialMapping,
+            HsCodeMaterialMapping.id == HsCodeGeographyRiskScore.hs_mapping_id,
+        )
+        .join(
+            latest_subq,
+            (latest_subq.c.hs_mapping_id == HsCodeGeographyRiskScore.hs_mapping_id)
+            & (latest_subq.c.latest_date == HsCodeGeographyRiskScore.as_of_date),
+        )
+        .where(
+            HsCodeMaterialMapping.material_id == material_id,
+            HsCodeMaterialMapping.market_scope == market_scope,
+            HsCodeGeographyRiskScore.country_code == country_code,
+        )
+        .order_by(HsCodeMaterialMapping.stage_sequence.asc().nulls_last())
+    )
+
+    return list(db.scalars(stmt).all())
+
+
 __all__ = [
     "EventWithRelevance",
     "SupplierEdge",
@@ -903,6 +1388,8 @@ __all__ = [
     "get_facilities_for_company",
     "get_events_for_geographies",
     "get_events_for_materials",
+    "get_events_for_hs_mapping",
+    "get_hs_nodes_for_material",
     "get_regulations_scoping_company",
     "get_events_for_regulations",
     "get_supplier_chain",

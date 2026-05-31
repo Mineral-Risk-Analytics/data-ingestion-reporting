@@ -150,7 +150,8 @@ class AnalystNote(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     entity_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    # company | material | regulation | geography | risk_event
+    # company | company_material_exposure | company_supply_relationship |
+    # company_regulation_exposure | company_vehicle_model | material | ...
     entity_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     note_type: Mapped[str] = mapped_column(String(64), nullable=False)
     note_text: Mapped[str] = mapped_column(Text, nullable=False)

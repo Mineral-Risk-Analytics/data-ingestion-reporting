@@ -1,6 +1,7 @@
 """ORM models — import side effects register all metadata with Base."""
 
 from app.models.battery_chemistry import BatteryChemistry, BatteryChemistryMaterial, ChemistryRiskScore
+from app.models.country import Country
 from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.company import (
     Company,
@@ -10,7 +11,8 @@ from app.models.company import (
     CompanySupplyRelationship,
 )
 from app.models.documents import DocumentChunk, SourceDocument
-from app.models.facility import Facility
+from app.models.intelligence import InsightPost
+from app.models.facility import CompanyFacility, Facility, FacilityMaterialLink
 from app.models.ingestion import IngestionRun, RawApiPayload
 from app.models.platform import Tenant, UsageEvent, User
 from app.models.regulatory import (
@@ -18,10 +20,12 @@ from app.models.regulatory import (
     Regulation,
     RegulationGeographyScope,
     RegulationMaterialScope,
+    RegulationSourceAlias,
     RiskEvent,
     RiskEventCompany,
     RiskEventFacility,
     RiskEventGeography,
+    RiskEventHsMapping,
     RiskEventMaterial,
     RiskEventRegulation,
 )
@@ -33,13 +37,19 @@ from app.models.reporting import (
     ReportTemplateFocusEntity,
 )
 from app.models.review import SeedReviewFinding, SeedReviewRun
-from app.models.scoring import GeographyScore, MaterialScore
+from app.models.scoring import (
+    HsCodeGeographyRiskScore,
+    MaterialGeographyRiskScore,
+    MaterialGlobalRiskScore,
+)
 from app.models.source import Source
 from app.models.supply_chain_context import SupplyChainContext
 from app.models.supply import (
     CommodityPrice,
     HsCodeMaterialMapping,
+    HsCodeProductionShare,
     Material,
+    MaterialProductionShare,
     TradeFlow,
 )
 from app.models.vehicle import CompanyVehicleModel, VehicleModelChemistry
@@ -49,6 +59,8 @@ __all__ = [
     "BatteryChemistry",
     "BatteryChemistryMaterial",
     "ChemistryRiskScore",
+    # Country reference
+    "Country",
     "MaterialCriticalitySignal",
     # Company layer
     "Company",
@@ -59,8 +71,12 @@ __all__ = [
     # Documents
     "DocumentChunk",
     "SourceDocument",
+    # Intelligence hub
+    "InsightPost",
     # Facility
+    "CompanyFacility",
     "Facility",
+    "FacilityMaterialLink",
     # Ingestion
     "IngestionRun",
     "RawApiPayload",
@@ -73,10 +89,12 @@ __all__ = [
     "Regulation",
     "RegulationGeographyScope",
     "RegulationMaterialScope",
+    "RegulationSourceAlias",
     "RiskEvent",
     "RiskEventCompany",
     "RiskEventFacility",
     "RiskEventGeography",
+    "RiskEventHsMapping",
     "RiskEventMaterial",
     "RiskEventRegulation",
     # Reporting
@@ -89,8 +107,9 @@ __all__ = [
     "SeedReviewRun",
     "SeedReviewFinding",
     # Scoring
-    "GeographyScore",
-    "MaterialScore",
+    "HsCodeGeographyRiskScore",
+    "MaterialGeographyRiskScore",
+    "MaterialGlobalRiskScore",
     # Source
     "Source",
     # Domain config
@@ -98,7 +117,9 @@ __all__ = [
     # Supply
     "CommodityPrice",
     "HsCodeMaterialMapping",
+    "HsCodeProductionShare",
     "Material",
+    "MaterialProductionShare",
     "TradeFlow",
     # Vehicle (chemistry mix)
     "CompanyVehicleModel",

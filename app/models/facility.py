@@ -1,4 +1,9 @@
-"""Physical facilities operated by companies."""
+"""Physical facilities operated by companies, with a many-to-many junction.
+
+Migration 013 adds:
+  - ``mrds_dep_id`` on Facility — GEM external ID for dedup on re-ingestion
+  - ``FacilityMaterialLink`` — which minerals each facility produces + capacity
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,17 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -14,15 +29,24 @@ from app.db.base import Base
 
 if TYPE_CHECKING:
     from app.models.company import Company
+    from app.models.supply import Material
 
 
 class Facility(Base):
     """
-    A physical location where supply chain activity occurs. Linking companies to
-    facilities enables geographic risk analysis beyond headquarters country — a
-    company HQ'd in South Korea may have 80% of production capacity in China.
-    Facility-level data is sparse and often requires manual research or commercial
-    data sources (Benchmark Mineral Intelligence, Wood Mackenzie, USGS).
+    A physical location where supply chain activity occurs.
+
+    Linked to companies via the ``company_facilities`` junction table so that
+    JV or co-owned facilities (BlueOvalSK, Ultium Cells, etc.) can appear under
+    multiple company detail views without duplicating the facility row.
+
+    The global ``verified`` flag means: "this facility physically exists / the
+    data is trustworthy." Per-company verification lives on CompanyFacility.verified.
+
+    Mining and processing facilities are populated by the MRDS ingester
+    (``app/services/ingestion/mrds.py``). Cell factories, pack plants, and
+    recycling facilities are still maintained via ``seed_facilities.py``.
+    ``mrds_dep_id`` and ``name`` are set only on MRDS-sourced rows.
     """
 
     __tablename__ = "facilities"
@@ -30,11 +54,10 @@ class Facility(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    company_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True
-    )
     facility_type: Mapped[str] = mapped_column(String(64), nullable=False)
     # mine | refinery | cell_factory | pack_plant | recycling | r_and_d | hq
+    name: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    # Human-readable site name — populated from MRDS site_name; NULL for seeded facilities
     country: Mapped[str] = mapped_column(String(2), nullable=False, index=True)  # ISO2
     region: Mapped[Optional[str]] = mapped_column(String(128))
     city: Mapped[Optional[str]] = mapped_column(String(128))
@@ -46,6 +69,11 @@ class Facility(Base):
     longitude: Mapped[Optional[float]] = mapped_column(Float)
     data_source: Mapped[Optional[str]] = mapped_column(String(128))
     metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # GEM Global Mine Tracker external ID — set only on GEM-sourced facilities.
+    mrds_dep_id: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, unique=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -53,4 +81,134 @@ class Facility(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    company: Mapped["Company"] = relationship(back_populates="facilities")
+    company_links: Mapped[list["CompanyFacility"]] = relationship(
+        back_populates="facility", cascade="all, delete-orphan"
+    )
+    material_links: Mapped[list["FacilityMaterialLink"]] = relationship(
+        back_populates="facility", cascade="all, delete-orphan"
+    )
+
+
+class CompanyFacility(Base):
+    """
+    Junction table linking companies to their facilities.
+
+    ``ownership_type`` characterises the relationship:
+        operator        — the company runs the facility outright
+        jv_partner      — joint-venture co-owner (use ownership_pct for stake)
+        lessee          — long-term lease / offtake arrangement
+        minority_stake  — financial stake, not operational control
+        other           — catch-all
+
+    ``ownership_pct`` is a 0.0–1.0 fraction of ownership/stake where known.
+    NULL means the relationship is confirmed but the exact share is unknown.
+
+    ``verified`` = an analyst has confirmed this company–facility link is real.
+    """
+
+    __tablename__ = "company_facilities"
+    __table_args__ = (
+        UniqueConstraint("company_id", "facility_id", name="uq_company_facility"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    company_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("facilities.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ownership_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="operator"
+    )
+    ownership_pct: Mapped[Optional[float]] = mapped_column(Float)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    company: Mapped["Company"] = relationship(back_populates="facility_links")
+    facility: Mapped["Facility"] = relationship(back_populates="company_links")
+
+
+class FacilityMaterialLink(Base):
+    """Maps a facility to the minerals it produces.
+
+    Populated by the MRDS/GEM ingester. A single mine may produce multiple
+    minerals (e.g. cobalt is a by-product of copper mines in the DRC).
+    ``is_primary_product`` distinguishes the main commodity from co-products.
+
+    ``annual_capacity_tpy`` is the facility's stated nameplate capacity in
+    tonnes per year. NULL when MRDS does not publish a capacity figure.
+
+    ``supply_chain_stage`` (migration 029) records which processing stage the
+    facility operates at — ore, intermediate, battery_grade, etc.  NULL for
+    rows ingested before migration 029.  Used by Phase 3 ``hs_node_scorer.py``
+    to compute stage-specific structural_dependency:
+
+        at_risk_tpy = Σ capacity WHERE
+            material_id   = this material
+            supply_chain_stage = this node's stage
+            status ∈ {mothballed, closed, care_maintenance}
+            country       = this country
+
+    ``hs_mapping_id`` (migration 029) directly links a facility's capacity to
+    a specific HS stage node.  NULL until manually confirmed for rows where
+    MRDS does not resolve a specific HS code.
+    """
+
+    __tablename__ = "facility_material_links"
+    __table_args__ = (
+        UniqueConstraint("facility_id", "material_id", name="uq_facility_material_link"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    facility_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("facilities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    material_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("materials.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    annual_capacity_tpy: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True, comment="Nameplate capacity in t/yr; null = unknown"
+    )
+    capacity_unit: Mapped[str] = mapped_column(
+        String(32), nullable=False, server_default="t/yr"
+    )
+    is_primary_product: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
+    supply_chain_stage: Mapped[Optional[str]] = mapped_column(
+        String(16),
+        nullable=True,
+        comment=(
+            "ore | concentrate | intermediate | refined | battery_grade | "
+            "fabricated | scrap.  NULL for rows predating migration 029. "
+            "Stage determines which hs_code_geography_risk_scores node this "
+            "facility's capacity contributes to in the operational scoring pillar."
+        ),
+    )
+    hs_mapping_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("hs_code_material_mappings.id", ondelete="SET NULL"),
+        nullable=True,
+        comment=(
+            "FK to hs_code_material_mappings. NULL for historical rows. "
+            "When set, links this facility's capacity directly to a stage node "
+            "for stage-weighted structural_dependency calculation."
+        ),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    facility: Mapped["Facility"] = relationship(back_populates="material_links")
+    material: Mapped["Material"] = relationship()

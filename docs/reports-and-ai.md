@@ -100,6 +100,20 @@ Persistence is already modelled for a full reports workflow:
 - **`report_runs`** — one row per generation attempt (`queued` → `running` → `completed` / `failed`).
 - **`report_insights`** — ordered content blocks (`insight_type`, `title`, `body`), with optional FK to company, material, regulation, or geography.
 
+### `report_insights` vs `insight_posts`
+
+These two surfaces are deliberately separate and easy to confuse:
+
+| | `report_insights` | `insight_posts` (migration 012) |
+|---|---|---|
+| **Audience** | A specific paying customer | Public — `mineralriskanalytics.com` intelligence hub |
+| **Authoring** | Auto-generated inside a `report_runs` row | Manually authored by the partner |
+| **FK shape** | Tied to a `report_run_id` + optional company/material/regulation FKs | No FKs; tagged via `materials TEXT[]` / `geographies TEXT[]` arrays |
+| **Lifecycle** | Created on report generation; immutable | `draft` → `published` → `archived`, with `published_at` timestamp |
+| **Distribution** | Rendered into a customer PDF/HTML | Served to the public Next.js intelligence hub |
+
+When the LLM narrative work in this section is wired up, it generates `report_insights` rows. The intelligence-hub content surface stays manual and is not driven by any of the AI stubs below.
+
 Planned generation flow:
 
 1. Create `report_runs` row.
@@ -119,5 +133,6 @@ Planned generation flow:
 ## Related reading
 
 - [Overview](overview.md)
-- [Data model & internal API](data-model-and-api.md) — `report_runs`, `report_insights`, `document_chunks`
-- [Scoring](scoring.md) — inputs to narrative insight generation
+- [Data model & internal API](data-model-and-api.md) — `report_runs`, `report_insights`, `insight_posts`, `document_chunks`
+- [Database architecture](database_architecture.md) — `insight_posts` schema (migration 012)
+- [Scoring](scoring.md) — inputs to narrative insight generation; market-layer scores feeding the public hub

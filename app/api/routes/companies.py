@@ -22,7 +22,7 @@ from app.models.company import (
     CompanyScore,
     CompanySupplyRelationship,
 )
-from app.models.facility import Facility
+from app.models.facility import CompanyFacility, Facility
 from app.models.regulatory import (
     CompanyRegulationExposure,
     Regulation,
@@ -32,13 +32,15 @@ from app.models.regulatory import (
 from app.models.reporting import AnalystNote
 from app.models.supply import Material
 from app.models.vehicle import CompanyVehicleModel, VehicleModelChemistry
-from app.schemas.common import PaginatedResponse
+from app.schemas.common import PaginatedResponse, VerifiedResponse, VerifiedUpdate
 from app.schemas.company import (
     CompanyAliasRead,
     CompanyDetail,
     CompanyEventRead,
     CompanyListItem,
     CompanySummary,
+    EventReviewResponse,
+    EventReviewUpdate,
     ExposureRead,
     FacilityRead,
     RegulationExposureRead,
@@ -66,6 +68,94 @@ def _get_company_or_404(db: Session, company_id: uuid.UUID) -> Company:
             status_code=status.HTTP_404_NOT_FOUND, detail="Company not found"
         )
     return company
+
+
+def _get_company_material_exposure_or_404(
+    db: Session, company_id: uuid.UUID, exposure_id: int
+) -> CompanyMaterialExposure:
+    _get_company_or_404(db, company_id)
+    row = db.get(CompanyMaterialExposure, exposure_id)
+    if row is None or row.company_id != company_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Exposure not found"
+        )
+    return row
+
+
+def _get_company_relationship_or_404(
+    db: Session, company_id: uuid.UUID, relationship_id: int
+) -> CompanySupplyRelationship:
+    _get_company_or_404(db, company_id)
+    row = db.get(CompanySupplyRelationship, relationship_id)
+    if row is None or (row.buyer_id != company_id and row.supplier_id != company_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Relationship not found"
+        )
+    return row
+
+
+def _get_company_regulation_exposure_or_404(
+    db: Session, company_id: uuid.UUID, exposure_id: int
+) -> CompanyRegulationExposure:
+    _get_company_or_404(db, company_id)
+    row = db.get(CompanyRegulationExposure, exposure_id)
+    if row is None or row.company_id != company_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Regulation exposure not found",
+        )
+    return row
+
+
+def _get_company_vehicle_model_or_404(
+    db: Session, company_id: uuid.UUID, model_id: int
+) -> CompanyVehicleModel:
+    _get_company_or_404(db, company_id)
+    row = db.get(CompanyVehicleModel, model_id)
+    if row is None or row.company_id != company_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Vehicle model not found"
+        )
+    return row
+
+
+def _list_entity_notes(
+    db: Session, *, entity_type: str, entity_id: str
+) -> list[AnalystNoteRead]:
+    rows = (
+        db.execute(
+            select(AnalystNote)
+            .where(
+                AnalystNote.entity_type == entity_type,
+                AnalystNote.entity_id == entity_id,
+            )
+            .order_by(AnalystNote.created_at.desc())
+        )
+        .scalars()
+        .all()
+    )
+    return [AnalystNoteRead.model_validate(n) for n in rows]
+
+
+def _create_entity_note(
+    db: Session, *, entity_type: str, entity_id: str, body: AnalystNoteCreate
+) -> AnalystNoteRead:
+    note = AnalystNote(
+        entity_type=entity_type,
+        entity_id=entity_id,
+        note_type=body.note_type,
+        note_text=body.note_text,
+    )
+    db.add(note)
+    db.commit()
+    db.refresh(note)
+    return AnalystNoteRead.model_validate(note)
+
+
+def _set_verified(db: Session, row: Any, verified: bool) -> VerifiedResponse:
+    row.verified = verified
+    db.commit()
+    return VerifiedResponse(verified=row.verified)
 
 
 def _latest_score_subquery() -> Any:
@@ -260,6 +350,7 @@ def get_company_exposures(
             data_confidence=exp.data_confidence,
             rationale=exp.rationale,
             as_of_date=exp.as_of_date,
+            verified=exp.verified,
         )
         for exp, material_name in rows
     ]
@@ -314,6 +405,7 @@ def get_company_relationships(
                 canonical_name=other.canonical_name,
                 supply_chain_stage=other.supply_chain_stage,
             ),
+            verified=rel.verified,
         )
 
     return RelationshipsResponse(
@@ -347,6 +439,7 @@ def get_company_regulations(
             compliance_status=exp.compliance_status,
             exposure_reason=exp.exposure_reason,
             assessed_at=exp.assessed_at,
+            verified=exp.verified,
         )
         for exp, reg in rows
     ]
@@ -386,11 +479,56 @@ def get_company_events(
             summary=ev.summary,
             severity_score=ev.severity_score,
             confidence_score=ev.confidence_score,
+            event_link_id=str(link.id),
             relevance_score=link.relevance_score,
             match_reason=link.match_reason,
+            review_status=link.review_status,
+            review_note=link.review_note,
         )
         for ev, link in rows
     ]
+
+
+_VALID_REVIEW_STATUSES = frozenset({"pending", "confirmed", "excluded"})
+
+
+@router.patch(
+    "/{company_id}/events/{event_link_id}/review",
+    response_model=EventReviewResponse,
+)
+def set_event_review_status(
+    company_id: uuid.UUID,
+    event_link_id: uuid.UUID,
+    body: EventReviewUpdate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> EventReviewResponse:
+    """Set the triage review status on a company-event junction row.
+
+    Only the junction row that belongs to this company can be updated here —
+    the company_id is re-validated on the link row to prevent cross-company writes.
+    """
+    if body.review_status not in _VALID_REVIEW_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"review_status must be one of: {sorted(_VALID_REVIEW_STATUSES)}",
+        )
+    link = db.scalar(
+        select(RiskEventCompany).where(
+            RiskEventCompany.id == event_link_id,
+            RiskEventCompany.company_id == company_id,
+        )
+    )
+    if link is None:
+        raise HTTPException(status_code=404, detail="Event link not found")
+    link.review_status = body.review_status
+    link.review_note = body.review_note
+    db.commit()
+    return EventReviewResponse(
+        event_link_id=str(link.id),
+        review_status=link.review_status,
+        review_note=link.review_note,
+    )
 
 
 @router.get("/{company_id}/facilities", response_model=list[FacilityRead])
@@ -400,16 +538,32 @@ def get_company_facilities(
     db: Session = Depends(get_db),
 ) -> list[FacilityRead]:
     _get_company_or_404(db, company_id)
-    rows = (
-        db.execute(
-            select(Facility)
-            .where(Facility.company_id == company_id)
-            .order_by(Facility.country, Facility.city.asc().nullslast())
+    rows = db.execute(
+        select(CompanyFacility, Facility)
+        .join(Facility, Facility.id == CompanyFacility.facility_id)
+        .where(CompanyFacility.company_id == company_id)
+        .order_by(Facility.country, Facility.city.asc().nullslast())
+    ).all()
+
+    return [
+        FacilityRead(
+            id=f.id,
+            facility_type=f.facility_type,
+            country=f.country,
+            region=f.region,
+            city=f.city,
+            status=f.status,
+            capacity_notes=f.capacity_notes,
+            latitude=f.latitude,
+            longitude=f.longitude,
+            data_source=f.data_source,
+            company_facility_id=link.id,
+            ownership_type=link.ownership_type,
+            ownership_pct=link.ownership_pct,
+            verified=link.verified,
         )
-        .scalars()
-        .all()
-    )
-    return [FacilityRead.model_validate(f) for f in rows]
+        for link, f in rows
+    ]
 
 
 @router.get("/{company_id}/vehicle-models", response_model=list[VehicleModelRead])
@@ -459,6 +613,7 @@ def get_company_vehicle_models(
                 production_volume_year=m.production_volume_year,
                 is_active=m.is_active,
                 data_source=m.data_source,
+                verified=m.verified,
                 chemistries=[
                     VehicleModelChemistryRead(
                         id=c.id,
@@ -488,19 +643,11 @@ def get_company_notes(
     db: Session = Depends(get_db),
 ) -> list[AnalystNoteRead]:
     _get_company_or_404(db, company_id)
-    rows = (
-        db.execute(
-            select(AnalystNote)
-            .where(
-                AnalystNote.entity_type == "company",
-                AnalystNote.entity_id == str(company_id),
-            )
-            .order_by(AnalystNote.created_at.desc())
-        )
-        .scalars()
-        .all()
+    return _list_entity_notes(
+        db,
+        entity_type="company",
+        entity_id=str(company_id),
     )
-    return [AnalystNoteRead.model_validate(n) for n in rows]
 
 
 @router.post(
@@ -515,22 +662,269 @@ def create_company_note(
     db: Session = Depends(get_db),
 ) -> AnalystNoteRead:
     _get_company_or_404(db, company_id)
-    note = AnalystNote(
+    return _create_entity_note(
+        db,
         entity_type="company",
         entity_id=str(company_id),
-        note_type=body.note_type,
-        note_text=body.note_text,
+        body=body,
     )
-    db.add(note)
-    db.commit()
-    db.refresh(note)
-    return AnalystNoteRead.model_validate(note)
+
+
+@router.get(
+    "/{company_id}/exposures/{exposure_id}/notes",
+    response_model=list[AnalystNoteRead],
+)
+def list_company_material_exposure_notes(
+    company_id: uuid.UUID,
+    exposure_id: int,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[AnalystNoteRead]:
+    _get_company_material_exposure_or_404(db, company_id, exposure_id)
+    return _list_entity_notes(
+        db,
+        entity_type="company_material_exposure",
+        entity_id=str(exposure_id),
+    )
+
+
+@router.post(
+    "/{company_id}/exposures/{exposure_id}/notes",
+    response_model=AnalystNoteRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_company_material_exposure_note(
+    company_id: uuid.UUID,
+    exposure_id: int,
+    body: AnalystNoteCreate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AnalystNoteRead:
+    _get_company_material_exposure_or_404(db, company_id, exposure_id)
+    return _create_entity_note(
+        db,
+        entity_type="company_material_exposure",
+        entity_id=str(exposure_id),
+        body=body,
+    )
+
+
+@router.get(
+    "/{company_id}/relationships/{relationship_id}/notes",
+    response_model=list[AnalystNoteRead],
+)
+def list_company_relationship_notes(
+    company_id: uuid.UUID,
+    relationship_id: int,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[AnalystNoteRead]:
+    _get_company_relationship_or_404(db, company_id, relationship_id)
+    return _list_entity_notes(
+        db,
+        entity_type="company_supply_relationship",
+        entity_id=str(relationship_id),
+    )
+
+
+@router.post(
+    "/{company_id}/relationships/{relationship_id}/notes",
+    response_model=AnalystNoteRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_company_relationship_note(
+    company_id: uuid.UUID,
+    relationship_id: int,
+    body: AnalystNoteCreate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AnalystNoteRead:
+    _get_company_relationship_or_404(db, company_id, relationship_id)
+    return _create_entity_note(
+        db,
+        entity_type="company_supply_relationship",
+        entity_id=str(relationship_id),
+        body=body,
+    )
+
+
+@router.get(
+    "/{company_id}/regulation-exposures/{exposure_id}/notes",
+    response_model=list[AnalystNoteRead],
+)
+def list_company_regulation_exposure_notes(
+    company_id: uuid.UUID,
+    exposure_id: int,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[AnalystNoteRead]:
+    _get_company_regulation_exposure_or_404(db, company_id, exposure_id)
+    return _list_entity_notes(
+        db,
+        entity_type="company_regulation_exposure",
+        entity_id=str(exposure_id),
+    )
+
+
+@router.post(
+    "/{company_id}/regulation-exposures/{exposure_id}/notes",
+    response_model=AnalystNoteRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_company_regulation_exposure_note(
+    company_id: uuid.UUID,
+    exposure_id: int,
+    body: AnalystNoteCreate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AnalystNoteRead:
+    _get_company_regulation_exposure_or_404(db, company_id, exposure_id)
+    return _create_entity_note(
+        db,
+        entity_type="company_regulation_exposure",
+        entity_id=str(exposure_id),
+        body=body,
+    )
+
+
+@router.get(
+    "/{company_id}/vehicle-models/{model_id}/notes",
+    response_model=list[AnalystNoteRead],
+)
+def list_company_vehicle_model_notes(
+    company_id: uuid.UUID,
+    model_id: int,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[AnalystNoteRead]:
+    _get_company_vehicle_model_or_404(db, company_id, model_id)
+    return _list_entity_notes(
+        db,
+        entity_type="company_vehicle_model",
+        entity_id=str(model_id),
+    )
+
+
+@router.post(
+    "/{company_id}/vehicle-models/{model_id}/notes",
+    response_model=AnalystNoteRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_company_vehicle_model_note(
+    company_id: uuid.UUID,
+    model_id: int,
+    body: AnalystNoteCreate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> AnalystNoteRead:
+    _get_company_vehicle_model_or_404(db, company_id, model_id)
+    return _create_entity_note(
+        db,
+        entity_type="company_vehicle_model",
+        entity_id=str(model_id),
+        body=body,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Legacy route retained for scoring pipeline (Phase 3 will wrap this in a
 # proper admin-guarded scoring endpoint).
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Verified-flag PATCH endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.patch("/{company_id}/verified", response_model=VerifiedResponse)
+def set_company_verified(
+    company_id: uuid.UUID,
+    body: VerifiedUpdate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> VerifiedResponse:
+    company = _get_company_or_404(db, company_id)
+    return _set_verified(db, company, body.verified)
+
+
+@router.patch("/{company_id}/exposures/{exposure_id}/verified", response_model=VerifiedResponse)
+def set_exposure_verified(
+    company_id: uuid.UUID,
+    exposure_id: int,
+    body: VerifiedUpdate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> VerifiedResponse:
+    row = _get_company_material_exposure_or_404(db, company_id, exposure_id)
+    return _set_verified(db, row, body.verified)
+
+
+@router.patch("/{company_id}/relationships/{relationship_id}/verified", response_model=VerifiedResponse)
+def set_relationship_verified(
+    company_id: uuid.UUID,
+    relationship_id: int,
+    body: VerifiedUpdate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> VerifiedResponse:
+    row = _get_company_relationship_or_404(db, company_id, relationship_id)
+    return _set_verified(db, row, body.verified)
+
+
+@router.patch("/{company_id}/regulation-exposures/{exposure_id}/verified", response_model=VerifiedResponse)
+def set_regulation_exposure_verified(
+    company_id: uuid.UUID,
+    exposure_id: int,
+    body: VerifiedUpdate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> VerifiedResponse:
+    row = _get_company_regulation_exposure_or_404(db, company_id, exposure_id)
+    return _set_verified(db, row, body.verified)
+
+
+@router.patch("/{company_id}/vehicle-models/{model_id}/verified", response_model=VerifiedResponse)
+def set_vehicle_model_verified(
+    company_id: uuid.UUID,
+    model_id: int,
+    body: VerifiedUpdate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> VerifiedResponse:
+    row = _get_company_vehicle_model_or_404(db, company_id, model_id)
+    return _set_verified(db, row, body.verified)
+
+
+@router.patch(
+    "/{company_id}/facilities/{company_facility_id}/verified",
+    response_model=VerifiedResponse,
+)
+def set_company_facility_verified(
+    company_id: uuid.UUID,
+    company_facility_id: uuid.UUID,
+    body: VerifiedUpdate,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> VerifiedResponse:
+    """Toggle the verified flag on a company–facility junction row.
+
+    ``company_facility_id`` is the UUID of the ``company_facilities`` row, not
+    the facility itself. Only the junction row that belongs to this company can
+    be updated here.
+    """
+    _get_company_or_404(db, company_id)
+    link = db.scalar(
+        select(CompanyFacility).where(
+            CompanyFacility.id == company_facility_id,
+            CompanyFacility.company_id == company_id,
+        )
+    )
+    if link is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Company-facility link not found"
+        )
+    return _set_verified(db, link, body.verified)
 
 
 @router.post("/{company_id}/rescore", status_code=202)

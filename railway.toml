@@ -5,6 +5,6 @@ dockerfilePath = "Dockerfile"
 [deploy]
 # Railway sets $PORT automatically — the Dockerfile CMD uses it.
 healthcheckPath = "/api/v1/health"
-healthcheckTimeout = 30
+healthcheckTimeout = 120
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3

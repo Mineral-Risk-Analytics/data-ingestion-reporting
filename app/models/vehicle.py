@@ -72,6 +72,7 @@ class CompanyVehicleModel(Base):
     )
     data_source: Mapped[Optional[str]] = mapped_column(String(128))
     metadata_json: Mapped[Optional[Any]] = mapped_column(JSONB)
+    verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
