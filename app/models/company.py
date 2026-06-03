@@ -35,14 +35,55 @@ class Company(Base):
         String(512), unique=True, nullable=False, index=True
     )
     legal_name: Mapped[Optional[str]] = mapped_column(String(512))
+    # Free-string stage (legacy, Axis-B activity vocabulary). Migration 044
+    # added the normalised FK column ``primary_activity_stage_fk`` alongside
+    # this; both coexist during Phase 1. This column gets dropped in a
+    # later cleanup once scoring code migrates to the FK.
     supply_chain_stage: Mapped[Optional[str]] = mapped_column(String(64), index=True)
     # miner | refiner | cell_maker | pack_maker | oem | trader | other
+    primary_activity_stage_fk: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("supply_chain_stages.stage_code", ondelete="RESTRICT"),
+        index=True,
+        comment=(
+            "FK to supply_chain_stages.stage_code (Axis B / activity).  "
+            "Distinct from facilities.supply_chain_stage and "
+            "hs_code_material_mappings.supply_chain_stage which carry the "
+            "product-form / Axis A taxonomy."
+        ),
+    )
     headquarters_country: Mapped[Optional[str]] = mapped_column(String(2), index=True)  # ISO2
     headquarters_region: Mapped[Optional[str]] = mapped_column(String(128))
+    incorporated_country: Mapped[Optional[str]] = mapped_column(String(2))  # ISO2; FK-ready
     public_ticker: Mapped[Optional[str]] = mapped_column(String(32), index=True)
     is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     duns_number: Mapped[Optional[str]] = mapped_column(String(32))
     lei: Mapped[Optional[str]] = mapped_column(String(20))
+    # SEC enrichment (migration 044). cik is unique (partial index on
+    # non-NULL); non-SEC filers leave it NULL.
+    cik: Mapped[Optional[str]] = mapped_column(String(10))
+    sic: Mapped[Optional[str]] = mapped_column(String(4))
+    sic_description: Mapped[Optional[str]] = mapped_column(String(256))
+    exchanges: Mapped[Optional[Any]] = mapped_column(JSONB)
+    sec_metadata: Mapped[Optional[Any]] = mapped_column(JSONB)
+    # Risk flags (migration 044)
+    is_state_owned_or_influenced: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    has_facilities: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
+    operates_as_trader: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    is_sanctioned: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    sanctioning_jurisdictions: Mapped[Optional[Any]] = mapped_column(JSONB)
+    has_uflpa_designation: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    uflpa_status: Mapped[Optional[str]] = mapped_column(String(32))
     parent_company_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         ForeignKey("companies.id", ondelete="SET NULL")
     )

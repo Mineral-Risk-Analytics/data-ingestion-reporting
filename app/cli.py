@@ -35,6 +35,78 @@ def seed_cmd() -> None:
         s.close()
 
 
+@app.command("backfill-cik-map")
+def backfill_cik_map_cmd() -> None:
+    """One-shot backfill of Company.cik from the hardcoded CIK_MAP.
+
+    Copies the 12 (name, CIK) pairs hardcoded in
+    ``app/tasks/ingestion_jobs.py`` onto the matching Company rows so
+    the SEC ingester can find them by CIK lookup.  Resolution order:
+    exact canonical_name → prefix → alias.  Skips rows that already
+    have a non-NULL cik (partner curation wins).  Logs anything
+    unmatched for manual review.
+
+    Run this once after applying migration 044 + the company seed
+    template load.  Safe to re-run — non-destructive.
+
+    \b
+    Examples:
+      bdi-ingest backfill-cik-map
+    """
+    from app.services.ingestion.backfill_cik_map import backfill_cik_map
+
+    s = _session()
+    try:
+        result = backfill_cik_map(s)
+        s.commit()
+        typer.echo(json.dumps({"ok": True, **result}, indent=2, default=str))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("seed-supply-chain-stages")
+def seed_supply_chain_stages_cmd() -> None:
+    """Upsert the canonical supply_chain_stages reference table.
+
+    Seeds the 16 stage codes (mining, beneficiation, refining,
+    precursor_production, cathode_active_material, anode_active_material,
+    separator_production, electrolyte_production, cell_making,
+    module_assembly, pack_assembly, vehicle_assembly, recycling, trading,
+    financial, integrated) with display names, long-form descriptions,
+    bottleneck_weight multipliers, and HS-chapter hints.
+
+    Run this after applying migration 044 and before any partner-curated
+    Company seed load — companies.primary_supply_chain_stage_fk references
+    this table.
+
+    Idempotent: re-running refreshes display_name / description /
+    bottleneck_weight / etc. without touching created_at.
+
+    \b
+    Examples:
+      bdi-ingest seed-supply-chain-stages
+    """
+    from app.services.ingestion.seed_supply_chain_stages import (
+        seed_supply_chain_stages,
+    )
+
+    s = _session()
+    try:
+        result = seed_supply_chain_stages(s)
+        s.commit()
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("seed-countries")
 def seed_countries_cmd() -> None:
     """Upsert the countries reference table.
@@ -146,9 +218,9 @@ def ingest_usgs_cmd(
         ),
     ),
     csv_format: str = typer.Option(
-        "auto",
+        "2026",
         "--csv-format",
-        help="CSV format: auto | 2025 | 2026.  Auto-detects from column headers.",
+        help="CSV format (kept for compatibility; only '2026' supported).",
     ),
 ) -> None:
     """Ingest USGS Mineral Commodity Summaries data from the official CSV.
@@ -162,14 +234,16 @@ def ingest_usgs_cmd(
     the alias table's ``is_skipped=true`` rows.  Unknown chapters log a
     warning so partner can decide whether to add an alias or a skip row.
 
-    For the 2026 long-format CSV: additionally writes per-HS-node
-    production shares for sub-typed materials (Silicon ferrosilicon vs
-    metal, Copper mine vs refinery) AND US import-source shares (with
-    market_scope='us') from the 'Import Sources' section.
+    Writes per-HS-node production shares for sub-typed materials (Silicon
+    ferrosilicon vs metal, Copper mine vs refinery) AND US import-source
+    shares (with market_scope='us') from the 'Import Sources' section.
+
+    Note (2026-05-24): the 2025 wide-format parser was removed.  The
+    --csv-format flag is kept for backwards-compatible invocation but
+    only '2026' is accepted.
     """
     from pathlib import Path
     from app.models.criticality_signal import MaterialCriticalitySignal
-    from app.services.ingestion.seeds.usgs_mcs_parser import parse_usgs_csv
     from app.services.ingestion.seeds.mcs2026_parser import parse_mcs2026_csv
     from app.services.ingestion.material_resolver import MaterialAliasResolver
 
@@ -178,35 +252,22 @@ def ingest_usgs_cmd(
         typer.echo(f"File not found: {filepath}", err=True)
         raise typer.Exit(code=1)
 
-    # ── Format detection ──────────────────────────────────────────────────
-    # 2026 long format: header includes "MCS chapter" as the first column.
-    # 2025 wide format: header has "Commodity" + per-year columns like
-    # "World mine production 2024".  We sniff the first line in cp1252
-    # (handles em-dashes that appear in 2026; harmless for 2025).
-    detected = csv_format
-    if csv_format == "auto":
-        with open(path, encoding="cp1252", errors="replace") as f:
-            first_line = f.readline()
-        if "MCS chapter" in first_line:
-            detected = "2026"
-        else:
-            detected = "2025"
-        typer.echo(f"  [info] auto-detected MCS CSV format: {detected}", err=True)
-    elif csv_format not in ("2025", "2026"):
+    # Format selection — only 2026 supported as of 2026-05-24.  Reject
+    # explicit --csv-format=2025 calls and accept either "2026" or "auto"
+    # (auto is a no-op; the parser handles encoding detection internally).
+    if csv_format not in ("2026", "auto"):
         typer.echo(
-            f"Invalid --csv-format {csv_format!r}; must be auto|2025|2026.",
+            f"--csv-format {csv_format!r} is not supported — only '2026' "
+            "is available. The 2025 wide-format parser was removed.",
             err=True,
         )
         raise typer.Exit(code=1)
 
-    # Default mcs_year per format if the user didn't pass --mcs-year.
+    # Default mcs_year if the user didn't pass --mcs-year.
     if mcs_year is None:
-        mcs_year = 2026 if detected == "2026" else 2025
+        mcs_year = 2026
 
-    if detected == "2026":
-        records = parse_mcs2026_csv(path)
-    else:
-        records = parse_usgs_csv(path)
+    records = parse_mcs2026_csv(path)
     if not records:
         typer.echo("No records parsed — check the file format.", err=True)
         raise typer.Exit(code=1)
@@ -216,12 +277,14 @@ def ingest_usgs_cmd(
         from app.models.supply import (
             HsCodeMaterialMapping,
             HsCodeProductionShare,
+            MaterialCapacityShare,
             MaterialProductionShare,
         )
 
         resolver = MaterialAliasResolver(s)
         signals_written = 0
         shares_written = 0
+        capacity_shares_written = 0
         hs_shares_written = 0
         hs_shares_skipped_no_mapping = 0
         us_import_shares_written = 0
@@ -367,6 +430,39 @@ def ingest_usgs_cmd(
                         existing_share.production_share = share["production_share"]
                         existing_share.unit_of_measure = share.get("unit_of_measure")
                         shares_written += 1
+
+                # ── material_capacity_shares upsert (migration 045) ───────
+                # MCS publishes Capacity rows separately from Production for
+                # ~8 tracked chapters today.  detail_type carries the verbatim
+                # Statistics_detail so TITANIUM's sponge-metal vs TiO2-pigment
+                # capacities stay distinct.  Unique key includes detail_type.
+                for cap in rec.get("capacity_shares") or []:
+                    ref_year = cap.get("reference_year") or mcs_year
+                    existing_cap = s.scalar(
+                        select(MaterialCapacityShare).where(
+                            MaterialCapacityShare.material_id == material.id,
+                            MaterialCapacityShare.country_code == cap["country_code"],
+                            MaterialCapacityShare.reference_year == ref_year,
+                            MaterialCapacityShare.detail_type == cap["detail_type"],
+                        )
+                    )
+                    if existing_cap is None:
+                        s.add(MaterialCapacityShare(
+                            material_id=material.id,
+                            country_code=cap["country_code"],
+                            reference_year=ref_year,
+                            detail_type=cap["detail_type"],
+                            capacity_volume=cap["capacity_volume"],
+                            capacity_share=cap["capacity_share"],
+                            unit_of_measure=cap.get("unit_of_measure"),
+                            data_source="usgs_mcs",
+                        ))
+                        capacity_shares_written += 1
+                    elif force:
+                        existing_cap.capacity_volume = cap["capacity_volume"]
+                        existing_cap.capacity_share = cap["capacity_share"]
+                        existing_cap.unit_of_measure = cap.get("unit_of_measure")
+                        capacity_shares_written += 1
 
             # ── Per-HS-node global production shares ─────────────────────
             # Two lookup modes (refactored 2026-05-09):
@@ -633,6 +729,7 @@ def ingest_usgs_cmd(
             "records_unknown": len(unknown_aliases),
             "signals_written": signals_written,
             "shares_written": shares_written,
+            "capacity_shares_written": capacity_shares_written,
             "hs_shares_written": hs_shares_written,
             "hs_shares_skipped_no_mapping": hs_shares_skipped_no_mapping,
             "us_import_shares_written": us_import_shares_written,
@@ -3619,12 +3716,16 @@ def ingest_mcs_pdf_cmd(
     \b
       1. Inserts 10-digit US HTS rows into hs_code_material_mappings (market_scope='us')
       2. Derives and inserts 6-digit global rows (market_scope='global', ON CONFLICT DO NOTHING)
-      3. Inserts world production shares into hs_code_production_shares (market_scope='global')
-      4. Inserts US import source shares into hs_code_production_shares (market_scope='us')
-      5. Appends salient notes to MaterialCriticalitySignal.metadata_json
+      3. Appends salient notes to MaterialCriticalitySignal.metadata_json (write-only;
+         no current reader — forward-compatibility hook)
 
-    All inserts are idempotent: re-running with the same PDF updates production share values
-    without duplicating mapping rows.
+    All inserts are idempotent: re-running with the same PDF is safe.
+
+    Section 5.1 cleanup (2026-06): per-country world-production share writes
+    and US import-source share writes have been removed.  Both tables
+    (``hs_code_production_shares`` for market_scope='global' and 'us') are
+    populated by the CSV path (``bdi-ingest ingest-usgs``) which extracts
+    the same data more reliably.
 
     Prerequisites:
 
@@ -3669,19 +3770,34 @@ def ingest_mcs_pdf_cmd(
         if not dry_run:
             s.commit()
 
-        total_us = sum(v["us_rows_inserted"] for v in stats.values())
-        total_global = sum(v["global_rows_inserted"] for v in stats.values())
-        total_prod = sum(v["production_shares_inserted"] for v in stats.values())
-        total_imp = sum(v["import_source_shares_inserted"] for v in stats.values())
+        # 2026-05-31: seed_to_db now returns per-chapter stats PLUS a
+        # special ``__run_meta__`` key carrying run-level counters
+        # (chapters skipped due to missing material or per-section
+        # exception).  Filter the meta key out of per-chapter sums.
+        run_meta = stats.pop("__run_meta__", {})
+        total_us = sum(v["us_rows_processed"] for v in stats.values())
+        total_global = sum(v["global_rows_processed"] for v in stats.values())
+        # Section 5.1 cleanup (2026-06): ``production_share_rows`` removed
+        # from the CLI summary along with the parser's Step 4a write block.
+        # CSV path (``ingest-usgs``) is the sole populator of
+        # ``hs_code_production_shares`` for market_scope='global'.
+        total_imp_skipped = sum(
+            v.get("import_source_shares_skipped", 0) for v in stats.values()
+        )
+        total_salient = sum(
+            v.get("salient_notes_appended", 0) for v in stats.values()
+        )
 
         typer.echo(json.dumps({
             "ok": True,
             "dry_run": dry_run,
             "commodities_processed": len(stats),
+            "commodities_skipped_no_material": run_meta.get("skipped_no_material", 0),
+            "commodities_skipped_on_error": run_meta.get("skipped_on_error", 0),
             "us_mapping_rows": total_us,
             "global_mapping_rows": total_global,
-            "production_share_rows": total_prod,
-            "import_source_rows": total_imp,
+            "import_source_rows_skipped": total_imp_skipped,
+            "salient_notes_appended": total_salient,
             "by_commodity": stats,
         }, indent=2))
     except Exception as exc:

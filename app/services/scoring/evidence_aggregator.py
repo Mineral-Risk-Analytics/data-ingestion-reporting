@@ -769,11 +769,22 @@ def derive_financial_inputs(
     avg_severity = sum(_safe_severity(ew) for ew in filing_events) / filing_count
     base_filing_signal = min(40.0, avg_severity * 40.0)
 
+    # SEC subtype sets are the canonical source — defined alongside the
+    # SEC ingester's filing-type map so adding a new subtype to a bucket
+    # is one edit in one place.  Aspirational vocabulary (LEVERAGE_WARNING,
+    # COVENANT_STRESS, GOING_CONCERN, CASH_RUNWAY, CAPEX_CUT) is preserved
+    # inside those sets for any non-SEC ingester that eventually emits
+    # them.  See app/services/ingestion/sec_subtype_map.py.
+    from app.services.ingestion.sec_subtype_map import (
+        LEVERAGE_SUBTYPES,
+        LIQUIDITY_SUBTYPES,
+    )
+
     leverage_sum = 0.0
     for ew in filing_events:
         subtype = ew.event.event_subtype or ""  # typed col (migration 040)
         text = (ew.event.title or "").lower()
-        if subtype in ("LEVERAGE_WARNING", "COVENANT_STRESS") or (
+        if subtype in LEVERAGE_SUBTYPES or (
             "leverage" in text or "covenant" in text or "debt" in text
         ):
             leverage_sum += _safe_severity(ew)
@@ -783,7 +794,7 @@ def derive_financial_inputs(
     for ew in filing_events:
         subtype = ew.event.event_subtype or ""  # typed col (migration 040)
         text = (ew.event.title or "").lower()
-        if subtype in ("GOING_CONCERN", "CASH_RUNWAY", "CAPEX_CUT") or (
+        if subtype in LIQUIDITY_SUBTYPES or (
             "going concern" in text
             or "cash runway" in text
             or "suspended" in text

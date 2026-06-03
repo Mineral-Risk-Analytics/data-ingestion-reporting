@@ -52,61 +52,13 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 
-# ---------------------------------------------------------------------------
-# Section vocabulary — fixed so downstream extractors can route by tag
-# ---------------------------------------------------------------------------
-
-SectionType = Literal[
-    "tariff",            # tariff codes table → _parse_tariff_table
-    "production",        # world production / reserves table → _parse_production_leaders
-    "import_sources",    # US import sources percentages → _parse_import_sources
-    "salient_notes",     # quantitative narrative section → _extract_salient_notes
-    "events_trends",     # qualitative narrative; not currently parsed (reserved)
-]
-
-
-# ---------------------------------------------------------------------------
-# Sub-section
-# ---------------------------------------------------------------------------
-
-class CommoditySection(BaseModel):
-    """One sub-section inside a commodity chapter.
-
-    ``start_line`` is inclusive. ``end_line`` is exclusive (Python slice
-    semantics: ``lines[start_line:end_line]``).
-    """
-
-    section_type: SectionType = Field(
-        description=(
-            "Type of sub-section.  Restricted to a fixed vocabulary so that "
-            "downstream code can route to the correct extractor by tag rather "
-            "than by raw heading text.  Use 'tariff' for the tariff-table "
-            "section, 'production' for World Mine/Smelter/Refinery Production "
-            "tables, 'import_sources' for US import-source percentage lists, "
-            "'salient_notes' for the Salient Statistics block, and "
-            "'events_trends' for the Events, Trends, and Issues narrative."
-        ),
-    )
-    start_line: int = Field(
-        ge=0,
-        description="Inclusive starting line index in the joined PDF text.",
-    )
-    end_line: int = Field(
-        ge=1,
-        description=(
-            "Exclusive ending line index — `lines[start_line:end_line]` "
-            "yields exactly the section's text."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def _check_line_order(self) -> "CommoditySection":
-        if self.end_line <= self.start_line:
-            raise ValueError(
-                f"end_line ({self.end_line}) must be > start_line "
-                f"({self.start_line}) for section {self.section_type!r}"
-            )
-        return self
+# Section 10 cleanup (2026-06): ``SectionType`` Literal + ``CommoditySection``
+# class removed.  The LLM locator only emits chapter-level bounds now;
+# sub-section identification is done by the deterministic regex extractors
+# in ``mcs_pdf_parser.py``.  The historical ``"production"`` SectionType
+# entry was also dead post Section 5.1 (per-country world-production
+# extractor deleted; CSV path is sole populator).  If a future feature
+# needs sub-section routing tags, reinstate from git history.
 
 
 # ---------------------------------------------------------------------------
@@ -167,17 +119,10 @@ class CommodityChapter(BaseModel):
             "yields the chapter's full text."
         ),
     )
-    sections: list[CommoditySection] = Field(
-        default_factory=list,
-        description=(
-            "Sub-sections within this chapter.  May be empty if the LLM cannot "
-            "identify any standard sub-section.  Sub-sections need not cover "
-            "the chapter completely — gaps between sub-sections are unparsed "
-            "by design (e.g. inter-section narrative or footnotes).  Each "
-            "sub-section's line range MUST be fully contained inside this "
-            "chapter's line range; the validator enforces this."
-        ),
-    )
+    # ``sections`` field removed 2026-06 (Section 10 cleanup) — the LLM
+    # never populated it (per the system prompt) and no downstream code
+    # iterated it.  Pydantic v2 defaults to ``extra='ignore'`` so existing
+    # cache files with a ``sections: []`` field still parse cleanly.
 
     @model_validator(mode="after")
     def _check_consistency(self) -> "CommodityChapter":
@@ -191,14 +136,6 @@ class CommodityChapter(BaseModel):
                 f"Chapter {self.canonical_material!r}: end_page "
                 f"({self.end_page}) must be >= start_page ({self.start_page})"
             )
-        for sec in self.sections:
-            if sec.start_line < self.start_line or sec.end_line > self.end_line:
-                raise ValueError(
-                    f"Chapter {self.canonical_material!r}: sub-section "
-                    f"{sec.section_type!r} bounds "
-                    f"({sec.start_line}, {sec.end_line}) are outside the "
-                    f"chapter bounds ({self.start_line}, {self.end_line})."
-                )
         return self
 
 
@@ -291,12 +228,13 @@ class LocatorResult(BaseModel):
         return errors
 
     def validate_line_bounds(self, total_lines: int) -> list[str]:
-        """Return error strings — one per chapter or sub-section whose
-        line bounds exceed the actual PDF line count.  Empty list ⇒ all
-        valid.
+        """Return error strings — one per chapter whose line bounds exceed
+        the actual PDF line count.  Empty list ⇒ all valid.
 
         Cheap bounds check that catches LLM hallucinations of line numbers
-        before they cause IndexErrors downstream.
+        before they cause IndexErrors downstream.  Section 10 cleanup
+        (2026-06): the sub-section loop was removed along with
+        ``CommodityChapter.sections``.
         """
         errors: list[str] = []
         for chapter in self.chapters:
@@ -305,13 +243,6 @@ class LocatorResult(BaseModel):
                     f"Chapter {chapter.canonical_material!r}: end_line "
                     f"{chapter.end_line} exceeds PDF line count {total_lines}"
                 )
-            for sec in chapter.sections:
-                if sec.end_line > total_lines:
-                    errors.append(
-                        f"Chapter {chapter.canonical_material!r}, section "
-                        f"{sec.section_type!r}: end_line {sec.end_line} "
-                        f"exceeds PDF line count {total_lines}"
-                    )
         return errors
 
 
@@ -328,17 +259,13 @@ def chapter_text(chapter: CommodityChapter, lines: list[str]) -> str:
     return "\n".join(lines[chapter.start_line:chapter.end_line])
 
 
-def section_text(section: CommoditySection, lines: list[str]) -> str:
-    """Return the sub-section's text from the joined PDF text lines."""
-    return "\n".join(lines[section.start_line:section.end_line])
+# section_text helper removed 2026-06 (Section 10 cleanup) along with
+# ``CommoditySection`` — no remaining caller.
 
 
 __all__ = [
-    "SectionType",
-    "CommoditySection",
     "CommodityChapter",
     "SkippedCommodity",
     "LocatorResult",
     "chapter_text",
-    "section_text",
 ]

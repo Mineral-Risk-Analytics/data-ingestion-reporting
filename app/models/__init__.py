@@ -43,12 +43,18 @@ from app.models.scoring import (
     MaterialGlobalRiskScore,
 )
 from app.models.source import Source
-from app.models.supply_chain_context import SupplyChainContext
+from app.models.supply_chain_context import (
+    CompanyActivityStage,
+    CompanyJvParent,
+    SupplyChainContext,
+    SupplyChainStage,
+)
 from app.models.supply import (
     CommodityPrice,
     HsCodeMaterialMapping,
     HsCodeProductionShare,
     Material,
+    MaterialCapacityShare,
     MaterialProductionShare,
     TradeFlow,
 )
@@ -112,13 +118,17 @@ __all__ = [
     "MaterialGlobalRiskScore",
     # Source
     "Source",
-    # Domain config
+    # Domain config + canonical activity-stage taxonomy (migration 044)
     "SupplyChainContext",
+    "SupplyChainStage",
+    "CompanyActivityStage",
+    "CompanyJvParent",
     # Supply
     "CommodityPrice",
     "HsCodeMaterialMapping",
     "HsCodeProductionShare",
     "Material",
+    "MaterialCapacityShare",
     "MaterialProductionShare",
     "TradeFlow",
     # Vehicle (chemistry mix)

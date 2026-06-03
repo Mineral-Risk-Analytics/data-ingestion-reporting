@@ -17,17 +17,37 @@ unlocked by the new format:
   silicon metal are separate ``Statistics_detail`` values rather than
   needing a hand-coded `_HS_NODE_SHARES_CONFIG` lookup.  Same for
   Copper's mine vs refinery production.
-* **5-year time series** (2020–2024 plus 2025 estimate).  YoY trends
-  computed from real years instead of just two.
+* **YoY trend signal.**  Production rows in the 2026 file carry two
+  Year strings (``"2024"`` and ``"2025"``); the parser computes a
+  single-year YoY delta from them.  An earlier comment claimed a
+  5-year series; that was aspirational — USGS condensed the older
+  years out of the 2026 publication.  ``by_year`` time-series is at
+  most 2 data points per country today.
 * **US import sources are structured** in the CSV (``Import Sources``
   section).  Previously only the PDF parser had this data.
 * **Critical-mineral flag** (``Is critical mineral 2025`` column)
   available as structured input rather than hardcoded.
+* **Capacity data extracted as a distinct signal.** 220 Capacity rows
+  across 8 tracked chapters (ALUMINUM, BISMUTH, GALLIUM, INDIUM,
+  MAGNESIUM METAL, SELENIUM, TELLURIUM, TITANIUM) land in
+  ``capacity_shares`` for downstream landing in
+  ``material_capacity_shares`` (migration 045).  Enables a
+  spare-capacity / utilization-overhang signal that pure production
+  HHI can't express.
 
 Encoding
 --------
-The 2026 CSV uses Windows-1252 (cp1252) — em-dash, en-dash, and other
-characters fail under UTF-8.  Always read with ``encoding='cp1252'``.
+The MCS 2026 CSV file as published is Windows-1252 (cp1252) — em-dash,
+en-dash, and other characters fail under strict UTF-8.  The loader
+tries UTF-8 first so future USGS editions that publish UTF-8 work
+without code changes, then falls back to cp1252 on UnicodeDecodeError.
+
+Section-name matching is also unicode-dash-tolerant.  The Salient
+Statistics section header USGS publishes today is
+"Salient Statistics—United States" with U+2014 EM DASH; we match via
+startswith("Salient Statistics") so an ASCII hyphen, en-dash variant,
+or trailing-region change doesn't silently drop every chapter's salient
+signals.
 
 Output contract
 ---------------
@@ -70,7 +90,7 @@ from __future__ import annotations
 
 import csv
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -78,9 +98,12 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-# Reuse country name → ISO-2 mapping from the legacy 2025 parser.  USGS
-# country names are stable across editions; no need to duplicate.
-from app.services.ingestion.seeds.usgs_mcs_parser import _COUNTRY_ISO2
+# Country name → ISO-2 mapping lives in its own module so it can outlive
+# the deprecated 2025 wide-format parser.  Same data, no behaviour change.
+from app.services.ingestion.seeds.usgs_country_mapping import (
+    _COUNTRY_ISO2,
+    _EXCLUDE_COUNTRIES,
+)
 
 
 # Chapter → canonical material mapping is now stored in
@@ -106,36 +129,6 @@ from app.services.ingestion.seeds.usgs_mcs_parser import _COUNTRY_ISO2
 # prefix (the first entry in `hs_codes`).
 
 # ---------------------------------------------------------------------------
-# Chapter-level HS prefix attribution
-# ---------------------------------------------------------------------------
-# When a chapter describes a single supply-chain stage of a canonical
-# material that's primarily defined by another chapter (e.g. BAUXITE
-# AND ALUMINA describes the ore stage of Aluminum, while the ALUMINUM
-# chapter describes refined metal), the chapter's per-country production
-# data should land in ``hs_code_production_shares`` keyed by the
-# stage-specific HS prefix instead of the material-level
-# ``material_production_shares`` table.
-#
-# Mechanically: when the parser sees a chapter listed here, it ROUTES
-# the chapter's per-country production into ``hs_production_shares``
-# (with this prefix and ``type_substring="(chapter-level)"``) and
-# leaves ``production_shares`` empty for that record.  This avoids
-# collision with the primary chapter's material-level shares.
-#
-# Pair these with ``writes_material_signals=False`` on the alias for
-# the same chapter so the CLI also skips material-level signal upserts.
-
-_CHAPTER_HS_PREFIX: dict[str, str] = {
-    # Deprecated 2026-05-09: previously routed BAUXITE AND ALUMINA → 2606
-    # (Aluminum ore stage).  Now handled by ``_DETAIL_STAGE_PATTERNS``
-    # below — "Bauxite, mine production" auto-routes to ore stage and
-    # "Alumina, refinery production" auto-routes to intermediate stage,
-    # so the chapter no longer needs an explicit override.  Kept the
-    # dict empty for future per-chapter overrides.
-}
-
-
-# ---------------------------------------------------------------------------
 # Stage auto-classification by Detail substring (added 2026-05-09)
 # ---------------------------------------------------------------------------
 # Replaces most of the manual ``_DETAIL_TO_HS_PREFIX`` dict.  For each row
@@ -157,10 +150,35 @@ _CHAPTER_HS_PREFIX: dict[str, str] = {
 # Al metal).  The "alumina, refinery" pattern wins because it appears
 # above the generic "refinery production" pattern.
 _DETAIL_STAGE_PATTERNS: list[tuple[str, str]] = [
+    # PATTERN CONVENTION: each pattern is a multi-word substring (lower-
+    # cased at match time).  Avoid single-word patterns ("ore", "metal")
+    # — they false-match too easily across unrelated chapters.
+    #
     # ── Specific patterns first (must match before the generic catches) ──
     ("alumina, refinery",   "intermediate"),  # BAUXITE → Al2O3 oxide intermediate
     ("bauxite, mine",       "ore"),           # BAUXITE → bauxite ore
-    # ── Generic patterns ─────────────────────────────────────────────────
+
+    # ── BORON (no "mine production" / "refinery production" strings) ──
+    # USGS publishes per-mineral-form rows.  BORON-specific substrings
+    # confirmed via 2026-05-24 cross-chapter audit — none false-match
+    # other chapters in MCS 2026.  "Production—All forms" is an aggregate
+    # that gets skipped via the "all forms" filter in _classify_detail_stage.
+    ("crude borates",       "ore"),           # BORON ore form
+    ("crude ore",           "ore"),           # BORON ore form
+    ("datolite ore",        "ore"),           # BORON ore form
+    ("ulexite",             "ore"),           # BORON ore mineral
+    ("refined borates",     "refined"),       # BORON refined
+    ("boric oxide",         "refined"),       # BORON refined (B2O3)
+    ("compounds",           "refined"),       # BORON refined; only chapter using "compounds" in production details
+
+    # ── GALLIUM, TITANIUM: byproduct/sponge stages ────────────────────
+    # GALLIUM is recovered as a byproduct of bauxite/zinc refining — no
+    # mine.  "Primary production" = first metallic Ga output = refined stage.
+    ("primary production",  "refined"),       # GALLIUM
+    # TITANIUM sponge metal = first solid Ti form from Kroll process = refined.
+    ("sponge metal",        "refined"),       # TITANIUM
+
+    # ── Generic patterns (catch-alls for the standard metals) ────────
     ("smelter production",  "refined"),       # ALUMINUM smelter → Al metal refined
     ("refinery production", "refined"),       # COPPER refinery → cathode refined
     ("mine production",     "ore"),           # everything else: mine = ore
@@ -194,52 +212,107 @@ _DETAIL_TO_HS_PREFIX: dict[tuple[str, str], str] = {
 # rely on the ``Statistics`` column to confirm it's "Production" (rather
 # than "Reserves" or "Capacity") for the actual production tonnage rows.
 
-_SALIENT_SECTION = "Salient Statistics—United States"  # cp1252 em-dash
+# Section-name matching is unicode-dash-tolerant.  The exact string USGS
+# publishes today is "Salient Statistics—United States" with U+2014 EM
+# DASH; we match by prefix so any unicode-dash variant (en-dash U+2013,
+# ASCII hyphen "-", trailing region change) still works.
+_SALIENT_SECTION_PREFIX = "Salient Statistics"
 _IMPORT_SECTION = "Import Sources"
 _WORLD_SECTION_PREFIX = "World "
 
-# Salient Statistics_detail strings we extract for material-level signals.
-# Substring match, case-insensitive.
-_SALIENT_PATTERNS = {
-    # Returns a single-year value for the year in `Year`; we use the
-    # latest non-estimated year for capacity / consumption.
-    "capacity":          "capacity",                  # production capacity
-    "consumption":       "apparent",                  # apparent consumption
-    "import_reliance":   "net import reliance",       # net import reliance %
-    "yearend_stocks":    "stocks",                    # producer stocks yearend
-    "import_volume":     "imports for consumption",   # imports volume
-}
+
+def _is_salient_section(section: str | None) -> bool:
+    """Return True for any Salient Statistics section header variant."""
+    if not section:
+        return False
+    return section.lstrip().startswith(_SALIENT_SECTION_PREFIX)
+
+# Note: an earlier ``_SALIENT_PATTERNS`` constant was defined here as a
+# substring-match lookup for salient signals, but the actual
+# ``_extract_us_salient_signals`` function used inline substring checks
+# instead.  Removed 2026-05-31 — if a future refactor wants to centralise
+# the patterns, re-add and route the function through them.
 
 
 # ---------------------------------------------------------------------------
 # Value parsing
 # ---------------------------------------------------------------------------
 
+# USGS sentinel strings for "no quantitative value available" — withheld
+# under disclosure rules, not applicable, suppressed for small magnitudes,
+# or qualitative-only.  Verified against MCS 2026 actual cell content
+# (8,886 rows): NA (353 occurrences), em-dash (313), W (224), E (92),
+# s (48), XX (8).  Lowercase 's' and uppercase 'XX' were previously
+# handled by accident via the float() ValueError net; listing them
+# explicitly makes the no-data semantics intentional, not incidental.
+_NO_DATA_SENTINELS: frozenset[str] = frozenset({
+    "W",      # withheld (proprietary data protection)
+    "NA",     # not applicable
+    "N/A",
+    "E",      # estimated indicator with no value attached
+    "s",      # less than half the unit shown (effectively zero)
+    "XX",     # value withheld for disclosure reasons
+    "—",      # U+2014 em dash — USGS "no data"
+    "–",      # U+2013 en dash variant
+    "-",      # ASCII hyphen variant
+})
+
+
+# Pattern for numeric ranges like "50–300", "500–17,000", "330 - 390".
+# Used by _parse_value to compute a midpoint instead of dropping the cell.
+# MCS 2026 contains 8 such cells (typically in reserves columns where
+# USGS knows production happens but can't pin down a single number).
+_RANGE_PATTERN = re.compile(
+    r"^\s*([\d,]+(?:\.\d+)?)\s*[–—-]\s*([\d,]+(?:\.\d+)?)\s*$"
+)
+
+
 def _parse_value(value: str) -> Optional[float]:
     """Parse an MCS Value cell.  Returns None for withheld/unavailable.
 
-    Value patterns observed in MCS 2026:
-      - numeric with commas: ``"3,640"`` → 3640.0
-      - withheld:            ``"W"``    → None
-      - zero / unavailable:  ``"—"``    → None  (em-dash)
-                             ``"–"``    → None  (en-dash)
-                             ``"NA"``   → None
-      - greater-than:        ``">95"``  → 95.0  (lower-bound estimate)
-      - exponent / status:   ``"E"``    → None  (estimated marker; value missing)
+    Value patterns observed in MCS 2026 (count from full 8,886-row file):
+      - numeric with commas:  ``"3,640"``       → 3640.0
+      - withheld:             ``"W"`` (224)     → None
+      - withheld (XX form):   ``"XX"`` (8)      → None
+      - not applicable:       ``"NA"`` (353)    → None
+      - sub-rounding:         ``"s"`` (48)      → None  (less than half unit shown)
+      - estimated, no value:  ``"E"`` (92)      → None  (estimator marker; value missing)
+      - dash variants:        ``"—"``, ``"–"``, ``"-"`` (313+) → None
+      - greater-than:         ``">95"``         → 95.0  (lower-bound estimate)
+      - less-than:            ``"<50"``         → 50.0  (upper-bound estimate)
+      - numeric range:        ``"50–300"``      → 175.0 (midpoint, 2026-05-24)
+      - numeric range w/ comma: ``"500–17,000"`` → 8750.0
+      - numeric range w/ spaces: ``"330 - 390"`` → 360.0
+      - qualitative:          ``"Large"``, ``"Variable, depending on…"`` → None
+                              (no float() interpretation; signal of presence
+                              without quantification is lost — known floor
+                              on reserve_hhi accuracy.)
 
-    For bounded percentages (``<25``, ``<50``, ``>50`` etc.) callers that
-    know the value is a 0–100 percentage should use
-    ``_parse_percent_with_bound`` instead — it converts ``<X`` to a
-    midpoint estimate.  The bare ``_parse_value`` strips bounds rather
-    than rejecting them, which preserves coarse signal at the cost of
-    losing direction (``<50`` and ``>50`` both return 50).
+    Direction loss caveat: bare ``_parse_value`` strips ``<``/``>`` bounds
+    rather than rejecting them.  ``<50`` and ``>50`` both return 50.0.
+    Callers reading 0-100 percentages should use ``_parse_percent_with_bound``
+    instead — it converts ``<X``/``>X`` to midpoint estimates that preserve
+    direction.
     """
     if value is None:
         return None
     v = value.strip()
-    if not v or v in ("W", "NA", "N/A", "E", "—", "–", "-"):
+    if not v or v in _NO_DATA_SENTINELS:
         return None
-    # Handle ">95" or ">2,000,000" — strip the ">" and parse as lower bound
+
+    # Numeric range like "50–300" → midpoint.  Checked before bound stripping
+    # because en-dash inside a range looks similar to em-dash sentinels.
+    range_match = _RANGE_PATTERN.match(v)
+    if range_match:
+        try:
+            lower = float(range_match.group(1).replace(",", ""))
+            upper = float(range_match.group(2).replace(",", ""))
+        except ValueError:
+            return None
+        return (lower + upper) / 2.0
+
+    # Bounded estimate: ">95" or ">2,000,000".  We strip the prefix and
+    # parse as the bound value (loses direction; see docstring caveat).
     v = v.lstrip(">").lstrip("<").strip()
     v = v.replace(",", "")
     try:
@@ -251,42 +324,58 @@ def _parse_value(value: str) -> Optional[float]:
 def _parse_percent_with_bound(value: str) -> Optional[float]:
     """Parse an MCS Value cell that is known to be a 0–100 percentage.
 
-    Same as ``_parse_value`` but converts bounded estimates to midpoints
-    so ``<50`` and ``>50`` no longer collapse to the same number:
+    Same sentinel-handling as ``_parse_value`` but converts bounded
+    estimates to midpoints so ``<50`` and ``>50`` no longer collapse to
+    the same number:
 
       - ``"<25"`` → 12.5  (midpoint of 0–25)
       - ``"<50"`` → 25.0  (midpoint of 0–50)
       - ``">50"`` → 75.0  (midpoint of 50–100)
       - ``">95"`` → 97.5  (midpoint of 95–100)
 
-    Used for net-import-reliance and other percent values where direction
-    matters more than precision.
+    Result is clamped to ``[0.0, 100.0]`` so a malformed ``">120"`` cell
+    can't produce an out-of-range 110.  Used for net-import-reliance and
+    other percent values where direction matters more than precision.
     """
     if value is None:
         return None
     v = value.strip()
-    if not v or v in ("W", "NA", "N/A", "E", "—", "–", "-"):
+    if not v or v in _NO_DATA_SENTINELS:
         return None
     if v.startswith("<"):
         try:
             upper = float(v[1:].replace(",", "").strip())
         except ValueError:
             return None
-        return upper / 2.0
+        return max(0.0, min(100.0, upper / 2.0))
     if v.startswith(">"):
         try:
             lower = float(v[1:].replace(",", "").strip())
         except ValueError:
             return None
-        return (lower + 100.0) / 2.0
+        return max(0.0, min(100.0, (lower + 100.0) / 2.0))
     try:
-        return float(v.replace(",", ""))
+        return max(0.0, min(100.0, float(v.replace(",", ""))))
     except ValueError:
         return None
 
 
 def _hhi(country_productions: dict[str, float]) -> float:
-    """Normalised HHI from {country: production_volume}.  Range 0–1."""
+    """Raw Herfindahl-Hirschman Index from ``{country: production_volume}``.
+
+    Returns the standard HHI: sum of squared market shares.  Mathematical
+    range is ``[1/N, 1.0]`` where ``N`` is the number of producing
+    countries with non-zero volume: ``1/N`` at perfect competition,
+    ``1.0`` at monopoly.  This is intentional and matches DOJ/FTC and
+    IMF supply-chain convention — the ``1/N`` floor itself carries
+    supply-chain signal (a material produced equally across 3 countries
+    is more concentrated than one produced equally across 30 countries,
+    because losing any one producer hits the 3-country case harder).
+
+    Empty input returns ``0.0``; an all-zero-volume dict also returns
+    ``0.0``.  Caller is expected to gate the call on ``country_prod``
+    truthiness when it wants ``None`` for no-data chapters.
+    """
     total = sum(country_productions.values())
     if total == 0:
         return 0.0
@@ -332,27 +421,52 @@ def _extract_world_production_per_country(
 
     Walks all rows in the chapter whose ``Section`` starts with "World ".
     Filters to ``Statistics`` containing "production" (case-insensitive)
-    and excludes "Reserves" / "Capacity" rows.
+    and excludes "Capacity" rows (Capacity is extracted separately by
+    ``_extract_world_capacity_per_country``).  Reserves rows are bucketed
+    into ``country_reserves`` and filtered to the latest reserves year.
 
-    When ``detail_substring`` is provided, additionally filters
-    ``Statistics_detail`` to rows containing that substring (used for
-    sub-type extraction — e.g. ``"ferrosilicon"`` to extract just the
-    ferrosilicon sub-type).  When None, aggregates ALL sub-types.
+    Cross-detail aggregation
+    ------------------------
+    When ``detail_substring`` is None and a chapter has multiple production
+    sub-types in the same year for the same country (e.g. Copper's
+    "mine production" + "refinery production" rows under one chapter),
+    this function SUMS them into a single material-level country total.
+    Callers wanting per-stage breakdowns must call
+    ``_extract_per_stage_world_production`` instead — that wrapper buckets
+    rows by stage and calls this helper per-bucket so the cross-sum
+    happens within one stage.
+
+    detail_substring scope
+    ----------------------
+    When provided, ``detail_substring`` filters BOTH production AND
+    reserves rows.  Calling with ``detail_substring="ferrosilicon"``
+    returns ferrosilicon-specific production *and* ferrosilicon-specific
+    reserves — correct for sub-type extraction, where production and
+    reserves of the same sub-type should track together.
+
+    Units
+    -----
+    Headline unit is taken from the first non-empty Unit cell encountered
+    in iteration order.  This assumes all included rows share a unit
+    (true for every tracked chapter in MCS 2026).  When the assumption
+    is violated, a warning is logged and the headline unit reports the
+    first one seen — the per-country sums silently mix units, so the
+    chapter alias should be marked is_skipped=true rather than relying
+    on this function to make sense of mixed-unit data.
 
     Returns:
-        country_prod:     {iso2: production_volume}  for the latest year
-        country_reserves: {iso2: reserves}            for the latest year
+        country_prod:     {iso2: production_volume}  for the latest production year
+        country_reserves: {iso2: reserves}            for the latest reserves year
         all_country_prod_by_year: {iso2: {year: vol}} for time-series use
-        latest_year:      int (4-digit year used for the headline shares)
-        unit:             str (unit of measurement, taken from any data row)
+        latest_year:      int (4-digit year used for the headline production shares)
+        unit:             str (unit of measurement; see "Units" caveat above)
     """
     country_prod: dict[str, float] = {}
     country_reserves: dict[str, float] = {}
     by_year: dict[str, dict[int, float]] = defaultdict(dict)
     unit = ""
+    units_seen: set[str] = set()
 
-    # Identify candidate rows (excluding "Reserves" detail_substring matches
-    # which carry the reserves data instead of production).
     detail_low = detail_substring.lower() if detail_substring else None
     production_rows: list[dict] = []
     reserves_rows: list[dict] = []
@@ -370,22 +484,29 @@ def _extract_world_production_per_country(
             continue
         if "production" in stat:
             production_rows.append(r)
-        elif "reserves" in stat or "reserves" in detail:
+        elif "reserves" in stat:
             reserves_rows.append(r)
+        # Capacity rows fall through here; see _extract_world_capacity_per_country.
 
-    # Find the latest year in the production rows (skip estimated for
-    # the headline shares — `_pick_latest_year` strips the suffix).
+    # Latest production year — strips _estimated suffix via _pick_latest_year
+    # but does not deprioritize estimated vs actual when both exist for the
+    # same year (no estimated-suffix rows exist in MCS 2026 production data;
+    # add a prefer-actual flag if a future file publishes both).
     available_years = [r.get("Year", "") for r in production_rows]
     latest_year = _pick_latest_year(available_years)
 
     # Build per-country production for the latest year + the time series.
+    # Aggregate-row filter uses the shared _EXCLUDE_COUNTRIES set so we
+    # catch "other countries" / "united states and canada" alongside the
+    # "world total" rows the inline 'world' substring check handles.
     for r in production_rows:
-        iso2 = _resolve_country(r.get("Country", ""))
-        if iso2 is None or iso2 == "":
-            continue
-        # Skip "World total" rows
         country_name_low = (r.get("Country") or "").strip().lower()
+        if not country_name_low or country_name_low in _EXCLUDE_COUNTRIES:
+            continue
         if "world" in country_name_low:
+            continue
+        iso2 = _resolve_country(r.get("Country", ""))
+        if iso2 is None:
             continue
         val = _parse_value(r.get("Value", ""))
         if val is None:
@@ -398,15 +519,45 @@ def _extract_world_production_per_country(
         by_year[iso2][year] = val
         if year == latest_year:
             country_prod[iso2] = country_prod.get(iso2, 0.0) + val
-        if not unit:
-            unit = (r.get("Unit") or "").strip()
+        row_unit = (r.get("Unit") or "").strip()
+        if row_unit:
+            units_seen.add(row_unit)
+            if not unit:
+                unit = row_unit
 
-    # Reserves — usually a single year (often 2024 in MCS 2026).
+    # Mixed-unit warning: HELIUM (the one chapter where this fires today)
+    # is is_skipped=true in the alias table, so this branch never fires in
+    # production today.  Logged so a future tracked chapter with mixed
+    # units doesn't silently produce unit-incoherent per-country sums.
+    if len(units_seen) > 1:
+        log.warning(
+            "mcs2026_parser.mixed_units_in_chapter",
+            units=sorted(units_seen),
+            kept_unit=unit,
+            note=(
+                "Per-country production sums mix units. Consider marking "
+                "this chapter is_skipped=true in material_source_aliases."
+            ),
+        )
+
+    # Reserves — filter to latest year before summing so multi-year
+    # reserves data doesn't silently overcount.  Current MCS 2026 file
+    # has all reserves at Year='2025' so this is a no-op today, but
+    # protects against the bug pattern fixed 2026-05-31.
+    reserves_years = [r.get("Year", "") for r in reserves_rows]
+    latest_reserves_year = _pick_latest_year(reserves_years)
     for r in reserves_rows:
+        year_str = r.get("Year", "")
+        m = re.match(r"^\s*(\d{4})", year_str)
+        if not m or int(m.group(1)) != latest_reserves_year:
+            continue
+        country_name_low = (r.get("Country") or "").strip().lower()
+        if not country_name_low or country_name_low in _EXCLUDE_COUNTRIES:
+            continue
+        if "world" in country_name_low:
+            continue
         iso2 = _resolve_country(r.get("Country", ""))
         if iso2 is None:
-            continue
-        if "world" in (r.get("Country") or "").strip().lower():
             continue
         val = _parse_value(r.get("Value", ""))
         if val is not None:
@@ -415,69 +566,171 @@ def _extract_world_production_per_country(
     return country_prod, country_reserves, dict(by_year), latest_year, unit
 
 
+def _extract_world_capacity_per_country(
+    chapter_rows: list[dict],
+) -> list[tuple[str, dict[str, float], Optional[int], str]]:
+    """Extract per-country capacity values from World sections.
+
+    Differentiated from production (Issue 4.1 fix, 2026-05-31): MCS publishes
+    "Capacity" rows separately from "Production" rows for 8 tracked chapters
+    today — ALUMINUM, BISMUTH, GALLIUM, INDIUM, MAGNESIUM METAL, SELENIUM,
+    TELLURIUM, TITANIUM AND TITANIUM DIOXIDE.  Capacity = theoretical maximum
+    a facility could produce; production = actual tonnes delivered.  Together
+    they enable a spare-capacity / utilization-overhang signal that pure
+    production HHI can't express.
+
+    Returns a list of buckets, one per distinct Statistics_detail string:
+
+        [(detail_type, {iso2: capacity_volume}, latest_year, unit), ...]
+
+    where detail_type is the verbatim Statistics_detail (e.g. "Smelter
+    capacity", "Titanium sponge metal Capacity").  Multiple buckets per
+    chapter when a material has multiple capacity types — TITANIUM has both
+    "Titanium sponge metal Capacity" and "TiO2 Pigment Capacity" as distinct
+    capacity streams.  Callers store these as separate
+    ``material_capacity_shares`` rows keyed on detail_type.
+
+    Skips "rounded" aggregate rows (world totals — caller derives total
+    from country sum).  Same country-resolution + ``_EXCLUDE_COUNTRIES``
+    aggregate-row filter as the production extractor.
+    """
+    by_detail: dict[str, list[dict]] = defaultdict(list)
+    for r in chapter_rows:
+        section = r.get("Section", "") or ""
+        if not section.startswith(_WORLD_SECTION_PREFIX):
+            continue
+        stat = (r.get("Statistics") or "").lower()
+        if "capacity" not in stat:
+            continue
+        detail = (r.get("Statistics_detail") or "").strip()
+        if not detail or "rounded" in detail.lower():
+            continue
+        by_detail[detail].append(r)
+
+    buckets: list[tuple[str, dict[str, float], Optional[int], str]] = []
+    for detail_type, bucket_rows in by_detail.items():
+        years = [r.get("Year", "") for r in bucket_rows]
+        latest_year = _pick_latest_year(years)
+        country_cap: dict[str, float] = {}
+        unit = ""
+        for r in bucket_rows:
+            year_str = r.get("Year", "")
+            m = re.match(r"^\s*(\d{4})", year_str)
+            if not m or int(m.group(1)) != latest_year:
+                continue
+            country_name_low = (r.get("Country") or "").strip().lower()
+            if not country_name_low or country_name_low in _EXCLUDE_COUNTRIES:
+                continue
+            if "world" in country_name_low:
+                continue
+            iso2 = _resolve_country(r.get("Country", ""))
+            if iso2 is None:
+                continue
+            val = _parse_value(r.get("Value", ""))
+            if val is None:
+                continue
+            country_cap[iso2] = country_cap.get(iso2, 0.0) + val
+            row_unit = (r.get("Unit") or "").strip()
+            if not unit and row_unit:
+                unit = row_unit
+        if country_cap:
+            buckets.append((detail_type, country_cap, latest_year, unit))
+    return buckets
+
+
 def _classify_detail_stage(detail: str) -> Optional[str]:
     """Return the supply_chain_stage for a Statistics_detail value.
 
     Walks ``_DETAIL_STAGE_PATTERNS`` in order; returns the first match.
-    Returns None if no pattern matches — caller skips the row (typically
-    rounding-total rows like "Mine production: rounded").
+
+    Returns None for:
+      * rows whose detail contains ``"rounded"`` (USGS world-total rounding
+        rows — caller derives world total from the country sum)
+      * rows whose detail contains ``"all forms"`` (USGS aggregate rows
+        like BORON's "Production—All forms" or SULFUR's "Production, all
+        forms" — summing the per-form rows below would double-count)
+      * details that don't match any pattern (silently skipped — see
+        section 3 audit of mcs2026_parser.py for a periodic check that
+        none of the unclassified strings belong to tracked materials).
     """
     if not detail:
         return None
     detail_low = detail.lower()
-    if "rounded" in detail_low:
-        return None  # totals — caller derives world total from country sum
+    # Aggregate rows that double-count if summed alongside per-form rows.
+    if "rounded" in detail_low or "all forms" in detail_low:
+        return None
     for pattern, stage in _DETAIL_STAGE_PATTERNS:
         if pattern in detail_low:
             return stage
     return None
 
 
+# Data-quality flag values emitted by _extract_per_stage_world_production.
+# ``None`` means a stage had a single source-detail bucket (no consolidation
+# happened); explicit values flag stages where the consolidation made a
+# judgment call partner may want to review.
+_DQ_NOT_CONSOLIDATED = None
+_DQ_ADDITIVE = "additive"           # multiple details, ≤30% country overlap
+_DQ_DUPLICATE_SUSPECT = "duplicate_suspect"  # multiple details, >30% country overlap
+
+
 def _extract_per_stage_world_production(
     chapter_rows: list[dict],
-) -> list[tuple[str, str, dict[str, float], Optional[int], str]]:
+) -> list[tuple[str, str, dict[str, float], Optional[int], str, Optional[str]]]:
     """Group all "World *" production rows by detected supply_chain_stage.
 
     Replaces the per-substring loop in ``parse_mcs2026_csv`` with auto-
     detection.  For each supply_chain_stage that has at least one resolvable
     country production row in the latest year, returns ONE entry:
 
-        (stage, detail_substring, country_prod, latest_year, unit)
+        (stage, detail_substring, country_prod, latest_year, unit, data_quality_flag)
 
     where ``country_prod`` is ``{iso2: production_volume}`` for the latest
     available year.  Multiple stages are returned when a chapter publishes
     mixed-stage data in one section (Cu mine + refinery → ore + refined;
     BAUXITE alumina + bauxite → ore + intermediate).
 
-    Ambiguity handling (added 2026-05-09):
+    Ambiguity handling (data_quality_flag, added 2026-05-31)
+    --------------------------------------------------------
     Some chapters publish multiple Statistics_detail strings that all
     classify to the same supply_chain_stage.  Three patterns observed:
 
       * **Additive** — different products at the same stage that sum into
-        a country's total supply.  Example: SODA ASH "natural" +
-        "synthetic"; PGM "palladium" + "platinum"; CLAYS "bentonite" +
-        "kaolin".
-      * **Duplicate** — same physical supply measured under different
-        unit conventions.  Example: IRON ORE "iron content" + "usable";
-        SELENIUM / TELLURIUM "refinery production" + "concentrate
-        equivalent".  Summing here double-counts.
+        a country's total supply.  Example: PGM "palladium" + "platinum"
+        (same mine produces both); BORON's per-mineral-form ore details;
+        TITANIUM "ilmenite" + "rutile".  Country overlap is high (often
+        100%) but the values represent distinct flows.  flag=_DQ_ADDITIVE.
+
+      * **Duplicate / asymmetric overlap** — one detail covers all major
+        producers while a sub-detail (e.g. ``": concentrate"``,
+        ``": iron content"``, ``": copper telluride"``) covers a subset
+        of them measuring the same flow differently.  TELLURIUM is the
+        only currently-tracked battery material where this fires.  When
+        country overlap is >30% between sub-buckets, flag=_DQ_DUPLICATE_SUSPECT
+        so partner-review can decide per-chapter how to interpret it.
+
       * **Stage-mixed within ore** — DIATOMITE "mine production" + "mine
-        production: processed".  Both technically ore-stage in our
-        taxonomy; processed is downstream of mine.
+        production: processed".  Both classify to the ``ore`` stage; the
+        processed row is conservatively summed.  DIATOMITE is is_skipped
+        so this doesn't fire for tracked materials today.
 
-    We sum per (stage × country) across all detail strings in the same
-    stage.  Rationale: additive cases are handled correctly; duplicate
-    cases double-count both the numerator and denominator equally per
-    country, so the resulting country *share* (which is what HHI consumes)
-    stays roughly accurate.  Stage-mixed cases get conservatively
-    over-counted but they're not in the launch-10 today.  Tradeoff
-    documented in ``docs/scoring-audit-2026-05.md``.
+    The current implementation sums all three patterns per (stage × country).
+    The data_quality_flag surfaces consolidation events to downstream code
+    (and partner review) without changing the math.  Adjudication is a
+    methodology decision — see docs/scoring-audit-2026-05.md.
 
-    The previous implementation emitted one entry per (stage × detail)
-    pair, which caused unique-constraint violations downstream because
-    multiple buckets resolve to the same hs_mapping_id at write time and
-    try to insert duplicate rows for the same
-    (hs_mapping_id × country × year × scope × source) key.
+    Unit consistency
+    ----------------
+    When multiple buckets share a stage, their units must match.  Mixed
+    units within a stage are flagged with ``log.warning`` and the consolidated
+    output unit is the most common one; the inconsistent bucket still
+    contributes its values but the sum is unit-incoherent and unreliable.
+    The chapter alias should be marked ``is_skipped=true`` if this fires.
+
+    Returns:
+        list of 6-tuples (stage, detail_low, country_prod, latest_year,
+        unit, data_quality_flag).  Previous callers using 5-tuple
+        destructuring need updating.
     """
     # First pass — build (stage, detail) buckets and extract per-country
     # production per bucket.
@@ -495,7 +748,10 @@ def _extract_per_stage_world_production(
             continue
         by_bucket[(stage, detail.lower())].append(r)
 
-    # For each bucket, get its per-country production.
+    # For each bucket, get its per-country production.  Empty buckets
+    # (all values withheld / qualitative) are logged so investigations
+    # can distinguish "no data" from "parser bug" when chapter coverage
+    # looks thin.
     bucket_extractions: list[
         tuple[str, str, dict[str, float], Optional[int], str]
     ] = []
@@ -504,13 +760,82 @@ def _extract_per_stage_world_production(
             _extract_world_production_per_country(bucket_rows, detail_substring=None)
         )
         if not country_prod:
+            log.debug(
+                "mcs2026_parser.empty_bucket_skipped",
+                stage=stage,
+                detail=detail_low,
+                row_count=len(bucket_rows),
+            )
             continue
         bucket_extractions.append(
             (stage, detail_low, country_prod, latest_year, unit or "")
         )
 
+    # Cross-bucket unit consistency check (Issue 5.1).  Sum-based
+    # consolidation is only well-defined if the buckets share a unit.
+    units_per_stage: dict[str, Counter] = defaultdict(Counter)
+    countries_per_bucket: dict[tuple[str, str], set[str]] = {}
+    for stage, detail_low, country_prod, _yr, unit in bucket_extractions:
+        if unit:
+            units_per_stage[stage][unit] += 1
+        countries_per_bucket[(stage, detail_low)] = set(country_prod.keys())
+
+    mixed_unit_stages: set[str] = set()
+    for stage, units_seen in units_per_stage.items():
+        if len(units_seen) > 1:
+            mixed_unit_stages.add(stage)
+            log.warning(
+                "mcs2026_parser.mixed_units_in_stage_consolidation",
+                stage=stage,
+                units=dict(units_seen),
+                note=(
+                    "Per-country sums across buckets with different units "
+                    "are unit-incoherent. Mark this chapter is_skipped=true "
+                    "in material_source_aliases."
+                ),
+            )
+
+    # Compute the data_quality_flag per stage based on country-overlap
+    # geometry.  Single-bucket stages get flag=None (no consolidation).
+    # Multi-bucket stages: high overlap (>30%) → DUPLICATE_SUSPECT;
+    # low overlap → ADDITIVE.
+    stage_to_buckets: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for stage, detail_low, *_ in bucket_extractions:
+        stage_to_buckets[stage].append((stage, detail_low))
+
+    def _stage_overlap_pct(stage_buckets: list[tuple[str, str]]) -> float:
+        """Highest pairwise country overlap across buckets in a stage,
+        normalised to the smaller bucket's size (so a 1-country bucket
+        overlapping fully with a 7-country bucket scores 100%, exposing
+        asymmetric duplication)."""
+        sets = [countries_per_bucket[b] for b in stage_buckets if countries_per_bucket.get(b)]
+        if len(sets) < 2:
+            return 0.0
+        max_overlap = 0.0
+        for i in range(len(sets)):
+            for j in range(i + 1, len(sets)):
+                inter = sets[i] & sets[j]
+                smaller = min(len(sets[i]), len(sets[j]))
+                if smaller > 0:
+                    pct = len(inter) / smaller
+                    if pct > max_overlap:
+                        max_overlap = pct
+        return max_overlap
+
+    stage_dq_flag: dict[str, Optional[str]] = {}
+    for stage, buckets in stage_to_buckets.items():
+        if len(buckets) <= 1:
+            stage_dq_flag[stage] = _DQ_NOT_CONSOLIDATED
+        elif _stage_overlap_pct(buckets) > 0.30:
+            stage_dq_flag[stage] = _DQ_DUPLICATE_SUSPECT
+        else:
+            stage_dq_flag[stage] = _DQ_ADDITIVE
+
     # Consolidate: SUM per (stage × country) across all buckets sharing
-    # a stage.  See docstring for tradeoff rationale.
+    # a stage.  Tiebreak in by_stage_meta uses strict ``>`` on country_count,
+    # so the first-seen bucket wins on ties; dict iteration is insertion
+    # order (Python 3.7+) so this is deterministic but coupled to row
+    # order in the CSV.
     by_stage_country: dict[str, dict[str, float]] = defaultdict(
         lambda: defaultdict(float)
     )
@@ -519,10 +844,6 @@ def _extract_per_stage_world_production(
     for stage, detail_low, country_prod, latest_year, unit in bucket_extractions:
         for iso2, vol in country_prod.items():
             by_stage_country[stage][iso2] += vol
-        # Keep the meta from the bucket with the most countries (most
-        # comprehensive geographic coverage) — used for unit + year on the
-        # consolidated row, and for the type_substring reported back to
-        # the caller.
         prev = by_stage_meta.get(stage)
         if prev is None or len(country_prod) > prev["country_count"]:
             by_stage_meta[stage] = {
@@ -533,16 +854,19 @@ def _extract_per_stage_world_production(
             }
         by_stage_details[stage].append(detail_low)
 
-    # Audit log: when a stage has more than one source detail string, the
-    # consolidation is non-trivial.  Recorded so we can review later.
+    # Per-stage consolidation log — promoted to INFO 2026-05-31 so
+    # data-quality events surface in standard logs without spam (one
+    # event per consolidated stage, not per bucket).
     for stage, details in by_stage_details.items():
         if len(details) > 1:
-            log.debug(
+            log.info(
                 "mcs2026_parser.same_stage_bucket_consolidated",
                 stage=stage,
                 source_details=sorted(details),
                 kept_meta_detail=by_stage_meta[stage]["detail_low"],
                 country_count=len(by_stage_country[stage]),
+                data_quality_flag=stage_dq_flag[stage],
+                mixed_units=stage in mixed_unit_stages,
             )
 
     return [
@@ -552,6 +876,7 @@ def _extract_per_stage_world_production(
             dict(by_stage_country[stage]),
             by_stage_meta[stage]["latest_year"],
             by_stage_meta[stage]["unit"],
+            stage_dq_flag[stage],
         )
         for stage in by_stage_country
     ]
@@ -574,7 +899,7 @@ def _extract_price_unit_from_salient(chapter_rows: list[dict]) -> Optional[str]:
     """
     salient_prices = [
         r for r in chapter_rows
-        if r.get("Section") == _SALIENT_SECTION
+        if _is_salient_section(r.get("Section"))
         and (r.get("Statistics") or "").strip().lower() == "price"
     ]
     if not salient_prices:
@@ -607,23 +932,71 @@ def _extract_price_unit_from_salient(chapter_rows: list[dict]) -> Optional[str]:
     return None
 
 
+# Word-boundary regex for the NIR "Total" sub-type detection.  Avoids
+# accidental matches inside compound detail strings — though MCS 2026
+# only uses "Total" as a whole-word qualifier today, this guards against
+# future formats that might say "subtotal", "totalised", etc.
+_NIR_TOTAL_RE = re.compile(r"\btotal\b", re.IGNORECASE)
+
+
+# Reserve-life-index sanity floor: world_reserves / world_prod ratios
+# below this value are almost certainly a unit-scale mismatch (e.g.,
+# reserves in tonnes vs production in thousand tonnes — would give an
+# RLI of ~0.001 when the real value is ~1000 years).  Parser returns
+# None for any RLI below this floor rather than emitting a misleadingly
+# tiny "years of reserves" number.  Issue 8.3 fix (2026-05-31): hoisted
+# from inside the per-chapter loop to module level so it's defined once.
+_RLI_MIN_PLAUSIBLE = 2.0
+
+
 def _extract_us_salient_signals(
     chapter_rows: list[dict],
 ) -> dict[str, Optional[float]]:
     """Extract US-domestic signals from Salient Statistics—United States.
 
     Returns a dict with keys we care about for material-level scoring:
-        - capacity_utilization: production / capacity ratio (0–1) for latest year
-        - production_yoy_pct:   (latest − prior) / prior for ANY production stat
-        - apparent_consumption: latest year value
+        - capacity_utilization: US-production ÷ US-capacity for latest year
+        - production_yoy_pct:   (latest - prior) / prior for production sum
+        - apparent_consumption: latest year US apparent consumption
         - net_import_reliance:  pct (0–100) for latest year, primary stat
 
-    Unavailable signals return None.  Sub-type splits (e.g. Silicon's
-    ferrosilicon vs metal) are present as separate ``Statistics_detail``
-    rows; we aggregate by summing across sub-types when computing YoY.
+    Unavailable signals return None.
+
+    Sub-type aggregation
+    --------------------
+    Sub-type splits (Silicon's ferrosilicon + silicon metal + Total;
+    ALUMINUM's Primary + Secondary; ANTIMONY's Mine + Smelter) are
+    present as separate ``Statistics_detail`` rows; we sum across
+    sub-types per (stat, year).  This is correct when sub-types are
+    additive components of one supply chain (ALUMINUM Primary +
+    Secondary = total US Al supply).  Chapters where sub-types mix
+    distinct supply-chain stages (BAUXITE AND ALUMINA "mine" + "refinery"
+    in Salient Production) are aliased with ``writes_material_signals=False``
+    so the cross-stage sum doesn't poison material-level signals.
+
+    Capacity-utilization data source (Issue 6.1 fix, 2026-05-31)
+    -----------------------------------------------------------
+    MCS 2026 publishes Capacity rows in WORLD sections, NOT in Salient.
+    A pre-fix implementation looked for ``"capacity" in stat`` within
+    salient rows and always found zero, yielding None for every chapter.
+    The fix filters World-section Capacity rows to ``Country='United
+    States'`` and uses that sum as the capacity denominator against the
+    Salient Production numerator.  Works for the 8 tracked chapters
+    with US capacity (ALUMINUM, BISMUTH, GALLIUM, INDIUM, MAGNESIUM
+    METAL, SELENIUM, TELLURIUM, TITANIUM) when their World capacity
+    section includes a US row.
+
+    YoY zero-handling (Issue 6.2 fix, 2026-05-31)
+    --------------------------------------------
+    Previous version filtered ``_latest_two`` to ``v > 0`` years, which
+    hid production-dropout signals (mine closures going to zero).  Now
+    uses the latest 2 actual years regardless of zero; the outer
+    compute guards against ``prior_v == 0`` to avoid divide-by-zero.
     """
-    salient = [r for r in chapter_rows if r.get("Section") == _SALIENT_SECTION]
+    salient = [r for r in chapter_rows if _is_salient_section(r.get("Section"))]
     if not salient:
+        log.debug("mcs2026_parser.salient_no_rows",
+                  chapter=(chapter_rows[0].get("MCS chapter") if chapter_rows else None))
         return {
             "capacity_utilization": None,
             "production_yoy_pct": None,
@@ -631,11 +1004,16 @@ def _extract_us_salient_signals(
             "net_import_reliance": None,
         }
 
-    # Bucket rows by Statistics + year.  Sum across sub-types (Statistics_detail).
+    # Bucket rows by Statistics + year.  Sum across sub-types
+    # (Statistics_detail).  Filter "rounded" detail rows (Issue 6.7)
+    # to be defensive against double-counting if USGS ever publishes a
+    # rounded-aggregate alongside its per-sub-type breakdown in salient.
     by_stat_year: dict[tuple[str, int], float] = defaultdict(float)
-    by_stat_year_count: dict[tuple[str, int], int] = defaultdict(int)
     for r in salient:
         stat = (r.get("Statistics") or "").lower()
+        detail = (r.get("Statistics_detail") or "").lower()
+        if "rounded" in detail:
+            continue
         year_str = r.get("Year", "")
         m = re.match(r"^\s*(\d{4})", year_str)
         if not m:
@@ -645,13 +1023,15 @@ def _extract_us_salient_signals(
         if val is None:
             continue
         by_stat_year[(stat, year)] += val
-        by_stat_year_count[(stat, year)] += 1
 
     def _latest_two(stat_low: str) -> Optional[tuple[int, float, int, float]]:
-        """Return (latest_year, latest_val, prior_year, prior_val) for ``stat`` —
-        latest non-zero, prior most recent.  None if <2 data points."""
+        """Return (latest_year, latest_val, prior_year, prior_val) for ``stat``
+        — the two most recent years for which a value exists, zeros included.
+        None if fewer than 2 years of data.  Caller is responsible for
+        guarding against prior_val == 0 when computing rates.
+        """
         years = sorted(
-            (y for (s, y), v in by_stat_year.items() if s == stat_low and v > 0),
+            (y for (s, y) in by_stat_year if s == stat_low),
             reverse=True,
         )
         if len(years) < 2:
@@ -660,36 +1040,97 @@ def _extract_us_salient_signals(
         return (latest, by_stat_year[(stat_low, latest)],
                 prior,  by_stat_year[(stat_low, prior)])
 
-    # Capacity utilization — production ÷ capacity for the latest year
-    # where both are present.
+    # ── Capacity utilization (Issue 6.1) ─────────────────────────────────
+    # Numerator: latest US production from Salient (already summed across
+    # sub-types in by_stat_year).
+    # Denominator: latest US capacity from World-section Capacity rows.
     capacity_utilization = None
-    cap_years = sorted(
-        ({y for (s, y) in by_stat_year if "capacity" in s}),
+    prod_years_avail = sorted(
+        {y for (s, y) in by_stat_year if "production" in s},
         reverse=True,
     )
-    prod_years = sorted(
-        ({y for (s, y) in by_stat_year if "production" in s}),
-        reverse=True,
-    )
-    common = set(cap_years) & set(prod_years)
-    if common:
-        latest_common = max(common)
-        cap = sum(v for (s, y), v in by_stat_year.items()
-                  if "capacity" in s and y == latest_common)
-        prod = sum(v for (s, y), v in by_stat_year.items()
-                   if "production" in s and y == latest_common)
-        if cap > 0:
-            capacity_utilization = round(prod / cap, 4)
+    us_capacity_by_year: dict[int, float] = defaultdict(float)
+    for r in chapter_rows:
+        section = r.get("Section", "") or ""
+        if not section.startswith(_WORLD_SECTION_PREFIX):
+            continue
+        if "capacity" not in (r.get("Statistics") or "").lower():
+            continue
+        detail = (r.get("Statistics_detail") or "").lower()
+        if "rounded" in detail:
+            continue
+        if (r.get("Country") or "").strip().lower() != "united states":
+            continue
+        year_str = r.get("Year", "")
+        m = re.match(r"^\s*(\d{4})", year_str)
+        if not m:
+            continue
+        val = _parse_value(r.get("Value", ""))
+        if val is None:
+            continue
+        us_capacity_by_year[int(m.group(1))] += val
 
-    # Production YoY %
+    if prod_years_avail and us_capacity_by_year:
+        common = set(prod_years_avail) & set(us_capacity_by_year.keys())
+        if common:
+            latest_common = max(common)
+            prod_us = sum(
+                v for (s, y), v in by_stat_year.items()
+                if "production" in s and y == latest_common
+            )
+            cap_us = us_capacity_by_year[latest_common]
+            if cap_us > 0:
+                raw_ratio = prod_us / cap_us
+                # Sanity gate: utilization > 1.0 means the numerator and
+                # denominator are scoped differently.  Most common cause:
+                # Salient Production sums Primary + Secondary (recycled
+                # scrap) while World Capacity is primary smelter only —
+                # ALUMINUM and MAGNESIUM METAL trigger this.  Return None
+                # rather than emit an impossible value; partner can
+                # refine the numerator filter (e.g. to "primary"-only
+                # sub-types) when methodology resolves it.
+                if raw_ratio > 1.0:
+                    log.warning(
+                        "mcs2026_parser.salient_capacity_utilization_over_unity",
+                        raw_ratio=round(raw_ratio, 4),
+                        prod_us=prod_us,
+                        cap_us=cap_us,
+                        year=latest_common,
+                        note=(
+                            "Numerator likely includes recycled / secondary "
+                            "production not covered by primary capacity. "
+                            "Returning None until partner refines the "
+                            "production-sub-type filter."
+                        ),
+                    )
+                else:
+                    capacity_utilization = round(raw_ratio, 4)
+
+    if capacity_utilization is None:
+        log.debug(
+            "mcs2026_parser.salient_capacity_utilization_unavailable",
+            has_us_capacity=bool(us_capacity_by_year),
+            has_us_production=bool(prod_years_avail),
+        )
+
+    # ── Production YoY % ─────────────────────────────────────────────────
+    # Uses the latest two ACTUAL years (zeros allowed).  Outer guard
+    # against prior_v == 0 protects against divide-by-zero.
     production_yoy_pct = None
     pair = _latest_two("production")
     if pair:
-        latest_y, latest_v, _prior_y, prior_v = pair
+        _latest_y, latest_v, _prior_y, prior_v = pair
         if prior_v > 0:
             production_yoy_pct = round((latest_v - prior_v) / prior_v, 4)
+        else:
+            log.debug(
+                "mcs2026_parser.salient_yoy_undefined_prior_zero",
+                latest_value=latest_v, prior_value=prior_v,
+            )
+    else:
+        log.debug("mcs2026_parser.salient_yoy_unavailable_too_few_years")
 
-    # Apparent consumption — latest value
+    # ── Apparent consumption — latest value ──────────────────────────────
     apparent_consumption = None
     cons_years = sorted(
         ({y for (s, y) in by_stat_year if "consumption" in s}),
@@ -701,21 +1142,25 @@ def _extract_us_salient_signals(
             v for (s, y), v in by_stat_year.items()
             if "consumption" in s and y == latest_y
         )
+    else:
+        log.debug("mcs2026_parser.salient_consumption_unavailable")
 
-    # Net import reliance — value can be 0–100 in the CSV.
+    # ── Net import reliance ──────────────────────────────────────────────
     # NIR uses bounded estimates ("<50", ">50") that need midpoint-aware
-    # parsing.  Re-parse the raw rows directly with `_parse_percent_with_bound`
-    # rather than relying on the sum/count buckets above (which used the
-    # bound-stripping `_parse_value`).  Prefer the "Total" sub-type if
-    # present (Silicon has ferrosilicon + silicon metal + Total); fall
-    # back to the average across sub-types when no Total row exists.
+    # parsing.  Re-parse the raw rows directly with
+    # `_parse_percent_with_bound` rather than relying on the sum/count
+    # buckets above (which used the bound-stripping `_parse_value`).
+    # Prefer the "Total" sub-type if present (Silicon has ferrosilicon +
+    # silicon metal + Total); fall back to the average across sub-types
+    # when no Total row exists.  Total detection uses a word-boundary
+    # regex (Issue 6.4) so substrings like "subtotal" don't accidentally
+    # match.
     nir = None
     nir_rows = [
         r for r in salient
         if "net import reliance" in (r.get("Statistics") or "").lower()
     ]
     if nir_rows:
-        # Bucket: {(detail_low, year): value}
         nir_by_detail_year: dict[tuple[str, int], float] = {}
         for r in nir_rows:
             year_str = r.get("Year", "")
@@ -731,10 +1176,9 @@ def _extract_us_salient_signals(
 
         if nir_by_detail_year:
             latest_y = max(y for (_, y) in nir_by_detail_year)
-            # Prefer "Total" sub-type if present.
             total_keys = [
                 k for k in nir_by_detail_year
-                if k[1] == latest_y and "total" in k[0]
+                if k[1] == latest_y and _NIR_TOTAL_RE.search(k[0])
             ]
             if total_keys:
                 nir = round(nir_by_detail_year[total_keys[0]], 2)
@@ -744,6 +1188,8 @@ def _extract_us_salient_signals(
                     if y == latest_y
                 ]
                 nir = round(sum(latest_vals) / len(latest_vals), 2)
+    if nir is None:
+        log.debug("mcs2026_parser.salient_nir_unavailable")
 
     return {
         "capacity_utilization": capacity_utilization,
@@ -753,6 +1199,19 @@ def _extract_us_salient_signals(
     }
 
 
+# Aggregate-row labels in the Import Sources Country column.
+# Verified against MCS 2026: "Other countries" is the only non-Total
+# aggregate value in real data (~159 rows).  Kept as a frozenset so
+# membership lookup is O(1).
+_IMPORT_SOURCE_AGGREGATE_COUNTRIES: frozenset[str] = frozenset({
+    "total",
+    "other",
+    "other countries",        # Issue 7.1 — real MCS value, plural + capitalised
+    "world total",
+    "",
+})
+
+
 def _extract_us_import_sources(
     chapter_rows: list[dict],
     chapter: str,
@@ -760,9 +1219,34 @@ def _extract_us_import_sources(
     """Extract US import sources from the Import Sources section.
 
     Each row gives a country's % share of US imports for a given sub-type
-    (Statistics_detail).  We translate sub-types to HS prefixes via
-    `_DETAIL_TO_HS_PREFIX`; unmapped sub-types fall through to the
-    material's primary HS prefix.
+    (``Statistics_detail``).  Sub-types translate to HS prefixes via
+    ``_DETAIL_TO_HS_PREFIX``; unmapped sub-types fall through to the
+    material's primary HS prefix (caller resolves the default).
+
+    Field naming caveat (Issue 7.3): the output field is named
+    ``production_share`` for column-name parity with the parser's other
+    share outputs, but the value here is a fraction of *US imports*,
+    NOT global production.  Downstream this lands in
+    ``HsCodeProductionShare.production_share`` with ``market_scope='us'``
+    — the table column shares the naming compromise.  Treat as
+    "share of supply through this channel" rather than literal production.
+
+    Bounded values (Issue 7.5): shares are parsed with
+    ``_parse_percent_with_bound`` so bounded estimates like ``"<10"``
+    resolve to a midpoint (5.0%) rather than collapsing to the bound
+    value via ``_parse_value``.  Real MCS 2026 import-source data
+    doesn't include bounded values today, so this is defensive against
+    future format variation.
+
+    Per-product methodology gap (Issue 7.7 — DEFERRED): for tracked
+    chapters other than SILICON, the per-sub-type HS resolution falls
+    through to ``hs_prefix=""``.  The CLI then collapses to the
+    material's primary HS prefix, so per-product import attribution
+    (e.g. ANTIMONY's Ore vs Oxide vs Unwrought metal) is lost in
+    storage.  Closing this gap requires partner-curated
+    ``_DETAIL_TO_HS_PREFIX`` entries for top-impact chapters (ANTIMONY,
+    NIOBIUM, RARE EARTHS, TITANIUM, TUNGSTEN).  Tracked as a follow-up
+    task; not blocking material-level geopolitical scoring today.
 
     Returns a list of:
         {
@@ -770,6 +1254,7 @@ def _extract_us_import_sources(
           "country_code": str (ISO-2),
           "production_share": float (0.0–1.0),
           "reference_year_range": str (e.g. "2021–24"),
+          "type_substring": str (verbatim Statistics_detail),
         }
     """
     rows = [r for r in chapter_rows if r.get("Section") == _IMPORT_SECTION]
@@ -779,15 +1264,19 @@ def _extract_us_import_sources(
     sources: list[dict] = []
     for r in rows:
         country = r.get("Country", "").strip()
-        # Skip "Total" / "Other" rows
-        if country.lower() in ("total", "other", "world total", ""):
+        # Issue 7.1 — explicit aggregate-row filter (was an accidental
+        # fall-through via the country-resolution step previously).
+        if country.lower() in _IMPORT_SOURCE_AGGREGATE_COUNTRIES:
             continue
         iso2 = _resolve_country(country)
         if iso2 is None:
             continue
-        share_pct = _parse_value(r.get("Value", ""))
+        share_pct = _parse_percent_with_bound(r.get("Value", ""))
         if share_pct is None:
             continue
+        # Issue 7.4 — clamp to [0.0, 1.0] so corrupted or
+        # bound-defying values can't propagate impossible shares.
+        share_fraction = max(0.0, min(1.0, share_pct / 100.0))
 
         detail = (r.get("Statistics_detail") or "").lower()
         # Resolve sub-type to HS prefix.
@@ -797,16 +1286,22 @@ def _extract_us_import_sources(
                 hs_prefix = prefix
                 break
         if hs_prefix is None:
-            # No sub-type-specific mapping; fall back to the material's
-            # primary HS prefix.  Caller resolves which prefix in the
-            # caller's hs_codes list.
-            hs_prefix = ""  # signal "unresolved" — caller picks default
+            # No sub-type-specific mapping; signal "unresolved" so the
+            # CLI's keyword resolver + primary-fallback chain can pick a
+            # default.  Empty string (not None) for backwards compat
+            # with the CLI's ``if hs_prefix:`` truthy check; see Issue
+            # 7.6 follow-up for a cleaner sentinel.
+            hs_prefix = ""
 
-        year_range = r.get("Year", "").strip() or "2021–24"
+        # Issue 7.2 — MCS 2026 always publishes Year='2021–24' here, so
+        # the previous hardcoded fallback is unreachable in real data.
+        # Drop the literal fallback; if Year is somehow missing, pass an
+        # empty string and let the caller decide what to do.
+        year_range = r.get("Year", "").strip()
         sources.append({
             "hs_code_prefix": hs_prefix,
             "country_code": iso2,
-            "production_share": round(share_pct / 100.0, 6),
+            "production_share": round(share_fraction, 6),
             "reference_year_range": year_range,
             "type_substring": detail or "(unspecified)",
         })
@@ -829,7 +1324,23 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
     alias table, fills in fallback HS prefixes from
     ``materials.hs_codes``, and writes the upserts.
 
-    Output contract — one record per chapter present in the CSV::
+    Reserve_life_index unit assumption (Issue 8.7): the function
+    computes ``world_reserves / world_prod`` and assumes both come from
+    the same unit-of-measure.  MCS consistently publishes both in
+    tonnes for tracked materials, but the function does not validate
+    this.  ``_RLI_MIN_PLAUSIBLE`` catches gross unit-scale mismatches
+    (returns None when the ratio looks unphysically small) but doesn't
+    detect a numerator/denominator unit-cross.
+
+    Output contract — one record per chapter present in the CSV.
+
+    NOTE (Issue 8.5): the field list documented below must match the
+    dict literal in ``results.append({...})`` at the bottom of the
+    per-chapter loop.  Adding or renaming a key needs to happen in
+    both places.
+
+    CLI-consumed fields (cli.py ingest_usgs_cmd reads each of these into
+    a downstream DB write)::
 
         {
           "source_system": "mcs_2026_csv",
@@ -846,11 +1357,19 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
           "production_shares":     list[dict],     # material-level country shares
           "hs_production_shares":  list[dict],     # sub-type splits per `_DETAIL_TO_HS_PREFIX`
           "us_import_sources":     list[dict],     # raw — hs_code_prefix may be ""
-          "ranked_countries":      list[str],
-          "latest_year":           int | None,
-          "world_total":           float | None,
-          "world_unit":            str | None,
-          "notes":                 str,
+          "capacity_shares":       list[dict],     # per-country capacity rows (Issue 4.1 fix, 2026-05-31).  One entry per (country × detail_type).  detail_type carries the verbatim MCS Statistics_detail string (e.g. "Smelter capacity", "Titanium sponge metal Capacity") so TITANIUM's sponge-metal vs TiO2-pigment capacity remain distinct in the DB.
+        }
+
+    Audit-only fields (kept in the output for debugging / sanity-checking
+    parser behaviour; verified 2026-05-24 to be NOT consumed by the CLI
+    write path; safe to ignore but cheap to produce so they stay)::
+
+        {
+          "ranked_countries":      list[str],     # top-N producer ISO-2s
+          "latest_year":           int | None,    # year used for headline shares
+          "world_total":           float | None,  # sum of country production
+          "world_unit":            str | None,    # unit of measure for world_total
+          "notes":                 str,           # human-readable parse summary
         }
 
     Skipped chapters (e.g. ABRASIVES, ARSENIC, ASBESTOS — non-battery)
@@ -860,10 +1379,18 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
     """
     filepath = Path(filepath)
 
-    # cp1252 encoding due to em-dash / en-dash characters in section names
-    # and detail strings.
-    with open(filepath, encoding="cp1252") as f:
-        all_rows = list(csv.DictReader(f))
+    # Encoding: try UTF-8 first (future-proofs against a USGS publication
+    # format switch) then fall back to cp1252 for the current 2026 file
+    # which has em-dashes / en-dashes in section names + detail strings.
+    # The full file is read once during sniffing; the second open() reuses
+    # whichever encoding succeeded.
+    try:
+        with open(filepath, encoding="utf-8") as f:
+            all_rows = list(csv.DictReader(f))
+    except UnicodeDecodeError:
+        log.debug("mcs2026_parser.encoding_fallback_cp1252", path=str(filepath))
+        with open(filepath, encoding="cp1252") as f:
+            all_rows = list(csv.DictReader(f))
 
     # Index rows by chapter for fast filtering.
     by_chapter: dict[str, list[dict]] = defaultdict(list)
@@ -902,7 +1429,8 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
 
         # Reserve life index — guard against unit-scale mismatches that
         # produce implausibly low values (same logic as the 2025 parser).
-        _RLI_MIN_PLAUSIBLE = 2.0
+        # Floor constant ``_RLI_MIN_PLAUSIBLE`` is module-level (Issue 8.3
+        # fix 2026-05-31; was previously redeclared inside this loop).
         reserve_life_index: Optional[float] = None
         if world_reserves and world_prod and world_prod > 0:
             rli_candidate = round(world_reserves / world_prod, 1)
@@ -943,17 +1471,27 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
         }
 
         # ── Path A: stage auto-detection ──
-        for stage, detail_low, country_prod, _yr, unit in (
-            _extract_per_stage_world_production(chapter_rows)
-        ):
+        # 6-tuple unpacking (was 5-tuple pre-2026-05-31).  data_quality_flag
+        # is None for single-bucket stages and 'additive' / 'duplicate_suspect'
+        # for stages where the consolidation made a judgment call.
+        #
+        # Loop variables prefixed ``stage_`` (Issue 8.1/8.2 fix 2026-05-31)
+        # to avoid shadowing the material-level ``country_prod`` and
+        # ``unit`` bindings from the outer scope.  Pre-fix, ``unit``
+        # silently took the last per-stage loop iteration's value and
+        # the orchestrator's ``world_unit`` output would report the
+        # wrong value if a chapter ever had mixed-stage units.
+        for (
+            stage, detail_low, stage_country_prod, _yr, stage_unit, dq_flag
+        ) in _extract_per_stage_world_production(chapter_rows):
             # Skip if this detail substring is handled by the explicit
             # sub-type override below (Silicon ferrosilicon/silicon metal).
             if any(ovr in detail_low for ovr in path_b_overrides):
                 continue
-            sub_world = sum(country_prod.values())
+            sub_world = sum(stage_country_prod.values())
             if sub_world <= 0:
                 continue
-            for iso2, vol in country_prod.items():
+            for iso2, vol in stage_country_prod.items():
                 hs_production_shares.append({
                     # Empty prefix signals stage-based lookup at write time.
                     "hs_code_prefix": "",
@@ -961,11 +1499,26 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
                     "country_code":   iso2,
                     "production_volume": vol,
                     "production_share":  round(vol / sub_world, 6),
-                    "unit_of_measure":   unit or None,
+                    "unit_of_measure":   stage_unit or None,
                     "type_substring":    detail_low,
+                    # Issue 5.2 (2026-05-31): surface the consolidation
+                    # judgment so downstream review / future scoring can
+                    # gate on TELLURIUM-style duplicate_suspect cases.
+                    "data_quality_flag": dq_flag,
                 })
 
         # ── Path B: explicit sub-type prefix overrides ──
+        # Iterates ALL _DETAIL_TO_HS_PREFIX entries (not first-match-wins
+        # like the import-source loop).  When a chapter has multiple
+        # matching entries — e.g. SILICON's ferrosilicon AND silicon
+        # metal — each emits its own hs_production_shares row.  This is
+        # intentional: the entries route to different HS prefixes so
+        # they're disjoint in storage (Issue 8.6 comment 2026-05-31).
+        #
+        # Path A above skips details handled by Path B via the
+        # ``path_b_overrides`` set, so the two paths emit disjoint
+        # rows for the same chapter — no double-write (Issue 8.8
+        # comment 2026-05-31).
         for (cfg_chapter, cfg_detail), hs_prefix in _DETAIL_TO_HS_PREFIX.items():
             if cfg_chapter != chapter:
                 continue
@@ -993,11 +1546,37 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
         # from material.hs_codes[0] after canonical resolution.
         us_import_sources = _extract_us_import_sources(chapter_rows, chapter)
 
+        # ── Per-country capacity (Issue 4.1 fix) ──────────────────────────
+        # Differentiated from production: MCS publishes Capacity rows
+        # for 8 tracked chapters (ALUMINUM, BISMUTH, GALLIUM, INDIUM,
+        # MAGNESIUM METAL, SELENIUM, TELLURIUM, TITANIUM).  One bucket
+        # per Statistics_detail; TITANIUM has two (sponge metal + TiO2
+        # pigment) which remain distinct in the output and the DB.
+        capacity_buckets = _extract_world_capacity_per_country(chapter_rows)
+        capacity_shares: list[dict] = []
+        for detail_type, cap_country, cap_year, cap_unit in capacity_buckets:
+            bucket_world = sum(cap_country.values())
+            if bucket_world <= 0:
+                continue
+            for iso2, vol in cap_country.items():
+                capacity_shares.append({
+                    "country_code":     iso2,
+                    "reference_year":   cap_year,
+                    "detail_type":      detail_type,
+                    "capacity_volume":  vol,
+                    "capacity_share":   round(vol / bucket_world, 6),
+                    "unit_of_measure":  cap_unit or None,
+                })
+
         notes_parts = [
             "Source: USGS Mineral Commodity Summaries 2026 long-format CSV.",
             f"Latest production year used: {latest_year}.",
         ]
-        if world_prod:
+        # Issue 8.4 fix (2026-05-31): explicit ``is not None`` so a
+        # legitimate zero world_total still surfaces in notes.  The
+        # other notes branches already use this pattern; this one was
+        # inconsistent with a truthy check.
+        if world_prod is not None:
             notes_parts.append(f"World total: {world_prod:,.0f} {unit}.")
         if salient["production_yoy_pct"] is not None:
             notes_parts.append(
@@ -1008,37 +1587,32 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
                 f"US net import reliance: {salient['net_import_reliance']:.0f}%."
             )
         notes_parts.append(
-            "criticality_score = normalised HHI of country production shares."
+            "criticality_score = raw HHI of country production shares "
+            "(sum of squared shares; range 1/N to 1.0)."
         )
         if ranked_countries:
             notes_parts.append(
                 f"Top producing countries: {', '.join(ranked_countries[:5])}."
             )
 
-        # ── Chapter-level HS prefix re-routing (deprecated 2026-05-09) ───
-        # ``_CHAPTER_HS_PREFIX`` is now empty by default — stage auto-
-        # detection handles former entries (BAUXITE AND ALUMINA's bauxite
-        # mine + alumina refinery rows now route via ``stage`` to the
-        # appropriate Aluminum HS mappings without an explicit override).
-        # Block kept in place for future per-chapter overrides if a
-        # chapter publishes production data the auto-detector can't
-        # classify.  Empty dict → block is a no-op today.
-        chapter_prefix = _CHAPTER_HS_PREFIX.get(chapter)
-        if chapter_prefix and production_shares:
-            for ps in production_shares:
-                hs_production_shares.append({
-                    "hs_code_prefix":   chapter_prefix,
-                    "country_code":     ps["country_code"],
-                    "production_volume": ps["production_volume"],
-                    "production_share": ps["production_share"],
-                    "unit_of_measure":  ps.get("unit_of_measure"),
-                    "type_substring":   "(chapter-level)",
-                })
-            production_shares = []  # don't double-write at the material level
+        # Chapter-level HS prefix re-routing was removed 2026-05-24 along
+        # with the now-deleted ``_CHAPTER_HS_PREFIX`` dict.  ``_DETAIL_STAGE_PATTERNS``
+        # handles the cases this block used to cover (BAUXITE AND ALUMINA's
+        # bauxite mine + alumina refinery rows auto-route via ``stage``).
+        # If a future MCS chapter publishes production data the auto-
+        # detector can't classify, re-add a small chapter-override
+        # mechanism here rather than reviving the empty-dict no-op.
 
         results.append({
             "source_system":           "mcs_2026_csv",
             "source_name":             chapter,
+            # criticality_score and hhi_score intentionally carry the same
+            # value today.  criticality_score is the column scoring code
+            # consumes; hhi_score is preserved so partner-curated
+            # composites (e.g. HHI × import_dependency × strategic-mineral
+            # flag) can land in criticality_score without losing the raw
+            # HHI signal.  When that divergence happens, do not silently
+            # drop the alias — update the CLI's persistence path too.
             "criticality_score":       criticality,
             "hhi_score":               criticality,
             "reserve_hhi_score":       reserve_hhi,
@@ -1051,12 +1625,37 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
             "production_shares":       production_shares,
             "hs_production_shares":    hs_production_shares,
             "us_import_sources":       us_import_sources,
+            "capacity_shares":         capacity_shares,
             "ranked_countries":        ranked_countries,
             "latest_year":             latest_year,
             "world_total":             world_prod,
             "world_unit":              unit or None,
             "notes":                   " ".join(notes_parts),
         })
+
+    # Per-run consolidation summary (Issue 5.3) — counts how often the
+    # same-stage bucket consolidation made a judgment call this run.
+    # ``duplicate_suspect`` cases are the ones partner-review should
+    # adjudicate (TELLURIUM is the only tracked battery material that
+    # currently fires this today).
+    dq_counts: Counter = Counter()
+    for rec in results:
+        for hs in rec.get("hs_production_shares") or []:
+            flag = hs.get("data_quality_flag")
+            if flag:
+                dq_counts[flag] += 1
+    log.info(
+        "mcs2026_parser.run_summary",
+        chapter_records=len(results),
+        total_hs_production_shares=sum(
+            len(r.get("hs_production_shares") or []) for r in results
+        ),
+        consolidation_additive_rows=dq_counts[_DQ_ADDITIVE],
+        consolidation_duplicate_suspect_rows=dq_counts[_DQ_DUPLICATE_SUSPECT],
+        total_capacity_shares=sum(
+            len(r.get("capacity_shares") or []) for r in results
+        ),
+    )
 
     return results
 

@@ -152,6 +152,36 @@ class MaterialAliasResolver:
             f"to seed_material_source_aliases.py and re-seed."
         )
 
+    def list_for_source(self, source_system: str) -> set[str]:
+        """Return the set of raw ``source_name`` values registered for a
+        ``source_system``, normalised the same way ``resolve`` normalises
+        lookups (``.strip().upper()``).
+
+        Use this when a parser needs to know "which raw headings should I
+        treat as known commodity anchors?"  Today that's the MCS PDF
+        regex fallback path — it walks the PDF text looking for all-caps
+        headings and needs to distinguish known commodity headings (which
+        start a section) from unknown ones (which only terminate the
+        previous section).
+
+        Cached the same as ``resolve``; subsequent calls are O(N) over
+        the in-process bucket, no extra DB roundtrip.
+
+        Section 4.4 fix (2026-06): replaces ad-hoc private-session access
+        (``self._resolver._session.scalars(...)``) in ``mcs_pdf_parser``.
+        """
+        self._ensure_loaded(source_system)
+        # _cache stores keys lowercased; recover the upper-cased canonical
+        # form by re-reading the underlying alias rows directly from cache
+        # values would lose the original case.  Re-query but keep result
+        # local to this call — the result is small (~30 rows for mcs_pdf).
+        rows = self._session.scalars(
+            select(MaterialSourceAlias).where(
+                MaterialSourceAlias.source_system == source_system
+            )
+        ).all()
+        return {r.source_name.strip().upper() for r in rows}
+
     def refresh(self) -> None:
         """Drop the in-process cache.  Call after seeding new aliases."""
         self._cache.clear()

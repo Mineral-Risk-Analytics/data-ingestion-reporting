@@ -27,6 +27,11 @@ class RiskEventDraft:
     risk_categories: list[str]
     geography: dict
     metadata: dict
+    # Typed event_subtype (migration 040 column).  Defaults to None for
+    # callers that set the value directly on RiskEvent.  Callers with a
+    # canonical mapping (SEC ingester via sec_subtype_map) populate this
+    # so the granular subtype flows through with the draft.
+    event_subtype: str | None = None
 
 
 def build_regulatory_risk_event(parsed: ParsedRegulation) -> RiskEventDraft:
@@ -66,29 +71,52 @@ def build_sec_filing_event(
     accession: str,
     filed_at: datetime | None,
     narrative: str | None,
+    items: list[str] | None = None,
 ) -> RiskEventDraft:
-    severity = 0.25
-    if form.upper() in {"8-K", "6-K"}:
-        severity += 0.15
-    if form.upper() == "10-K":
-        severity += 0.05
-    text = (narrative or "").lower()
-    if any(x in text for x in ("supply chain", "lithium", "battery", "sec 1502")):
-        severity += 0.10
+    """Build a RiskEventDraft from a SEC filing.
+
+    Replaces the pre-2026-05-23 hardcoded category/subtype/severity logic.
+    Routes form + items through ``sec_subtype_map.map_sec_filing`` which
+    is the single source of truth for:
+      * event_subtype (granular — drives aggregator bucketing)
+      * risk_category (which pillar's evidence query picks the event up)
+      * severity_bump (added to a small base to keep the dynamic range)
+
+    Multi-item 8-K filings select the highest-severity item (e.g. an 8-K
+    carrying both 2.04 DEBT_ACCELERATION and 9.01 ATTACHED_EXHIBITS
+    becomes a DEBT_ACCELERATION event; the full items list stays in
+    SourceDocument.metadata_json for audit).
+
+    The old narrative keyword bump ("supply chain"/"lithium"/"battery"/
+    "sec 1502") is removed because the narrative is currently a stub
+    placeholder (Workstream B will land real body-text extraction) and
+    the keyword bump was effectively dead.  When real narratives arrive,
+    add the bump back as a separate severity-adjustment layer rather
+    than inline here.
+    """
+    # Lazy import keeps the module dependency tree shallow — the mapping
+    # is SEC-specific while this normaliser also serves news and FR.
+    from app.services.ingestion.sec_subtype_map import map_sec_filing
+
+    subtype, category, severity_bump = map_sec_filing(form, items or [])
+    # Base severity stays small (0.10) so the bump (0.00 – 0.55) is the
+    # dominant component.  Old code centred on 0.25; new mapping centres
+    # the dynamic range on 0.10 + bump → 0.10–0.65, leaving 0.65–0.95
+    # headroom for future severity adjustments (Haiku classifier output,
+    # title keyword bumps once narratives land).
+    severity_score = min(0.95, 0.10 + severity_bump)
 
     return RiskEventDraft(
         event_type="sec_filing_signal",
         title=f"{form} — {company or 'issuer'}",
         summary=narrative[:4000] if narrative else None,
         event_date=filed_at,
-        severity_score=min(0.90, severity),
+        severity_score=severity_score,
         confidence_score=0.55,
-        risk_categories=[
-            # SEC filings map to financial_pressure; operational signals covered by other events
-            RiskCategory.FINANCIAL_PRESSURE.value,
-        ],
+        risk_categories=[category],
         geography={"issuer": company, "accession": accession},
-        metadata={"form": form},
+        metadata={"form": form, "items": items or []},
+        event_subtype=subtype,
     )
 
 

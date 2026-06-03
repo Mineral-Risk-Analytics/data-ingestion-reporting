@@ -6,7 +6,8 @@ material Y?".  Replaces four scattered Python dicts:
     mcs2026_parser._CHAPTER_TO_MATERIAL          → source_system='mcs_2026_csv'
     mcs2026_fig10_parser._PRICE_NAME_TO_MATERIAL → source_system='fig10_prices'
     mcs_pdf_parser._MCS_COMMODITY_MAP            → source_system='mcs_pdf'
-    usgs_mcs_parser._COMMODITY_CONFIG            → source_system='mcs_2025_csv'
+    (formerly usgs_mcs_parser._COMMODITY_CONFIG, ported here when the
+     2025 wide-format parser was removed 2026-05-24) → source_system='mcs_2025_csv'
 
 Format
 ------
@@ -190,11 +191,14 @@ _MCS_2026_CSV: list[_AliasRow] = [
 # ---------------------------------------------------------------------------
 # Source: USGS MCS 2025 wide-format CSV (mcs_2025_csv)
 #
-# Different commodity-name conventions than 2026.  Ported from
-# usgs_mcs_parser._COMMODITY_CONFIG.  USGS's trailing-whitespace quirks
-# are kept verbatim (``'Boron '``, ``'Iron Ore  '``) — the resolver
-# normalizes them; storing the raw form lets partner cross-check the CSV.
-# Note ``'Gemanium'`` (sic) is a USGS typo we have to match.
+# Different commodity-name conventions than 2026.  Ported from the
+# 2025 wide-format parser's ``_COMMODITY_CONFIG`` when that parser was
+# removed 2026-05-24.  USGS's trailing-whitespace quirks are kept verbatim
+# (``'Boron '``, ``'Iron Ore  '``) — the resolver normalizes them; storing
+# the raw form lets partner cross-check the CSV.  Note ``'Gemanium'`` (sic)
+# is a USGS typo we have to match.  Kept registered (even though no
+# ingester currently produces 2025-format records) so that a partner-
+# supplied old CSV can still be resolved against existing aliases.
 # ---------------------------------------------------------------------------
 
 _MCS_2025_CSV: list[_AliasRow] = [

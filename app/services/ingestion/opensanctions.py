@@ -845,6 +845,14 @@ def ingest_opensanctions(
 
         event = RiskEvent(
             event_type="sanctions_listing",
+            # 2026-05-19: event_subtype="EXPORT_RESTRICTION" added so
+            # these events feed the Geopolitical pillar's specific
+            # export_restriction_exposure sub-input (not just the broad
+            # event_score path).  Sanctions are functionally export
+            # restrictions on the named entities; the sub-input gating
+            # in evidence_aggregator.derive_geopolitical_inputs matches
+            # on event_subtype.
+            event_subtype="EXPORT_RESTRICTION",
             event_date=event_date,
             title=title,
             summary=summary,
@@ -1018,6 +1026,14 @@ def ingest_opensanctions(
 
         geo_event = RiskEvent(
             event_type="geography_sanctions_exposure",
+            # 2026-05-19: event_subtype="EXPORT_RESTRICTION" added —
+            # geography sanctions exposure is the aggregate "this
+            # country has accumulated sanctioned-entity volume" signal,
+            # which functionally restricts trade with that country
+            # broadly.  Routes into Geopolitical pillar's
+            # export_restriction_exposure sub-input alongside the
+            # company-listing events.
+            event_subtype="EXPORT_RESTRICTION",
             event_date=event_date,
             title=title,
             summary=summary,

@@ -23,7 +23,12 @@ Aggregation across multiple rows mapping to the same canonical
 (e.g. ``"Fluorspar, acid grade"`` + ``"Fluorspar, metallurgical grade"``
 both → ``"Fluorspar"``) happens in the CLI after resolution.
 
-Encoding: ``utf-8-sig`` to strip Fig 10's UTF-8 BOM.
+Encoding
+--------
+The MCS 2026 Fig 10 file is published as UTF-8 with BOM (``utf-8-sig``
+strips the BOM cleanly).  The parser falls back to ``cp1252`` on
+``UnicodeDecodeError`` for consistency with the main commodity CSV
+parser (see ``mcs2026_parser.parse_mcs2026_csv`` for the same pattern).
 """
 
 from __future__ import annotations
@@ -32,6 +37,15 @@ import csv
 from pathlib import Path
 from typing import Optional
 
+import structlog
+
+# Reuse the no-data sentinel set from the main parser so a future Fig 10
+# file using USGS sentinels (W, NA, em-dash, etc.) gets the same explicit
+# treatment as the commodity-data CSV.  Issue 9.1 fix (2026-05-31).
+from app.services.ingestion.seeds.mcs2026_parser import _NO_DATA_SENTINELS
+
+log = structlog.get_logger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Value parsing
@@ -39,16 +53,35 @@ from typing import Optional
 
 def _parse_pct(value: str) -> Optional[float]:
     """Parse a Fig 10 percent cell.  Returns a signed fraction (e.g.
-    ``"-24"`` → ``-0.24``).  Returns None for blank / unparseable cells.
+    ``"-24"`` → ``-0.24``).  Returns ``None`` for blank / unparseable /
+    sentinel cells.
 
     Fig 10 publishes whole-number percents (no decimals); the signed
     fraction representation matches how production_yoy_pct is stored.
+
+    Handles:
+      * blank / None                                  → None
+      * USGS no-data sentinels (W, NA, E, s, XX,
+        em-dash, en-dash, hyphen)                     → None
+      * bounded estimates ``">95"`` / ``"<10"``       → bound value as
+        signed fraction (direction-lossy, matching ``_parse_value`` in
+        the main parser).  Defensive; not observed in Fig 10 today.
+
+    Note: a bare ``"-"`` is treated as a no-data sentinel, NOT a negative
+    sign — that comes from the sentinel set.  Negative numbers like
+    ``"-24"`` parse correctly because float() handles the leading minus
+    while the sentinel check requires exact membership match.
     """
     if value is None:
         return None
     v = value.strip()
-    if not v:
+    if not v or v in _NO_DATA_SENTINELS:
         return None
+    # Strip bounded-estimate prefixes — direction-lossy but recovers the
+    # coarse signal value.  Real Fig 10 data doesn't use these today;
+    # included for parity with the main parser's _parse_value.
+    if v.startswith(">") or v.startswith("<"):
+        v = v[1:].strip()
     try:
         return float(v) / 100.0
     except ValueError:
@@ -67,19 +100,31 @@ def parse_mcs2026_fig10_csv(filepath: str | Path) -> list[dict]:
     CLI's job via ``material_resolver``.  Skipping (e.g. Iridium,
     Asbestos) and aggregation (Fluorspar grades, REE oxides) also
     happen downstream of resolution.
+
+    Encoding: tries ``utf-8-sig`` first (the format USGS publishes
+    today, BOM stripped), falls back to ``cp1252`` on ``UnicodeDecodeError``
+    to future-proof against a publication format switch.  Issue 9.6
+    fix (2026-05-31).
     """
     filepath = Path(filepath)
-    # utf-8-sig strips the UTF-8 BOM that Fig 10 ships with.
-    with open(filepath, encoding="utf-8-sig") as f:
-        rows = list(csv.DictReader(f))
+
+    # Issue 9.6 (2026-05-31): try utf-8-sig first, cp1252 fallback.
+    try:
+        with open(filepath, encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+    except UnicodeDecodeError:
+        log.debug("fig10_parser.encoding_fallback_cp1252", path=str(filepath))
+        with open(filepath, encoding="cp1252") as f:
+            rows = list(csv.DictReader(f))
 
     records: list[dict] = []
+    skipped_no_signal = 0
     for r in rows:
-        # Strip whitespace from the keying field — Fig 10 occasionally
-        # ships rows with trailing spaces ("Nickel ", "Platinum ",
-        # "Tungsten, concentrate ").  The alias resolver normalises with
-        # btrim+lower on lookup, so storing the trimmed form here is
-        # safe and avoids subtle dedupe issues.
+        # Issue 9.2 (2026-05-31): strip whitespace as defensive
+        # normalization.  Earlier MCS editions had occasional trailing-
+        # space rows; the current 2026 file has none.  The alias resolver
+        # normalizes via btrim+lower on lookup so storing the trimmed
+        # form here avoids subtle dedupe issues regardless.
         raw_name = (r.get("critical_mineral_priced") or "").strip()
         if not raw_name:
             continue
@@ -90,7 +135,15 @@ def parse_mcs2026_fig10_csv(filepath: str | Path) -> list[dict]:
         cagr = _parse_pct(raw_cagr)
 
         # Skip rows where both metrics are missing — they carry no signal.
+        # Issue 9.5 (2026-05-31): log the skip for observability.
         if yoy is None and cagr is None:
+            skipped_no_signal += 1
+            log.debug(
+                "fig10_parser.row_skipped_no_signal",
+                source_name=raw_name,
+                raw_pch=raw_pch,
+                raw_cagr=raw_cagr,
+            )
             continue
 
         records.append({
@@ -102,6 +155,11 @@ def parse_mcs2026_fig10_csv(filepath: str | Path) -> list[dict]:
             "raw_cagr":           raw_cagr,
         })
 
+    log.info(
+        "fig10_parser.run_summary",
+        records_emitted=len(records),
+        rows_skipped_no_signal=skipped_no_signal,
+    )
     return records
 
 
