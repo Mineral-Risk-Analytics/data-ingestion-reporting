@@ -3,9 +3,19 @@
 Fetches bilateral export data (flowCode=X, partnerCode=0 = world aggregate)
 from the UN Comtrade API v1 and upserts normalised rows into ``trade_flows``.
 
-Data links to the Material Concentration pillar (30% weight) of the supply
-chain risk scoring model — which countries control what share of exports for
-battery-critical materials.
+Where this data lands in the scoring engine
+-------------------------------------------
+Trade flows feed two sub-inputs through ``trade_signal_builder``:
+
+  * ``trade_volatility`` sub-input of the Material Concentration pillar
+    (30% of that pillar; pillar is 25% of the company score, so effective
+    weight ≈ 7.5%).
+  * ``country_concentration`` sub-input of the Geopolitical / Trade pillar
+    via TRADE_CONCENTRATION events (40% of that pillar; pillar is 20% of
+    the company score, so effective weight up to ~8% per event).
+
+Plus EXPORT_DROP / IMPORT_DROP events that contribute to the
+export-restriction and import-disruption sub-inputs of the same pillars.
 
 Important notes
 ---------------
@@ -87,8 +97,22 @@ CONSUMER_COUNTRIES: dict[str, int] = {
     "FR": 251,  "GB": 826,  "BE": 56,   "IN": 699,
 }
 
-# Reverse map: Comtrade numeric code → ISO2. Used to translate partner codes.
-# Re-built at runtime by get_reporter_countries() when the DB is available.
+# Reverse map: Comtrade numeric code → ISO2.  Used by parse_comtrade_rows()
+# to translate the partner-country numeric code returned by the API back to
+# ISO2 for storage in trade_flows.partner_country.
+#
+# Initial value covers the hardcoded REPORTER_COUNTRIES fallback.  Re-built
+# inside ingest_comtrade() (NOT inside get_reporter_countries()) from the
+# DB-resolved reporter set so the partner-code translation tracks whatever
+# countries the current ingest run targets.  Module-level mutation is
+# intentional but works only because ingest is single-threaded; if parallel
+# ingest is ever added, move this onto the ingest call's state.
+#
+# Reserved for future bilateral-flow support.  Today every call uses
+# partnerCode=WORLD_PARTNER_CODE so every row's partner_country lands as
+# "WLD" — the numeric → ISO2 translation has never been exercised against
+# real data.  When bilateral fetch lands (e.g. "CN→US specifically"), this
+# map is what makes the partner_country column meaningful.
 _CODE_TO_ISO2: dict[int, str] = {v: k for k, v in REPORTER_COUNTRIES.items()}
 
 # Comtrade uses 0 for "all partners" (world aggregate).
@@ -151,19 +175,42 @@ _API_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=15.0, pool=15.0)
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 5.0  # seconds; doubles on each retry
 
-# Circuit breaker: stop the ingester when the daily rate limit is clearly
-# exhausted.  Comtrade free tier caps at ~500 calls/day; once we hit it,
-# every remaining call just burns ~35s on doomed in-request retries.
-# When this many CONSECUTIVE rate-limit errors come back from the outer
-# loop, abort the run with a clear message rather than grinding for hours.
-# Threshold of 3 = 3 × 3 in-request retries = 9 actual 429 responses,
-# which is definitive.  Any successful call resets the counter, so
-# transient blips don't trigger it.
-_RATE_LIMIT_BREAKER_THRESHOLD = 3
+# Circuit breaker: stop the ingester when the daily rate limit is exhausted.
+#
+# Comtrade returns HTTP 429 for two conditions:
+#   1. Per-second rate limit hit — transient.  Resolves in ≤2 seconds.
+#      Our 5/10/20-sec exponential backoff inside `_comtrade_get` handles
+#      this comfortably.
+#   2. Daily quota exhausted — persistent.  No amount of backoff resolves
+#      this until the daily counter resets at midnight UTC.
+#
+# By the time `_comtrade_get` raises an HTTPStatusError(429), all 3 inner
+# retries (35 seconds of cumulative backoff) have already failed.  That
+# means the transient case has been fully exercised — anything that
+# survives those 35 seconds is effectively the persistent case.  We
+# therefore trip the breaker on a SINGLE such failure rather than
+# accumulating consecutive ones.  Trade-off: a 30-second-plus API
+# outage could be misread as quota exhaustion and end the daily run
+# early.  Cost of that false positive is low — the Inngest daily cron
+# recovers tomorrow either way, and the source-document dedup means
+# already-ingested batches consume zero quota on the next run.
+#
+# Comtrade rate-limit reference (verified against UN Comtrade docs):
+#   Basic Individual (free, our tier today): 500 calls/day, 1 call/sec
+#   Premium Individual:                      5,000 calls/day, 5 calls/sec
+#   Premium Institutional / Pro:             Unlimited per day, 5 calls/sec
+_RATE_LIMIT_BREAKER_THRESHOLD = 1
 
 
 class ComtradeRateLimitExhausted(Exception):
-    """Raised when the outer-loop circuit breaker trips on consecutive 429s.
+    """Raised when the outer-loop circuit breaker trips on a 429 that
+    survives the in-request retry layer.
+
+    The in-request layer already exercises 35 seconds of cumulative
+    backoff (5/10/20 sec exponential).  A 429 that comes back after all
+    that backoff is overwhelmingly likely to be a persistent
+    daily-quota exhaustion (vs. a transient per-second rate limit
+    that the backoff would have resolved).
 
     Carries enough context so the caller can resume the run later — the
     per-iteration commit means everything fetched so far is already in
@@ -172,8 +219,8 @@ class ComtradeRateLimitExhausted(Exception):
 
     def __init__(self, consecutive_count: int, last_reporter: str, last_year: int) -> None:
         super().__init__(
-            f"Comtrade rate limit appears exhausted: {consecutive_count} consecutive "
-            f"429-after-retries failures (last attempt: reporter={last_reporter}, "
+            f"Comtrade rate limit appears exhausted: {consecutive_count} "
+            f"429-after-retries failure(s) (last attempt: reporter={last_reporter}, "
             f"year={last_year}).  Re-run later — already-ingested rows will be "
             f"skipped via the source-document dedup."
         )
@@ -230,12 +277,17 @@ def _comtrade_get(
             if isinstance(data, dict) and data.get("error"):
                 raise ValueError(f"Comtrade API error: {data['error']}")
             return data
-        except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError) as exc:
+            # ConnectError covers DNS hiccups and transient TLS / handshake
+            # failures — same retry policy as the timeouts above.  Without
+            # this, a single DNS blip raises out of the function and the
+            # whole batch counts as an error rather than being retried.
             delay = _RETRY_BASE_DELAY * (2 ** attempt)
             log.warning(
-                "comtrade.timeout",
+                "comtrade.transient_network_error",
                 attempt=attempt + 1,
                 retry_in_seconds=delay,
+                error_type=type(exc).__name__,
                 error=str(exc),
             )
             time.sleep(delay)
@@ -259,13 +311,30 @@ def fetch_annual_exports(
 ) -> list[dict]:
     """Fetch annual trade records for one reporter × HS prefix × year.
 
+    Despite the name ("annual exports"), this function ingests both
+    exports (``flow_code='X'``) and imports (``flow_code='M'``).  The
+    name is preserved because ``ingest_comtrade`` and the test suite
+    both import it by this name; renaming would break those callers.
+
     Args:
         flow_code: ``"X"`` for exports (default), ``"M"`` for imports.
                    Both use ``partnerCode=0`` (world aggregate).
 
     Returns the list of data rows from the Comtrade response, or [] if no data.
     Each row is a raw dict from the API ``data`` array.
+
+    Granularity: ``breakdownMode='plus'`` returns the extended breakdown
+    (one row per 6-digit subheading reported), instead of Comtrade's
+    default ``'classic'`` aggregation that returns one aggregated row
+    at the queried level.  Without ``'plus'``, querying ``cmdCode='8507'``
+    returns a single aggregated row at hs_code='8507'; with ``'plus'``,
+    we get individual rows at hs_code='850710' (lead-acid),
+    '850760' (lithium-ion), etc. — which is what the engine&#x2019;s
+    HS-mapping-driven material attribution depends on for stage
+    differentiation.  API call count stays the same; row count per
+    response grows by 1-20x typical.
     """
+    settings = get_settings()
     endpoint = f"{base_url}/C/A/HS"
     params = {
         "reporterCode": reporter_code,
@@ -273,8 +342,9 @@ def fetch_annual_exports(
         "period": year,
         "cmdCode": hs_prefix,
         "flowCode": flow_code,
-        "maxRecords": 100000,
+        "maxRecords": settings.comtrade_max_records,
         "includeDesc": "true",
+        "breakdownMode": "plus",
     }
 
     log.info(
@@ -303,7 +373,8 @@ def parse_comtrade_rows(
     """Normalise raw Comtrade API rows into TradeFlow insert dicts.
 
     Returns dicts with keys matching TradeFlow columns. Skips rows where both
-    ``trade_value_usd`` and ``quantity`` are None or zero.
+    ``trade_value_usd`` and ``quantity`` are None or zero — Comtrade reports
+    "no trade observed" rows as zero, and they carry no scoring signal.
 
     Converts numeric ``partnerCode`` to ISO2 using the reverse of
     ``REPORTER_COUNTRIES``; falls back to ``str(partnerCode)`` for unknown codes.
@@ -311,6 +382,11 @@ def parse_comtrade_rows(
 
     ``flow_code`` sets ``import_export_flag``: ``"X"`` → ``"export"``,
     ``"M"`` → ``"import"``.  Defaults to ``"X"`` for backward compatibility.
+
+    ``quantity_unit`` is read from the response&#x2019;s ``qtyUnitAbbr`` field
+    (which is typically ``"kg"`` for Comtrade since ``netWgt`` is reported
+    in kilograms).  Falls back to ``"kg"`` when the field is missing — safer
+    than NULL when we want downstream code to assume kilograms.
     """
     _FLOW_FLAG = {"X": "export", "M": "import"}
     results: list[dict] = []
@@ -329,7 +405,12 @@ def parse_comtrade_rows(
         except (TypeError, ValueError):
             quantity = None
 
-        # Skip rows with no meaningful data
+        # Skip rows with no meaningful data.  A row where both the value
+        # and the quantity are zero (or absent) is Comtrade&#x2019;s way of
+        # saying "no trade observed for this (reporter, partner, period,
+        # commodity) tuple" — keeping such rows would inflate trade_flows
+        # with empty observations that downstream scoring would have to
+        # filter anyway.
         if (trade_value_usd is None or trade_value_usd == 0) and (
             quantity is None or quantity == 0
         ):
@@ -345,6 +426,14 @@ def parse_comtrade_rows(
             except (TypeError, ValueError):
                 partner_country = str(partner_code) if partner_code is not None else "UNK"
 
+        # 3.3 fix: read the unit from the response rather than hardcoding
+        # "kg".  Comtrade&#x2019;s netWgt is always in kilograms today (so
+        # qtyUnitAbbr is always "kg"), but reading the field defends against
+        # a future Comtrade convention change without us silently mis-
+        # labelling the unit.
+        quantity_unit_raw = row.get("qtyUnitAbbr") if quantity is not None else None
+        quantity_unit = (quantity_unit_raw or "kg") if quantity is not None else None
+
         results.append(
             {
                 "period": str(year),
@@ -354,7 +443,7 @@ def parse_comtrade_rows(
                 "hs_description": row.get("cmdDesc") or None,
                 "import_export_flag": _FLOW_FLAG.get(flow_code, flow_code),
                 "quantity": quantity,
-                "quantity_unit": "kg" if quantity is not None else None,
+                "quantity_unit": quantity_unit,
                 "trade_value_usd": trade_value_usd,
                 "metadata_json": {
                     "comtrade_flow_code": flow_code,

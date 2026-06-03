@@ -967,6 +967,56 @@ def seed_material_aliases_cmd(
         s.close()
 
 
+@app.command("seed-country-material-relevance")
+def seed_country_material_relevance_cmd(
+    force_update: bool = typer.Option(
+        False,
+        "--force-update",
+        help=(
+            "Overwrite partner-curated rows in addition to the auto-derived "
+            "MCS-share rows.  Without this flag, partner edits to tier / "
+            "is_hcg / notes survive re-seed; MCS-sourced producer rows "
+            "always refresh from the latest material_production_shares."
+        ),
+    ),
+) -> None:
+    """Seed per-(country, material, role) relevance flags.
+
+    Producer rows are auto-derived from material_production_shares using
+    share-based thresholds:
+        tier='top'   when share >= 30%
+        tier='mid'   when 10% <= share < 30%
+        tier='minor' when 1%  <= share < 10%
+        is_hcg=TRUE  when share >= 40%
+
+    Consumer rows are seeded as partner-curated placeholders at
+    tier='minor' for each launch material x is_major_consumer country.
+    Partner refines tier values over time; Phase 2 may auto-derive from
+    Comtrade import shares once that data is fully backfilled.
+
+    Scope: the 10 launch-list materials (Lithium, Cobalt, Nickel,
+    Manganese, Natural Graphite, Phosphate (Battery Grade), Iron Ore
+    (LFP Grade), Copper, Aluminum, Rare Earth Elements).
+
+    Prerequisites: seed-materials, seed-countries, ingest-usgs (so
+    material_production_shares has data).
+
+    Idempotent without --force-update: re-running refreshes MCS-derived
+    rows from the latest USGS data while preserving partner edits.
+    """
+    from app.services.ingestion.seed_country_material_relevance import run_seed
+
+    s = _session()
+    try:
+        result = run_seed(s, force_update=force_update)
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("seed-regulation-aliases")
 def seed_regulation_aliases_cmd(
     force_update: bool = typer.Option(

@@ -180,6 +180,26 @@ class CountryShareItem(BaseModel):
     share_pct: int  # rounded integer percentage, e.g. 47
 
 
+class CountryMaterialRelevanceItem(BaseModel):
+    """One row from country_material_relevance — a per-(material, country, role)
+    relevance flag with partner-curation surface.
+
+    Producer rows are auto-derived from material_production_shares; consumer
+    rows are initial placeholders or partner-curated.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    country_code: str               # ISO-3166-1 alpha-2
+    country_name: Optional[str] = None  # joined from countries.name when available
+    role: str                       # 'producer' | 'consumer'
+    tier: Optional[str] = None      # 'top' | 'mid' | 'minor' | 'emerging'
+    is_hcg: bool
+    source: str                     # 'mcs_share' | 'partner_curated' | 'derived'
+    derived_share: Optional[float] = None
+    reference_year: Optional[int] = None
+    notes: Optional[str] = None
+
+
 class MaterialListPillarScore(BaseModel):
     """One pillar's score for the Materials list row.
 

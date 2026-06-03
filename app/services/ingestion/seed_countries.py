@@ -834,12 +834,19 @@ _COUNTRIES: list[dict] = [
     # ── Bloc identifiers (not ISO 3166 countries) ────────────────────────────
     {
         "iso2": "EU", "name": "European Union", "iso3": None, "region": "Europe",
-        "comtrade_code": None,
+        "comtrade_code": 97,
         "common_names": ["European Union", "EU"],
         "detection_patterns": None,
         "is_sanctions_risk": False,
         "is_major_producer": False, "is_major_consumer": True,
-        "notes": "Bloc identifier used in regulation_geography_scope and risk_event_geography.",
+        "notes": (
+            "Bloc identifier used in regulation_geography_scope and "
+            "risk_event_geography. Comtrade reporterCode 97 returns "
+            "extra-EU trade only (intra-EU flows are NOT included); the "
+            "individual member-state reporters (DE, FR, BE, etc.) carry "
+            "their full trade including intra-EU. Use EU=97 for bloc-level "
+            "scoring views; use member states for individual-country views."
+        ),
     },
 
     # ── Added 2026-05-09: countries appearing in MCS 2026 World Production

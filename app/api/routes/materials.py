@@ -20,7 +20,9 @@ from app.models.facility import FacilityMaterialLink
 from app.models.regulatory import RiskEvent, RiskEventHsMapping, RiskEventMaterial
 from app.models.reporting import AnalystNote
 from app.models.scoring import HsCodeGeographyRiskScore, MaterialGlobalRiskScore
+from app.models.country import Country
 from app.models.supply import (
+    CountryMaterialRelevance,
     HsCodeMaterialMapping,
     HsCodeProductionShare,
     Material,
@@ -29,6 +31,7 @@ from app.models.supply import (
 from app.services.scoring.launch_list import LAUNCH_LIST_CANONICAL_NAMES
 from app.schemas.common import PaginatedResponse, VerifiedResponse, VerifiedUpdate
 from app.schemas.materials import (
+    CountryMaterialRelevanceItem,
     CountryShareItem,
     HsMappingGeographyRead,
     HsMappingRead,
@@ -798,6 +801,76 @@ def list_material_hs_mappings(
     return [
         _annotate_mapping(m, mat, cross_mapped, aggregates)
         for m in mappings
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Country-material relevance — Phase 1 read endpoint
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/materials/{material_id}/country-relevance",
+    response_model=list[CountryMaterialRelevanceItem],
+)
+def list_material_country_relevance(
+    material_id: int,
+    role: Optional[str] = Query(
+        None,
+        pattern="^(producer|consumer)$",
+        description="Filter to producer or consumer rows only.  Omit for both.",
+    ),
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[CountryMaterialRelevanceItem]:
+    """List per-country relevance flags for one material.
+
+    Returns producer rows auto-derived from material_production_shares
+    plus consumer rows seeded as partner-curated placeholders. Each row
+    carries:
+
+      * country_code + country_name
+      * role ('producer' | 'consumer')
+      * tier ('top' | 'mid' | 'minor' | 'emerging' | null)
+      * is_hcg (High-Concentration Geography flag, per-(material, country))
+      * source ('mcs_share' | 'partner_curated' | 'derived')
+      * derived_share + reference_year (where applicable)
+      * notes
+
+    Phase 1: read-only. Partner curation happens via the seed CLI today;
+    a dedicated PATCH endpoint lands in Phase 2 when the scoring engine
+    starts reading is_hcg from this table.
+    """
+    _get_material_or_404(db, material_id)
+
+    q = (
+        select(CountryMaterialRelevance, Country.name)
+        .outerjoin(Country, Country.iso2 == CountryMaterialRelevance.country_code)
+        .where(CountryMaterialRelevance.material_id == material_id)
+    )
+    if role is not None:
+        q = q.where(CountryMaterialRelevance.role == role)
+    q = q.order_by(
+        CountryMaterialRelevance.role,
+        # Producers sort by share descending so the top countries appear first;
+        # consumers (no share) sort by country code.
+        CountryMaterialRelevance.derived_share.desc().nullslast(),
+        CountryMaterialRelevance.country_code,
+    )
+
+    rows = db.execute(q).all()
+    return [
+        CountryMaterialRelevanceItem(
+            country_code=rel.country_code,
+            country_name=country_name,
+            role=rel.role,
+            tier=rel.tier,
+            is_hcg=rel.is_hcg,
+            source=rel.source,
+            derived_share=rel.derived_share,
+            reference_year=rel.reference_year,
+            notes=rel.notes,
+        )
+        for rel, country_name in rows
     ]
 
 

@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     comtrade_api_key: str = ""
     comtrade_base_url: str = "https://comtradeapi.un.org/data/v1/get"
     comtrade_rate_limit_delay: float = 1.0  # seconds between API calls
+    # Max records per call.  Tier-dependent: 100,000 for Basic Individual
+    # (our current tier), 250,000 for Premium tiers.  Bump when upgrading
+    # the subscription so we don't silently bottleneck.
+    comtrade_max_records: int = 100_000
 
     # Clerk auth (JWT via JWKS)
     # When clerk_jwks_url is empty AND app_env == "development", auth is bypassed
