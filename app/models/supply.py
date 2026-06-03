@@ -223,6 +223,79 @@ class MaterialProductionShare(Base):
     material: Mapped["Material"] = relationship(back_populates="production_shares")
 
 
+class MaterialCapacityShare(Base):
+    """
+    Country-level installed capacity volume and share for a material in a given year.
+    Distinct from ``MaterialProductionShare``: capacity = theoretical maximum
+    output; production = actual delivered tonnes.  Together they enable
+    spare-capacity / utilization-overhang signals in scoring.
+
+    Granularity: material × country × year × detail_type.  ``detail_type``
+    is the verbatim USGS ``Statistics_detail`` string (e.g. "Smelter capacity",
+    "Refinery capacity", "Titanium sponge metal Capacity", "TiO2 Pigment
+    Capacity").  Required because some chapters publish multiple capacity
+    streams under one canonical material (TITANIUM has both sponge metal
+    AND TiO2 pigment capacities — different products, same material).
+
+    ``capacity_share`` is computed per (material × year × detail_type)
+    bucket so multi-stream chapters don't produce shares > 1.0.
+
+    Populated by ``bdi-ingest ingest-usgs`` from MCS 2026 Capacity rows.
+    Added by migration 045 (2026-05-31).
+    """
+
+    __tablename__ = "material_capacity_shares"
+    __table_args__ = (
+        UniqueConstraint(
+            "material_id", "country_code", "reference_year", "detail_type",
+            name="uq_material_capacity_share",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    material_id: Mapped[int] = mapped_column(
+        ForeignKey("materials.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    country_code: Mapped[str] = mapped_column(String(2), nullable=False, index=True)
+    reference_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    detail_type: Mapped[str] = mapped_column(
+        String(128),
+        nullable=False,
+        comment=(
+            "Verbatim MCS Statistics_detail. Distinguishes capacity streams "
+            "within a chapter (TITANIUM: 'Titanium sponge metal Capacity' vs "
+            "'TiO2 Pigment Capacity')."
+        ),
+    )
+    capacity_volume: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Raw capacity volume from MCS (unit in unit_of_measure)",
+    )
+    capacity_share: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+        comment=(
+            "Fraction of world capacity within this (material, year, detail_type) "
+            "bucket (0.0–1.0)."
+        ),
+    )
+    unit_of_measure: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="Unit from MCS Unit column, e.g. 'metric tons', 'kilograms'",
+    )
+    data_source: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="usgs_mcs",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class TradeFlow(Base):
     """
     A single import or export observation from Comtrade trade data.

@@ -406,7 +406,7 @@ G-Cov-4 detectors to article text.
 1. ~~**G-Cov-1**~~ — OpenSanctions regulatory category.  Done; ingester updated, backfill via SQL UPDATE OR re-ingest after pulling latest.
 2. ~~**G-Cov-2**~~ — GTA `EXPORT_RESTRICTION` → Operational pillar.  Done; `_export_restriction_operational_impacts()` helper writes half-weighted impacts, synthetic test passes.
 
-Both verified end-to-end in `Automotive Data Solutions/test_gcov_1_2.py`.
+Both verified end-to-end in `scripts/audit/test_gcov_1_2.py`.
 
 ### Future bundle (post-G4c)
 

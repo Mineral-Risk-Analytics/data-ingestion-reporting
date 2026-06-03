@@ -5,19 +5,33 @@ Parses USGS Mineral Commodity Summaries annual PDF using pdfplumber.
 Extracts per-commodity:
   1. Tariff tables (10-digit US HTS codes) → hs_code_material_mappings (market_scope='us')
   2. Derived 6-digit global rows → hs_code_material_mappings (market_scope='global')
-  3. Production leaders → hs_code_production_shares (market_scope='global')
-  4. Import sources → hs_code_production_shares (market_scope='us')
-  5. Salient notes → MaterialCriticalitySignal.metadata_json
+  3. Salient notes → MaterialCriticalitySignal.metadata_json (write-only today;
+     no downstream reader, retained as a forward-compatibility hook)
 
 Insert order per commodity (must follow this sequence):
   1. 10-digit US HTS rows (INSERT ... ON CONFLICT DO NOTHING)
   2. Derived 6-digit global rows (INSERT ... ON CONFLICT DO NOTHING)
   3. SELECT back hs_mapping_id for every inserted or pre-existing row
-  4. Insert hs_code_production_shares using those IDs
 
-Steps 1–2 must complete before step 4 because hs_code_production_shares.hs_mapping_id
-is a non-nullable FK.  An ON CONFLICT DO NOTHING row that already exists must still have
-its ID retrieved via a follow-up SELECT — do NOT assume the ID from the initial insert.
+Steps 1–2 use ON CONFLICT DO NOTHING so re-runs are safe.  Pre-existing rows
+must still have their IDs retrieved via a follow-up SELECT — do NOT assume
+the ID from the initial insert.
+
+Section 5 cleanup (2026-06)
+----------------------------
+Removed the per-country world-production extractor (``_parse_production_leaders``)
+and its DB write path (Step 4a + ``_pick_production_hs_id`` +
+``_upsert_production_share``).  Real-PDF audit confirmed the extractor
+produced 0 rows against MCS 2026 layout, and the CSV path
+(``mcs2026_parser._hs_production_shares`` → 413 production-share rows in
+``hs_code_production_shares`` with market_scope='global') has been the
+sole populator of that table since May 2026.  The PDF parser's promise
+to deliver per-country shares predated the CSV refactor and was
+vestigial.  Tariff codes (Steps 1-2 above) are still uniquely the PDF
+parser's job; the CSV path doesn't capture HS codes.
+
+Removed in the same pass: ``_parse_import_sources`` continues to run for
+diagnostic purposes (Step 4b stays disabled — see in-line note).
 
 See docs/hs-code-redesign.md § MCS PDF Parser Plan for the full specification.
 """
@@ -34,7 +48,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.models.supply import HsCodeMaterialMapping, HsCodeProductionShare, Material
+from app.models.supply import HsCodeMaterialMapping, Material
 from app.models.criticality_signal import MaterialCriticalitySignal
 
 if TYPE_CHECKING:
@@ -45,88 +59,29 @@ log = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 # Commodity name normalisation — PDF all-caps headings → materials.canonical_name
 # ---------------------------------------------------------------------------
-# This dict is now DEPRECATED — the same mappings live in
-# ``material_source_aliases`` (source_system='mcs_pdf').  The regex
-# fallback path uses ``MaterialAliasResolver``; this dict is retained
-# only as a build-time fallback for callers that haven't been updated
-# yet.  Will be removed once all callers pass a resolver.
-
-_MCS_COMMODITY_MAP: dict[str, str] = {
-    "COBALT":                   "Cobalt",
-    "LITHIUM":                  "Lithium",
-    "NICKEL":                   "Nickel",
-    "MANGANESE":                "Manganese",
-    "GRAPHITE (NATURAL)":       "Natural Graphite",
-    "RARE EARTHS":              "Rare Earth Elements",
-    "PLATINUM-GROUP METALS":    "Platinum-Group Metals",
-    "ALUMINUM":                 "Aluminum",
-    "COPPER":                   "Copper",
-    "SILICON":                  "Silicon (Anode Grade)",
-    "TITANIUM":                 "Titanium",
-    "CHROMIUM":                 "Chromium",
-    "TUNGSTEN":                 "Tungsten",
-    "MOLYBDENUM":               "Molybdenum",
-    "VANADIUM":                 "Vanadium",
-    "NIOBIUM":                  "Niobium",
-    "TANTALUM":                 "Tantalum",
-    "TIN":                      "Tin",
-    "ZINC":                     "Zinc",
-    "BORON":                    "Boron",
-    "FLUORSPAR":                "Fluorspar",
-    "MAGNESIUM":                "Magnesium",
-    "IRON ORE":                 "Iron Ore (LFP Grade)",
-    "SILVER":                   "Silver",
-    "GALLIUM":                  "Gallium",
-    "GERMANIUM":                "Germanium",
-    "INDIUM":                   "Indium",
-    "ANTIMONY":                 "Antimony",
-    "ZIRCONIUM AND HAFNIUM":    "Zirconium",
-    # Sodium-ion battery cathode precursor — MCS publishes Na2CO3 production
-    # under the SODA ASH chapter.  After the May 2026 partner-CSV review the
-    # canonical material was kept as "Sodium" with multiple HS prefixes
-    # (NaOH, Na phosphate, Na2CO3, peroxometallates) rather than narrowed
-    # to just sodium carbonate.
-    "SODA ASH":                 "Sodium",
-    # Add entries as new commodities are covered by MCS
-}
+# REMOVED 2026-06 (Section 4.3 fix): the legacy ``_MCS_COMMODITY_MAP`` dict
+# was deleted.  The single source of truth for "PDF heading → canonical
+# material" is now ``material_source_aliases`` (source_system='mcs_pdf').
+# Resolution happens via ``MaterialAliasResolver``, which the regex
+# fallback path (Path B) requires.  Path B will raise ``RuntimeError`` if
+# constructed without a resolver — matching the docstring contract.
+# Path A (LLM locator) gets canonical names directly from the LLM result
+# and does not need a resolver.
+#
+# See app/services/ingestion/seed_material_source_aliases.py for the
+# current alias rows (source_system='mcs_pdf').
 
 # ---------------------------------------------------------------------------
-# Stage preference for world mine production share linkage.
-# ---------------------------------------------------------------------------
-# Maps canonical material name → preferred supply_chain_stage for the
-# hs_code_production_shares row that anchors world production shares from
-# the MCS PDF.  Used by ``_pick_production_hs_id``.
+# Removed 2026-06 (Section 5.1 cleanup):
+#   ``_MCS_PRODUCTION_STAGE_PREFERENCE`` + ``_MCS_PRODUCTION_STAGE_PREFERENCE_DEFAULT``
+# The PDF parser no longer writes per-country world-production rows
+# (``_parse_production_leaders`` + ``_pick_production_hs_id`` deleted).
+# The CSV path (``mcs2026_parser._hs_production_shares``) is the sole
+# populator of ``hs_code_production_shares`` for market_scope='global'.
 #
-# Default for any material NOT listed here: "ore" — most MCS commodities
-# report mine production tonnages at the ore stage.  The dict carries
-# ONLY the exceptions where USGS reports production at a different stage.
-# Trimmed in May 2026 from 30 entries to 5; redundant defaults removed.
-#
-# When adding a new material that doesn't have an ore-stage HS prefix
-# (e.g. a co-product like Gallium that's only recovered during refining),
-# add an entry here.  Otherwise leave it out and the default takes over.
-
-_MCS_PRODUCTION_STAGE_PREFERENCE_DEFAULT = "ore"
-
-_MCS_PRODUCTION_STAGE_PREFERENCE: dict[str, str] = {
-    # Co-products of zinc/copper refining — no standalone "ore" stage.
-    # First appearance in the supply chain is as a refined metal
-    # recovered during smelter operations.
-    "Gallium":   "refined",
-    "Germanium": "refined",
-    "Indium":    "refined",
-    # USGS reports silicon-metal world production at the refined stage
-    # (HS 280461 — silicon-metal ≥99.99%).  Quartz mining is upstream of
-    # MCS's silicon chapter, not reported there.
-    "Silicon (Anode Grade)": "refined",
-    # USGS reports under the SODA ASH chapter; soda ash (Na2CO3) is the
-    # battery-grade input for Na-ion cathode synthesis (Na2CO3 → cathode
-    # active material).  Without this override the function's lowest-
-    # stage-sequence fallback would land production data on caustic-soda
-    # intermediate (281511), which is the wrong stage for our scoring.
-    "Sodium":    "battery_grade",
-}
-
+# If a future schema change reintroduces per-country PDF extraction,
+# the stage-preference dict can be reinstated; until then it's dead
+# configuration.
 # ---------------------------------------------------------------------------
 # Stage assignment for parser-derived 6-digit and 10-digit rows
 # ---------------------------------------------------------------------------
@@ -153,10 +108,18 @@ _MCS_PRODUCTION_STAGE_PREFERENCE: dict[str, str] = {
 # 10-digit US HTS code in HHHH.SS.XXXX format
 _HTS_CODE_RE = re.compile(r'\b(\d{4}\.\d{2}\.\d{4})\b')
 
-# Import sources section header — year range varies by material and edition
-# e.g. "Import Sources (2021–24):" or "Import Sources (2020-2024):"
+# Import sources section header — year range varies by material and edition,
+# AND some chapters add qualifiers inside the parens:
+#   "Import Sources (2021–24):"            ← most common
+#   "Import Sources (2020-2024):"          ← 4-digit end year variant
+#   "Import Sources (2021–24, by value):"  ← 2 occurrences in MCS 2026
+# Permissive content match (Section 1.1 fix 2026-05-31): accept any
+# non-empty parenthesised content so the "by value" variant + future
+# qualifier additions don't silently drop import-source data.  The
+# tighter validation lives downstream in ``_parse_import_sources``
+# which extracts the year range via _IMPORT_PCT_RE-adjacent patterns.
 _IMPORT_SOURCES_RE = re.compile(
-    r'Import Sources\s*\(\d{4}[–\-]\d{2,4}\)\s*:',
+    r'Import Sources\s*\([^)]+\)\s*:',
     re.IGNORECASE,
 )
 
@@ -175,7 +138,8 @@ _IMPORT_PCT_RE = re.compile(r'([A-Za-z][A-Za-z\s\(\)\-\.\']+?),\s*(\d+(?:\.\d+)?
 # Statistics sections, so the parsed body is the back-half of the chapter).
 # This was the root cause of the 2026-05 zero-row results for Aluminum,
 # Bauxite/Alumina, and Iron Ore.  Group 1 captures the heading text without
-# the footnote so callers can use it for `_MCS_COMMODITY_MAP` lookup.
+# the footnote so callers can use it for material_source_aliases lookup
+# (source_system='mcs_pdf').
 _COMMODITY_HEADING_RE = re.compile(
     r'^([A-Z][A-Z\s\(\)\-]+[A-Z])(?:[\d¹²³⁴⁵⁶⁷⁸⁹⁰]+)?\s*$'
 )
@@ -200,13 +164,8 @@ class TariffEntry:
     confidence: float = 1.0
 
 
-@dataclass
-class ProductionShare:
-    """One country row from MCS world mine production table."""
-    country_name: str      # raw name from PDF; resolved to ISO-2 by the seeder
-    production_value: float
-    reference_year: int
-    is_estimate: bool = False
+# ProductionShare dataclass removed 2026-06 (Section 5.1 cleanup) —
+# see file header for rationale.
 
 
 @dataclass
@@ -219,11 +178,14 @@ class ImportSource:
 
 @dataclass
 class CommoditySection:
-    """All parsed data for one MCS commodity section."""
+    """All parsed data for one MCS commodity section.
+
+    Section 5.1 cleanup (2026-06): ``production_leaders`` removed —
+    see file header.
+    """
     heading: str                         # all-caps heading as found in PDF
-    canonical_name: str                  # resolved via _MCS_COMMODITY_MAP
+    canonical_name: str                  # resolved via material_source_aliases (source_system='mcs_pdf')
     tariff_entries: list[TariffEntry] = field(default_factory=list)
-    production_leaders: list[ProductionShare] = field(default_factory=list)
     import_sources: list[ImportSource] = field(default_factory=list)
     salient_notes: str = ""
 
@@ -239,9 +201,11 @@ class MCSPdfParser:
     Page layout: each commodity occupies 2 pages in consistent order.
     Extraction targets per commodity:
       - tariff_table: list[TariffEntry(description, hts_code, confidence)]
-      - production_leaders: list[ProductionShare(country_name, production_value, year)]
       - import_sources: list[ImportSource(country_name, share, year)]
-      - salient_notes: str (raw text from "Salient Statistics" section)
+                        (parsed for diagnostics; DB write disabled May 2026)
+      - salient_notes: str (raw text from "Salient Statistics" section;
+                        written to MaterialCriticalitySignal.metadata_json
+                        but no current reader)
 
     Usage::
 
@@ -284,8 +248,8 @@ class MCSPdfParser:
         Parse all commodity sections from the PDF.
 
         Two code paths share the same downstream extractors
-        (``_parse_tariff_table``, ``_parse_production_leaders``,
-        ``_parse_import_sources``, ``_extract_salient_notes``) — they only
+        (``_parse_tariff_table``, ``_parse_import_sources``,
+        ``_extract_salient_notes``) — they only
         differ in how the per-commodity text bounds are determined.
 
         Path A — LLM-driven section detection (preferred):
@@ -320,6 +284,25 @@ class MCSPdfParser:
         """
         if use_llm_sections and canonical_materials:
             return self._parse_via_llm_locator(canonical_materials)
+        # Silent fall-through cases — make the path choice visible so
+        # operators / debug-script callers can see why their LLM cache
+        # isn't being read (2.2 fix) or why their canonical list was
+        # ignored (2.3 fix).
+        if use_llm_sections and not canonical_materials:
+            log.warning(
+                "mcs_pdf_parser.path_fallback",
+                requested="llm_locator",
+                used="regex",
+                reason="canonical_materials missing — LLM path requires it",
+            )
+        elif not use_llm_sections and canonical_materials:
+            log.debug(
+                "mcs_pdf_parser.canonical_materials_ignored",
+                path="regex",
+                count=len(canonical_materials),
+                reason="Path B (regex) discovers commodities from PDF headings; "
+                       "the canonical_materials argument is informational only here",
+            )
         return self._parse_via_regex()
 
     def _read_pdf_text(self) -> str:
@@ -390,16 +373,20 @@ class MCSPdfParser:
                 canonical_name=chapter.canonical_material,
             )
             section.tariff_entries = self._parse_tariff_table(chapter_text)
-            section.production_leaders = self._parse_production_leaders(chapter_text)
             section.import_sources = self._parse_import_sources(chapter_text)
             section.salient_notes = self._extract_salient_notes(chapter_text)
 
-            if not section.tariff_entries and not section.production_leaders:
+            if not section.tariff_entries:
+                # Section 5.1 cleanup (2026-06): tariff entries are the
+                # sole DB-write contribution from this chapter (US HTS
+                # 10-digit + derived global 6-digit).  An empty list
+                # means the LLM-located bounds didn't include the tariff
+                # block — likely a chapter-bounds error worth surfacing.
                 log.warning(
                     "mcs_pdf_parser.empty_section",
                     canonical_name=chapter.canonical_material,
                     heading=chapter.pdf_heading,
-                    note="LLM-located chapter produced no tariff or production rows; "
+                    note="LLM-located chapter produced no tariff rows; "
                          "verify the chapter bounds in the cache file are correct.",
                 )
 
@@ -409,7 +396,6 @@ class MCSPdfParser:
                 commodity=chapter.canonical_material,
                 source="llm_locator",
                 tariff_entries=len(section.tariff_entries),
-                production_leaders=len(section.production_leaders),
                 import_sources=len(section.import_sources),
             )
 
@@ -436,15 +422,21 @@ class MCSPdfParser:
 
             section = CommoditySection(heading=heading, canonical_name=canonical)
             section.tariff_entries = self._parse_tariff_table(body)
-            section.production_leaders = self._parse_production_leaders(body)
             section.import_sources = self._parse_import_sources(body)
             section.salient_notes = self._extract_salient_notes(body)
 
-            if not section.tariff_entries and not section.production_leaders:
+            if not section.tariff_entries:
+                # 2.8 fix (2026-05-31): include a path-specific actionable
+                # note so the empty-section log shape matches Path A's.
+                # Section 5.1 cleanup (2026-06): production-leaders criterion
+                # dropped — tariff entries are the only DB-write contribution.
                 log.warning(
                     "mcs_pdf_parser.empty_section",
                     canonical_name=canonical,
                     heading=heading,
+                    note="Regex-detected heading produced no tariff rows; "
+                         "verify the heading matches a real MCS commodity "
+                         "chapter (not an Appendix / Intro / subsection label).",
                 )
 
             sections.append(section)
@@ -453,7 +445,6 @@ class MCSPdfParser:
                 commodity=canonical,
                 source="regex",
                 tariff_entries=len(section.tariff_entries),
-                production_leaders=len(section.production_leaders),
                 import_sources=len(section.import_sources),
             )
 
@@ -479,9 +470,35 @@ class MCSPdfParser:
         Country name resolution uses Country.common_names loaded from the DB once at
         the start of seeding.
 
-        Returns a summary dict with counts per commodity.
+        Returns a summary dict ``{canonical_name: counters}`` plus a special
+        ``__run_meta__`` key carrying the run-level counters (chapters
+        skipped due to missing material, chapters that raised during
+        per-section processing).
+
+        Per-section error handling (3.5 fix 2026-05-31): each section is
+        processed inside try/except so that a failure parsing or writing
+        one chapter doesn't abort the whole seed run.  The failing chapter
+        is logged via ``log.exception`` and counted in
+        ``__run_meta__.skipped_on_error``; the rest of the chapters
+        continue.  ``parent_stage_cache`` (3.6 deferred concern) is shared
+        across all sections and survives raises — its state at the point
+        of an exception may leave a partially-populated entry for the
+        failing chapter's HS code, but since the cache is just a per-run
+        memo of DB SELECTs there's no correctness risk; subsequent sections
+        either hit the cache (correct value, no re-query) or miss and
+        re-query (correct value, slight overhead).
+
+        Dry-run note (3.10): the material map is still loaded in dry-run
+        mode because it's needed for per-section logging (material_id
+        lookup happens before the dry-run short-circuit).
+        ``_upsert_mapping_row`` and friends short-circuit on the flag,
+        but the read-side queries (``_assign_stage`` stage lookups,
+        salient-notes destination probes) still execute.
         """
-        country_map = self._build_country_map(session)
+        # Section 6.2 cleanup (2026-06): ``country_map`` removed.  Its
+        # only consumer was the deleted Step 4a (world production shares)
+        # and the disabled Step 4b (US import sources).  Country resolution
+        # is no longer the PDF parser's job.
         material_map = self._build_material_map(session)
 
         # ── Constrain the LLM to MCS-chapter materials only ──────────────
@@ -523,10 +540,18 @@ class MCSPdfParser:
         )
 
         # Cached 4-digit-parent stage lookups, shared across all materials in
-        # this seed run.  Populated lazily by `_assign_stage`.
+        # this seed run.  Populated lazily by `_assign_stage`.  Survives
+        # per-section exceptions (see 3.5 / 3.6 in seed_to_db docstring).
         parent_stage_cache: dict[tuple[str, int], tuple[Optional[str], Optional[int]]] = {}
 
         stats: dict[str, dict[str, int]] = {}
+        # Run-level meta counters (3.2 + 3.5 fix 2026-05-31).  Surfaced
+        # via the special ``__run_meta__`` key in the return dict.
+        run_meta: dict[str, int] = {
+            "skipped_no_material": 0,
+            "skipped_on_error": 0,
+            "chapters_processed": 0,
+        }
 
         for section in sections:
             material_id = material_map.get(section.canonical_name)
@@ -535,195 +560,204 @@ class MCSPdfParser:
                     "mcs_pdf_parser.material_not_found",
                     canonical_name=section.canonical_name,
                 )
+                run_meta["skipped_no_material"] += 1
                 continue
 
+            # 3.1 counter rename (2026-05-31): ``us_rows_inserted`` /
+            # ``global_rows_inserted`` were misleading — they counted
+            # every processed row (including pre-existing ON CONFLICT
+            # DO NOTHING rows) because ``_upsert_mapping_row`` always
+            # returns -1 (placeholder).  Renamed to ``*_processed`` so
+            # CLI summary reflects actual semantics.
+            #
+            # 3.4: ``import_source_shares_inserted`` renamed to
+            # ``import_source_shares_skipped`` since Step 4b is disabled
+            # — the counter now reflects how many rows the parser SAW
+            # and intentionally did NOT write.
+            #
+            # 3.7: ``salient_notes_appended`` added so CLI can report it.
+            # Section 5.1 cleanup (2026-06): ``production_shares_inserted``
+            # counter removed along with the Step 4a write block (CSV path
+            # now sole populator of ``hs_code_production_shares`` for
+            # market_scope='global').
             s: dict[str, int] = {
-                "us_rows_inserted": 0,
-                "global_rows_inserted": 0,
-                "production_shares_inserted": 0,
-                "import_source_shares_inserted": 0,
+                "us_rows_processed": 0,
+                "global_rows_processed": 0,
+                "import_source_shares_skipped": 0,
                 "stage_assigned_us": 0,
                 "stage_assigned_global": 0,
                 "stage_unresolved_us": 0,
                 "stage_unresolved_global": 0,
+                "salient_notes_appended": 0,
             }
 
-            # --- Step 1: insert 10-digit US HTS rows ---
-            us_id_map: dict[str, int] = {}  # hts_code (no dots) → hs_mapping_id
-            for entry in section.tariff_entries:
-                hts_nodots = entry.hts_code   # already normalised
-                stage, stage_seq = self._assign_stage(
-                    session,
-                    hs_code_prefix=hts_nodots,
-                    digit_count=10,
-                    material_id=material_id,
-                    canonical_name=section.canonical_name,
-                    parent_stage_cache=parent_stage_cache,
-                )
-                if stage is not None:
-                    s["stage_assigned_us"] += 1
-                else:
-                    s["stage_unresolved_us"] += 1
-                row_id = self._upsert_mapping_row(
-                    session,
-                    hs_code_prefix=hts_nodots,
-                    material_id=material_id,
-                    description=entry.description,
-                    confidence=entry.confidence,
-                    digit_count=10,
-                    market_scope="us",
-                    supply_chain_stage=stage,
-                    stage_sequence=stage_seq,
-                    dry_run=dry_run,
-                )
-                if row_id is not None:
-                    us_id_map[hts_nodots] = row_id
-                    s["us_rows_inserted"] += 1
-
-            # --- Step 2: derive 6-digit global rows and insert ON CONFLICT DO NOTHING ---
-            # Build: 6-digit prefix → max confidence among all 10-digit codes that share it
-            six_digit_conf: dict[str, float] = {}
-            six_digit_desc: dict[str, str] = {}
-            for entry in section.tariff_entries:
-                six = entry.hts_code[:6]
-                if six not in six_digit_conf or entry.confidence > six_digit_conf[six]:
-                    six_digit_conf[six] = entry.confidence
-                    six_digit_desc[six] = entry.description
-
-            global_id_map: dict[str, int] = {}  # 6-digit prefix → hs_mapping_id
-            for six_prefix, conf in six_digit_conf.items():
-                stage, stage_seq = self._assign_stage(
-                    session,
-                    hs_code_prefix=six_prefix,
-                    digit_count=6,
-                    material_id=material_id,
-                    canonical_name=section.canonical_name,
-                    parent_stage_cache=parent_stage_cache,
-                )
-                if stage is not None:
-                    s["stage_assigned_global"] += 1
-                else:
-                    s["stage_unresolved_global"] += 1
-                row_id = self._upsert_mapping_row(
-                    session,
-                    hs_code_prefix=six_prefix,
-                    material_id=material_id,
-                    description=six_digit_desc[six_prefix],
-                    confidence=conf,
-                    digit_count=6,
-                    market_scope="global",
-                    supply_chain_stage=stage,
-                    stage_sequence=stage_seq,
-                    dry_run=dry_run,
-                )
-                if row_id is not None:
-                    global_id_map[six_prefix] = row_id
-                    s["global_rows_inserted"] += 1
-
-            if not dry_run:
-                session.flush()
-
-            # --- Step 3: SELECT back IDs for all rows (covers ON CONFLICT DO NOTHING) ---
-            us_id_map = self._select_back_ids(
-                session, material_id=material_id, market_scope="us",
-                prefixes=list(us_id_map.keys()), dry_run=dry_run,
-            )
-            global_id_map = self._select_back_ids(
-                session, material_id=material_id, market_scope="global",
-                prefixes=list(global_id_map.keys()), dry_run=dry_run,
-            )
-
-            # --- Step 4a: world production shares → linked to the most-raw 6-digit row ---
-            if section.production_leaders and global_id_map:
-                prod_hs_id = self._pick_production_hs_id(
-                    session,
-                    canonical_name=section.canonical_name,
-                    material_id=material_id,
-                    global_id_map=global_id_map,
-                )
-                if prod_hs_id is not None:
-                    world_total = sum(
-                        p.production_value for p in section.production_leaders
+            # 3.5 fix (2026-05-31): wrap per-section processing in
+            # try/except so one chapter's failure doesn't abort the whole
+            # seed run.  Failing chapter is logged + counted in
+            # run_meta; subsequent chapters continue.
+            try:
+                # --- Step 1: insert 10-digit US HTS rows ---
+                us_id_map: dict[str, int] = {}  # hts_code (no dots) → hs_mapping_id
+                for entry in section.tariff_entries:
+                    hts_nodots = entry.hts_code   # already normalised
+                    stage, stage_seq = self._assign_stage(
+                        session,
+                        hs_code_prefix=hts_nodots,
+                        digit_count=10,
+                        material_id=material_id,
+                        canonical_name=section.canonical_name,
+                        parent_stage_cache=parent_stage_cache,
                     )
-                    for prod in section.production_leaders:
-                        iso2 = self._resolve_country(prod.country_name, country_map)
-                        if iso2 is None:
-                            continue
-                        share = prod.production_value / world_total if world_total else 0.0
-                        written = self._upsert_production_share(
-                            session,
-                            hs_mapping_id=prod_hs_id,
-                            country_code=iso2,
-                            production_share=share,
-                            production_volume=prod.production_value,
-                            reference_year=prod.reference_year,
-                            market_scope="global",
-                            source="usgs_mcs",
-                            dry_run=dry_run,
-                        )
-                        s["production_shares_inserted"] += written
+                    if stage is not None:
+                        s["stage_assigned_us"] += 1
+                    else:
+                        s["stage_unresolved_us"] += 1
+                    row_id = self._upsert_mapping_row(
+                        session,
+                        hs_code_prefix=hts_nodots,
+                        material_id=material_id,
+                        description=entry.description,
+                        confidence=entry.confidence,
+                        digit_count=10,
+                        market_scope="us",
+                        supply_chain_stage=stage,
+                        stage_sequence=stage_seq,
+                        dry_run=dry_run,
+                    )
+                    if row_id is not None:
+                        us_id_map[hts_nodots] = row_id
+                        s["us_rows_processed"] += 1
 
-                    # NOTE: previously this block also wrote a cached HHI back to
-                    # `hs_code_material_mappings.{hhi_score, hhi_reference_year,
-                    # hhi_source}`.  Migration 035 dropped those columns — the
-                    # cache was written-only and never read.  Runtime HHI is
-                    # computed by `hs_node_scorer` directly from
-                    # `hs_code_production_shares` and persisted on
-                    # `hs_code_geography_risk_scores.hhi_at_stage`.
+                # --- Step 2: derive 6-digit global rows and insert ON CONFLICT DO NOTHING ---
+                # Build: 6-digit prefix → max confidence among all 10-digit codes that share it
+                six_digit_conf: dict[str, float] = {}
+                six_digit_desc: dict[str, str] = {}
+                for entry in section.tariff_entries:
+                    six = entry.hts_code[:6]
+                    if six not in six_digit_conf or entry.confidence > six_digit_conf[six]:
+                        six_digit_conf[six] = entry.confidence
+                        six_digit_desc[six] = entry.description
 
-            # --- Step 4b: US import sources — DISABLED May 2026 ---
-            # The previous implementation fan-out each PDF sub-type's
-            # country share across EVERY 10-digit US HTS row in the
-            # chapter (e.g. "Chromite ores: South Africa 96%" was
-            # written to ferrochromium and chromium-metal codes too —
-            # incorrect attribution).
-            #
-            # Per-country US import shares now come exclusively from
-            # ``ingest-usgs`` (MCS 2026 long-format CSV) using the
-            # keyword-based sub-type resolver against
-            # ``hs_code_material_mappings.keywords``.  That path
-            # attributes each sub-type to its specific 6-digit prefix
-            # (e.g. "Chromite (ores and concentrates)" → 261000) instead
-            # of fan-outing to all chapter codes.
-            #
-            # Trade-offs:
-            #   * 10-digit codes get no per-country share data attached
-            #     — 10-digit nodes are still useful for tariff lookups
-            #     (their primary purpose) but won't have a population
-            #     of ``hs_code_production_shares`` rows.  If partner
-            #     ever needs per-country attribution at 10-digit
-            #     granularity, see the next-step plan: a sub-type →
-            #     10-digit code-group keyword mapping that mirrors the
-            #     6-digit one we already have for the CSV path.
-            #   * ``section.import_sources`` is still parsed for
-            #     diagnostics and forward compatibility; just not
-            #     written.
-            if section.import_sources and us_id_map:
-                log.debug(
-                    "mcs_pdf_parser.import_sources_skipped",
-                    canonical=section.canonical_name,
-                    count=len(section.import_sources),
+                global_id_map: dict[str, int] = {}  # 6-digit prefix → hs_mapping_id
+                for six_prefix, conf in six_digit_conf.items():
+                    stage, stage_seq = self._assign_stage(
+                        session,
+                        hs_code_prefix=six_prefix,
+                        digit_count=6,
+                        material_id=material_id,
+                        canonical_name=section.canonical_name,
+                        parent_stage_cache=parent_stage_cache,
+                    )
+                    if stage is not None:
+                        s["stage_assigned_global"] += 1
+                    else:
+                        s["stage_unresolved_global"] += 1
+                    row_id = self._upsert_mapping_row(
+                        session,
+                        hs_code_prefix=six_prefix,
+                        material_id=material_id,
+                        description=six_digit_desc[six_prefix],
+                        confidence=conf,
+                        digit_count=6,
+                        market_scope="global",
+                        supply_chain_stage=stage,
+                        stage_sequence=stage_seq,
+                        dry_run=dry_run,
+                    )
+                    if row_id is not None:
+                        global_id_map[six_prefix] = row_id
+                        s["global_rows_processed"] += 1
+
+                # Per-section flush required so Step 3 SELECT-back sees
+                # the inserts.  The end-of-function flush is redundant
+                # in steady state but defensive against any future write
+                # added after Step 4 — see 3.9 in seed_to_db docstring.
+                if not dry_run:
+                    session.flush()
+
+                # --- Step 3: SELECT back IDs for all rows (covers ON CONFLICT DO NOTHING) ---
+                us_id_map = self._select_back_ids(
+                    session, material_id=material_id, market_scope="us",
+                    prefixes=list(us_id_map.keys()), dry_run=dry_run,
+                )
+                global_id_map = self._select_back_ids(
+                    session, material_id=material_id, market_scope="global",
+                    prefixes=list(global_id_map.keys()), dry_run=dry_run,
+                )
+
+                # --- Step 4a: world production shares — DELETED 2026-06 ---
+                # See file header for rationale.  Summary: the CSV path
+                # (mcs2026_parser) is the sole populator of
+                # ``hs_code_production_shares`` for market_scope='global';
+                # the PDF parser's extractor was redundant and never
+                # actually wrote rows against MCS 2026 layout (real-PDF
+                # audit confirmed 0 rows extracted).
+
+                # --- Step 4b: US import sources — DISABLED May 2026 ---
+                # See seed_to_db docstring for the trade-off rationale.
+                # 3.3 (2026-05-31): import_sources is parsed by the
+                # extractor for diagnostics + forward compatibility, but
+                # nothing is written here.  Counter renamed to
+                # ``import_source_shares_skipped`` for accuracy.
+                if section.import_sources and us_id_map:
+                    s["import_source_shares_skipped"] = len(section.import_sources)
+                    log.debug(
+                        "mcs_pdf_parser.import_sources_skipped",
+                        canonical=section.canonical_name,
+                        count=len(section.import_sources),
+                        note=(
+                            "Per-country US import shares are now sourced "
+                            "from ingest-usgs (CSV path) only.  PDF write "
+                            "path disabled May 2026."
+                        ),
+                    )
+
+                # --- Salient notes → append to MaterialCriticalitySignal ---
+                if section.salient_notes and not dry_run:
+                    self._append_salient_notes(
+                        session,
+                        material_id=material_id,
+                        notes=section.salient_notes,
+                        reference_year=self._reference_year,
+                    )
+                    s["salient_notes_appended"] = 1
+
+                stats[section.canonical_name] = s
+                run_meta["chapters_processed"] += 1
+
+            except Exception as exc:  # noqa: BLE001 — intentional broad catch
+                # 3.5 fix (2026-05-31): per-section error isolation.  Log
+                # full traceback so partner can see WHAT failed; continue
+                # with the next section rather than aborting the whole
+                # seed run.  Failing chapter is NOT added to ``stats`` —
+                # only fully-processed chapters appear there.  The CLI
+                # summary should compare ``len(stats)`` against
+                # ``run_meta['chapters_processed']`` to spot mismatches.
+                run_meta["skipped_on_error"] += 1
+                log.exception(
+                    "mcs_pdf_parser.section_failed",
+                    canonical_name=section.canonical_name,
+                    error_type=type(exc).__name__,
                     note=(
-                        "Per-country US import shares are now sourced "
-                        "from ingest-usgs (CSV path) only.  PDF write "
-                        "path disabled May 2026."
+                        "Section processing raised; chapter skipped.  "
+                        "Subsequent chapters continue.  Inspect the "
+                        "traceback above to identify the failure point."
                     ),
                 )
 
-            # --- Salient notes → append to MaterialCriticalitySignal ---
-            if section.salient_notes and not dry_run:
-                self._append_salient_notes(
-                    session,
-                    material_id=material_id,
-                    notes=section.salient_notes,
-                    reference_year=self._reference_year,
-                )
-
-            stats[section.canonical_name] = s
-
         if not dry_run:
+            # Redundant in steady state — every Step 2 already flushed
+            # the per-section work — but defensive against any future
+            # write added after Step 4 that wouldn't otherwise hit the
+            # DB before the CLI's commit.
             session.flush()
 
+        # 3.2 + 3.7 (2026-05-31): surface run-level counters via the
+        # __run_meta__ key.  Existing CLI iterates ``stats.values()`` to
+        # sum per-chapter counters; that iteration naturally excludes
+        # __run_meta__ via the meta-prefix convention, but explicit
+        # ``skip if k.startswith('__')`` in the CLI would be cleaner.
+        stats["__run_meta__"] = run_meta
         return stats
 
     # ------------------------------------------------------------------
@@ -739,7 +773,8 @@ class MCSPdfParser:
           1. Walk the full text once and record the line index of EVERY
              commodity-style heading (any all-caps line that matches
              ``_COMMODITY_HEADING_RE`` and looks plausible — short, no digits).
-             Both known (in ``_MCS_COMMODITY_MAP``) and unknown headings count.
+             Both known (registered in ``material_source_aliases`` under
+             source_system='mcs_pdf') and unknown headings count.
           2. For each known heading, the section body is the text between its
              line and the NEXT heading (known or unknown).  This means a CHROMIUM
              section terminates at the next CLAYS heading even though CLAYS is
@@ -747,6 +782,12 @@ class MCSPdfParser:
              chromium section.
           3. Unknown headings act as section terminators only; their content is
              discarded.
+
+        Body text contains ``--- PAGE BREAK ---`` separator lines emitted by
+        ``_read_pdf_text``.  Downstream extractors operate on regex patterns
+        that don't match the marker, so they're harmless — but salient-notes
+        extraction does include the marker if it falls between anchors.
+        That's tolerated; the marker is stripped in human-facing surfaces.
 
         Why this fixes the previous misattribution
         -------------------------------------------
@@ -758,27 +799,35 @@ class MCSPdfParser:
         Treating ANY all-caps heading as a boundary eliminates this leak path.
 
         Returns ``{heading: section_body_text}`` keyed by uppercase heading.
-        Only headings present in ``_MCS_COMMODITY_MAP`` appear in the result.
+        Only headings registered in ``material_source_aliases`` (source_system
+        ='mcs_pdf') appear in the result.
+
+        Raises ``RuntimeError`` if invoked without a resolver — matches the
+        Path B contract documented in ``__init__``.  Section 4.3 fix
+        (2026-06): the previous fall-through to the deleted
+        ``_MCS_COMMODITY_MAP`` dict has been removed.
         """
-        # "Known headings" come from the alias table now — the resolver
-        # tells us which PDF headings have a partner-curated mapping
-        # under source_system='mcs_pdf'.  When no resolver is wired in
-        # (legacy callers), fall back to the deprecated dict.
-        if self._resolver is not None:
-            from app.models.supply import MaterialSourceAlias as _MSA  # local import
-            known_rows = self._resolver._session.scalars(  # type: ignore[attr-defined]
-                select(_MSA).where(_MSA.source_system == "mcs_pdf")
-            ).all()
-            known_headings = {r.source_name.strip().upper() for r in known_rows}
-        else:
-            known_headings = set(_MCS_COMMODITY_MAP.keys())
+        if self._resolver is None:
+            # Section 4.3 fix (2026-06): align code with __init__ docstring.
+            # Path B can't resolve headings → canonicals without the alias
+            # table.  Callers must construct the parser with a resolver
+            # (the CLI does so at cli.py:3761).
+            raise RuntimeError(
+                "MCSPdfParser._split_into_commodity_sections requires a "
+                "MaterialAliasResolver. Construct the parser with "
+                "MCSPdfParser(path, reference_year, resolver=resolver)."
+            )
+        # Section 4.4 fix (2026-06): use the public list_for_source method
+        # instead of reaching into resolver._session — keeps the parser
+        # decoupled from the resolver's internal storage.
+        known_headings = self._resolver.list_for_source("mcs_pdf")
         lines = full_text.splitlines()
 
         # Step 1: locate every plausible heading line (known + unknown).
         # `_commodity_heading_text` returns the canonical heading string with
         # any trailing footnote marker stripped (e.g. "ALUMINUM1" → "ALUMINUM"),
-        # so the per-heading dict and `_MCS_COMMODITY_MAP` lookup operate on
-        # the form that matches the curated map keys.
+        # so the heading-positions list operates on the form that matches the
+        # alias-table source_name values.
         heading_positions: list[tuple[int, str]] = []  # [(line_index, canonical_heading)]
         for i, line in enumerate(lines):
             heading = self._commodity_heading_text(line)
@@ -798,14 +847,19 @@ class MCSPdfParser:
                 else len(lines)
             )
             body = "\n".join(lines[line_idx + 1:end_line])
-            # Multiple sections under the same heading should not happen in MCS,
-            # but if it does, concatenate so we don't silently drop content.
+            # MCS prints each chapter heading at the top of EVERY page of the
+            # chapter — so a 2-page commodity appears in `heading_positions`
+            # twice.  The concatenation path stitches page-1 and page-2 bodies
+            # back together.  Section 4.1 fix (2026-06): the previous warning
+            # log fired on every chapter (~26/run) because page-2 continuation
+            # is the dominant case, not an anomaly.  Downgraded to debug.
             if upper_text in sections:
                 sections[upper_text] = sections[upper_text] + "\n" + body
-                log.warning(
+                log.debug(
                     "mcs_pdf_parser.duplicate_heading",
                     heading=upper_text,
-                    note="Section appears more than once in PDF — concatenating bodies",
+                    note="Section appears more than once in PDF — concatenating "
+                         "bodies (expected for multi-page chapters)",
                 )
             else:
                 sections[upper_text] = body
@@ -815,7 +869,8 @@ class MCSPdfParser:
                 "mcs_pdf_parser.no_sections_found",
                 heading_candidates_detected=len(heading_positions),
                 known_heading_keys=len(known_headings),
-                note="No matched sections — verify _MCS_COMMODITY_MAP keys against PDF headings",
+                note="No matched sections — verify material_source_aliases "
+                     "(source_system='mcs_pdf') against PDF headings",
             )
 
         return sections
@@ -823,22 +878,28 @@ class MCSPdfParser:
     def _resolve_pdf_heading(self, heading: str) -> Optional[str]:
         """Resolve a PDF heading to a canonical material name.
 
-        Uses ``MaterialAliasResolver`` (source_system='mcs_pdf') when
-        the parser was constructed with a resolver, falls back to the
-        deprecated ``_MCS_COMMODITY_MAP`` dict otherwise.  Returns the
-        canonical name on success; returns None when the heading is
-        skipped (alias is_skipped=True) or unknown (no alias row).
+        Uses ``MaterialAliasResolver`` (source_system='mcs_pdf') as the
+        single source of truth.  Returns the canonical name on success;
+        returns None when the heading is skipped (alias is_skipped=True)
+        or unknown (no alias row).
+
+        Section 4.3 fix (2026-06): the deprecated ``_MCS_COMMODITY_MAP``
+        fallback was removed; this method now raises ``RuntimeError`` if
+        called without a resolver — matching ``__init__``'s contract.
         """
         if self._resolver is None:
-            return _MCS_COMMODITY_MAP.get(heading)
+            raise RuntimeError(
+                "MCSPdfParser._resolve_pdf_heading requires a "
+                "MaterialAliasResolver. Construct the parser with "
+                "MCSPdfParser(path, reference_year, resolver=resolver)."
+            )
         result = self._resolver.resolve("mcs_pdf", heading)
         if result.status == "ok":
             assert result.material is not None
             return result.material.canonical_name
         return None
 
-    @staticmethod
-    def _commodity_heading_text(line: str) -> Optional[str]:
+    def _commodity_heading_text(self, line: str) -> Optional[str]:
         """Return the canonical heading text (without footnote marker) or None.
 
         Heuristic — needs to be permissive enough to catch all MCS commodity
@@ -849,18 +910,26 @@ class MCSPdfParser:
           - Matches ``_COMMODITY_HEADING_RE`` (2+ uppercase letters, allowed
             spaces / parens / hyphens, optional trailing footnote digits)
           - Not one of the known false-positive labels found in MCS body text
-            ("ABOUT", "PREPARED BY", page numbers in caps form, etc.)
+            (in-chapter subsection titles like "TARIFF", document-structure
+            labels like "APPENDIX A", and observed cross-column artifacts
+            from MCS 2026 such as "IRZ IRZ")
 
         Returns the captured heading text (group 1 of the regex), uppercased
         and with trailing footnote digits stripped — e.g. ``ALUMINUM1`` →
-        ``ALUMINUM``.  This is the form callers should use for
-        ``_MCS_COMMODITY_MAP`` lookup.
+        ``ALUMINUM``.  This is the form callers should match against
+        ``material_source_aliases.source_name`` for source_system='mcs_pdf'.
 
-        The list of false-positive labels is intentionally conservative —
-        when in doubt, treat a line as a heading and let the unknown-heading
-        branch in ``_split_into_commodity_sections`` discard its content.
-        Missing a commodity heading is worse than over-segmenting; over-
-        segmenting just drops some non-battery body text.
+        The deny-list is conservative — when in doubt, treat a line as a
+        heading and let the unknown-heading branch in
+        ``_split_into_commodity_sections`` discard its content.  Missing a
+        commodity heading is worse than over-segmenting; over-segmenting
+        just drops some non-battery body text.
+
+        Section 4.7 fix (2026-06): demoted from ``@staticmethod`` to an
+        instance method — the call site in ``_split_into_commodity_sections``
+        already uses ``self._commodity_heading_text(line)``, and dropping
+        the decorator matches Python convention for instance-method
+        access patterns.
         """
         stripped = line.strip()
         if not (2 <= len(stripped) <= 60):
@@ -870,8 +939,11 @@ class MCSPdfParser:
             return None
         heading = match.group(1).upper()
         # Common in-section labels that match the heading regex but aren't
-        # commodity titles.  Extend if false positives are observed.
+        # commodity titles.  Extend if false positives are observed in new
+        # MCS editions.  Last extended Section 4.2/4.5 fix (2026-06) with
+        # entries surfaced by real-PDF audit against MCS 2026.
         _NOT_HEADINGS = {
+            # In-chapter subsection titles
             "ABOUT",
             "PREPARED BY",
             "TARIFF",
@@ -884,6 +956,30 @@ class MCSPdfParser:
             "IMPORT SOURCES",
             "DOMESTIC PRODUCTION",
             "SUBSTITUTES",
+            # Document-structure labels surfaced by 2026-06 audit
+            # (Section 4.2 fix).  These currently terminate sections
+            # correctly (not in the alias table) but emitting them as
+            # heading candidates adds log noise.
+            "APPENDIX A",
+            "APPENDIX B",
+            "APPENDIX C",
+            "APPENDIX D",
+            "CONTENTS",
+            "EXPLANATION",
+            "FOREWORD",
+            "INSTANT INFORMATION",
+            "INTRODUCTION",
+            "KEY PUBLICATIONS",
+            "MINERAL COMMODITY",
+            "WHERE TO OBTAIN PUBLICATIONS",
+            # Cross-column / cross-region layout artifacts.  "IRZ IRZ"
+            # appears in MCS 2026 as a region-code cluster repeated in
+            # two columns of the appendix tables; "ARAB" and "ASIA AND
+            # EURASIA SAUDI" similarly fragment from the regional
+            # production tables.  Section 4.5 fix (2026-06).
+            "ARAB",
+            "ASIA AND EURASIA SAUDI",
+            "IRZ IRZ",
         }
         if heading in _NOT_HEADINGS:
             return None
@@ -934,6 +1030,33 @@ class MCSPdfParser:
             desc_lines = [ln.strip() for ln in context.splitlines() if ln.strip()]
             description = desc_lines[-1] if desc_lines else raw_code
 
+            # Section 5.4 fix (2026-06): MCS sometimes wraps a long
+            # description onto a continuation line AFTER the HTS code.
+            # Example from COBALT chapter:
+            #   "Cobalt mattes and other intermediate products; 8105.20.9000 Free."
+            #   "cobalt powders"
+            # The pre-code line ends with `;` (or `,`) and the trailing
+            # clause "cobalt powders" sits on the line below — invisible
+            # to a pre-code lookback.  Capture the immediate next line
+            # only when the description ends in a continuation indicator.
+            if description.rstrip().endswith((";", ",")):
+                after_start = match.end()
+                after = block[after_start:after_start + 200]
+                lines_after = after.splitlines()
+                # First line after the match contains the rest of the
+                # tariff row (rate value); the SECOND non-empty line is
+                # the wrapped continuation candidate.  Only fold it in
+                # if it's plainly lowercase prose and not another row
+                # (no HTS code, no leading whitespace block).
+                if len(lines_after) >= 2:
+                    cont = lines_after[1].strip()
+                    if (
+                        cont
+                        and cont[0].islower()
+                        and not _HTS_CODE_RE.search(cont)
+                    ):
+                        description = f"{description} {cont}"
+
             entries.append(TariffEntry(
                 description=description[:512],
                 hts_code=normalised,
@@ -943,107 +1066,25 @@ class MCSPdfParser:
 
         return entries
 
-    def _parse_production_leaders(self, section_text: str) -> list[ProductionShare]:
-        """
-        Extract world production country data from the chapter's production table.
-
-        MCS uses several variant headers depending on the commodity:
-            "World Mine Production and Reserves"          (most ores: Co, Ni, Cu, …)
-            "World Smelter Production and Capacity"       (Aluminum)
-            "World Refinery Production and Reserves"      (some refined products)
-            "World Mine Production"                       (some)
-            "World Refinery Production"                   (some)
-        The regex below matches any "World <Mine|Smelter|Refinery> Production"
-        prefix.  Without this broadening, Aluminum (and other non-Mine
-        production headers) silently produced zero rows because the previous
-        anchor required the literal "Mine" word.
-
-        Derives production shares from raw tonnages (normalised against world total).
-        Skips "World total" and "Other" rows — these are meta-rows, not countries.
-        """
-        leaders: list[ProductionShare] = []
-
-        header_match = re.search(
-            r'World\s+(?:Mine|Smelter|Refinery)\s+Production',
-            section_text,
-            re.IGNORECASE,
-        )
-        if not header_match:
-            return leaders
-
-        # Extract the block that follows the header
-        block_start = header_match.end()
-        # Stop at the next major section (two blank lines or a known section header)
-        next_section = re.search(
-            r'\n(Salient|Import Sources|Tariff|Recycling|World\s+Smelter|Events)',
-            section_text[block_start:],
-            re.IGNORECASE,
-        )
-        if next_section:
-            block = section_text[block_start:block_start + next_section.start()]
-        else:
-            block = section_text[block_start:block_start + 3000]
-
-        # Detect the reference year from column header lines (e.g. "2024    2025(e)")
-        year_col_match = re.search(
-            r'\b(20\d{2})\s*\(e\)',
-            block,
-        )
-        if year_col_match:
-            reference_year = int(year_col_match.group(1))
-        else:
-            # Fall back to MCS publication year minus 1 (MCS 2026 → data year 2025)
-            reference_year = self._reference_year - 1
-
-        # Parse country/tonnage rows
-        # Format: CountryName    NNNN    MMMM(e)
-        # Numbers may include commas (thousands separator) and trailing 'e'
-        world_total: float | None = None
-        row_re = re.compile(
-            r'^((?:[A-Z][a-z]+\s?)+(?:\([A-Za-z\s]+\))?)\s{2,}'  # country name
-            r'([\d,]+)\s*e?\s*'                                     # col 1 value
-            r'([\d,]+)\s*e?\s*$',                                   # col 2 value (estimated)
-            re.MULTILINE,
-        )
-        for m in row_re.finditer(block):
-            name = m.group(1).strip()
-            # Second column is the more recent year (estimated); first is prior year
-            try:
-                value = float(m.group(3).replace(",", ""))
-            except (ValueError, AttributeError):
-                try:
-                    value = float(m.group(2).replace(",", ""))
-                except ValueError:
-                    continue
-
-            lower_name = name.lower()
-            if "world total" in lower_name or "world (rounded)" in lower_name:
-                world_total = value
-                continue
-            if lower_name.startswith("other") or name in ("e", "W"):
-                continue
-
-            leaders.append(ProductionShare(
-                country_name=name,
-                production_value=value,
-                reference_year=reference_year,
-            ))
-
-        # If world total not found, derive it from the sum
-        if world_total is None and leaders:
-            world_total = sum(ldr.production_value for ldr in leaders)
-
-        # Store world_total on the instance for use by seed_to_db (passed back via
-        # the leaders list as a sentinel — caller computes share from values directly)
-        return leaders
+    # _parse_production_leaders removed 2026-06 (Section 5.1 cleanup).
+    # CSV path (mcs2026_parser._hs_production_shares) is the sole populator
+    # of hs_code_production_shares for market_scope='global'.
 
     def _parse_import_sources(self, section_text: str) -> list[ImportSource]:
         """
         Extract US import source country percentages.
 
-        The section header format is "Import Sources (YYYY–YY):" where the year
-        range varies by material and edition.  Uses regex to locate the header
-        and extracts the inline country/percentage list that follows.
+        The section header format is "Import Sources (YYYY–YY[, qualifier]):"
+        where the year range varies by material and edition.  Uses regex to
+        locate the header and extracts the inline country/percentage list
+        that follows.
+
+        Section 5.2 fix (2026-06): the year-parse regex no longer requires
+        a closing ``)`` immediately after the end year — that anchor broke
+        on the ``(2021–24, by value)`` variant introduced in MCS 2026
+        (2 occurrences).  Falling back to ``reference_year - 1`` produced
+        the right answer by coincidence today but would diverge if USGS
+        published a different range with a qualifier.
         """
         sources: list[ImportSource] = []
 
@@ -1051,8 +1092,10 @@ class MCSPdfParser:
         if not header_match:
             return sources
 
-        # Parse reference year from header (end year of range)
-        year_match = re.search(r'\((\d{4})[–\-](\d{2,4})\)', header_match.group(0))
+        # Parse reference year from header (end year of range).
+        # Use a word boundary on the end year instead of requiring ``)`` so
+        # qualifier-suffixed variants like ``(2021–24, by value):`` parse.
+        year_match = re.search(r'\((\d{4})[–\-](\d{2,4})\b', header_match.group(0))
         if year_match:
             end_str = year_match.group(2)
             start_year = int(year_match.group(1))
@@ -1090,21 +1133,59 @@ class MCSPdfParser:
         return sources
 
     def _extract_salient_notes(self, section_text: str) -> str:
-        """Extract the 'Salient Statistics' narrative text block."""
+        """Extract the 'Salient Statistics' narrative text block.
+
+        Section 5.3 fix (2026-06): stop-anchor regex now requires the
+        colon-terminated section-header form.  The previous version matched
+        bare ``Import`` inside ``Imports for consumption`` (a data row of the
+        Salient Statistics table itself), truncating salient text to ~120
+        chars of ~1500.  The new anchor list explicitly enumerates the
+        post-Salient section headers documented in the MCS layout:
+
+          - ``Recycling:``
+          - ``Import Sources (...):``
+          - ``Tariff:``
+          - ``Depletion Allowance:``
+          - ``Government Stockpile:``
+          - ``Events, Trends, and Issues:``
+          - ``Substitutes:``
+          - ``World <Mine|Smelter|Refinery> Production``
+            (these column headers don't always have a trailing colon)
+
+        The captured block still contains pdfplumber's ``--- PAGE BREAK ---``
+        markers; downstream consumers may strip them.  No reader of
+        ``MaterialCriticalitySignal.metadata_json['salient_notes']`` exists
+        today (write-only, forward-compat hook) — fixing this is so the
+        first reader gets honest data rather than truncated snippets.
+        """
         match = re.search(r'Salient\s+Statistics', section_text, re.IGNORECASE)
         if not match:
             return ""
-        # Take up to 2000 chars after the header
-        block = section_text[match.end():match.end() + 2000]
-        # Stop at next major section
+        # Take up to 4000 chars after the header — salient tables are
+        # multi-paragraph and the prior 2000-char window truncated
+        # rows mid-table even after the anchor fix.
+        block = section_text[match.end():match.end() + 4000]
+        # Stop at next major section.  Each alternative carries its own
+        # tail because "Events, Trends, and Issues:" has variable text
+        # between "Trends" and the colon, and "Import Sources" carries
+        # a parenthesised year qualifier before the colon.
         stop = re.search(
-            r'\n(Events|Trends|Import|Tariff|World\s+Mine)',
+            r'\n('
+            r'Recycling\s*:'
+            r'|Import Sources\s*\([^)]+\)\s*:'
+            r'|Tariff\s*:'
+            r'|Depletion Allowance\s*:'
+            r'|Government Stockpile\s*:'
+            r'|Events,\s+Trends[^:\n]*:'
+            r'|Substitutes\s*:'
+            r'|World\s+(?:Mine|Smelter|Refinery)\s+Production'
+            r')',
             block,
             re.IGNORECASE,
         )
         if stop:
             block = block[:stop.start()]
-        return block.strip()[:2000]
+        return block.strip()[:4000]
 
     # ------------------------------------------------------------------
     # DB seeding helpers
@@ -1169,11 +1250,20 @@ class MCSPdfParser:
             return parent_stage_cache[cache_key]
 
         # ── Step 1: exact-prefix lookup ────────────────────────────────────
-        stage, seq = _lookup(hs_code_prefix)
-        if stage is not None:
-            return stage, seq
+        # Section 6.1 fix (2026-06): skip the exact-prefix lookup for
+        # 10-digit codes — they're stored with market_scope='us' but this
+        # lookup filters market_scope='global' (the resolver is only
+        # interested in stage propagation from the global stage graph),
+        # so the query always misses for digit_count=10.  Go straight to
+        # the 6-digit truncation, which is where 10-digit stages actually
+        # come from in practice.  6-digit and 4-digit lookups still hit
+        # Step 1 normally.
+        if digit_count != 10:
+            stage, seq = _lookup(hs_code_prefix)
+            if stage is not None:
+                return stage, seq
 
-        # 10-digit codes also try the 6-digit truncation.
+        # 10-digit codes try the 6-digit truncation as their first lookup.
         if digit_count == 10 and len(hs_code_prefix) >= 6:
             stage, seq = _lookup(hs_code_prefix[:6])
             if stage is not None:
@@ -1200,49 +1290,11 @@ class MCSPdfParser:
         )
         return (None, None)
 
-    @staticmethod
-    def _build_country_map(session: Session) -> dict[str, str]:
-        """
-        Build a lowercase name → ISO-2 lookup from the countries table.
-
-        Includes name, iso2, and all entries in common_names JSONB array.
-        """
-        from app.models.country import Country  # noqa: PLC0415
-
-        result: dict[str, str] = {}
-        rows = session.execute(
-            select(Country.iso2, Country.name, Country.common_names)
-        ).all()
-
-        for iso2, canonical, common_names in rows:
-            result[canonical.lower()] = iso2
-            result[iso2.lower()] = iso2
-            if common_names and isinstance(common_names, list):
-                for alias in common_names:
-                    if isinstance(alias, str):
-                        result[alias.lower()] = iso2
-
-        # MCS-specific overrides not reliably covered by common_names
-        _MCS_OVERRIDES: dict[str, str] = {
-            "congo (kinshasa)": "CD",
-            "congo, democratic republic of the": "CD",
-            "drc": "CD",
-            "russia": "RU",
-            "russian federation": "RU",
-            "south korea": "KR",
-            "korea, republic of": "KR",
-            "korea, south": "KR",
-            "taiwan": "TW",
-            "taiwan, province of china": "TW",
-            "iran": "IR",
-            "syria": "SY",
-            "vietnam": "VN",
-            "viet nam": "VN",
-            "ivory coast": "CI",
-            "côte d'ivoire": "CI",
-        }
-        result.update({k: v for k, v in _MCS_OVERRIDES.items()})
-        return result
+    # _build_country_map + _resolve_country removed 2026-06 (Section 6.2
+    # cleanup).  Their only callers (deleted Step 4a + disabled Step 4b)
+    # are gone.  If a future schema change reintroduces per-country writes
+    # from the PDF path, the MCS-specific override list lived here in
+    # source control — recover via `git log`.
 
     @staticmethod
     def _build_material_map(session: Session) -> dict[str, int]:
@@ -1251,23 +1303,6 @@ class MCSPdfParser:
             select(Material.canonical_name, Material.id)
         ).all()
         return {name: mid for name, mid in rows}
-
-    @staticmethod
-    def _resolve_country(name: str, country_map: dict[str, str]) -> str | None:
-        """Resolve a MCS country name to ISO-2.  Returns None if unresolvable."""
-        if not name:
-            return None
-        key = name.strip().lower()
-        iso2 = country_map.get(key)
-        if iso2:
-            return iso2
-        # Fuzzy: try removing trailing parenthetical e.g. "Congo (Kinshasa)"
-        bare = re.sub(r'\s*\([^)]+\)', '', key).strip()
-        iso2 = country_map.get(bare)
-        if iso2:
-            return iso2
-        log.debug("mcs_pdf_parser.country_unresolved", name=name)
-        return None
 
     @staticmethod
     def _upsert_mapping_row(
@@ -1343,116 +1378,8 @@ class MCSPdfParser:
         ).all()
         return {prefix: row_id for prefix, row_id in rows}
 
-    @staticmethod
-    def _pick_production_hs_id(
-        session: Session,
-        *,
-        canonical_name: str,
-        material_id: int,
-        global_id_map: dict[str, int],
-    ) -> Optional[int]:
-        """
-        Select the hs_mapping_id to link world production shares to.
-
-        Priority:
-          1. An existing 6-digit global row with the preferred production stage
-             (from _MCS_PRODUCTION_STAGE_PREFERENCE) for this material — e.g. 'ore'
-          2. The newly-inserted 6-digit global row with the lowest stage_sequence
-          3. The first entry in global_id_map if no stage data exists yet
-
-        This fallback chain is necessary because newly-inserted rows from this parser
-        run have supply_chain_stage=NULL (stage is seeded later by seed_hs_mappings).
-        The preferred-stage lookup covers rows already in the DB with stage metadata.
-        """
-        if not global_id_map:
-            return None
-
-        preferred_stage = _MCS_PRODUCTION_STAGE_PREFERENCE.get(
-            canonical_name, _MCS_PRODUCTION_STAGE_PREFERENCE_DEFAULT,
-        )
-
-        # Try: find a global row for this material with the preferred stage
-        existing = session.execute(
-            select(HsCodeMaterialMapping.id).where(
-                HsCodeMaterialMapping.material_id == material_id,
-                HsCodeMaterialMapping.market_scope == "global",
-                HsCodeMaterialMapping.supply_chain_stage == preferred_stage,
-            )
-            .order_by(HsCodeMaterialMapping.digit_count.desc())  # prefer 6-digit over 4-digit
-            .limit(1)
-        ).scalar_one_or_none()
-
-        if existing is not None:
-            return existing
-
-        # Try: lowest stage_sequence among our newly-inserted global rows
-        if global_id_map:
-            prefix_list = list(global_id_map.keys())
-            staged = session.execute(
-                select(HsCodeMaterialMapping.id, HsCodeMaterialMapping.stage_sequence).where(
-                    HsCodeMaterialMapping.material_id == material_id,
-                    HsCodeMaterialMapping.market_scope == "global",
-                    HsCodeMaterialMapping.hs_code_prefix.in_(prefix_list),
-                    HsCodeMaterialMapping.stage_sequence.is_not(None),
-                )
-                .order_by(HsCodeMaterialMapping.stage_sequence)
-                .limit(1)
-            ).first()
-            if staged:
-                return staged[0]
-
-        # Final fallback: first entry in global_id_map
-        return next(iter(global_id_map.values()))
-
-    @staticmethod
-    def _upsert_production_share(
-        session: Session,
-        *,
-        hs_mapping_id: int,
-        country_code: str,
-        production_share: float,
-        production_volume: Optional[float],
-        reference_year: int,
-        market_scope: str,
-        source: str,
-        dry_run: bool,
-    ) -> int:
-        """
-        Insert or update one hs_code_production_shares row.
-
-        Uses ON CONFLICT DO UPDATE to refresh values on re-runs.
-        Returns 1 if a row was written (insert or update), 0 on dry run.
-        """
-        if dry_run:
-            log.debug(
-                "mcs_pdf_parser.dry_run.share",
-                hs_mapping_id=hs_mapping_id,
-                country=country_code,
-                share=production_share,
-            )
-            return 0
-
-        stmt = (
-            pg_insert(HsCodeProductionShare)
-            .values(
-                hs_mapping_id=hs_mapping_id,
-                country_code=country_code,
-                production_share=production_share,
-                production_volume=production_volume,
-                reference_year=reference_year,
-                market_scope=market_scope,
-                source=source,
-            )
-            .on_conflict_do_update(
-                constraint="uq_hs_production_share",
-                set_={
-                    "production_share": production_share,
-                    "production_volume": production_volume,
-                },
-            )
-        )
-        session.execute(stmt)
-        return 1
+    # _pick_production_hs_id + _upsert_production_share removed 2026-06
+    # (Section 5.1 cleanup) along with the Step 4a write block they served.
 
     @staticmethod
     def _append_salient_notes(

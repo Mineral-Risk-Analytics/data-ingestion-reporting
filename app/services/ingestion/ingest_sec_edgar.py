@@ -13,10 +13,28 @@ or HS attribution.  Every other source in the codebase had moved to
 dedicated ingesters with proper attribution; SEC EDGAR was the last
 production caller of the generic path.  Closing it here:
   * adds ``RiskEventMaterial`` rows when the filing narrative mentions
-    a tracked material (previously lost — the audit's N3 follow-up gap)
+    a tracked material (previously lost — the audit's N3 follow-up gap;
+    currently gated off until Workstream B lands real body-text fetch)
   * sets ``event_subtype='FINANCIAL_PRESSURE'`` on the typed column
     (migration 040) so downstream filters fire correctly
   * removes one source of architectural inconsistency
+
+Workstream A (2026-05-23) additions
+-----------------------------------
+* Issuer enrichment per CIK: refreshes ``Company.sic``, ``sic_description``,
+  ``exchanges``, ``sec_metadata`` (addresses + fiscalYearEnd + etc.) from
+  the submissions JSON, and upserts ``CompanyAlias`` rows for formerNames
+  and dual-class tickers.  Looked up by ``Company.cik`` (migration 044);
+  CIKs with no matching Company row are listed in ``companies_missing``
+  in the result dict so partner curation can fill the gap.
+* Per-filing metadata threaded into ``SourceDocument.metadata_json``:
+  ``items`` (8-K item codes parsed from the comma-separated string),
+  ``primary_doc_description``, ``is_xbrl`` / ``is_inline_xbrl``,
+  ``size_bytes``, ``file_number``.  8-K items are the highest-value
+  addition — they enable the deferred 8-K-item → event_subtype mapping.
+* Material attribution gated off when ``ParsedFiling.is_narrative_placeholder``
+  is True (the current default for all rows) so the Haiku classifier
+  doesn't burn API calls on stub narrative text.
 
 Source identifier
 -----------------
@@ -34,7 +52,6 @@ financial-pressure signals for them come from other sources.
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -46,6 +63,8 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.utils.hashing import sha256_bytes
 from app.models import (
+    Company,
+    CompanyAlias,
     RiskEvent,
     RiskEventHsMapping,
     RiskEventMaterial,
@@ -128,7 +147,6 @@ def _upsert_source_document(
     *,
     source: Source,
     filing: ParsedFiling,
-    raw_blob: dict,
 ) -> SourceDocument:
     """Idempotent upsert keyed on (source_id, accession_number)."""
     ext_id = filing.accession_number.replace("/", "-")
@@ -142,18 +160,32 @@ def _upsert_source_document(
     checksum = sha256_bytes(
         f"{filing.accession_number}:{filing.form}".encode("utf-8")
     )
+    metadata = {
+        "cik": filing.cik,
+        "form": filing.form,
+        "ticker": filing.ticker,
+        "accession": filing.accession_number,
+        # Workstream A #3 (2026-05-23): per-filing metadata threaded from
+        # filings.recent.* arrays.  Carries 8-K item codes (the highest-
+        # value addition — drives event_subtype once that mapping lands),
+        # plus XBRL availability flags for future structured-data ingest
+        # priority, plus primaryDocDescription for human-readable filing
+        # context, plus size/fileNumber for audit.  See filing_parser.py
+        # for source field names.
+        "items": filing.items,
+        "primary_doc_description": filing.primary_doc_description,
+        "is_xbrl": filing.is_xbrl,
+        "is_inline_xbrl": filing.is_inline_xbrl,
+        "size_bytes": filing.size_bytes,
+        "file_number": filing.file_number,
+    }
     if existing is not None:
         existing.title = title
         existing.url = filing.primary_document_url
         existing.published_at = filing.filed_at
         existing.document_type = DocumentType.FILING.value
         existing.raw_text = filing.narrative_excerpt
-        existing.metadata_json = {
-            "cik": filing.cik,
-            "form": filing.form,
-            "ticker": filing.ticker,
-            "accession": filing.accession_number,
-        }
+        existing.metadata_json = metadata
         existing.checksum = checksum
         existing.fetched_at = datetime.now(timezone.utc)
         session.flush()
@@ -166,17 +198,149 @@ def _upsert_source_document(
         published_at=filing.filed_at,
         document_type=DocumentType.FILING.value,
         raw_text=filing.narrative_excerpt,
-        metadata_json={
-            "cik": filing.cik,
-            "form": filing.form,
-            "ticker": filing.ticker,
-            "accession": filing.accession_number,
-        },
+        metadata_json=metadata,
         checksum=checksum,
     )
     session.add(doc)
     session.flush()
     return doc
+
+
+def _upsert_alias(
+    session: Session,
+    company_id,
+    alias: str,
+    alias_type: str,
+) -> bool:
+    """Insert ``CompanyAlias`` if (company_id, alias) doesn't exist yet.
+
+    Returns True when a new row is written, False when the alias already
+    existed.  Idempotent so the SEC enrichment can be re-run safely without
+    creating duplicates on every CIK refresh.
+    """
+    cleaned = (alias or "").strip()
+    if not cleaned:
+        return False
+    existing = session.scalar(
+        select(CompanyAlias)
+        .where(
+            CompanyAlias.company_id == company_id,
+            CompanyAlias.alias == cleaned,
+        )
+        .limit(1)
+    )
+    if existing is not None:
+        return False
+    session.add(
+        CompanyAlias(
+            company_id=company_id,
+            alias=cleaned[:512],
+            alias_type=alias_type,
+        )
+    )
+    return True
+
+
+def _enrich_company_from_submissions(
+    session: Session,
+    company: Company,
+    data: dict,
+) -> dict[str, int]:
+    """Refresh issuer-level ``Company`` fields from SEC submissions JSON.
+
+    Field policy:
+      * SEC-canonical fields (sic, sic_description, exchanges, sec_metadata)
+        are **refreshed on every call** — SEC is the source of truth.
+      * Partner-curatable fields (legal_name, public_ticker) are only set
+        when currently NULL — partner edits win.
+      * ``is_public`` is flipped to True if currently False (presence in
+        SEC submissions is proof of public-issuer status).
+      * Aliases (formerNames + extra tickers beyond the first) are upserted
+        — existing rows preserved, missing rows added.
+
+    Returns a counts dict for caller reporting.  Safe to call repeatedly.
+    """
+    counts = {"fields_refreshed": 0, "fields_set": 0, "aliases_added": 0}
+
+    # ── SEC-canonical fields (always refresh) ──────────────────────────
+    sic = data.get("sic")
+    if sic:
+        sic_str = str(sic)[:4]
+        if company.sic != sic_str:
+            company.sic = sic_str
+            counts["fields_refreshed"] += 1
+
+    sic_desc = data.get("sicDescription")
+    if sic_desc:
+        trimmed = str(sic_desc)[:256]
+        if company.sic_description != trimmed:
+            company.sic_description = trimmed
+            counts["fields_refreshed"] += 1
+
+    exchanges = data.get("exchanges") or []
+    if exchanges:
+        normalized = [str(e) for e in exchanges]
+        if (company.exchanges or []) != normalized:
+            company.exchanges = normalized
+            counts["fields_refreshed"] += 1
+
+    # sec_metadata snapshot — overwrite every run.  This is our bag of
+    # SEC-derived fields that don't warrant first-class columns yet
+    # (addresses, fiscal year end, category, entity type, phones,
+    # description URL, EIN).  The synced_at timestamp makes staleness
+    # visible without an extra column.
+    addresses = data.get("addresses") or {}
+    sec_metadata = {
+        "name": data.get("name"),
+        "ein": data.get("ein"),
+        "category": data.get("category"),
+        "entity_type": data.get("entityType"),
+        "fiscal_year_end": data.get("fiscalYearEnd"),
+        "phone": data.get("phone"),
+        "description": data.get("description"),
+        "website": data.get("website"),
+        "investor_website": data.get("investorWebsite"),
+        "flags": data.get("flags"),
+        "former_names_raw": data.get("formerNames"),
+        "business_address": addresses.get("business"),
+        "mailing_address": addresses.get("mailing"),
+        "synced_at": datetime.now(timezone.utc).isoformat(),
+    }
+    company.sec_metadata = sec_metadata
+    counts["fields_refreshed"] += 1
+
+    # ── Partner-curatable fields (only set when NULL) ─────────────────
+    if company.is_public is False:
+        company.is_public = True
+        counts["fields_set"] += 1
+
+    name = data.get("name")
+    if company.legal_name is None and isinstance(name, str) and name:
+        company.legal_name = name[:512]
+        counts["fields_set"] += 1
+
+    tickers = data.get("tickers") or []
+    if tickers and company.public_ticker is None:
+        company.public_ticker = str(tickers[0])[:32]
+        counts["fields_set"] += 1
+
+    # ── Aliases (upsert) ──────────────────────────────────────────────
+    # Additional tickers beyond [0] (dual-class shares, secondary listings,
+    # ADRs).  alias_type="ticker" so the resolver can disambiguate later.
+    for extra_ticker in tickers[1:]:
+        if _upsert_alias(session, company.id, str(extra_ticker), "ticker"):
+            counts["aliases_added"] += 1
+
+    # formerNames — SEC publishes as list of {"name": "...", "from": "...",
+    # "to": "..."}.  Take .name; the from/to dates live in
+    # sec_metadata.former_names_raw for audit.
+    for fn in data.get("formerNames") or []:
+        former = fn.get("name") if isinstance(fn, dict) else fn
+        if former and isinstance(former, str):
+            if _upsert_alias(session, company.id, former, "former_name"):
+                counts["aliases_added"] += 1
+
+    return counts
 
 
 def _persist_material_links(
@@ -287,7 +451,16 @@ def ingest_sec_edgar(
         )
 
     source = _get_or_create_source(session)
-    material_cache = MaterialCache.build(session)
+
+    # Material attribution caches: only built when the per-event gate has
+    # a chance of opening.  Today every ParsedFiling is a narrative-stub
+    # placeholder (Workstream B will land real body-text extraction), so
+    # we lazy-init these to None and rebuild only inside the per-event
+    # branch.  This avoids the per-run MaterialCache.build() scan and the
+    # one-time materials_by_id load for what would be guaranteed-skip runs.
+    material_cache = None
+    material_classifier = None
+
     # Gated by feature_flags.LINK_EVENTS_TO_COMPANIES — when False (the
     # Foundation phase 3 default), persist_company_links no-ops, so there
     # is no value in paying for the cache build or the per-event resolver
@@ -298,38 +471,57 @@ def ingest_sec_edgar(
         else None
     )
 
-    # ── Optional Haiku classifier refinement layer (Tier 3 audit, 2026-05-09) ──
-    # Auto-enabled when ANTHROPIC_API_KEY is present; falls back gracefully
-    # to keyword-only attribution otherwise.  Refines MaterialCache.detect
-    # output by asking Haiku 4.5 whether each candidate material is what the
-    # filing is *materially about* vs incidentally mentioned in defensive
-    # risk-factor language.  See material_classifier.py module docstring.
-    from app.models.supply import Material
-    from app.services.ingestion.material_classifier import MaterialClassifier
-    materials_by_id = {
-        m.id: m.canonical_name
-        for m in session.scalars(select(Material)).all()
-    }
-    material_classifier = MaterialClassifier(materials_by_id=materials_by_id)
-    log.info(
-        "sec_edgar.classifier_status",
-        enabled=material_classifier.enabled,
-        note=("Haiku refinement active" if material_classifier.enabled
-              else "keyword-only attribution (set ANTHROPIC_API_KEY to enable)"),
-    )
-
     filings_seen = 0
     filings_inserted = 0
     risk_events_inserted = 0
     mat_links_total = 0
     hs_links_total = 0
     company_links_total = 0
+    companies_enriched = 0
+    companies_missing: list[str] = []
+    issuer_fields_refreshed = 0
+    issuer_fields_set = 0
+    issuer_aliases_added = 0
 
     try:
         for raw_cik in cik_list:
             data = _fetch_submissions(http_client, raw_cik)
             if not data:
                 continue
+
+            # ── Workstream A #2 (2026-05-23): issuer enrichment ───────
+            # Look up the Company row by CIK and refresh issuer-level
+            # fields from the submissions JSON (sic, exchanges, addresses,
+            # formerNames, extra tickers).  Best-effort: a missing Company
+            # is logged but does NOT block the per-filing event creation
+            # below — partner curation is the source of truth for which
+            # companies are tracked, and we don't auto-create Company
+            # stubs from CIK alone.  Run backfill-cik-map first if you
+            # haven't, otherwise issuers will skip with companies_missing.
+            cik_padded = str(raw_cik).strip().zfill(10)
+            company = session.scalar(
+                select(Company).where(Company.cik == cik_padded).limit(1)
+            )
+            if company is None:
+                companies_missing.append(cik_padded)
+                log.warning(
+                    "sec_edgar.enrich.company_missing",
+                    cik=cik_padded,
+                    issuer_name=data.get("name"),
+                    note=(
+                        "No Company row has this CIK.  Run "
+                        "`bdi-ingest backfill-cik-map` or add the "
+                        "company to the partner-curated seed template."
+                    ),
+                )
+            else:
+                enrich_counts = _enrich_company_from_submissions(
+                    session, company, data
+                )
+                companies_enriched += 1
+                issuer_fields_refreshed += enrich_counts["fields_refreshed"]
+                issuer_fields_set += enrich_counts["fields_set"]
+                issuer_aliases_added += enrich_counts["aliases_added"]
 
             parsed_filings = parse_sec_filing(data, max_filings=max_filings)
             for pf in parsed_filings:
@@ -344,7 +536,7 @@ def ingest_sec_edgar(
                     )
                 )
                 doc = _upsert_source_document(
-                    session, source=source, filing=pf, raw_blob=data
+                    session, source=source, filing=pf
                 )
                 if doc_before is None:
                     filings_inserted += 1
@@ -364,14 +556,18 @@ def ingest_sec_edgar(
                     accession=pf.accession_number,
                     filed_at=pf.filed_at,
                     narrative=pf.narrative_excerpt,
+                    items=pf.items,
                 )
                 event = RiskEvent(
                     source_document_id=doc.id,
                     event_type=draft.event_type,
-                    # Migration 040: typed event_subtype column.  Drives
-                    # the financial-pressure pillar's filing-signal evidence
-                    # query in evidence_query.
-                    event_subtype="FINANCIAL_PRESSURE",
+                    # Migration 040: typed event_subtype column.  Pre-2026-
+                    # 05-23 we hardcoded "FINANCIAL_PRESSURE" here which
+                    # collapsed the full 8-K item space into one bucket.
+                    # Now draft.event_subtype carries the granular value
+                    # mapped by sec_subtype_map.map_sec_filing — see that
+                    # module for the form + 8-K-item priority logic.
+                    event_subtype=draft.event_subtype,
                     event_date=draft.event_date,
                     title=draft.title[:1024],
                     summary=draft.summary,
@@ -388,30 +584,70 @@ def ingest_sec_edgar(
                 session.flush()
                 risk_events_inserted += 1
 
-                # ── 3. Material attribution: keyword pre-filter + LLM refine ──
+                # ── 3. Material attribution: gated on real narrative ──────
                 # Two-step attribution (Tier 3 audit, 2026-05-09):
-                #   a) MaterialCache.detect gives a cheap keyword-based
-                #      candidate set (already capped at top-3 by Tier 1.3).
-                #   b) When Haiku is enabled, MaterialClassifier.classify
-                #      asks the LLM whether each candidate is the filing's
+                #   a) MaterialCache.detect = cheap keyword-based candidate
+                #      set (capped at top-3 by Tier 1.3).
+                #   b) MaterialClassifier.classify = optional Haiku refiner
+                #      that decides whether each candidate is the filing's
                 #      actual subject vs an incidental risk-factor mention.
-                #      Rejected candidates get dropped; confirmed ones have
-                #      their relevance scaled by Haiku's confidence.
-                #      When Haiku is disabled, classify() is a passthrough.
                 #
-                # The old pipeline.py path ran no MaterialCache and produced
-                # zero material/HS junctions.
-                search_text = " ".join(
-                    filter(None, [event.title, event.summary])
-                )
-                if search_text.strip():
-                    detected = material_cache.detect(search_text)
-                    refined = material_classifier.classify(search_text, detected)
-                    mat_w, hs_w = _persist_material_links(
-                        session, event, refined
+                # GATE (2026-05-23): the submissions endpoint only returns
+                # metadata, so ParsedFiling.narrative_excerpt is a hardcoded
+                # stub like "10-K filing for Tesla, Inc. (CIK 0001318605).".
+                # Running detect+classify on the stub means:
+                #   - keyword match only ever fires when the issuer NAME
+                #     contains a material keyword (handful of names like
+                #     "Lithium Americas Corp" — useless for 99% of filers);
+                #   - every event still issues a Haiku call against
+                #     trivial text, burning API budget for ~zero signal.
+                # We therefore skip the whole block when the narrative is a
+                # placeholder.  Once Workstream B lands real filing-body
+                # extraction (Items 1A / 2 / 7 for 10-K, full body for 8-K),
+                # ParsedFiling.is_narrative_placeholder will be False and
+                # this gate will auto-open.
+                if not pf.is_narrative_placeholder:
+                    # Lazy-init the caches on first real narrative — see
+                    # block-2 comment near `material_cache = None` above
+                    # for why these are deferred until needed.
+                    if material_cache is None:
+                        material_cache = MaterialCache.build(session)
+                    if material_classifier is None:
+                        from app.models.supply import Material
+                        from app.services.ingestion.material_classifier import (
+                            MaterialClassifier,
+                        )
+                        materials_by_id = {
+                            m.id: m.canonical_name
+                            for m in session.scalars(select(Material)).all()
+                        }
+                        material_classifier = MaterialClassifier(
+                            materials_by_id=materials_by_id
+                        )
+                        log.info(
+                            "sec_edgar.classifier_status",
+                            enabled=material_classifier.enabled,
+                            note=(
+                                "Haiku refinement active"
+                                if material_classifier.enabled
+                                else "keyword-only attribution "
+                                "(set ANTHROPIC_API_KEY to enable)"
+                            ),
+                        )
+
+                    search_text = " ".join(
+                        filter(None, [event.title, event.summary])
                     )
-                    mat_links_total += mat_w
-                    hs_links_total += hs_w
+                    if search_text.strip():
+                        detected = material_cache.detect(search_text)
+                        refined = material_classifier.classify(
+                            search_text, detected
+                        )
+                        mat_w, hs_w = _persist_material_links(
+                            session, event, refined
+                        )
+                        mat_links_total += mat_w
+                        hs_links_total += hs_w
 
                 # ── 4. Company linkage via existing entity_resolution ──────
                 # Gated by feature_flags.LINK_EVENTS_TO_COMPANIES (default
@@ -440,6 +676,14 @@ def ingest_sec_edgar(
         "material_links_written": mat_links_total,
         "hs_links_written": hs_links_total,
         "company_links_written": company_links_total,
+        # Workstream A #2 issuer-enrichment counts (added 2026-05-23).
+        # companies_missing surfaces CIKs that need partner curation or
+        # backfill; non-empty list is a soft warning, not a failure.
+        "companies_enriched": companies_enriched,
+        "companies_missing": companies_missing,
+        "issuer_fields_refreshed": issuer_fields_refreshed,
+        "issuer_fields_set": issuer_fields_set,
+        "issuer_aliases_added": issuer_aliases_added,
     }
     log.info("sec_edgar.ingest.done", **result)
     return result

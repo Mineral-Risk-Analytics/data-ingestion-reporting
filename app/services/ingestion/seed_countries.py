@@ -268,9 +268,15 @@ _COUNTRIES: list[dict] = [
             {"pattern": "burma",   "context": "primary"},
             {"pattern": "burmese", "context": "mentioned"},
         ],
-        "is_sanctions_risk": False,
+        # 2026-05-19 partner-direction: flipped is_sanctions_risk False
+        # → True.  Myanmar has substantial US/EU sanctions exposure
+        # (Tatmadaw-affiliated entities post-2021 coup) AND meaningful
+        # mineral-supply relevance: ~10% global tin output, heavy-REE
+        # smuggled via China, tungsten.  Geography sanctions exposure
+        # events will now fire for MM when entity counts cross threshold.
+        "is_sanctions_risk": True,
         "is_major_producer": True, "is_major_consumer": False,
-        "notes": "Major rare earth (heavy REE) and tin producer.",
+        "notes": "Major rare earth (heavy REE) and tin producer; sanctions risk post-2021 coup.",
     },
     {
         "iso2": "GN", "name": "Guinea", "iso3": "GIN", "region": "Africa",

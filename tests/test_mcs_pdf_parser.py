@@ -19,13 +19,33 @@ from app.services.ingestion.mcs_pdf_parser import (
     MCSPdfParser,
     _HTS_CODE_RE,
     _IMPORT_SOURCES_RE,
-    _MCS_COMMODITY_MAP,
-    _MCS_PRODUCTION_STAGE_PREFERENCE,
     CommoditySection,
     ImportSource,
-    ProductionShare,
     TariffEntry,
 )
+from app.services.ingestion.seed_material_source_aliases import _ALIASES
+
+
+def _mcs_pdf_aliases() -> dict[str, str]:
+    """Return ``{source_name (upper-stripped): canonical}`` for the
+    mcs_pdf alias rows that resolve to a tracked material.
+
+    Skipped aliases (4-tuple with None canonical) are excluded; secondary
+    aliases (5-tuple) include the canonical they share with a primary.
+
+    Replaces the deleted ``_MCS_COMMODITY_MAP`` dict (Section 4.3 fix
+    2026-06).
+    """
+    out: dict[str, str] = {}
+    for row in _ALIASES:
+        if row[0] != "mcs_pdf":
+            continue
+        source_name = row[1].strip().upper()
+        canonical = row[2]  # 3-tuple / 5-tuple both put canonical at idx 2
+        if canonical is None:
+            continue  # explicit skip row
+        out[source_name] = canonical
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -98,46 +118,47 @@ Nickel tariff content here.
 
 
 # ---------------------------------------------------------------------------
-# Commodity map tests
+# Alias coverage tests (post Section 4.3: _MCS_COMMODITY_MAP deleted; source
+# of truth is material_source_aliases (source_system='mcs_pdf'))
 # ---------------------------------------------------------------------------
 
-class TestCommodityMap:
-    def test_all_values_are_nonempty_strings(self):
-        for heading, canonical in _MCS_COMMODITY_MAP.items():
+class TestMcsPdfAliases:
+    """Verify the mcs_pdf rows in material_source_aliases stay coherent.
+
+    Replaces the deleted ``TestCommodityMap`` class.  Same intent:
+    catch blank canonicals, missing core commodities, and unintended
+    duplicate canonicals across primary aliases.
+    """
+
+    def test_all_canonicals_are_nonempty_strings(self):
+        for heading, canonical in _mcs_pdf_aliases().items():
             assert isinstance(canonical, str) and canonical.strip(), (
-                f"Blank canonical name for heading {heading!r}"
+                f"Blank canonical for mcs_pdf alias {heading!r}"
             )
 
-    def test_known_headings_present(self):
+    def test_core_headings_present(self):
         expected = {"COBALT", "LITHIUM", "NICKEL", "MANGANESE", "ALUMINUM", "COPPER"}
-        assert expected.issubset(_MCS_COMMODITY_MAP.keys())
+        assert expected.issubset(_mcs_pdf_aliases().keys())
 
-    def test_no_duplicate_canonical_names(self):
-        canonicals = list(_MCS_COMMODITY_MAP.values())
-        # Some commodities legitimately share a canonical name — but this should be intentional
-        dupes = [c for c in set(canonicals) if canonicals.count(c) > 1]
-        # If any dupes exist, flag them so the developer can review
-        assert not dupes, f"Duplicate canonical names in _MCS_COMMODITY_MAP: {dupes}"
-
-
-class TestProductionStagePreference:
-    def test_all_stages_are_valid(self):
-        valid_stages = {
-            "ore", "concentrate", "intermediate", "refined",
-            "battery_grade", "fabricated", "scrap",
-        }
-        for name, stage in _MCS_PRODUCTION_STAGE_PREFERENCE.items():
-            assert stage in valid_stages, (
-                f"Invalid stage {stage!r} for {name!r}"
-            )
-
-    def test_production_stage_overrides_are_subset_of_commodity_map(self):
-        """Explicit stage overrides must reference materials that appear in the commodity map."""
-        canon_values = set(_MCS_COMMODITY_MAP.values())
-        extra = set(_MCS_PRODUCTION_STAGE_PREFERENCE) - canon_values
-        assert not extra, (
-            f"_MCS_PRODUCTION_STAGE_PREFERENCE has unknown canonicals: {extra}"
+    def test_no_duplicate_canonical_names_among_primary_rows(self):
+        """Primary alias rows (3-tuples) must not share a canonical.
+        Secondary aliases (5-tuples) intentionally reuse a primary's
+        canonical (e.g. BAUXITE AND ALUMINA → Aluminum) and are filtered
+        out of this check.
+        """
+        primary_canonicals = [
+            row[2] for row in _ALIASES
+            if row[0] == "mcs_pdf" and len(row) == 3
+        ]
+        dupes = [c for c in set(primary_canonicals) if primary_canonicals.count(c) > 1]
+        assert not dupes, (
+            f"Duplicate canonical names in mcs_pdf primary aliases: {dupes}"
         )
+
+
+# TestProductionStagePreference removed 2026-06 (Section 5.1 cleanup).
+# _MCS_PRODUCTION_STAGE_PREFERENCE was used only by _pick_production_hs_id,
+# which is itself removed.  See mcs_pdf_parser.py file header for context.
 
 
 # ---------------------------------------------------------------------------
@@ -220,28 +241,8 @@ class TestParserTextExtraction:
         codes = [e.hts_code for e in entries]
         assert codes.count("2605000000") == 1
 
-    def test_parse_production_leaders_extracts_countries(self, parser: MCSPdfParser):
-        leaders = parser._parse_production_leaders(COBALT_PRODUCTION_BLOCK)
-        country_names = [ldr.country_name for ldr in leaders]
-        assert any("Congo" in n for n in country_names)
-        assert any("Russia" in n for n in country_names)
-        assert any("Australia" in n for n in country_names)
-
-    def test_parse_production_leaders_excludes_world_total(self, parser: MCSPdfParser):
-        leaders = parser._parse_production_leaders(COBALT_PRODUCTION_BLOCK)
-        for ldr in leaders:
-            assert "world total" not in ldr.country_name.lower()
-
-    def test_parse_production_leaders_excludes_other(self, parser: MCSPdfParser):
-        leaders = parser._parse_production_leaders(COBALT_PRODUCTION_BLOCK)
-        for ldr in leaders:
-            assert not ldr.country_name.lower().startswith("other")
-
-    def test_parse_production_leaders_uses_estimated_year(self, parser: MCSPdfParser):
-        leaders = parser._parse_production_leaders(COBALT_PRODUCTION_BLOCK)
-        if leaders:
-            # Block has "2025(e)" so reference year should be 2025
-            assert leaders[0].reference_year == 2025
+    # _parse_production_leaders tests removed 2026-06 (Section 5.1 cleanup)
+    # — the extractor itself is gone.  See file header in mcs_pdf_parser.py.
 
     def test_parse_import_sources_extracts_countries(self, parser: MCSPdfParser):
         sources = parser._parse_import_sources(COBALT_IMPORT_BLOCK)
@@ -331,97 +332,59 @@ class TestSixDigitDerivation:
 
 
 # ---------------------------------------------------------------------------
-# Country resolution tests
+# Country resolution tests removed 2026-06 (Section 6.2 cleanup).
+# ``_resolve_country`` + ``_build_country_map`` are deleted — country
+# resolution is no longer the PDF parser's job (Step 4a deleted in
+# Section 5.1, Step 4b disabled May 2026).
 # ---------------------------------------------------------------------------
-
-class TestCountryResolution:
-    @pytest.fixture
-    def country_map(self) -> dict[str, str]:
-        return {
-            "congo (kinshasa)": "CD",
-            "democratic republic of the congo": "CD",
-            "drc": "CD",
-            "russia": "RU",
-            "russian federation": "RU",
-            "australia": "AU",
-            "finland": "FI",
-            "south africa": "ZA",
-            "norway": "NO",
-            "canada": "CA",
-            "china": "CN",
-            "united states": "US",
-        }
-
-    @pytest.mark.parametrize("name, expected_iso2", [
-        ("Congo (Kinshasa)", "CD"),
-        ("Russia", "RU"),
-        ("Australia", "AU"),
-        ("Finland", "FI"),
-        ("South Africa", "ZA"),
-        ("China", "CN"),
-        ("  United States  ", "US"),   # whitespace stripped
-    ])
-    def test_resolves_known_countries(
-        self,
-        name: str,
-        expected_iso2: str,
-        country_map: dict[str, str],
-    ):
-        result = MCSPdfParser._resolve_country(name, country_map)
-        assert result == expected_iso2
-
-    def test_returns_none_for_unknown(self, country_map: dict[str, str]):
-        result = MCSPdfParser._resolve_country("Atlantis", country_map)
-        assert result is None
-
-    def test_empty_string_returns_none(self, country_map: dict[str, str]):
-        result = MCSPdfParser._resolve_country("", country_map)
-        assert result is None
-
-    def test_strips_parenthetical_fallback(self, country_map: dict[str, str]):
-        # "Congo (Kinshasa)" → try "congo (kinshasa)" first, fall back to "congo"
-        # The fixture has "congo (kinshasa)" so it should match directly
-        result = MCSPdfParser._resolve_country("Congo (Kinshasa)", country_map)
-        assert result == "CD"
 
 
 # ---------------------------------------------------------------------------
 # Production share calculation tests
 # ---------------------------------------------------------------------------
 
-class TestProductionShareCalculation:
-    def test_shares_sum_to_at_most_one(self):
-        """After normalising by world total, country shares should sum to ≤ 1."""
-        leaders = [
-            ProductionShare("Congo (Kinshasa)", 170_000, 2025),
-            ProductionShare("Russia", 7_600, 2025),
-            ProductionShare("Australia", 5_500, 2025),
-        ]
-        world_total = sum(ldr.production_value for ldr in leaders)
-        shares = [ldr.production_value / world_total for ldr in leaders]
-        assert sum(shares) <= 1.001  # allow floating-point tolerance
-
-    def test_dominant_producer_has_highest_share(self):
-        leaders = [
-            ProductionShare("DRC", 170_000, 2025),
-            ProductionShare("Australia", 5_500, 2025),
-        ]
-        world_total = sum(ldr.production_value for ldr in leaders)
-        drc_share = 170_000 / world_total
-        aus_share = 5_500 / world_total
-        assert drc_share > aus_share
+# TestProductionShareCalculation removed 2026-06 (Section 5.1 cleanup).
+# ProductionShare dataclass is gone; share computation now lives entirely
+# in the CSV path (mcs2026_parser).
 
 
 # ---------------------------------------------------------------------------
 # Section splitting tests
 # ---------------------------------------------------------------------------
 
+class _FakeResolver:
+    """Tiny fake satisfying ``MaterialAliasResolver.list_for_source`` +
+    ``.resolve``.  Used by the section-splitting tests so they don't have
+    to construct a real DB session.
+
+    Section 4.3 + 4.4 fix (2026-06): Path B now requires a resolver and
+    talks to it via ``list_for_source`` rather than reaching into
+    ``_session`` directly.
+    """
+
+    def __init__(self, known: set[str]) -> None:
+        self._known = known
+
+    def list_for_source(self, source_system: str) -> set[str]:
+        return set(self._known)
+
+    def resolve(self, source_system: str, source_name: str):
+        # Not exercised by these tests — they only call
+        # _split_into_commodity_sections, not _resolve_pdf_heading.
+        from app.services.ingestion.material_resolver import ResolveResult
+        return ResolveResult(material=None, status="unknown")
+
+
 class TestSectionSplitting:
     @pytest.fixture
     def parser(self, tmp_path: Path) -> MCSPdfParser:
         fake = tmp_path / "fake.pdf"
         fake.write_bytes(b"")
-        return MCSPdfParser(fake, reference_year=2026)
+        # Provide a fake resolver so Path B can identify which headings
+        # are real commodity anchors.  Mirror the real mcs_pdf rows for
+        # the three commodities used in FAKE_PDF_TEXT.
+        resolver = _FakeResolver(known={"ALUMINUM", "COBALT", "NICKEL"})
+        return MCSPdfParser(fake, reference_year=2026, resolver=resolver)  # type: ignore[arg-type]
 
     def test_splits_known_headings(self, parser: MCSPdfParser):
         sections = parser._split_into_commodity_sections(FAKE_PDF_TEXT)
@@ -437,13 +400,38 @@ class TestSectionSplitting:
         sections = parser._split_into_commodity_sections(FAKE_PDF_TEXT)
         assert "UNOBTANIUM" not in sections
 
+    def test_raises_without_resolver(self, tmp_path: Path):
+        """Section 4.3 fix: Path B requires a resolver — no fall-through
+        to a deleted dict.  Constructing a parser without a resolver is
+        allowed (Path A doesn't need one), but invoking the regex split
+        helper must raise.
+        """
+        fake = tmp_path / "fake.pdf"
+        fake.write_bytes(b"")
+        p = MCSPdfParser(fake, reference_year=2026)  # no resolver
+        with pytest.raises(RuntimeError, match="MaterialAliasResolver"):
+            p._split_into_commodity_sections(FAKE_PDF_TEXT)
+
+    def test_resolve_pdf_heading_raises_without_resolver(self, tmp_path: Path):
+        fake = tmp_path / "fake.pdf"
+        fake.write_bytes(b"")
+        p = MCSPdfParser(fake, reference_year=2026)  # no resolver
+        with pytest.raises(RuntimeError, match="MaterialAliasResolver"):
+            p._resolve_pdf_heading("COBALT")
+
 
 # ---------------------------------------------------------------------------
 # seed_to_db tests (mocked DB)
 # ---------------------------------------------------------------------------
 
 class TestSeedToDb:
-    """Verify the insert order contract: US rows → global rows → SELECT back → shares."""
+    """Verify the insert order contract: US rows → global rows → SELECT back.
+
+    Section 5.1 cleanup (2026-06): production_leaders + Step 4a removed,
+    so the seed contract is now tariff-only on the DB-write side.
+    Salient-notes append still runs; import_sources remains as a parser
+    diagnostic (DB write is disabled).
+    """
 
     @pytest.fixture
     def parser_with_fake_sections(self, tmp_path: Path, monkeypatch) -> MCSPdfParser:
@@ -467,10 +455,6 @@ class TestSeedToDb:
                     hts_code_raw="2822.00.0010",
                 ),
             ],
-            production_leaders=[
-                ProductionShare("Congo (Kinshasa)", 170_000, 2025),
-                ProductionShare("Australia", 5_500, 2025),
-            ],
             import_sources=[
                 ImportSource("Democratic Republic of the Congo", 0.30, 2024),
                 ImportSource("Finland", 0.26, 2024),
@@ -484,27 +468,12 @@ class TestSeedToDb:
         self, parser_with_fake_sections: MCSPdfParser
     ):
         session = MagicMock()
-        # _build_country_map and _build_material_map are static; mock their DB calls
-        session.execute.return_value.all.return_value = [
-            ("CD", "Congo (Kinshasa)", ["DRC", "Congo (Kinshasa)"]),
-            ("AU", "Australia", ["Australia"]),
-            ("FI", "Finland", ["Finland"]),
-        ]
-        # material map
-        with (
-            patch.object(
-                MCSPdfParser, "_build_country_map",
-                return_value={
-                    "congo (kinshasa)": "CD",
-                    "australia": "AU",
-                    "finland": "FI",
-                    "democratic republic of the congo": "CD",
-                },
-            ),
-            patch.object(
-                MCSPdfParser, "_build_material_map",
-                return_value={"Cobalt": 1},
-            ),
+        # Section 6.2 cleanup (2026-06): only _build_material_map is loaded;
+        # _build_country_map was deleted along with its consumers.
+        session.execute.return_value.all.return_value = []
+        with patch.object(
+            MCSPdfParser, "_build_material_map",
+            return_value={"Cobalt": 1},
         ):
             stats = parser_with_fake_sections.seed_to_db(session, dry_run=True)
 
@@ -530,11 +499,11 @@ class TestSeedToDb:
         monkeypatch.setattr(p, "parse", lambda *a, **k: [unknown_section])
 
         session = MagicMock()
-        with (
-            patch.object(MCSPdfParser, "_build_country_map", return_value={}),
-            patch.object(MCSPdfParser, "_build_material_map", return_value={}),
-            # Material map is EMPTY — Cobalt has no material_id
+        # Section 6.2 cleanup: _build_country_map patch removed.
+        with patch.object(
+            MCSPdfParser, "_build_material_map", return_value={},
         ):
+            # Material map is EMPTY — Cobalt has no material_id
             stats = p.seed_to_db(session, dry_run=True)
 
         assert "Cobalt" not in stats

@@ -20,8 +20,14 @@ Architecture
 3. A deterministic resolver converts page numbers → line indices using
    the ``--- PAGE BREAK ---`` markers, and converts textual anchors →
    line offsets via literal string match within the bounded chapter text.
-4. The resolved data is constructed as a public ``LocatorResult`` and
-   validated against the runtime checks (canonical materials, line bounds).
+4. The resolved data is constructed as a public ``LocatorResult``.
+   ``CommodityChapter`` / ``CommoditySection`` Pydantic constraints
+   enforce non-negative line indices and ``end_line > start_line``;
+   beyond that, the safety net is ``_heading_in_chapter_text`` (drops
+   chapters whose LLM-named heading doesn't appear within the resolved
+   bounds — catches page-number hallucinations).  Materials outside the
+   canonical list are filtered by the LLM (via the ``skipped`` field
+   per the system prompt), not by a post-step here.
 5. Optionally cached to disk as JSON.
 
 Caching
@@ -95,9 +101,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.services.ingestion.mcs_pdf_llm_schemas import (
     CommodityChapter,
-    CommoditySection,
     LocatorResult,
-    SectionType,
     SkippedCommodity,
 )
 
@@ -108,7 +112,10 @@ log = structlog.get_logger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-_MODEL = "claude-sonnet-4-6"
+# Section 7.1 fix (2026-06): allow override via env so future model
+# rotations (deprecation of claude-sonnet-4-6, A/B testing against a
+# newer Sonnet or Opus) don't require a source edit + redeploy.
+_MODEL = os.environ.get("MCS_LOCATOR_MODEL", "claude-sonnet-4-6")
 
 # Output budget.  Empirical history:
 #   - 8K: hit cap exactly, returned empty {}
@@ -189,10 +196,10 @@ NOT produce any text, thinking, preamble, summary, explanation, or
 commentary before the tool call.  Begin the tool call as your very first
 output token.
 
-For the `sections` field on each chapter: leave it as an empty list
-([]).  Do NOT populate sub-sections — the post-processor identifies them
-deterministically by regex against the chapter's text.  Including
-sub-sections wastes output budget and isn't used downstream.
+Each chapter record needs only `canonical_material`, `pdf_heading`,
+`start_page`, and `end_page` — the schema doesn't accept sub-sections.
+Downstream regex extractors locate Tariff / Production / Import Sources /
+Salient Statistics blocks within each chapter automatically.
 """
 
 
@@ -200,22 +207,21 @@ sub-sections wastes output budget and isn't used downstream.
 # Internal types — LLM-shaped payload (anchors instead of line numbers)
 # ---------------------------------------------------------------------------
 
-class _LLMSection(BaseModel):
-    """Sub-section as returned by the LLM — uses textual anchors."""
-
-    section_type: SectionType
-    start_anchor: str = Field(min_length=8, max_length=120)
-    end_anchor: Optional[str] = Field(default=None, max_length=120)
+# _LLMSection class removed 2026-06 (Section 10 cleanup) — chapter-only
+# locator; sub-section identification handled by regex extractors.
 
 
 class _LLMChapter(BaseModel):
-    """Chapter as returned by the LLM — uses page numbers + anchors."""
+    """Chapter as returned by the LLM — page numbers only.
+
+    Section 10 cleanup (2026-06): ``sections`` field removed.  The system
+    prompt asks the LLM for chapter bounds only.
+    """
 
     canonical_material: str
     pdf_heading: str
     start_page: int = Field(ge=1)
     end_page: int = Field(ge=1)
-    sections: list[_LLMSection] = Field(default_factory=list)
 
 
 class _LLMResponse(BaseModel):
@@ -349,14 +355,19 @@ def _build_page_index(lines: list[str]) -> dict[int, int]:
         if line.strip() != _PAGE_BREAK:
             continue
 
-        # Look for the first short numeric line within ±5 lines of the
-        # break — that's the printed page number.  USGS sometimes places
-        # it before the break (as a footer of the previous page) and
-        # sometimes after (as a header of the next page).
+        # Section 8.1 fix (2026-06): only consider numeric lines AFTER
+        # the break.  Page numbers that appear BEFORE a break are
+        # footers of the page ENDING (the content for that page started
+        # at the prior break, not at this one).  The previous code
+        # scanned ±5 lines symmetrically and picked the first match,
+        # which mis-indexed any page using footer-style numbering —
+        # observed in MCS 2026 intro pages (1-15).  Commodity chapters
+        # all use header-style numbering (number AFTER break), so this
+        # narrower scan keeps every chapter page correctly indexed
+        # while dropping the off-by-one-page intro entries (which the
+        # LLM never requests anyway).
         page_num: Optional[int] = None
-        for j in range(max(0, i - 5), min(n, i + 6)):
-            if j == i:
-                continue
+        for j in range(i + 1, min(n, i + 6)):
             m = _PAGE_NUMBER_RE.match(lines[j])
             if m:
                 page_num = int(m.group(1))
@@ -376,27 +387,9 @@ def _build_page_index(lines: list[str]) -> dict[int, int]:
     return page_to_line
 
 
-def _find_anchor_line(
-    anchor: str,
-    lines: list[str],
-    *,
-    start_line: int,
-    end_line: int,
-) -> Optional[int]:
-    """Return the FIRST line index in [start_line, end_line) that contains
-    ``anchor`` as a substring.  None if not found.
-
-    The match is case-sensitive and substring-based; the LLM is asked to
-    return the literal opening text of each sub-section so we can match
-    exactly.  If the anchor isn't found we return None and let the caller
-    decide whether to skip the section or treat it as a hard error.
-    """
-    if not anchor:
-        return None
-    for i in range(start_line, min(end_line, len(lines))):
-        if anchor in lines[i]:
-            return i
-    return None
+# _find_anchor_line removed 2026-06 (Section 10 cleanup) — sub-section
+# anchor resolution is no longer part of the contract; downstream regex
+# extractors locate sub-sections within chapter-bounded text.
 
 
 def _resolve_chapter(
@@ -407,10 +400,8 @@ def _resolve_chapter(
     """Convert one LLM-shaped chapter to the public schema.
 
     Returns None (and logs) when the chapter cannot be resolved — typically
-    because the LLM returned a page number we couldn't index, or every
-    sub-section's anchor failed to match.  Sub-sections whose anchors
-    can't be located are dropped individually rather than failing the
-    chapter.
+    because the LLM returned a page number we couldn't index, or because
+    the heading-presence safety net rejects the resolved bounds.
     """
     start_line_opt = page_to_line.get(llm_chapter.start_page)
     if start_line_opt is None:
@@ -473,44 +464,9 @@ def _resolve_chapter(
         )
         return None
 
-    # Resolve sub-section anchors to line indices.
-    resolved_sections: list[CommoditySection] = []
-    for sec in llm_chapter.sections:
-        s_idx = _find_anchor_line(
-            sec.start_anchor, lines, start_line=start_line_opt, end_line=end_line,
-        )
-        if s_idx is None:
-            log.info(
-                "mcs_pdf_llm_locator.section_anchor_not_found",
-                material=llm_chapter.canonical_material,
-                section_type=sec.section_type,
-                anchor=sec.start_anchor[:60],
-            )
-            continue
-        # End anchor: search AFTER the start anchor; default to chapter end.
-        if sec.end_anchor:
-            e_idx = _find_anchor_line(
-                sec.end_anchor, lines, start_line=s_idx + 1, end_line=end_line,
-            )
-            sec_end = e_idx if e_idx is not None else end_line
-        else:
-            sec_end = end_line
-        # Defensive: ensure end > start
-        if sec_end <= s_idx:
-            sec_end = s_idx + 1
-        try:
-            resolved_sections.append(CommoditySection(
-                section_type=sec.section_type,
-                start_line=s_idx,
-                end_line=sec_end,
-            ))
-        except ValidationError as exc:
-            log.warning(
-                "mcs_pdf_llm_locator.section_validation_failed",
-                material=llm_chapter.canonical_material,
-                section_type=sec.section_type,
-                error=str(exc),
-            )
+    # Section 10 cleanup (2026-06): sub-section anchor resolution removed
+    # along with ``_find_anchor_line`` — the LLM no longer emits anchors
+    # and downstream regex extractors locate sub-sections automatically.
 
     try:
         return CommodityChapter(
@@ -520,7 +476,6 @@ def _resolve_chapter(
             end_page=llm_chapter.end_page,
             start_line=start_line_opt,
             end_line=end_line,
-            sections=resolved_sections,
         )
     except ValidationError as exc:
         log.warning(
