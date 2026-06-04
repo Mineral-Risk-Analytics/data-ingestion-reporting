@@ -164,6 +164,19 @@ _SOURCE_NAME = "UN Comtrade API"
 _SOURCE_TYPE = "comtrade"
 _BATCH_SIZE = 500
 
+# Comtrade "breakdownMode" parameter: 'plus' returns sub-headings (6-digit
+# typical), 'classic' aggregates to the queried level (4-digit if queried
+# with cmdCode=2604).  We use 'plus' so the engine&#x2019;s stage-level HS-code
+# mappings can match against trade-flow rows.  Embedded in the external_id
+# of every SourceDocument so future mode changes don&#x2019;t silently overwrite
+# data ingested under a different breakdown.
+_BREAKDOWN_MODE = "plus"
+
+# External-ID schema version.  Incremented when the structure of the
+# external_id string changes so old and new IDs can&#x2019;t collide.  v1 was
+# the pre-2026-06 format that didn&#x2019;t encode breakdown_mode.  v2 adds it.
+_EXTERNAL_ID_VERSION = "v2"
+
 # Hard wall-clock timeout for a single Comtrade API call.
 # httpx's timeout= is a per-socket-read limit, not a total-response limit, so
 # a slow-streaming 200 response can stall for many minutes. Setting a low read
@@ -344,7 +357,7 @@ def fetch_annual_exports(
         "flowCode": flow_code,
         "maxRecords": settings.comtrade_max_records,
         "includeDesc": "true",
-        "breakdownMode": "plus",
+        "breakdownMode": _BREAKDOWN_MODE,
     }
 
     log.info(
@@ -461,10 +474,43 @@ def parse_comtrade_rows(
 # ---------------------------------------------------------------------------
 
 def _get_or_create_comtrade_source(session: Session) -> int:
-    """Get or create the Source row for UN Comtrade. Returns source.id."""
+    """Get or create the Source row for UN Comtrade. Returns source.id.
+
+    ``config_json`` captures the static query shape so the Source row is
+    a complete audit-trail record of how we ingest from Comtrade.  On
+    every call we MERGE the live module constants into the row&#x2019;s
+    config_json — that way a code change to ``_BREAKDOWN_MODE`` or
+    ``_EXTERNAL_ID_VERSION`` propagates to the Source row on the next
+    ingest, without requiring the operator to manually re-create the
+    row.  Existing keys are overwritten; unknown keys (added by ad-hoc
+    operator edits) are preserved.
+    """
     settings = get_settings()
+    expected_config: dict[str, Any] = {
+        "base_url": settings.comtrade_base_url,
+        "freq": "A",
+        "classification": "HS",
+        "breakdown_mode": _BREAKDOWN_MODE,
+        "external_id_version": _EXTERNAL_ID_VERSION,
+    }
+
     existing = session.scalar(select(Source).where(Source.name == _SOURCE_NAME))
     if existing is not None:
+        # Merge live module constants into config_json — overwrites stale
+        # keys, preserves unknown ones.
+        current = dict(existing.config_json or {})
+        merged = {**current, **expected_config}
+        if merged != current:
+            existing.config_json = merged
+            session.flush()
+            log.info(
+                "comtrade.source_config_refreshed",
+                source_id=existing.id,
+                added_or_changed=[
+                    k for k in expected_config
+                    if current.get(k) != expected_config[k]
+                ],
+            )
         return existing.id
 
     source = Source(
@@ -472,11 +518,7 @@ def _get_or_create_comtrade_source(session: Session) -> int:
         source_type=_SOURCE_TYPE,
         phase="1",
         is_active=True,
-        config_json={
-            "base_url": settings.comtrade_base_url,
-            "freq": "A",
-            "classification": "HS",
-        },
+        config_json=expected_config,
     )
     session.add(source)
     session.flush()
@@ -484,10 +526,40 @@ def _get_or_create_comtrade_source(session: Session) -> int:
     return source.id
 
 
-def _external_id(reporter_iso2: str, hs_prefix: str, year: int, flow_code: str = "X") -> str:
-    # flow_code included so export and import runs for the same reporter/HS/year
-    # produce distinct source_documents and don't skip each other's idempotency check.
-    return f"comtrade_{flow_code}_A_HS_{hs_prefix}_{reporter_iso2}_{year}"
+def _external_id(
+    reporter_iso2: str,
+    hs_prefix: str,
+    year: int,
+    flow_code: str = "X",
+    breakdown_mode: str = _BREAKDOWN_MODE,
+) -> str:
+    """Generate the SourceDocument external_id for one (reporter, HS, year, flow,
+    breakdown_mode) batch.
+
+    Format (v2, post-2026-06)::
+
+        comtrade_v2_{flow}_A_HS_{breakdown}_{prefix}_{reporter}_{year}
+
+    Example: ``comtrade_v2_X_A_HS_plus_2604_AU_2024``
+
+    Includes:
+      * Version tag (v2) — bumps when the schema changes, prevents
+        collision with legacy v1 IDs.
+      * Flow code (X / M) — exports and imports for the same reporter/
+        HS/year produce distinct documents and don&#x2019;t trip each other&#x2019;s
+        idempotency check.
+      * Breakdown mode (plus / classic) — protects against future mode
+        A/B testing or restore-from-backup scenarios from silently
+        overwriting data ingested at a different aggregation level.
+      * Static ``A_HS`` segment — Annual frequency, Harmonized System
+        classification.  Hardcoded since those are the only values we
+        support today; if we ever ingest monthly or SITC, rev the
+        version tag.
+    """
+    return (
+        f"comtrade_{_EXTERNAL_ID_VERSION}_{flow_code}_A_HS_{breakdown_mode}_"
+        f"{hs_prefix}_{reporter_iso2}_{year}"
+    )
 
 
 def _create_source_document(
@@ -498,13 +570,17 @@ def _create_source_document(
     year: int,
     row_count: int,
     flow_code: str = "X",
+    breakdown_mode: str = _BREAKDOWN_MODE,
 ) -> int:
     """Create a SourceDocument for one API call batch. Returns source_document.id.
 
     If a document with this external_id already exists (source_id + external_id
     unique constraint), returns the existing row's id without inserting a duplicate.
     """
-    ext_id = _external_id(reporter_iso2, hs_prefix, year, flow_code=flow_code)
+    ext_id = _external_id(
+        reporter_iso2, hs_prefix, year,
+        flow_code=flow_code, breakdown_mode=breakdown_mode,
+    )
     existing = session.scalar(
         select(SourceDocument).where(
             SourceDocument.source_id == source_id,
@@ -525,6 +601,7 @@ def _create_source_document(
             "hs_prefix": hs_prefix,
             "year": year,
             "flow_code": flow_code,
+            "breakdown_mode": breakdown_mode,
             "row_count": row_count,
         },
     )
@@ -540,7 +617,8 @@ def _create_source_document(
 def _build_hs_material_map(
     session: Session,
 ) -> dict[str, list[tuple[int, float, int]]]:
-    """Return all hs_code_material_mappings keyed by normalised prefix.
+    """Return ``hs_code_material_mappings`` relevant to Comtrade attribution,
+    keyed by normalised prefix.
 
     Returns ``{prefix: [(material_id, confidence, hs_mapping_id), ...]}``.
     A single prefix may resolve to multiple materials (e.g. "2615" covers
@@ -554,13 +632,34 @@ def _build_hs_material_map(
 
     Prefixes are stored without dots so comparison against raw Comtrade HS
     codes (which also have no dots) is straightforward.
+
+    Filtered to ``market_scope='global' AND digit_count IN (4, 6)`` because:
+
+      * Comtrade returns HS codes at 6-digit max — 10-digit US-scope rows
+        are unreachable by the resolver and would just bloat the dict.
+      * The 4-digit and 6-digit global rows are the partner-curated set
+        the resolver actually uses.
+
+    Without the filter we'd load ~432 rows (102 + 205 + 190 by digit_count);
+    with the filter we load ~273 rows — ~44% smaller dict, same matches.
     """
-    rows = session.scalars(select(HsCodeMaterialMapping)).all()
+    rows = session.scalars(
+        select(HsCodeMaterialMapping).where(
+            HsCodeMaterialMapping.market_scope == "global",
+            HsCodeMaterialMapping.digit_count.in_([4, 6]),
+        )
+    ).all()
     result: dict[str, list[tuple[int, float, int]]] = {}
     for r in rows:
         prefix = r.hs_code_prefix.replace(".", "")
         result.setdefault(prefix, []).append((r.material_id, r.confidence, r.id))
     return result
+
+
+# Threshold below which a positive resolver match is logged as
+# under-curated.  Surfaces partner-review-worthy mappings (e.g. lithium
+# chloride at confidence 0.40 today) without disrupting attribution.
+_RESOLVER_LOW_CONFIDENCE_THRESHOLD = 0.50
 
 
 def _resolve_material_id(
@@ -576,12 +675,27 @@ def _resolve_material_id(
         If multiple map to it, return the highest-confidence one; if tied,
         return (None, None, None) — genuinely ambiguous at this granularity.
 
-    Pass 2 — 4-digit prefix fallback.
-        Collect all mapping rows whose 4-digit prefix is a prefix of hs_code.
-        Apply the same single/highest-confidence/tie-means-None logic.
+    Pass 2 — shorter-prefix fallback.
+        Walk progressively shorter prefixes of hs_code (longest first) until
+        we find one that has mapping entries.  Apply the same single /
+        highest-confidence / tie-means-None logic.  In practice this means
+        a 6-digit Comtrade code falls back to its 4-digit heading; HS doesn&#x2019;t
+        define 5-digit canonical levels, but the loop is general so any
+        intermediate length we ever curate works too.  We stop at the first
+        prefix length that yields candidates — we don&#x2019;t continue to even
+        shorter prefixes once any have matched.
 
     Returning (None, None, None) for ambiguous shared-prefix codes is
     intentional — NULL values are honest; wrong IDs silently poison scoring.
+
+    Diagnostic logging:
+      * ``comtrade.resolver.low_confidence`` — emitted when we return a
+        positive match with confidence below
+        ``_RESOLVER_LOW_CONFIDENCE_THRESHOLD``.  Useful for spotting
+        under-curated mappings.
+      * ``comtrade.resolver.ambiguous_null`` — emitted when ambiguity
+        forces a (None, None, None) return.  Useful for surfacing
+        partner-review-worthy codes (e.g. HS 2615 → Nb/Ta/V/Zr tie).
 
     2026-05-09 (Tier 1.4 audit, scope extension): added the third
     ``confidence`` element so GTA/Comtrade callers can downscale
@@ -589,23 +703,48 @@ def _resolve_material_id(
     Callers that don't need confidence can ignore it:
         ``mid, hs_id, _ = _resolve_material_id(code, hs_map)``.
     """
-    # Pass 1: exact 6-digit (or shorter if stored that way) match.
+    # Pass 1: exact match.  hs_material_map is keyed by the prefix as
+    # stored in the mapping table, so an exact-length hs_code matches
+    # whatever (4-digit or 6-digit) prefix exists at that exact key.
     exact = hs_material_map.get(hs_code)
     if exact:
         if len(exact) == 1:
             mid, conf, hs_id = exact[0]
+            _maybe_log_low_confidence(hs_code, "exact", mid, conf)
             return mid, hs_id, conf
         max_conf = max(c for _, c, _ in exact)
         top = [(mid, hs_id, c) for mid, c, hs_id in exact if c == max_conf]
         if len(top) == 1:
+            _maybe_log_low_confidence(hs_code, "exact", top[0][0], top[0][2])
             return top[0][0], top[0][1], top[0][2]
+        log.warning(
+            "comtrade.resolver.ambiguous_null",
+            hs_code=hs_code,
+            pass_="exact",
+            tied_material_ids=[
+                mid for mid, conf, _hs_id in exact if conf == max_conf
+            ],
+            tied_confidence=max_conf,
+            note=(
+                "Multiple materials share this HS code at the same "
+                "confidence; resolver refuses to guess.  Add a finer-"
+                "grained partner-curated mapping or a split-proportional "
+                "rule if this code should attribute."
+            ),
+        )
         return None, None, None
 
-    # Pass 2: 4-digit prefix fallback.
+    # Pass 2: shorter-prefix fallback — try progressively shorter
+    # prefixes (longest first) until we hit one with mapping entries.
     candidates: list[tuple[int, float, int]] = []
-    for prefix, entries in hs_material_map.items():
-        if len(prefix) == 4 and hs_code.startswith(prefix):
-            candidates.extend(entries)
+    matched_prefix_len: Optional[int] = None
+    for prefix_len in range(len(hs_code) - 1, 0, -1):
+        candidate_prefix = hs_code[:prefix_len]
+        entries = hs_material_map.get(candidate_prefix)
+        if entries:
+            candidates = list(entries)
+            matched_prefix_len = prefix_len
+            break
 
     if not candidates:
         return None, None, None
@@ -613,8 +752,51 @@ def _resolve_material_id(
     max_conf = max(c for _, c, _ in candidates)
     top = [(mid, hs_id, c) for mid, c, hs_id in candidates if c == max_conf]
     if len(top) == 1:
+        _maybe_log_low_confidence(
+            hs_code, f"prefix_{matched_prefix_len}", top[0][0], top[0][2],
+        )
         return top[0][0], top[0][1], top[0][2]
+    log.warning(
+        "comtrade.resolver.ambiguous_null",
+        hs_code=hs_code,
+        pass_=f"prefix_{matched_prefix_len}",
+        tied_material_ids=[
+            mid for mid, conf, _hs_id in candidates if conf == max_conf
+        ],
+        tied_confidence=max_conf,
+        note=(
+            "Multiple materials tied at the fallback-prefix level.  "
+            "Add a finer-grained partner-curated mapping or a split-"
+            "proportional rule if this code should attribute."
+        ),
+    )
     return None, None, None
+
+
+def _maybe_log_low_confidence(
+    hs_code: str, pass_label: str, material_id: int, confidence: float,
+) -> None:
+    """Emit a structured warning when a positive resolution lands below
+    ``_RESOLVER_LOW_CONFIDENCE_THRESHOLD``.  No-op otherwise.
+
+    Threshold is intentionally lower than the keyword-attribution
+    ceiling (0.85) — we want to flag genuinely under-curated mappings,
+    not normal mid-confidence matches.
+    """
+    if confidence < _RESOLVER_LOW_CONFIDENCE_THRESHOLD:
+        log.warning(
+            "comtrade.resolver.low_confidence",
+            hs_code=hs_code,
+            pass_=pass_label,
+            material_id=material_id,
+            confidence=confidence,
+            threshold=_RESOLVER_LOW_CONFIDENCE_THRESHOLD,
+            note=(
+                "Resolver returned a positive match below the low-"
+                "confidence threshold; this mapping may be under-"
+                "curated.  Consider partner review."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -647,11 +829,13 @@ def ingest_comtrade(
 
     Returns:
         {
-            "inserted": int,
-            "skipped_existing_doc": int,
-            "skipped_empty_response": int,
+            "inserted": int,                # new trade_flows rows written
+            "skipped_existing_doc": int,    # (reporter, prefix, year) already ingested
+            "skipped_empty_response": int,  # API returned no rows; marked as queried-and-empty
             "api_calls_made": int,
-            "errors": int,
+            "errors": int,                  # errors_api + errors_db (aggregate)
+            "errors_api": int,              # 6.6 fix: API-side failures (rate-limit, network, parse)
+            "errors_db": int,               # 6.6 fix: DB-side failures (connection, insert)
         }
 
     Raises:
@@ -692,12 +876,18 @@ def ingest_comtrade(
     #      not yet run).
     # The previous version relied solely on (3), which had a 6-prefix static
     # list locked into migration 001 — well behind the actual seeded coverage.
+    # Build the HS-material map once and reuse it for both prefix derivation
+    # (below, when no override) AND row-level material resolution (during
+    # the inner loop further down).  Without this cache the function would
+    # call _build_hs_material_map twice on every invocation — the Inngest
+    # daily job calls ingest_comtrade once per (prefix × year × flow) step
+    # so the duplication adds up across hundreds of steps per day.
+    hs_material_map = _build_hs_material_map(session)
+
     if hs_prefixes is not None:
         resolved_prefixes: list[str] = list(hs_prefixes)
         prefix_source = "explicit_kwarg"
     else:
-        # Pull the live mappings.
-        hs_material_map = _build_hs_material_map(session)
         if hs_material_map:
             # Use 4-digit prefixes — Comtrade accepts 4 (chapter+heading) or
             # 6 (subheading) cmdCode values; 4-digit broadens the API query
@@ -745,13 +935,17 @@ def ingest_comtrade(
 
     # --- One-time setup ------------------------------------------------------
     source_id = _get_or_create_comtrade_source(session)
-    hs_material_map = _build_hs_material_map(session)
+    # hs_material_map was built above (cached for both prefix derivation
+    # and row-level material resolution).
 
     inserted = 0
     skipped_existing_doc = 0
     skipped_empty_response = 0
     api_calls_made = 0
-    errors = 0
+    # 6.6 fix (2026-06): errors counter split into two so DB-side and API-side
+    # failures are distinguishable in operational reports.
+    errors_api = 0
+    errors_db = 0
     # Circuit-breaker state — reset to 0 on any successful API call.
     consecutive_rate_limit_errors = 0
 
@@ -780,7 +974,7 @@ def ingest_comtrade(
                         error=str(db_exc),
                     )
                     session.rollback()
-                    errors += 1
+                    errors_db += 1
                     continue
 
                 if existing_doc is not None:
@@ -828,7 +1022,7 @@ def ingest_comtrade(
                         error=str(exc),
                         is_rate_limit=is_rate_limit,
                     )
-                    errors += 1
+                    errors_api += 1
                     if is_rate_limit:
                         consecutive_rate_limit_errors += 1
                         if consecutive_rate_limit_errors >= _RATE_LIMIT_BREAKER_THRESHOLD:
@@ -850,28 +1044,83 @@ def ingest_comtrade(
                                 last_year=year,
                             ) from exc
                     continue
-                except (httpx.TimeoutException, ValueError) as exc:
-                    # Non-rate-limit failures: log + continue, but DON'T reset
-                    # the circuit breaker counter.  A timeout in the middle of
-                    # a rate-limit spell shouldn't mask the rate-limit signal.
+                except (httpx.RequestError, ValueError) as exc:
+                    # 6.4 fix (2026-06): widened from (httpx.TimeoutException,
+                    # ValueError) to httpx.RequestError so all transport-layer
+                    # errors are caught — ReadError / WriteError / NetworkError /
+                    # ProtocolError that can fire mid-streaming-response now
+                    # log + continue instead of propagating out of the loop.
+                    # Don't reset the circuit-breaker counter — a network blip
+                    # in the middle of a rate-limit spell shouldn't mask the
+                    # rate-limit signal.
                     log.warning(
                         "comtrade.api_error",
                         reporter=iso2,
                         hs_prefix=hs_prefix,
                         year=year,
                         error=str(exc),
+                        error_type=type(exc).__name__,
                         is_rate_limit=False,
                     )
-                    errors += 1
+                    errors_api += 1
                     continue
 
                 if not raw_rows:
+                    # 6.2 fix (2026-06): mark this (reporter, prefix, year, flow)
+                    # combination as queried-and-empty by creating a
+                    # SourceDocument with row_count=0 + was_empty=true.
+                    # Without this, chronic empties (e.g. Chile × nickel ores;
+                    # New Caledonia × lithium) would re-query daily, wasting
+                    # the daily 500-call quota for no data.  An empty
+                    # SourceDocument is enough for the idempotency check to
+                    # skip on subsequent runs.  ``was_empty=true`` in
+                    # metadata_json lets a diagnostic query identify the
+                    # chronic-empty combinations for partner review (maybe
+                    # drop that reporter from the relevant material's set).
                     log.debug(
                         "comtrade.empty_response",
                         reporter=iso2,
                         hs_prefix=hs_prefix,
                         year=year,
                     )
+                    try:
+                        _create_source_document(
+                            session,
+                            source_id=source_id,
+                            reporter_iso2=iso2,
+                            hs_prefix=hs_prefix,
+                            year=year,
+                            row_count=0,
+                            flow_code=flow_code,
+                        )
+                        # Mark the row explicitly as known-empty for diagnostics.
+                        # _create_source_document doesn&#x2019;t expose the doc back
+                        # to us in this branch, so re-query and patch.  Cheap
+                        # because we just inserted it.
+                        ext_id_empty = _external_id(
+                            iso2, hs_prefix, year, flow_code=flow_code,
+                        )
+                        empty_doc = session.scalar(
+                            select(SourceDocument).where(
+                                SourceDocument.source_id == source_id,
+                                SourceDocument.external_id == ext_id_empty,
+                            )
+                        )
+                        if empty_doc is not None:
+                            meta = dict(empty_doc.metadata_json or {})
+                            meta["was_empty"] = True
+                            empty_doc.metadata_json = meta
+                        session.commit()
+                    except OperationalError as db_exc:
+                        session.rollback()
+                        log.error(
+                            "comtrade.db_error_empty_marker",
+                            reporter=iso2,
+                            hs_prefix=hs_prefix,
+                            year=year,
+                            error=str(db_exc),
+                        )
+                        errors_db += 1
                     skipped_empty_response += 1
                     continue
 
@@ -895,10 +1144,7 @@ def ingest_comtrade(
 
                     batch_added = 0
                     for row_dict in normalised:
-                        # Confidence is recoverable downstream via
-                        # hs_mapping_id → HsCodeMaterialMapping.confidence;
-                        # TradeFlow only stores the FK so we discard it here.
-                        material_id, hs_mapping_id, _hs_conf = _resolve_material_id(
+                        material_id, hs_mapping_id, hs_conf = _resolve_material_id(
                             row_dict.get("hs_code") or "", hs_material_map
                         )
                         if material_id is None:
@@ -906,6 +1152,23 @@ def ingest_comtrade(
                                 "comtrade.no_material_mapping",
                                 hs_code=row_dict.get("hs_code"),
                             )
+
+                        # 5.5 fix (2026-06): preserve the resolver&#x2019;s
+                        # confidence on metadata_json so it&#x2019;s readable
+                        # without an HsCodeMaterialMapping join.  Downstream
+                        # signal builders still have the FK
+                        # (TradeFlow.hs_mapping_id → confidence) but the
+                        # metadata copy makes ad-hoc diagnostics and the
+                        # API endpoints cheaper.
+                        if hs_conf is not None:
+                            existing_meta = row_dict.get("metadata_json") or {}
+                            row_dict = {
+                                **row_dict,
+                                "metadata_json": {
+                                    **existing_meta,
+                                    "hs_mapping_confidence": hs_conf,
+                                },
+                            }
 
                         session.add(
                             TradeFlow(
@@ -941,22 +1204,31 @@ def ingest_comtrade(
                         year=year,
                         error=str(db_exc),
                     )
-                    errors += 1
+                    errors_db += 1
 
+    # 6.6 fix (2026-06): aggregated ``errors`` retained for backwards-compat
+    # with callers expecting the single counter; ``errors_api`` and
+    # ``errors_db`` give operators visibility into which side of the system
+    # is failing.
+    errors_total = errors_api + errors_db
     log.info(
         "comtrade.ingest.done",
         inserted=inserted,
         skipped_existing_doc=skipped_existing_doc,
         skipped_empty_response=skipped_empty_response,
         api_calls_made=api_calls_made,
-        errors=errors,
+        errors=errors_total,
+        errors_api=errors_api,
+        errors_db=errors_db,
     )
     return {
         "inserted": inserted,
         "skipped_existing_doc": skipped_existing_doc,
         "skipped_empty_response": skipped_empty_response,
         "api_calls_made": api_calls_made,
-        "errors": errors,
+        "errors": errors_total,
+        "errors_api": errors_api,
+        "errors_db": errors_db,
     }
 
 
