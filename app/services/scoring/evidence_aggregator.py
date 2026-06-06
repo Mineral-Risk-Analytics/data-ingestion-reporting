@@ -363,6 +363,20 @@ def derive_geopolitical_inputs(
         subtype = ew.event.event_subtype or ""  # typed col (migration 040)
         text = (ew.event.title or "").lower()
 
+        # 9.2.E + 9.3 symmetric routing (2026-06): EXPORT_RESTRICTION is
+        # the directly-observed policy subtype (emitted by gta.py,
+        # opensanctions.py, ingest_federal_register.py) and drives the
+        # ``export_restriction_exposure`` sub-input.  The 9.2.E rename
+        # introduced EXPORT_DECLINE for trade-volume-INFERRED declines
+        # (trade_signal_builder.py); the 9.3 audit decided NOT to add
+        # EXPORT_DECLINE to this specific match because the sub-input
+        # name promises "restriction" which is stronger than "decline."
+        # EXPORT_DECLINE events still feed broader category-anchored
+        # sub-inputs (trade_volatility in the Material Concentration
+        # pillar, country_concentration in the Geopolitical pillar) via
+        # ``risk_categories_json=[GEOPOLITICAL_TRADE]`` — those filter
+        # by category, not subtype.  See trade_signal_builder.py
+        # module docstring for the full routing table.
         if subtype == "EXPORT_RESTRICTION" or (
             "export" in text
             and ("restrict" in text or "ban" in text or "control" in text)

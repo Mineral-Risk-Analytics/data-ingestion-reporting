@@ -660,6 +660,106 @@ async def _step_build_trade_signals(years: list[int]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Authoritative-count helpers — DB-derived, retry-immune
+# ---------------------------------------------------------------------------
+#
+# Why these exist: ingest_comtrade_job's in-memory ``total_inserted`` and
+# ``total_api_calls`` counters undercount on Inngest step retries.  When a
+# step writes rows + commits the SourceDocument but its return payload
+# fails to make it back to the orchestrator (network blip, serialization
+# timeout right at the boundary), Inngest retries the step.  On retry,
+# the SourceDocument idempotency check at comtrade.py:979-1005 short-
+# circuits the inner loop and returns ``inserted=0``.  The orchestrator
+# then credits 0 even though the original writes are already in the DB.
+#
+# The DB query below counts trade_flows + source_documents created since
+# the run-start timestamp — that's authoritative regardless of how many
+# retries each step took.  Run on 2026-06-03 had counter=4648 but
+# authoritative=4930 (282-row undercount), which is why this exists.
+
+def _sync_capture_now() -> str:
+    """Return current UTC time as an ISO timestamp.
+
+    Used as a memoized Inngest step so retries see the same value — that
+    way the end-of-run count query has a stable lower-bound timestamp.
+    """
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+async def _step_capture_now() -> str:
+    return await asyncio.to_thread(_sync_capture_now)
+
+
+def _sync_count_comtrade_writes_since(since_iso: str) -> dict:
+    """Count Comtrade trade_flows + source_documents created since
+    ``since_iso`` (UTC ISO timestamp).
+
+    Returns ``{"inserted": N, "api_calls": M}`` where:
+      * ``inserted``  = COUNT(*) FROM trade_flows joined to the Comtrade
+                        SourceDocument set created since the cutoff.
+      * ``api_calls`` = COUNT(*) FROM source_documents in the same window
+                        (each successful API call writes exactly one
+                        SourceDocument — populated or empty-marker — so
+                        the document count is the call count).
+
+    Errors (DB connection, etc.) return ``{"error": str, "inserted": -1,
+    "api_calls": -1}`` so the orchestrator can fall back to the in-memory
+    counters rather than reporting zero.
+    """
+    from sqlalchemy import func as sa_func, select
+
+    from app.models.documents import SourceDocument
+    from app.models.source import Source
+    from app.models.supply import TradeFlow
+
+    session = get_session_factory()()
+    try:
+        source_id = session.scalar(
+            select(Source.id).where(Source.source_type == "comtrade")
+        )
+        if source_id is None:
+            return {"inserted": 0, "api_calls": 0}
+
+        since_dt = _dt.datetime.fromisoformat(since_iso)
+
+        api_calls = session.scalar(
+            select(sa_func.count())
+            .select_from(SourceDocument)
+            .where(
+                SourceDocument.source_id == source_id,
+                SourceDocument.created_at >= since_dt,
+            )
+        ) or 0
+
+        inserted = session.scalar(
+            select(sa_func.count())
+            .select_from(TradeFlow)
+            .join(
+                SourceDocument,
+                TradeFlow.source_document_id == SourceDocument.id,
+            )
+            .where(
+                SourceDocument.source_id == source_id,
+                SourceDocument.created_at >= since_dt,
+            )
+        ) or 0
+
+        return {"inserted": int(inserted), "api_calls": int(api_calls)}
+    except Exception as exc:
+        return {
+            "inserted": -1,
+            "api_calls": -1,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        session.close()
+
+
+async def _step_count_comtrade_writes_since(since_iso: str) -> dict:
+    return await asyncio.to_thread(_sync_count_comtrade_writes_since, since_iso)
+
+
+# ---------------------------------------------------------------------------
 # Job D — Daily Comtrade trade flow ingestion
 # ---------------------------------------------------------------------------
 
@@ -717,6 +817,15 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
     years = _target_years()
     log.info("comtrade_job.start", today=today_iso, years=years)
 
+    # Step 0: capture run-start timestamp as a memoized step so all Inngest
+    # retries see the same lower bound.  The end-of-run count query uses
+    # this timestamp to derive authoritative inserted/api_calls totals
+    # from the DB — see _sync_count_comtrade_writes_since for why.
+    run_started_at: str = await ctx.step.run(
+        "capture-run-start",
+        _step_capture_now,
+    )
+
     # Step 1: resolve HS prefixes from DB (not hardcoded — picks up new mappings)
     hs_prefixes: list[str] = await ctx.step.run(
         "get-hs-prefixes",
@@ -771,6 +880,46 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
         if rate_limited:
             break
 
+    # Authoritative end-of-run counts derived from the DB rather than from
+    # the in-memory per-step counters.  Step retries cause the counter
+    # to undercount (retried steps return inserted=0 even though the
+    # first attempt's writes already committed) — see the
+    # _sync_count_comtrade_writes_since docstring for the full reasoning.
+    # ``total_inserted_counter`` and ``total_api_calls_counter`` are
+    # preserved so the gap between the two is observable in the run
+    # summary; large gaps indicate frequent step retries.
+    authoritative = await ctx.step.run(
+        "count-run-writes",
+        _step_count_comtrade_writes_since,
+        run_started_at,
+    )
+    if authoritative.get("inserted", -1) >= 0:
+        total_inserted_actual = int(authoritative["inserted"])
+        total_api_calls_actual = int(authoritative["api_calls"])
+        retry_undercount = total_inserted_actual - total_inserted
+        if retry_undercount > 0:
+            log.warning(
+                "comtrade_job.retry_undercount_detected",
+                counter=total_inserted,
+                authoritative=total_inserted_actual,
+                gap_rows=retry_undercount,
+                hint=(
+                    "In-memory counter undercounted the DB. Likely cause: "
+                    "Inngest step retries where the first attempt committed "
+                    "but the return payload failed to deliver. Data integrity "
+                    "fine; only the run summary was previously affected."
+                ),
+            )
+    else:
+        # Fall back to the in-memory counters if the count query errored.
+        total_inserted_actual = total_inserted
+        total_api_calls_actual = total_api_calls
+        log.warning(
+            "comtrade_job.authoritative_count_failed",
+            error=authoritative.get("error"),
+            hint="Reporting in-memory counter values (may undercount).",
+        )
+
     # Final step: refresh synthetic risk events from trade flow data —
     # only after a clean run (a rate-limit halt mid-run leaves trade_flows
     # in a partial state that distorts the synthetic signals; tomorrow's
@@ -791,9 +940,11 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
     # queries/day for nothing).  Logging at WARNING so it's visible in
     # the Inngest dashboard as a flag.  Action: swap the cron from
     # ``0 6 * * *`` to ``0 6 * * SUN`` (or monthly) when this fires.
+    # Uses the authoritative count so a counter-undercount can't spuriously
+    # fire this signal.
     backfill_complete = (
         not rate_limited
-        and total_api_calls == 0
+        and total_api_calls_actual == 0
         and total_errors == 0
         and len(hs_prefixes) > 0
     )
@@ -817,8 +968,10 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
         "comtrade_job.done",
         today=today_iso,
         years=years,
-        total_inserted=total_inserted,
-        total_api_calls=total_api_calls,
+        total_inserted=total_inserted_actual,
+        total_inserted_counter=total_inserted,
+        total_api_calls=total_api_calls_actual,
+        total_api_calls_counter=total_api_calls,
         total_errors=total_errors,
         rate_limited=rate_limited,
         backfill_complete=backfill_complete,
@@ -828,8 +981,13 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
         "as_of_date": today_iso,
         "years": years,
         "prefixes_processed": len(hs_prefixes),
-        "total_inserted": total_inserted,
-        "total_api_calls": total_api_calls,
+        # Authoritative DB-derived counts (immune to Inngest step retries).
+        "total_inserted": total_inserted_actual,
+        "total_api_calls": total_api_calls_actual,
+        # In-memory per-step counters kept for diagnostic visibility;
+        # a gap between *_counter and the headline value flags retry churn.
+        "total_inserted_counter": total_inserted,
+        "total_api_calls_counter": total_api_calls,
         "total_errors": total_errors,
         "rate_limited": rate_limited,
         "backfill_complete": backfill_complete,

@@ -38,6 +38,7 @@ Re-running this ingestion is safe.  The unique constraint
 from __future__ import annotations
 
 import io
+import re
 from datetime import date, datetime
 from typing import Optional
 
@@ -46,6 +47,7 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.models.supply import CommodityPrice
 from app.services.ingestion.material_resolver import MaterialAliasResolver
 from app.services.ingestion.normalizers.material_resolver import (
@@ -54,44 +56,105 @@ from app.services.ingestion.normalizers.material_resolver import (
 
 log = structlog.get_logger(__name__)
 
+# 10.1 (2026-06): module-level default kept for backwards compatibility with
+# callers (and existing tests) that pass ``url=PINK_SHEET_URL`` explicitly.
+# Production callers should rely on the ``download_pink_sheet`` default,
+# which reads the URL from settings so an operator can override via the
+# ``WORLDBANK_PINK_SHEET_URL`` env var when the World Bank rotates the
+# URL each January.  When the configured URL 404s the download function
+# logs a discovery hint pointing at the URL it found by scraping the
+# landing page; the job still fails (we never silently switch sources).
 PINK_SHEET_URL = (
     "https://thedocs.worldbank.org/en/doc/74e8be41ceb20fa0da750cda2f6b9e4e-0050012026"
     "/related/CMO-Historical-Data-Monthly.xlsx"
+)
+
+# 10.1: regex matches the "Monthly prices" XLSX link on the World Bank
+# Commodity Markets landing page.  Used ONLY for failure-mode discovery
+# logging - never used as a fallback source.  The pattern is permissive
+# so it survives small landing-page redesigns: it just requires a doc
+# URL ending in CMO-Historical-Data-Monthly.xlsx anywhere in the HTML.
+_PINK_SHEET_URL_DISCOVERY_PATTERN = re.compile(
+    r'https://thedocs\.worldbank\.org/[^"\s]+CMO-Historical-Data-Monthly\.xlsx'
 )
 
 _SOURCE = "worldbank_pink_sheet"
 _ALIAS_SOURCE_SYSTEM = "worldbank_pinksheet"
 
 # ── Stage attribution per Pink Sheet header ─────────────────────────────────
-# Maps ``Pink Sheet column header → 6-digit HS prefix`` for headers whose
-# trading basis is unambiguous.  Resolution to ``hs_mapping_id`` happens
-# at ingest time via ``MaterialResolver.resolve_by_hs_code`` against the
-# curated rows in ``hs_code_material_mappings``.
+# Maps ``Pink Sheet column header -> 6-digit HS prefix`` for every column
+# the World Bank actually publishes in the "Monthly Prices" worksheet of
+# CMO-Historical-Data-Monthly.xlsx that maps to one of our tracked
+# materials.  Resolution to ``hs_mapping_id`` happens at ingest time via
+# ``MaterialResolver.resolve_by_hs_code`` against the curated rows in
+# ``hs_code_material_mappings``.
 #
-# Headers absent from this dict get ``hs_mapping_id=NULL`` and
-# ``price_form=NULL`` — Pink Sheet didn't disclose the form, so we don't
-# guess.  Examples: bare "Graphite", bare "Manganese".
+# 10.4 audit (2026-06)
+# --------------------
+# Authoritative inspection of the live XLSX file (71 columns total) and
+# its "Description" tab established the full scope of what Pink Sheet
+# does and does not publish.  Highlights:
 #
-# LME-convention basis (refined stage) is documented because the Pink
-# Sheet column header itself is just the metal name; the form is
-# implicit in the exchange spec.  This dict is the only place we encode
-# that convention.
+#   * Pink Sheet DOES publish: Aluminum, Copper, Iron ore, Lead, Nickel,
+#     Tin, Zinc, Gold, Platinum, Silver, Phosphate rock (plus energy +
+#     agricultural commodities not relevant here).  Each carries a
+#     documented price basis in the Description tab (LME settlement for
+#     the base metals, 62% Fe CFR China fines for iron ore, FOB North
+#     Africa for phosphate rock, etc.).
+#
+#   * Pink Sheet does NOT publish: Cobalt, Lithium (any form), Manganese
+#     (any form), Graphite (any form), or Rare Earth Elements.  These
+#     are our highest-priority battery minerals; for them the engine
+#     gets no Pink Sheet price-volatility signal.  USGS MCS Fig 10 is
+#     the current substitute (annual cadence, lower resolution).  Phase
+#     1.5 work is tracked to identify monthly price sources for these
+#     battery minerals (LME cobalt contract, Fastmarkets, Benchmark
+#     Mineral Intelligence, Argus Media are candidates).
+#
+# Pre-10.4 the dict contained four entries (Cobalt, Lithium carbonate,
+# Manganese ore, "Tin, LME") referencing columns that do not exist in
+# the live XLSX.  The parser silently skipped these unknown columns so
+# nothing was breaking, but the dead entries documented false
+# expectations.  10.4 removed them and adds the two entries that DO
+# resolve to tracked materials but were previously missing (Iron ore,
+# Phosphate rock).
+#
+# Downstream consequence to be aware of: ``market_aggregator``'s
+# price-volatility math filters CommodityPrice by material_id only -
+# rows from Pink Sheet for the same material are averaged into one
+# volatility signal regardless of their hs_mapping_id.  Each material
+# below currently has a SINGLE Pink Sheet column, so the no-mixing case
+# holds.
 _HEADER_TO_HS_PREFIX: dict[str, str] = {
-    # Stage-explicit headers
-    "Lithium carbonate, battery grade": "283691",  # battery_grade — Li2CO3
-    "Manganese ore":                    "2602",    # ore — manganese ores and concentrates
-    # LME / exchange convention → refined stage
-    "Cobalt":     "810520",  # cobalt unwrought (LME cathode 99.8%)
-    "Copper":     "740311",  # copper cathodes (LME Grade A)
-    "Nickel":     "750210",  # nickel unwrought, not alloyed (LME Class 1)
-    "Aluminum":   "760110",  # aluminium unwrought, not alloyed (LME primary ingot)
-    "Aluminium":  "760110",  # British-spelling header in some editions
-    "Tin":        "800110",  # tin unwrought, not alloyed (LME 99.85%)
-    "Tin, LME":   "800110",
-    "Zinc":       "790111",  # zinc unwrought, not alloyed (LME SHG 99.95%)
-    "Platinum":   "711011",  # platinum unwrought (LBMA AM)
-    # Intentionally absent (form not disclosed, no honest stage attribution):
-    #   "Graphite", "Natural graphite", "Manganese" (without "ore"), "Lithium" (bare)
+    # Base metals - LME settlement basis (refined stage)
+    "Aluminum":            "760110",  # aluminium unwrought, unalloyed (LME min 99.7% purity)
+    "Copper":              "740311",  # copper cathodes (LME grade A, min 99.9935% purity)
+    "Nickel":              "750210",  # nickel unwrought, unalloyed (LME cathodes, min 99.8%)
+    "Tin":                 "800110",  # tin unwrought, unalloyed (LME refined 99.85%)
+    "Zinc":                "790111",  # zinc unwrought, unalloyed (LME min 99.95% since 1990)
+    # Precious metals
+    "Platinum":            "711011",  # platinum unwrought (99.95% min purity, plate/ingot)
+    # Bulk ores / industrial inputs (10.4 additions, basis confirmed from XLSX
+    # Description tab)
+    "Iron ore, cfr spot":  "260111",  # iron ore fines, CFR China, 62% Fe, non-agglomerated
+    "Phosphate rock":      "251010",  # natural calcium phosphates, unground, FOB North Africa
+    # ---- Intentionally absent ------------------------------------------
+    # Columns that exist in the XLSX but are NOT mapped because they don't
+    # correspond to a tracked material:
+    #   "Lead" (LME refined 99.97%) - not in tracked battery materials
+    #   "Gold", "Silver" - not battery-relevant
+    #
+    # Columns the engine USED to reference that do NOT exist in the
+    # current XLSX (removed in 10.4):
+    #   "Cobalt", "Lithium carbonate, battery grade", "Manganese ore",
+    #   "Tin, LME", "Aluminium" (British spelling - XLSX uses American).
+    # These were dead entries that the parser silently skipped.
+    #
+    # Battery-critical minerals NOT published by Pink Sheet (cobalt,
+    # lithium, manganese, graphite, REEs) feed price-volatility scoring
+    # only via USGS MCS Fig 10 (annual cadence) today.  See Phase 1.5
+    # task "Identify monthly price sources for battery minerals not in
+    # Pink Sheet" for the planned remediation.
 }
 
 _UNIT_MAP: dict[str, str] = {
@@ -103,23 +166,119 @@ _UNIT_MAP: dict[str, str] = {
 _BATCH_SIZE = 500
 
 
-def download_pink_sheet(url: str = PINK_SHEET_URL, timeout: int = 60) -> bytes:
+def _discover_pink_sheet_url(landing_page_url: str, timeout: int = 30) -> Optional[str]:
+    """Scrape the World Bank Commodity Markets landing page for the current
+    "Monthly prices" XLSX URL.
+
+    10.1 helper (2026-06).  Used only when the configured download URL has
+    already failed with 404.  Returns the first URL on the page that
+    matches ``_PINK_SHEET_URL_DISCOVERY_PATTERN``, or ``None`` if no
+    match is found (page redesign / network error / etc).  The caller
+    logs the result as a hint - this function never causes the ingest
+    to switch to the discovered URL automatically, because a future
+    World Bank page redesign could cause the scraper to return a wrong
+    or stale URL and silently corrupt the ingest.
+    """
+    try:
+        resp = httpx.get(landing_page_url, timeout=timeout, follow_redirects=True)
+        resp.raise_for_status()
+    except (httpx.HTTPError, httpx.TimeoutException) as exc:
+        log.warning(
+            "pinksheet.url_discovery.failed",
+            landing_page=landing_page_url,
+            error=str(exc),
+            hint=(
+                "Couldn't scrape the World Bank landing page for an updated "
+                "URL hint.  Operator must find the current Monthly prices "
+                "XLSX URL manually and set WORLDBANK_PINK_SHEET_URL."
+            ),
+        )
+        return None
+
+    match = _PINK_SHEET_URL_DISCOVERY_PATTERN.search(resp.text)
+    if match is None:
+        log.warning(
+            "pinksheet.url_discovery.no_match",
+            landing_page=landing_page_url,
+            hint=(
+                "World Bank landing page no longer contains a URL matching "
+                "the expected pattern.  The page may have been redesigned. "
+                "Operator must find the Monthly prices XLSX URL manually."
+            ),
+        )
+        return None
+
+    return match.group(0)
+
+
+def download_pink_sheet(url: Optional[str] = None, timeout: int = 60) -> bytes:
     """Download the Pink Sheet Excel file and return raw bytes.
 
     Streams the response so the full file is not held as a single allocation
     until all chunks have been received.
 
+    Args:
+        url: Override URL. When None (default), reads from
+            ``settings.worldbank_pink_sheet_url`` so operator can fix a
+            broken URL via env var without a code change.
+
     Raises:
-        httpx.HTTPStatusError: on non-2xx HTTP response.
+        httpx.HTTPStatusError: on non-2xx HTTP response. 10.1 (2026-06):
+            on 404 specifically, scrapes the World Bank landing page for
+            a discovery hint and logs the URL it found before re-raising,
+            so the operator sees exactly what to set
+            ``WORLDBANK_PINK_SHEET_URL`` to.
         httpx.TimeoutException: if the download exceeds ``timeout`` seconds.
     """
-    log.info("pinksheet.download.start", url=url)
+    settings = get_settings()
+    effective_url = url if url is not None else settings.worldbank_pink_sheet_url
+
+    log.info("pinksheet.download.start", url=effective_url)
     chunks: list[bytes] = []
 
-    with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as response:
-        response.raise_for_status()
-        for chunk in response.iter_bytes():
-            chunks.append(chunk)
+    try:
+        with httpx.stream(
+            "GET", effective_url, timeout=timeout, follow_redirects=True,
+        ) as response:
+            response.raise_for_status()
+            for chunk in response.iter_bytes():
+                chunks.append(chunk)
+    except httpx.HTTPStatusError as exc:
+        # 10.1 (2026-06): on 404, fetch the World Bank landing page and
+        # extract the current Monthly-prices URL as a discovery hint for
+        # the operator.  Reported as a structured log so the operator
+        # gets the new URL handed to them - no silent retry against the
+        # scraped URL, because a page redesign could produce a wrong
+        # match.
+        if exc.response is not None and exc.response.status_code == 404:
+            discovered = _discover_pink_sheet_url(
+                settings.worldbank_pink_sheet_landing_page,
+            )
+            if discovered is not None and discovered != effective_url:
+                log.error(
+                    "pinksheet.download.url_404_with_discovered_hint",
+                    configured_url=effective_url,
+                    discovered_url=discovered,
+                    hint=(
+                        "World Bank rotates the Pink Sheet URL annually "
+                        "(typically in January).  Set "
+                        "WORLDBANK_PINK_SHEET_URL=<discovered_url> to fix.  "
+                        "Job still failing (not silently switching sources)."
+                    ),
+                )
+            else:
+                log.error(
+                    "pinksheet.download.url_404_no_hint_available",
+                    configured_url=effective_url,
+                    hint=(
+                        "World Bank URL returned 404 and discovery scraping "
+                        "produced no match.  Operator must find the current "
+                        "Monthly prices XLSX URL manually at "
+                        f"{settings.worldbank_pink_sheet_landing_page} and "
+                        "set WORLDBANK_PINK_SHEET_URL."
+                    ),
+                )
+        raise
 
     raw = b"".join(chunks)
     log.info("pinksheet.download.done", bytes=len(raw))
@@ -275,12 +434,21 @@ def parse_pink_sheet(
     return results
 
 
-def _days_since_last_run(session: Session) -> Optional[int]:
-    """Return days since the most recent Pink Sheet price row was inserted.
+def _days_since_latest_observation(session: Session) -> Optional[int]:
+    """Return days since the latest Pink Sheet observation in our DB.
 
-    Uses ``MAX(price_date)`` from ``commodity_prices`` for this source as a
-    proxy for the last successful run. Returns ``None`` if no rows exist yet
-    (i.e. first run).
+    10.2 rename (2026-06): was ``_days_since_last_run``.  The previous
+    name implied "days since the job last executed," but the function
+    actually measures the gap between today and the most recent
+    ``price_date`` row.  Those are different things: Pink Sheet
+    publishes monthly with publication lag, so a successful run on
+    March 3 2026 ingests data through Feb 2026 - the "last
+    observation" is Feb 1 (publication date - lag), not March 3.
+
+    Returns ``None`` if no rows exist yet (i.e. first run ever).  The
+    caller uses this to throttle redundant downloads when our latest
+    observation is fresh enough that no new monthly release can
+    plausibly exist yet.
     """
     max_date = session.scalar(
         select(func.max(CommodityPrice.price_date)).where(
@@ -296,7 +464,7 @@ def ingest_pink_sheet(
     session: Session,
     url: str = PINK_SHEET_URL,
     since_year: Optional[int] = None,
-    min_interval_days: int = 25,
+    min_interval_days: int = 28,
 ) -> dict[str, int]:
     """Download, parse, and upsert Pink Sheet prices into ``commodity_prices``.
 
@@ -306,10 +474,15 @@ def ingest_pink_sheet(
         since_year:        If set, only ingest rows from this year onward.
                            The Pink Sheet goes back to ~1960; limiting to recent
                            years reduces the initial load significantly.
-        min_interval_days: Skip the download if the most recent price row is
-                           younger than this many days. Default 25 — slightly
-                           less than a month so the scheduled job always catches
-                           the new monthly release. Pass 0 to force a run.
+        min_interval_days: Skip the download when our latest observation in
+                           ``commodity_prices`` is younger than this many days.
+                           10.2 (2026-06): default raised 25 → 28 to cover the
+                           full short-month window without false-positive runs.
+                           The check is "days between today and the latest
+                           ``price_date`` for this source", which is a freshness
+                           gate on the DATA, not a recency throttle on the job.
+                           See ``_days_since_latest_observation`` for the
+                           rationale.  Pass 0 to force a run.
 
     Returns:
         {
@@ -320,11 +493,15 @@ def ingest_pink_sheet(
         }
     """
     if min_interval_days > 0:
-        days_ago = _days_since_last_run(session)
+        # 10.2: renamed from _days_since_last_run to reflect what's
+        # actually measured (latest observation in DB, not latest job
+        # execution).  Variable kept locally as ``days_ago`` for
+        # log-payload backwards compatibility.
+        days_ago = _days_since_latest_observation(session)
         if days_ago is not None and days_ago < min_interval_days:
             log.info(
                 "pinksheet.ingest.skipped_too_recent",
-                days_since_last_run=days_ago,
+                days_since_latest_observation=days_ago,
                 min_interval_days=min_interval_days,
             )
             return {
@@ -422,6 +599,38 @@ def ingest_pink_sheet(
         hs_mapping_cache[header] = hs_mapping_id
         return hs_mapping_id
 
+    # --- 10.3 (2026-06): pre-fetch existing keys to eliminate N+1 SELECT -----
+    # Before 10.3 the loop did ``session.scalar(select(CommodityPrice).where(
+    # material_id=..., price_date=..., ...))`` per observation.  For a first
+    # full ingest (~30 commodities x 12 months x 30 years = ~10,800 rows)
+    # that issued ~10,800 sequential SELECT queries before any inserts, each
+    # one a DB round-trip.  Pre-fetching the entire existing key set for
+    # this source in a single SELECT, then doing O(1) set-membership checks
+    # in Python, converts that to 1 SELECT + ~22 batched INSERTs.
+    #
+    # Python set-of-tuples handles NULL semantics naturally: tuples with
+    # ``None`` in the same position compare equal.  The PostgreSQL unique
+    # constraint at migration 030 treats NULL as distinct (which is why
+    # the old per-row check needed the ``.is_(None)`` clauses), so two
+    # ``(mid, date, NULL, NULL)`` rows CAN exist in the DB; pre-fetching
+    # captures whichever ones are already there.  Repeat observations
+    # within the SAME run with the same key get added to the set on first
+    # insert so dup-protection holds across the run.
+    existing_keys: set[tuple] = set(
+        session.execute(
+            select(
+                CommodityPrice.material_id,
+                CommodityPrice.price_date,
+                CommodityPrice.hs_mapping_id,
+                CommodityPrice.price_form,
+            ).where(CommodityPrice.source == _SOURCE)
+        ).all()
+    )
+    log.info(
+        "pinksheet.ingest.existing_keys_prefetched",
+        count=len(existing_keys),
+    )
+
     # --- Upsert loop ----------------------------------------------------------
     inserted = skipped_unknown = skipped_existing = 0
     batch_pending = 0
@@ -453,22 +662,13 @@ def ingest_pink_sheet(
         # views.
         price_form: Optional[str] = header if hs_mapping_id is not None else None
 
-        # Existing-row check matches the post-migration-030 unique
-        # constraint: (material_id, price_date, source, hs_mapping_id,
-        # price_form).  PG treats NULL as distinct in unique constraints,
-        # so historical rows with NULL hs_mapping_id won't conflict.
-        exists = session.scalar(
-            select(CommodityPrice).where(
-                CommodityPrice.material_id == material_id,
-                CommodityPrice.price_date == obs["price_date"],
-                CommodityPrice.source == _SOURCE,
-                CommodityPrice.hs_mapping_id.is_(hs_mapping_id) if hs_mapping_id is None
-                    else CommodityPrice.hs_mapping_id == hs_mapping_id,
-                CommodityPrice.price_form.is_(price_form) if price_form is None
-                    else CommodityPrice.price_form == price_form,
-            )
-        )
-        if exists is not None:
+        # 10.3: O(1) set-membership replaces per-row SELECT.  Key matches
+        # the post-migration-030 unique constraint:
+        # (material_id, price_date, source, hs_mapping_id, price_form).
+        # Source is constant (_SOURCE) for this whole run so it doesn't
+        # need to be in the tuple key.
+        key = (material_id, obs["price_date"], hs_mapping_id, price_form)
+        if key in existing_keys:
             skipped_existing += 1
             continue
 
@@ -487,6 +687,12 @@ def ingest_pink_sheet(
                 },
             )
         )
+        # 10.3: track the just-inserted key so a duplicate observation
+        # within the SAME run (e.g. parser hiccup that yields the same
+        # (commodity, date) twice) gets skipped on the second occurrence
+        # rather than producing an extra row that would later collide on
+        # next-run replay.
+        existing_keys.add(key)
         inserted += 1
         batch_pending += 1
 

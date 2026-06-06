@@ -250,6 +250,30 @@ class IngestionPipeline:
         merged: dict[str, Any],
         company_cache: list[CachedCompanyInfo],
     ) -> int:
+        """Census-trade pipeline branch — PARKED SCAFFOLD.
+
+        Paired with the parked ``CensusTradeAdapter``; reachable only if
+        the adapter were unparked AND ``bdi-ingest ingest census-trade``
+        were re-added to the CLI mapping AND a scheduled job were wired
+        up.  Today none of those are true, so this method is dead code
+        in practice — preserved as a Phase 2 starting point.
+
+        Phase 2 todo when wiring this up:
+
+          * The synthetic ``build_trade_risk_event`` event derived from
+            the single max-trade-value row is shallow.  Replace with a
+            concentration / drop signal computed over the full bundle
+            once US-bilateral data is flowing.
+          * Confirm ``materials.resolve_by_hs_code`` handles 10-digit
+            HTS codes (Census's native resolution) or truncate to
+            6-digit at parse time.
+          * Document the ``CTY_CODE -> ISO2`` mapping path; Census uses
+            its own country code scheme (not ISO numeric, not Comtrade
+            numeric).
+
+        See ``app/services/ingestion/adapters/census_trade.py`` module
+        docstring for the full Phase 2 unpark checklist.
+        """
         _ = run
         count = 0
         geo = GeographyResolver()

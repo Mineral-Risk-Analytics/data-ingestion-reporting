@@ -145,7 +145,7 @@ def seed_countries_cmd() -> None:
 def ingest_cmd(
     source: str = typer.Argument(
         ...,
-        help="federal-register | census-trade | news",
+        help="federal-register | news",
     ),
     extra_json: Optional[str] = typer.Option(
         None,
@@ -161,12 +161,17 @@ def ingest_cmd(
     with full material attribution.  ``federal-register`` is also
     preferentially served by ``bdi-ingest ingest-federal-register`` for
     the same reason; this generic command is kept as a fallback debugging
-    entry point for the remaining pipeline-served sources (census-trade,
-    news) until they get dedicated modules of their own.
+    entry point for the remaining pipeline-served sources (currently
+    just ``news``) until they get dedicated modules of their own.
+
+    ``census-trade`` was REMOVED from this mapping in the June 2026
+    Trade Volumes audit — the Census adapter is parked as a Phase 2
+    scaffold (see ``app/services/ingestion/adapters/census_trade.py``
+    docstring).  Re-add this entry only when the Phase 2 unpark
+    prerequisites are complete.
     """
     mapping = {
         "federal-register": SourceType.FEDERAL_REGISTER.value,
-        "census-trade": SourceType.CENSUS_TRADE.value,
         "news": SourceType.NEWS.value,
     }
     st = mapping.get(source.replace("_", "-"))
@@ -2666,6 +2671,96 @@ def build_trade_signals_cmd(
     try:
         result = build_trade_signals(s, years=year_list)
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("backfill-trade-flow-mappings")
+def backfill_trade_flow_mappings_cmd(
+    batch_size: int = typer.Option(
+        2_000,
+        "--batch-size",
+        help="Rows fetched + updated per pass. Default 2000.",
+    ),
+    sample_cap: int = typer.Option(
+        20,
+        "--sample-cap",
+        help=(
+            "Maximum number of mismatch samples to include in the result "
+            "summary (the full mismatch count is still reported)."
+        ),
+    ),
+) -> None:
+    """Populate TradeFlow.hs_mapping_id for rows missing the FK.
+
+    Targets rows where material_id IS NOT NULL AND hs_mapping_id IS NULL.
+    Resolves each row's hs_code against the current hs_code_material_mappings
+    seed; if the resolved material matches the row's stored material, fills
+    in hs_mapping_id.  If the resolved material differs (mapping drift), the
+    row is left alone and logged as a mismatch — backfill never overwrites
+    attribution.  Idempotent: re-running is a no-op since updated rows fall
+    off the filter.
+
+    \b
+      bdi-ingest backfill-trade-flow-mappings
+      bdi-ingest backfill-trade-flow-mappings --batch-size 5000
+    """
+    from app.services.ingestion.comtrade import backfill_trade_flow_hs_mappings
+
+    s = _session()
+    try:
+        result = backfill_trade_flow_hs_mappings(
+            s, batch_size=batch_size, log_mismatch_samples=sample_cap,
+        )
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("reattribute-unmapped-trade-flows")
+def reattribute_unmapped_trade_flows_cmd(
+    batch_size: int = typer.Option(
+        2_000,
+        "--batch-size",
+        help="Rows fetched + updated per pass. Default 2000.",
+    ),
+    sample_cap: int = typer.Option(
+        20,
+        "--sample-cap",
+        help=(
+            "Maximum number of attribution samples to include in the result "
+            "summary (the full attributed count is still reported)."
+        ),
+    ),
+) -> None:
+    """Re-resolve TradeFlow rows that have material_id IS NULL.
+
+    Use this after expanding hs_code_material_mappings (e.g. partner adds
+    new 6-digit curations for previously-ambiguous codes) to pick up the
+    new mappings against historical rows.  Writes BOTH material_id AND
+    hs_mapping_id when the current seed produces a valid resolution; also
+    preserves the resolver's confidence in metadata_json so re-attributed
+    rows match the shape of fresh-ingest rows.  Idempotent: rows that now
+    have material_id set fall off the filter.
+
+    \b
+      bdi-ingest reattribute-unmapped-trade-flows
+      bdi-ingest reattribute-unmapped-trade-flows --batch-size 5000
+    """
+    from app.services.ingestion.comtrade import reattribute_unmapped_trade_flows
+
+    s = _session()
+    try:
+        result = reattribute_unmapped_trade_flows(
+            s, batch_size=batch_size, log_attribution_samples=sample_cap,
+        )
+        typer.echo(json.dumps({"ok": True, **result}, indent=2, default=str))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
         raise typer.Exit(code=1)

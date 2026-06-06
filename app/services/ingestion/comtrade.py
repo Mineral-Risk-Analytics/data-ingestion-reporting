@@ -61,7 +61,8 @@ from typing import Any, Optional
 
 import httpx
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func as sa_func, select
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -665,6 +666,8 @@ _RESOLVER_LOW_CONFIDENCE_THRESHOLD = 0.50
 def _resolve_material_id(
     hs_code: str,
     hs_material_map: dict[str, list[tuple[int, float, int]]],
+    *,
+    quiet: bool = False,
 ) -> tuple[Optional[int], Optional[int], Optional[float]]:
     """Return ``(material_id, hs_mapping_id, confidence)`` for a 6-digit hs_code.
 
@@ -697,6 +700,15 @@ def _resolve_material_id(
         forces a (None, None, None) return.  Useful for surfacing
         partner-review-worthy codes (e.g. HS 2615 → Nb/Ta/V/Zr tie).
 
+    7.1 fix (2026-06): the ``quiet`` keyword parameter (default False)
+    suppresses both diagnostic warnings.  Bulk-operation callers
+    (``backfill_trade_flow_hs_mappings``, ``reattribute_unmapped_trade_flows``)
+    pass ``quiet=True`` so they don&#x2019;t flood the log with thousands of
+    per-row warnings — the same 5-10 under-curated codes would otherwise
+    log a warning for every row they appear in.  Normal ingest (single
+    row per HS code per call) keeps the default to surface the diagnostics
+    in real time.
+
     2026-05-09 (Tier 1.4 audit, scope extension): added the third
     ``confidence`` element so GTA/Comtrade callers can downscale
     ``RiskEventMaterial.relevance_score`` for low-confidence mappings.
@@ -710,28 +722,31 @@ def _resolve_material_id(
     if exact:
         if len(exact) == 1:
             mid, conf, hs_id = exact[0]
-            _maybe_log_low_confidence(hs_code, "exact", mid, conf)
+            if not quiet:
+                _maybe_log_low_confidence(hs_code, "exact", mid, conf)
             return mid, hs_id, conf
         max_conf = max(c for _, c, _ in exact)
         top = [(mid, hs_id, c) for mid, c, hs_id in exact if c == max_conf]
         if len(top) == 1:
-            _maybe_log_low_confidence(hs_code, "exact", top[0][0], top[0][2])
+            if not quiet:
+                _maybe_log_low_confidence(hs_code, "exact", top[0][0], top[0][2])
             return top[0][0], top[0][1], top[0][2]
-        log.warning(
-            "comtrade.resolver.ambiguous_null",
-            hs_code=hs_code,
-            pass_="exact",
-            tied_material_ids=[
-                mid for mid, conf, _hs_id in exact if conf == max_conf
-            ],
-            tied_confidence=max_conf,
-            note=(
-                "Multiple materials share this HS code at the same "
-                "confidence; resolver refuses to guess.  Add a finer-"
-                "grained partner-curated mapping or a split-proportional "
-                "rule if this code should attribute."
-            ),
-        )
+        if not quiet:
+            log.warning(
+                "comtrade.resolver.ambiguous_null",
+                hs_code=hs_code,
+                pass_="exact",
+                tied_material_ids=[
+                    mid for mid, conf, _hs_id in exact if conf == max_conf
+                ],
+                tied_confidence=max_conf,
+                note=(
+                    "Multiple materials share this HS code at the same "
+                    "confidence; resolver refuses to guess.  Add a finer-"
+                    "grained partner-curated mapping or a split-proportional "
+                    "rule if this code should attribute."
+                ),
+            )
         return None, None, None
 
     # Pass 2: shorter-prefix fallback — try progressively shorter
@@ -752,24 +767,26 @@ def _resolve_material_id(
     max_conf = max(c for _, c, _ in candidates)
     top = [(mid, hs_id, c) for mid, c, hs_id in candidates if c == max_conf]
     if len(top) == 1:
-        _maybe_log_low_confidence(
-            hs_code, f"prefix_{matched_prefix_len}", top[0][0], top[0][2],
-        )
+        if not quiet:
+            _maybe_log_low_confidence(
+                hs_code, f"prefix_{matched_prefix_len}", top[0][0], top[0][2],
+            )
         return top[0][0], top[0][1], top[0][2]
-    log.warning(
-        "comtrade.resolver.ambiguous_null",
-        hs_code=hs_code,
-        pass_=f"prefix_{matched_prefix_len}",
-        tied_material_ids=[
-            mid for mid, conf, _hs_id in candidates if conf == max_conf
-        ],
-        tied_confidence=max_conf,
-        note=(
-            "Multiple materials tied at the fallback-prefix level.  "
-            "Add a finer-grained partner-curated mapping or a split-"
-            "proportional rule if this code should attribute."
-        ),
-    )
+    if not quiet:
+        log.warning(
+            "comtrade.resolver.ambiguous_null",
+            hs_code=hs_code,
+            pass_=f"prefix_{matched_prefix_len}",
+            tied_material_ids=[
+                mid for mid, conf, _hs_id in candidates if conf == max_conf
+            ],
+            tied_confidence=max_conf,
+            note=(
+                "Multiple materials tied at the fallback-prefix level.  "
+                "Add a finer-grained partner-curated mapping or a split-"
+                "proportional rule if this code should attribute."
+            ),
+        )
     return None, None, None
 
 
@@ -1241,16 +1258,24 @@ def backfill_trade_flow_hs_mappings(
     batch_size: int = 2_000,
     log_mismatch_samples: int = 20,
 ) -> dict[str, int]:
-    """Populate ``TradeFlow.hs_mapping_id`` for rows ingested before Phase 1.5.
+    """Populate ``TradeFlow.hs_mapping_id`` for any TradeFlow rows that
+    have ``material_id`` set but ``hs_mapping_id IS NULL``.
 
-    Migration 027 added ``hs_mapping_id`` to ``trade_flows``.  Rows ingested
-    before then have ``material_id`` set (from the legacy resolver) but
-    ``hs_mapping_id IS NULL``.  The 2026-05-09 confidence-weighting changes
-    in ``trade_signal_builder._get_annual_totals`` and
-    ``global_rollup._aggregate_trade_values_for_material`` use the FK to
-    reach ``HsCodeMaterialMapping.confidence``; NULL rows fall through at
-    confidence=1.0 via ``COALESCE``, which preserves backwards-compat but
-    masks the very signal the weighting is meant to expose.
+    Historical context: migration 027 added ``hs_mapping_id`` to
+    ``trade_flows``.  Pre-027 rows were ingested with ``material_id``
+    populated (from the legacy resolver) but no ``hs_mapping_id`` —
+    those rows are the original target of this function.  The same
+    invariant applies to any future row that lands without an FK (e.g.
+    a mid-ingest schema change, a manual data fix-up, or a partial
+    re-ingest using a stale code path), so this function remains the
+    canonical recovery tool whenever ``hs_mapping_id`` is missing.
+
+    The downstream confidence-weighting in
+    ``trade_signal_builder._get_annual_totals`` and
+    ``global_rollup._aggregate_trade_values_for_material`` uses the FK
+    to reach ``HsCodeMaterialMapping.confidence``; NULL rows fall through
+    at confidence=1.0 via ``COALESCE``, which preserves backwards-compat
+    but masks the signal the weighting is meant to expose.
 
     This function re-resolves each affected row's HS code against the
     current ``hs_code_material_mappings`` table.  Three outcomes per row:
@@ -1355,8 +1380,12 @@ def backfill_trade_flow_hs_mappings(
             if not hs_code:
                 unmapped += 1
                 continue
+            # 7.1 fix (2026-06): quiet=True silences per-row resolver
+            # diagnostics so bulk runs over millions of rows don&#x2019;t flood
+            # the log.  The under-curated and ambiguous codes have already
+            # been surfaced by the live ingest path.
             resolved_mid, resolved_hs_id, _conf = _resolve_material_id(
-                str(hs_code), hs_material_map
+                str(hs_code), hs_material_map, quiet=True,
             )
             if resolved_mid is None:
                 unmapped += 1
@@ -1534,8 +1563,10 @@ def reattribute_unmapped_trade_flows(
         if not rows:
             break
 
-        # Per-batch: {trade_flow_id: (material_id, hs_mapping_id)}
-        updates: dict[int, tuple[int, Optional[int]]] = {}
+        # Per-batch: {trade_flow_id: (material_id, hs_mapping_id, confidence)}
+        # 7.3 fix (2026-06): track confidence per row so the bulk UPDATE can
+        # mirror Section 5.5's metadata_json['hs_mapping_confidence'] copy.
+        updates: dict[int, tuple[int, Optional[int], Optional[float]]] = {}
         for tf_id, hs_code in rows:
             examined += 1
             if tf_id > last_id:
@@ -1543,13 +1574,14 @@ def reattribute_unmapped_trade_flows(
             if not hs_code:
                 still_unmapped += 1
                 continue
+            # 7.1 fix (2026-06): silence diagnostic warnings during bulk ops.
             resolved_mid, resolved_hs_id, resolved_conf = _resolve_material_id(
-                str(hs_code), hs_material_map
+                str(hs_code), hs_material_map, quiet=True,
             )
             if resolved_mid is None:
                 still_unmapped += 1
                 continue
-            updates[tf_id] = (resolved_mid, resolved_hs_id)
+            updates[tf_id] = (resolved_mid, resolved_hs_id, resolved_conf)
             if len(attribution_samples) < log_attribution_samples:
                 attribution_samples.append({
                     "trade_flow_id": tf_id,
@@ -1558,7 +1590,11 @@ def reattribute_unmapped_trade_flows(
                     "new_hs_mapping_id": resolved_hs_id,
                     "confidence": resolved_conf,
                 })
-            log.warning(
+            # 7.2 fix (2026-06): downgraded from WARNING per row.  Bulk
+            # operations could produce 50K+ events at WARNING level; the
+            # per-row trail lives at DEBUG and the aggregate summary fires
+            # once at the end of the run.
+            log.debug(
                 "comtrade.reattribute_unmapped.new_attribution",
                 trade_flow_id=tf_id,
                 hs_code=hs_code,
@@ -1567,17 +1603,41 @@ def reattribute_unmapped_trade_flows(
                 confidence=resolved_conf,
             )
 
-        # Apply the batch.  Group by (material_id, hs_mapping_id) so
-        # rows with the same resolution get a single UPDATE.
+        # Apply the batch.  Group by (material_id, hs_mapping_id, confidence)
+        # so rows with the same resolution get a single UPDATE.  Confidence
+        # is keyed to hs_mapping_id (one HsCodeMaterialMapping row → one
+        # confidence value), so the grouping is effectively still by
+        # (material_id, hs_mapping_id); the confidence is along for the ride.
         if updates:
-            grouped: dict[tuple[int, Optional[int]], list[int]] = {}
-            for tf_id, pair in updates.items():
-                grouped.setdefault(pair, []).append(tf_id)
-            for (mid, hs_id), tf_ids in grouped.items():
+            grouped: dict[
+                tuple[int, Optional[int], Optional[float]], list[int]
+            ] = {}
+            for tf_id, triple in updates.items():
+                grouped.setdefault(triple, []).append(tf_id)
+            for (mid, hs_id, conf), tf_ids in grouped.items():
+                # 7.3 fix (2026-06): preserve hs_mapping_confidence in
+                # metadata_json so re-attributed rows match the shape of
+                # fresh-ingest rows (Section 5.5).  jsonb_set with
+                # create_missing=true handles both the metadata_json IS
+                # NULL case and the existing-keys merge case.
+                values: dict[str, Any] = {
+                    "material_id": mid,
+                    "hs_mapping_id": hs_id,
+                }
+                if conf is not None:
+                    values["metadata_json"] = sa_func.jsonb_set(
+                        sa_func.coalesce(
+                            TradeFlow.metadata_json,
+                            sa_func.cast("{}", JSONB),
+                        ),
+                        "{hs_mapping_confidence}",
+                        sa_func.cast(str(conf), JSONB),
+                        True,
+                    )
                 session.execute(
                     TradeFlow.__table__.update()
                     .where(TradeFlow.id.in_(tf_ids))
-                    .values(material_id=mid, hs_mapping_id=hs_id)
+                    .values(**values)
                 )
                 attributed += len(tf_ids)
             session.commit()
@@ -1596,6 +1656,22 @@ def reattribute_unmapped_trade_flows(
         "still_unmapped": still_unmapped,
         "attribution_samples": attribution_samples,
     }
+    # 7.2 fix (2026-06): summary at WARNING so the &#x201C;something happened&#x201D;
+    # signal stays discoverable in structured-log dashboards (per-row
+    # events were downgraded to DEBUG above to avoid 50K-event floods).
+    if attributed > 0:
+        log.warning(
+            "comtrade.reattribute_unmapped.summary",
+            examined=examined,
+            attributed=attributed,
+            still_unmapped=still_unmapped,
+            sample_count=len(attribution_samples),
+            note=(
+                "Newly-attributed rows changed materialId/hsmapping_id; "
+                "downstream aggregates over the affected materials may need "
+                "rebuilding.  See attribution_samples for spot-checks."
+            ),
+        )
     log.info("comtrade.reattribute_unmapped.done", **{
         k: v for k, v in result.items() if k != "attribution_samples"
     })
