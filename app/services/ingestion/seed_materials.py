@@ -527,10 +527,6 @@ _MATERIALS: list[dict] = [
 ]
 
 
-# Backwards-compatibility alias.  Previously exported as _NON_USGS_MATERIALS;
-# the list now contains all 39 materials, so the new name is _MATERIALS.
-_NON_USGS_MATERIALS = _MATERIALS
-
 # ---------------------------------------------------------------------------
 # Battery chemistry material compositions
 #
@@ -683,16 +679,6 @@ def seed_materials_register(
     if inserted or updated:
         session.flush()
     return {"inserted": inserted, "updated": updated, "skipped_existing": skipped}
-
-
-# Backwards-compatibility wrapper.  Old callers (CLI etc.) continue to work.
-def seed_non_usgs_materials(session: Session) -> int:
-    """Deprecated — wraps seed_materials_register for compatibility.
-
-    Returns only the inserted count to preserve the old return type.
-    """
-    stats = seed_materials_register(session)
-    return stats["inserted"]
 
 
 def seed_battery_chemistry_junctions(session: Session) -> dict[str, int]:

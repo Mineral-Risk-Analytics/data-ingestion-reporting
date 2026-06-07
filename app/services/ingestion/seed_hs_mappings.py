@@ -377,6 +377,21 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Crystalline flake graphite and powder", 1.0, "ore", 6, "global"),
     ("250490", "Natural Graphite",
      "Other natural graphite (amorphous, lump)", 1.0, "ore", 6, "global"),
+    # 11.2 audit easy-add #3 (2026-06): synthetic graphite is a direct
+    # substitute for natural-flake anode material — ~50% of global anode-
+    # active-material production. Mapping to 'Natural Graphite' is pragmatic
+    # for Phase 1; Phase 1.5 may split into a separate canonical 'Synthetic
+    # Graphite' material since upstream supply dynamics (petroleum coke
+    # feedstock + graphitisation furnaces) differ from natural flake.
+    # Confidence 0.7 reflects this methodological compromise.
+    ("380110", "Natural Graphite",
+     "Artificial / synthetic graphite (anode-grade for Li-ion batteries).",
+     0.7, "battery_grade", 6, "global"),
+    # 11.2 audit easy-add #4 (2026-06): smaller volume than 380110 but
+    # directly battery-cell-bound. Same Phase 1.5 split question.
+    ("380130", "Natural Graphite",
+     "Carbonaceous pastes for electrodes (anode-side cell input).",
+     0.6, "battery_grade", 6, "global"),
 
     # ── Phosphate (Battery Grade) (6-digit) ──────────────────────────────
     ("251010", "Phosphate (Battery Grade)",
@@ -444,6 +459,14 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("282010", "Manganese",
      "Manganese dioxide (EMD/CMD — direct battery cathode input)",
      1.0, "battery_grade", 6, "global"),
+    # 11.2 audit easy-add #2 (2026-06): HS 283329 is the residual "other
+    # sulphates" bucket and also carries the Cobalt mapping (cobalt sulphate
+    # also classified here). Confidence 0.5 reflects that ~half the trade
+    # at this code is cobalt-not-manganese. Phase 1.5 partner refinement
+    # may set per-(country, year) shares if needed.
+    ("283329", "Manganese",
+     "Manganese sulphate (MnSO4·H2O, HPMSM — NCM cathode precursor).",
+     0.5, "battery_grade", 6, "global"),
     ("720211", "Manganese",
      "Ferromanganese, containing >4% carbon (high-carbon)", 1.0, "intermediate", 6, "global"),
     ("720219", "Manganese",
@@ -467,10 +490,26 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Copper waste and scrap", 1.0, "scrap", 6, "global"),
     ("740811", "Copper",
      "Wire rod of refined copper (continuous cast rod)", 1.0, "fabricated", 6, "global"),
+    # 11.2 audit easy-add #5 (2026-06): battery copper foil is a ~$5B+/yr
+    # market dominated by Korea (SK Nexilis, Iljin) and Japan (Furukawa,
+    # Nippon Mining). Confidence 0.7 reflects that HS 741011 also covers
+    # non-battery rolled foils (industrial, decorative); battery-grade is
+    # a large but not exclusive slice. China is also rapidly expanding
+    # battery-foil capacity.
+    ("741011", "Copper",
+     "Rolled copper foil, not backed, <0.15mm (battery current collector).",
+     0.7, "battery_grade", 6, "global"),
 
     # ── Nickel (6-digit) ──────────────────────────────────────────────────
     ("260400", "Nickel",
      "Nickel ores and concentrates (nickel content)", 1.0, "ore", 6, "global"),
+    # 11.2 audit easy-add #1 (2026-06): HS 283324 is specifically nickel
+    # sulphates within the 2833 sulphate family — clean single-material
+    # attribution. China dominates battery-grade NiSO4 refining for the
+    # NCM cathode supply chain.
+    ("283324", "Nickel",
+     "Nickel sulfates (NiSO4·6H2O — battery-grade NCM precursor input).",
+     1.0, "battery_grade", 6, "global"),
     ("720260", "Nickel",
      "Ferronickel", 1.0, "intermediate", 6, "global"),
     ("750210", "Nickel",
@@ -510,6 +549,14 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Aluminum alloys, unwrought (billet, T-bar)", 1.0, "refined", 6, "global"),
     ("760200", "Aluminum",
      "Aluminum waste and scrap", 1.0, "scrap", 6, "global"),
+    # 11.2 audit easy-add #6 (2026-06): battery aluminum foil is dominated
+    # by China (~70%+ of global capacity) with Korea + Japan as secondary
+    # suppliers. Confidence 0.7 reflects that HS 760711 also covers non-
+    # battery rolled foils (packaging, industrial); battery-grade is a
+    # meaningful but not exclusive slice.
+    ("760711", "Aluminum",
+     "Rolled aluminum foil, not backed, <0.2mm (battery current collector).",
+     0.7, "battery_grade", 6, "global"),
 
     # ── Tin (6-digit) ─────────────────────────────────────────────────────
     ("800110", "Tin",
@@ -771,6 +818,19 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("360690", "Rare Earth Elements",
      "Ferrocerium and other pyrophoric alloys — refined REE alloy form",
      0.7, "refined", 6, "global"),
+    # 11.2 audit easy-add #7 (2026-06): NdFeB magnets are the highest-
+    # leverage downstream form for the CRMA-critical magnet REEs (Nd, Pr,
+    # Dy, Tb).  China dominates ~90% of global sintered-magnet production.
+    # Confidence 0.8 reflects that 8505.11 also covers non-NdFeB sintered
+    # magnets (SmCo, ferrite) but NdFeB is the dominant slice by both
+    # value and battery-supply-chain relevance.  Conceptual note: EV motor
+    # materials are not strictly battery components, but partner direction
+    # (11.2 action item #7) is that battery-supply-chain scoring should
+    # include EV powertrain magnet exposure given the inseparable demand
+    # link.
+    ("850511", "Rare Earth Elements",
+     "Sintered NdFeB permanent magnets (EV motor + wind-turbine generator).",
+     0.8, "battery_grade", 6, "global"),
 
     # Individual motor REEs — narrowed from Rare Earths codes above
     ("280530", "Neodymium",
@@ -1052,12 +1112,13 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("261790", "Rare Earth Elements",
      "Rare-earth ores and concentrates (other) — bastnäsite / monazite mixed",
      0.7, "ore", 6, "global"),
-    ("283324", "Nickel",
-     "Nickel sulphate (NiSO4) — primary battery-grade precursor for cathode active material",
-     1.0, "battery_grade", 6, "global"),
-    ("283329", "Manganese",
-     "Manganese sulphate (MnSO4) — battery-grade cathode precursor",
-     1.0, "battery_grade", 6, "global"),
+    # 283324 Nickel + 283329 Manganese moved to their canonical material
+    # sections (Nickel 6-digit + Manganese 6-digit) in the 11.2 audit
+    # easy-adds.  Removed duplicates here.  Note: the Manganese mapping
+    # was previously at confidence 1.0; the canonical entry uses
+    # confidence 0.5 to reflect that HS 283329 ("other sulphates") also
+    # carries the Cobalt mapping (cobalt sulphate, confidence 0.8) — the
+    # code is genuinely multi-material at the 6-digit level.
     ("740311", "Copper",
      "Copper cathodes (refined) — battery current collector input",
      1.0, "refined", 6, "global"),
@@ -1254,6 +1315,54 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "cobalt sulfate",
         "cobaltous sulfate",
         "CoSO4",
+    ],
+    # 11.2 audit easy-adds (2026-06): keyword entries for the new
+    # battery-grade HS codes seeded in this pass.
+    ("283324", "Nickel"): [
+        "nickel sulfate",
+        "nickel sulphate",
+        "NiSO4",
+        "battery-grade nickel sulphate",
+    ],
+    ("283329", "Manganese"): [
+        "manganese sulfate",
+        "manganese sulphate",
+        "MnSO4",
+        "high-purity manganese sulphate",
+        "HPMSM",
+    ],
+    ("380110", "Natural Graphite"): [
+        "synthetic graphite",
+        "artificial graphite",
+        "anode-grade graphite",
+        "synthetic anode material",
+    ],
+    ("380130", "Natural Graphite"): [
+        "electrode paste",
+        "carbonaceous paste",
+        "anode electrode paste",
+    ],
+    ("741011", "Copper"): [
+        "battery copper foil",
+        "rolled copper foil",
+        "copper current collector",
+        "anode copper foil",
+        "cathode copper foil",
+    ],
+    ("760711", "Aluminum"): [
+        "battery aluminum foil",
+        "aluminium foil",
+        "cathode aluminum foil",
+        "rolled aluminum foil",
+        "aluminum current collector",
+    ],
+    ("850511", "Rare Earth Elements"): [
+        "NdFeB",
+        "neodymium magnet",
+        "neodymium-iron-boron",
+        "permanent magnet",
+        "sintered magnet",
+        "EV motor magnet",
     ],
 
     # ── Nickel ───────────────────────────────────────────────────────────

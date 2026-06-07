@@ -450,16 +450,6 @@ def _extract_tech_basket_minerals(technologies_raw: str | None) -> list[str]:
     return found
 
 
-# Keep old name as an alias so any external callers don't immediately break.
-# Remove in Phase 3.
-def _extract_minerals_from_tech_and_text(
-    technologies_raw: str | None,
-    title: str = "",
-    description: str = "",
-) -> list[str]:  # pragma: no cover
-    return _extract_tech_basket_minerals(technologies_raw)
-
-
 def _extract_policy_type_names(policy_type_raw: str | None) -> list[str]:
     """
     Parse policyType JSON array and return a flat list of name strings.
@@ -622,11 +612,6 @@ def parse_policy_tracker_file(
     records = _parse_csv_rows(_seq_rows_as_dicts(), iso3_map)
     log.info("iea_policy_tracker.parsed_xlsx", path=str(path), row_count=len(records))
     return records
-
-
-# Keep old name as an alias for backward compatibility
-parse_policy_tracker_xlsx = parse_policy_tracker_file
-
 
 # ---------------------------------------------------------------------------
 # DB helpers

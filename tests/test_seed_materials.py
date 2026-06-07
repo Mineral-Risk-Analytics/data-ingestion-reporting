@@ -12,20 +12,16 @@ import pytest
 from app.services.ingestion.seed_materials import (
     _JUNCTION_ROWS,
     _MATERIALS,
-    _NON_USGS_MATERIALS,
     seed_battery_chemistry_junctions,
-    seed_non_usgs_materials,
+    seed_materials_register,
 )
 
 
 # ---------------------------------------------------------------------------
-# Full materials register (_MATERIALS / _NON_USGS_MATERIALS alias)
+# Full materials register (_MATERIALS)
 # ---------------------------------------------------------------------------
 
 class TestMaterialsRegisterData:
-    def test_non_usgs_alias_is_full_register(self):
-        assert _NON_USGS_MATERIALS is _MATERIALS
-
     def test_register_has_thirty_nine_entries(self):
         assert len(_MATERIALS) == 39
 
@@ -111,30 +107,24 @@ class TestJunctionRowsData:
 
 
 # ---------------------------------------------------------------------------
-# seed_non_usgs_materials
+# seed_materials_register
 # ---------------------------------------------------------------------------
 
 def _make_session_for_seed(existing_names: set[str]) -> MagicMock:
     """Return a mock session where materials with names in existing_names already exist."""
     session = MagicMock()
-
-    def scalar_side_effect(stmt):
-        # Detect which canonical_name is being queried from the WHERE clause.
-        # We can't inspect the stmt deeply in a unit test, so we track call order.
-        return None  # all new by default
-
     session.scalar.return_value = None
     return session
 
 
-class TestSeedNonUsgsMaterials:
+class TestSeedMaterialsRegister:
     def test_inserts_all_when_table_empty(self):
         session = MagicMock()
         session.scalar.return_value = None  # all materials are new
 
-        count = seed_non_usgs_materials(session)
+        stats = seed_materials_register(session)
 
-        assert count == len(_MATERIALS)
+        assert stats["inserted"] == len(_MATERIALS)
         assert session.add.call_count == len(_MATERIALS)
 
     def test_skips_existing_materials(self):
@@ -151,15 +141,16 @@ class TestSeedNonUsgsMaterials:
 
         session.scalar.side_effect = scalar_se
 
-        count = seed_non_usgs_materials(session)
+        stats = seed_materials_register(session)
 
-        assert count == len(_MATERIALS) - 1
+        assert stats["inserted"] == len(_MATERIALS) - 1
+        assert stats["skipped_existing"] == 1
 
     def test_flush_called_when_insertions_made(self):
         session = MagicMock()
         session.scalar.return_value = None
 
-        seed_non_usgs_materials(session)
+        seed_materials_register(session)
 
         session.flush.assert_called()
 
@@ -167,7 +158,7 @@ class TestSeedNonUsgsMaterials:
         session = MagicMock()
         session.scalar.return_value = MagicMock()  # all exist
 
-        seed_non_usgs_materials(session)
+        seed_materials_register(session)
 
         session.flush.assert_not_called()
 

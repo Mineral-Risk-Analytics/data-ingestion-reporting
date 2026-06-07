@@ -2015,7 +2015,19 @@ def ingest_vpic_cmd(
 
 
 @app.command("seed-regulations")
-def seed_regulations_cmd() -> None:
+def seed_regulations_cmd(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Update scope_type and notes on existing regulation_material_scope and "
+            "regulation_geography_scope rows with current seed values.  "
+            "Non-destructive — does NOT delete scope rows that exist in the DB "
+            "but are absent from the seed.  Use after correcting scope "
+            "classifications in _MATERIAL_SCOPES or _GEOGRAPHY_SCOPES."
+        ),
+    ),
+) -> None:
     """Seed regulations, material/geography scopes, and company regulation exposures.
 
     Populates four tables: regulations, regulation_material_scope,
@@ -2026,6 +2038,8 @@ def seed_regulations_cmd() -> None:
     Only non_compliant / partial / unknown rows generate scoring uplift.
 
     Idempotent: safe to re-run after updating compliance statuses in the seed file.
+    With --force: also overwrites scope_type/notes on existing material and
+    geography scope rows.
 
     Run order:
         bdi-ingest seed-companies    # companies must exist
@@ -2036,7 +2050,7 @@ def seed_regulations_cmd() -> None:
 
     s = _session()
     try:
-        result = seed_regulations(s)
+        result = seed_regulations(s, force=force)
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)

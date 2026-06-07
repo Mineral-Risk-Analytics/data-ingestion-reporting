@@ -87,13 +87,14 @@ def test_financial_pressure_basic() -> None:
 
 
 def test_financial_pressure_sparse_evidence() -> None:
-    # filing_count=1 should halve the raw score
+    # evidence_count=1 should halve the raw score
+    # 11.4-Fin-B (2026-06-06): renamed filing_count → evidence_count.
     raw = 20.0 + 10.0 + 10.0  # = 40
     score = score_financial_pressure(
         base_filing_signal=20.0,
         leverage_warning_bonus=10.0,
         liquidity_stress_bonus=10.0,
-        filing_count=1,
+        evidence_count=1,
     )
     assert abs(score - raw * (1 / 2.0)) < 0.01
 
@@ -103,7 +104,7 @@ def test_financial_pressure_zero_filings_zeroes_score() -> None:
         base_filing_signal=40.0,
         leverage_warning_bonus=30.0,
         liquidity_stress_bonus=30.0,
-        filing_count=0,
+        evidence_count=0,
     )
     assert score == 0.0
 

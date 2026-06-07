@@ -344,13 +344,6 @@ _MIN_TRADE_VALUE_USD = _MIN_PER_COUNTRY_TRADE_USD
 # between assuming high confidence (1.0) and assuming low (0.5).
 _COMPANY_DATA_CONFIDENCE_DEFAULT = 0.8
 
-# Backwards-compat alias for the pre-9.6 constant.  Now serves only as
-# the ceiling for the relevance calculation: an exposure_score=1.0,
-# data_confidence=1.0 row yields relevance = 1.0 directly (mapped to
-# 1.30x multiplier).  The 0.85 number itself no longer appears in any
-# calculation but is preserved as a constant for code archaeologists.
-_COMPANY_RELEVANCE = 0.85  # pre-9.6 default; no longer used in calculation
-
 
 def _compute_company_relevance(
     exposure_score: float,
@@ -808,8 +801,7 @@ def _link_companies(
         the loop arbitrarily kept whichever exposure SQL returned first.
       * Rows with ``exposure_score == 0`` are skipped — a company with
         zero exposure to a material shouldn't inherit risk from a
-        material-anchored event.  Previously they'd have received a
-        ``_COMPANY_RELEVANCE`` (0.85) link anyway.
+        material-anchored event.
     """
     rows = db.scalars(
         select(CompanyMaterialExposure).where(

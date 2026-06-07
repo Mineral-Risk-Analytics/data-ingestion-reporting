@@ -114,30 +114,6 @@ _API_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=10.0, pool=10.0)
 _KEYWORD_BOOST = 0.12
 
 # ---------------------------------------------------------------------------
-# Geography detection
-# ---------------------------------------------------------------------------
-
-# NOTE: _GEO_PATTERNS and _detect_geographies() were removed in Phase 2.
-# Geography detection is now handled by GeographyCache (imported above), which
-# loads country detection patterns from countries.detection_patterns (DB-backed).
-# To add or update detection patterns, update seed_countries.py and re-run
-# `bdi-ingest seed-countries` — no code change required.
-#
-# _detect_geographies() is kept as a thin shim for any external callers.
-# Remove in Phase 3.
-
-def _detect_geographies(
-    text: str,
-    _cache: "GeographyCache | None" = None,
-) -> list[tuple[str, str, float]]:  # pragma: no cover
-    """Deprecated shim — callers should build a GeographyCache and call .detect()."""
-    if _cache is not None:
-        return _cache.detect(text)
-    # Fallback: return empty list if no cache provided (avoids DB call here).
-    return []
-
-
-# ---------------------------------------------------------------------------
 # Material detection
 # ---------------------------------------------------------------------------
 

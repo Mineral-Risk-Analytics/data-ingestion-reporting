@@ -20,12 +20,17 @@ Weekly scoring pipeline (four jobs, Monday UTC):
 
 Daily trade flow ingestion (one job):
 
-  Job D — ``ingest-comtrade-daily``      Daily 06:00 UTC
+  Job D — ``ingest-comtrade-daily``      Daily 04:00 UTC (midnight EDT)
       Fetches export + import trade flows from UN Comtrade for the 3 most
       recently complete calendar years.  Idempotent: already-committed
       (reporter × HS prefix × year) batches are skipped.  Designed to run
       daily until full coverage is reached (rate-limited to ~500 calls/day).
       Runs build-trade-signals after both flow directions complete.
+
+      Schedule moved from 06:00 → 04:00 UTC on 2026-06-06 when the 11.2 HS-
+      prefix expansion pushed expected runtime toward ~10-12 hours; starting
+      at midnight EDT keeps the finish before US business hours and avoids
+      overlap with the Monday 01:00-04:00 UTC rescore window.
 
 Timeout strategy
 ----------------
@@ -545,8 +550,43 @@ def _target_years() -> list[int]:
     return [end, end - 1, end - 2]
 
 
+def _derive_four_digit_prefixes(raw_prefixes: list[str]) -> list[str]:
+    """Truncate raw HS prefixes (any length) to 4-digit chapters, dedupe,
+    sort.  Pure helper extracted from ``_sync_get_hs_prefixes`` so the
+    derivation logic can be unit-tested without a DB session.
+
+    Mirrors ``comtrade.py::ingest_comtrade``'s prefix derivation at
+    lines 913-918 so the daily Inngest job and the CLI take the same
+    path on the same source data.
+    """
+    four_digit: set[str] = set()
+    for raw in raw_prefixes:
+        clean = raw.replace(".", "")
+        if len(clean) >= 4:
+            four_digit.add(clean[:4])
+    return sorted(four_digit)
+
+
 def _sync_get_hs_prefixes() -> list[str]:
-    """Return all distinct 4-digit HS prefixes from hs_code_material_mappings.
+    """Return all distinct 4-digit HS prefixes derived from
+    ``hs_code_material_mappings``.
+
+    Prior to the 11.2-followup fix (2026-06-06) this function pulled rows
+    where ``digit_count == 4`` only.  That diverged from the inner
+    ``comtrade.py::_build_hs_material_map`` logic, which derives 4-digit
+    prefixes from rows where ``digit_count IN (4, 6)`` by taking the
+    first four characters.  The divergence meant any newly seeded
+    6-digit mapping under a chapter that had no companion 4-digit
+    "umbrella" row was silently dropped from the daily Inngest job's
+    fetch list — even though a manual ``ingest_comtrade`` CLI invocation
+    would have picked it up.
+
+    The 11.2 easy adds surfaced the bug: HS 3801 / 7410 / 7607 / 8505
+    were seeded only at the 6-digit level (380110, 380130, 741011,
+    760711, 850511), so the daily run never queried Comtrade for them.
+
+    The current implementation matches comtrade.py: filter to
+    ``digit_count IN (4, 6)`` and truncate to the first four chars.
 
     Ordered deterministically for Inngest replay safety.
     """
@@ -555,13 +595,36 @@ def _sync_get_hs_prefixes() -> list[str]:
 
     session = get_session_factory()()
     try:
-        rows = session.scalars(
+        # Pull all 4- and 6-digit rows; derive the 4-digit prefix set.
+        # 10-digit US-scope rows are intentionally excluded — Comtrade
+        # only returns up to 6-digit cmdCodes, so deriving 4-digit
+        # umbrellas from 10-digit US-only rows would be misleading
+        # (it would imply we have global coverage we don't have).
+        raw_prefixes = session.scalars(
             select(HsCodeMaterialMapping.hs_code_prefix)
-            .where(HsCodeMaterialMapping.digit_count == 4)
+            .where(HsCodeMaterialMapping.digit_count.in_([4, 6]))
             .distinct()
-            .order_by(HsCodeMaterialMapping.hs_code_prefix)
         ).all()
-        return list(rows)
+
+        result = _derive_four_digit_prefixes(list(raw_prefixes))
+
+        # Surface which prefixes are present so an operator can spot
+        # newly onboarded chapters in the daily job log.  This is the
+        # blast-radius diagnostic referenced in the 11.2-followup fix:
+        # the very first run after this change will show a step count
+        # higher than the previous day, reflecting newly fetched
+        # chapters (3801/7410/7607/8505 for the 11.2 adds).
+        log.info(
+            "comtrade_job.prefixes_derived",
+            count=len(result),
+            prefixes=result,
+            note=(
+                "Derived from hs_code_material_mappings with "
+                "digit_count IN (4, 6).  An increase vs the previous "
+                "daily run indicates newly seeded 6-digit chapters."
+            ),
+        )
+        return result
     finally:
         session.close()
 
@@ -765,10 +828,22 @@ async def _step_count_comtrade_writes_since(since_iso: str) -> dict:
 
 @inngest_client.create_function(
     fn_id="ingest-comtrade-daily",
-    trigger=inngest.TriggerCron(cron="0 6 * * *"),
+    trigger=inngest.TriggerCron(cron="0 4 * * *"),
 )
 async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
-    """Daily UN Comtrade trade flow ingestion — runs every day at 06:00 UTC.
+    """Daily UN Comtrade trade flow ingestion — runs every day at 04:00 UTC
+    (midnight EDT / 21:00 PDT previous day).
+
+    Schedule history:
+
+    * Until 2026-06-06 the job ran at 06:00 UTC (02:00 EDT).
+    * Bumped to 04:00 UTC (midnight EDT) when the 11.2 HS-prefix expansion
+      pushed expected runtime from ~6 hours toward ~10-12 hours.  Starting
+      at midnight EDT keeps the finish before US business hours and avoids
+      any Monday-window overlap with the weekly rescore jobs at 01:00-04:00
+      UTC.  On Mondays the chemistry rescore (04:00 UTC) starts at the
+      same instant as this job, but chemistry reads pre-computed rollups —
+      not ``trade_flows`` — so there's no data-race concern.
 
     Fetches export (flow X) and import (flow M) annual trade data for all
     4-digit HS prefixes in hs_code_material_mappings, targeting the 3 most
@@ -939,7 +1014,7 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
     # daily runs from this point forward are wasteful (~14k SELECT
     # queries/day for nothing).  Logging at WARNING so it's visible in
     # the Inngest dashboard as a flag.  Action: swap the cron from
-    # ``0 6 * * *`` to ``0 6 * * SUN`` (or monthly) when this fires.
+    # ``0 4 * * *`` to ``0 4 * * SUN`` (or monthly) when this fires.
     # Uses the authoritative count so a counter-undercount can't spuriously
     # fire this signal.
     backfill_complete = (
@@ -958,7 +1033,7 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
                 "All (year × prefix × reporter × flow) combinations are "
                 "already ingested.  Daily runs from now on do ~14k SELECTs "
                 "for nothing.  Switch the cron in scoring_jobs.py from "
-                "'0 6 * * *' to '0 6 * * SUN' (weekly) — Comtrade publishes "
+                "'0 4 * * *' to '0 4 * * SUN' (weekly) — Comtrade publishes "
                 "annual data with a 4-6 month lag, so weekly is sufficient "
                 "to pick up new releases within a week of publication."
             ),
@@ -996,7 +1071,7 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
 
 
 SCHEDULED_FUNCTIONS = [
-    ingest_comtrade_job,            # Daily  — 06:00 UTC
+    ingest_comtrade_job,            # Daily  — 04:00 UTC (midnight EDT)
     rescore_hs_nodes_job,           # Level 0 — Mon 01:00 UTC
     rescore_market_scores_job,      # Level 1 — Mon 02:00 UTC
     rescore_global_rollups_job,     # Level 2 — Mon 03:00 UTC

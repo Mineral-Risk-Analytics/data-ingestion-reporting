@@ -638,18 +638,6 @@ def _content_hash(stable_key: str) -> str:
     return hashlib.sha256(stable_key.encode()).hexdigest()
 
 
-# Backwards-compat shim so anything importing the old three-arg helper
-# still works.  Logs a warning at import time.  Will be removed in a
-# future release; new callers should use ``_content_hash(stable_key)``
-# directly.
-def _content_hash_legacy(
-    title: str, summary: str, event_date: Optional[datetime]
-) -> str:
-    """Deprecated.  Pre-2026-05-11 title-based hash.  Do not use."""
-    date_str = event_date.date().isoformat() if event_date else ""
-    return hashlib.sha256(f"{title}|{summary}|{date_str}".encode()).hexdigest()
-
-
 # ---------------------------------------------------------------------------
 # Main ingest
 # ---------------------------------------------------------------------------

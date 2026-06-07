@@ -645,7 +645,7 @@ functions are:
 
 | Job | Cron | Mode |
 |---|---|---|
-| `ingest-comtrade-daily`  *(scoring_jobs.py)* | Daily 06:00 UTC | Auto-download (year×prefix×flow). Logs `comtrade_job.backfill_complete` once caught up — swap to weekly when seen. |
+| `ingest-comtrade-daily`  *(scoring_jobs.py)* | Daily 04:00 UTC (midnight EDT) | Auto-download (year×prefix×flow). Logs `comtrade_job.backfill_complete` once caught up — swap to weekly when seen. Moved from 06:00 → 04:00 UTC on 2026-06-06 to absorb runtime growth from the 11.2 HS-prefix expansion. |
 | `ingest-opensanctions-weekly` | Sun 22:00 UTC | Auto-download |
 | `ingest-federal-register-weekly` | Sun 22:30 UTC | Auto-download |
 | `ingest-worldbank-weekly` (Pink Sheet) | Sun 23:00 UTC | Auto-download (25-day gate) |

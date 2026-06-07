@@ -62,8 +62,6 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from sqlalchemy import text
-
 from app.models.country import Country
 from app.models.documents import SourceDocument
 from app.models.regulatory import (
@@ -248,11 +246,22 @@ GTA_INTERVENTION_CATEGORY_MAP: dict[str, str] = {
     "Import ban": "geopolitical_trade",
     "Sanitary and phytosanitary measure": "regulatory_compliance",
     "Technical barrier to trade": "regulatory_compliance",
-    "Local content requirement": "geopolitical_trade",
+    # 2026-06-06: Local content requirements and Procurement re-routed
+    # to regulatory_compliance.  These are domestic-content compliance
+    # mandates (Buy-American, EU domestic-procurement preferences) rather
+    # than trade restrictions — the regulatory_compliance category better
+    # captures the compliance-obligation character.  They also carry the
+    # PROCUREMENT_POLICY event_subtype so they don't feed tariff_exposure
+    # or export_restriction_exposure even when they would otherwise have
+    # matched a title-text fallback.
+    "Local content requirement": "regulatory_compliance",
+    "Local content requirements": "regulatory_compliance",
     "Trade finance": "financial_pressure",
     "Investment measure": "geopolitical_trade",
     "State aid": "financial_pressure",
-    "Procurement": "geopolitical_trade",
+    "Procurement": "regulatory_compliance",
+    "Procurement policy": "regulatory_compliance",
+    "Public-private partnership": "regulatory_compliance",
 }
 DEFAULT_GTA_CATEGORY = "geopolitical_trade"
 
@@ -275,6 +284,22 @@ DEFAULT_GTA_CATEGORY = "geopolitical_trade"
 # No subtype is set for instruments that don't map cleanly to any bucket
 # (Procurement, Public-private partnership) — text matching handles those.
 _INTERVENTION_SUBTYPE_MAP: dict[str, str] = {
+    # Procurement-side interventions (Buy-American mandates, domestic-content
+    # procurement preferences, local-content requirements applied through
+    # government purchasing).  Added 2026-06-06.  These actions create
+    # market distortion in the implementing country but are not "trade
+    # restrictions" in the traditional sense — they affect international
+    # trade flows indirectly through public-sector demand-side preferences.
+    # The PROCUREMENT_POLICY subtype routes nowhere by default (no entry
+    # in the tariff/export sub-input matchers in market_aggregator), making
+    # these events informational rather than score-moving.  Partner can
+    # promote them to a scored sub-input via the existing GeoCovragePillar
+    # tuning if customer use cases warrant.
+    "Procurement":                       "PROCUREMENT_POLICY",
+    "Procurement policy":                "PROCUREMENT_POLICY",
+    "Local content requirement":         "PROCUREMENT_POLICY",
+    "Local content requirements":        "PROCUREMENT_POLICY",
+    "Public-private partnership":        "PROCUREMENT_POLICY",
     # Export-side interventions (implementing country IS the producer
     # whose supply just got constrained).
     # 2026-05-06: GTA's actual data uses singular forms ("Export licensing
@@ -973,11 +998,6 @@ def _existing_event_id(
         return by_hash
 
     if gta_id:
-        try:
-            from sqlalchemy import text  # noqa: PLC0415  - lazy import for SQLite path
-        except ImportError:
-            text = None  # type: ignore[assignment]
-
         # Postgres path — JSONB key access. Cheap and correct.
         try:
             by_id = session.scalar(
@@ -1024,7 +1044,7 @@ def _severity_for(intervention_type: str, in_force: bool) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Implementation-level severity multipliers (Scope 2 audit, 2026-05-06)
+# Implementation-level severity multipliers — PARTNER-TUNABLE
 # ---------------------------------------------------------------------------
 # Source: GTA's "Implementation Level" column.  Distribution observed in the
 # real interventions_batteries.csv (n=1728):
@@ -1033,29 +1053,37 @@ def _severity_for(intervention_type: str, in_force: bool) -> float:
 # National      — legislative/regulatory action by a sovereign government.  Baseline 1.0×.
 # Subnational   — US state, Indian state, etc.  Less binding; 0.5×.
 # Supranational — EU directives, RCEP, ASEAN-level commitments.  Harder to reverse; 1.1×.
-# NFI           — National Financial Institution (EXIM banks, state development
-#                 banks, sovereign wealth funds).  All NFI rows in the data
-#                 are financial-support instruments: trade finance, state
-#                 loans, loan guarantees, financial grants, state aid, equity
-#                 stakes.  These are subsidy-type events, not tariff or
-#                 export restrictions.  They don't map to TARIFF /
-#                 IMPORT_DISRUPTION / EXPORT_RESTRICTION subtypes, so they
-#                 are excluded from the HS-node tariff/export sub-scores
-#                 regardless of multiplier.  Listed here at 1.0× for
-#                 completeness; if a future "EXPORT_SUBSIDY" subtype is added
-#                 the multiplier may need recalibration.
-# IFI           — International Financial Institution (European Investment
-#                 Bank, World Bank, EBRD, ADB).  Same pattern as NFI: all
-#                 financial-support instruments, not regulatory restrictions.
-#                 Listed at 1.0× for the same reason.
+#
+# NFI / IFI — financial-support instruments (trade finance, state loans, loan
+# guarantees, financial grants, state aid, equity stakes) issued by:
+#   * NFI = National Financial Institution (EXIM banks, state development banks,
+#           sovereign wealth funds)
+#   * IFI = International Financial Institution (European Investment Bank,
+#           World Bank, EBRD, ADB, IADB)
+#
+# Once the EXPORT_SUBSIDY event_subtype routing was wired (G-Cov-3, 2026-05-09),
+# these started feeding the Geopolitical pillar's production_subsidy_distortion
+# sub-input.  Both currently at 1.0× — a placeholder pending partner
+# calibration on the relative bite of IFI grants (typically smaller and more
+# conditional than national programs) versus national NFI programs.
+#
+# RECOMMENDED PARTNER-TUNED VALUES (pending sign-off):
+#   NFI 1.0× (no change — national-financial-institution programs typically
+#             carry national-level political backing)
+#   IFI 0.6× (international grants are smaller, more conditional, more
+#             carefully-targeted than national programs)
+#
+# To apply the recommended IFI discount, partner edits the `ifi` entry below.
+# Tests in tests/test_gta_severity_modifiers.py should be updated to match.
 _IMPLEMENTATION_LEVEL_MULTIPLIER: dict[str, float] = {
     "national":      1.00,
     "subnational":   0.50,   # GTA real-data spelling (no hyphen)
     "sub-national":  0.50,   # alternate spelling tolerated
     "supranational": 1.10,   # GTA's actual category for multilateral commitments
     "multilateral":  1.10,   # legacy alias
-    "nfi":           1.00,   # National Financial Institution — financial support
-    "ifi":           1.00,   # International Financial Institution — financial support
+    "nfi":           1.00,   # National Financial Institution — PARTNER-TUNABLE
+    "ifi":           1.00,   # International Financial Institution — PARTNER-TUNABLE
+                             # (recommended 0.6 once partner confirms)
 }
 
 # Horizontal interventions apply broadly across many products.  The
@@ -1286,10 +1314,10 @@ def ingest_gta(
             "eligible_firm": eligible_firm,
             "affected_sectors_raw": affected_sectors_raw,
         }
-        if event_subtype:
-            # event_subtype kept in metadata_json for one release cycle
-            # to support backwards-compat readers; drop later.
-            metadata["event_subtype"] = event_subtype
+        # event_subtype is on the typed column ``RiskEvent.event_subtype``
+        # (migration 040).  Backwards-compat duplicate in metadata_json was
+        # dropped 2026-06-06 after the one-release-cycle deprecation window
+        # — all readers now use the typed column.
         if date_announced is not None:
             # Used by market_aggregator's policy_proximity_adjustment when
             # date_announced is within 90 days of as_of_date.

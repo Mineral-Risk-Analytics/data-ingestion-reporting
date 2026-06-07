@@ -234,6 +234,129 @@ def _compute_operational_signal(
 
 
 # ---------------------------------------------------------------------------
+# 11.1.A (2026-06) — Parent/child HS mapping propagation
+# ---------------------------------------------------------------------------
+# Pre-11.1.A the scorer joined events on ``RiskEventHsMapping.hs_mapping_id ==
+# hs_mapping_id`` (strict equality).  That meant a Federal Register tariff
+# tagged to the 4-digit chapter mapping (e.g. ``2601`` for iron ore) would
+# only lift ``tariff_exposure`` on the 4-digit node, NOT on its 6-digit
+# children ``260111`` / ``260112``.  At Level-1 the rollup averages the
+# children's zero-tariff scores with the parent's lifted score, diluting
+# the signal.
+#
+# 11.1.A closes this by treating events tagged to any (parent ∪ child)
+# mapping FOR THE SAME MATERIAL as in-scope for the current node.  Cross-
+# material contamination (e.g. HS 2615 covers Nb/Ta/V/Zr) is prevented by
+# the same-material filter.  Production shares + HHI + operational signal
+# remain strictly per-node — those are structural measurements that don't
+# logically propagate across granularities.
+
+
+def _classify_hs_relations(
+    our_prefix: str,
+    siblings: list[tuple[int, str]],
+) -> tuple[list[int], list[int]]:
+    """Classify same-material HS mappings as parents / children of ``our_prefix``.
+
+    Pure helper for testing.  Inputs are normalised (no dots).  Returns
+    ``(parent_ids, child_ids)``.
+
+    Parent: ``sibling_prefix`` is a strict prefix of ``our_prefix`` (e.g.
+    ``2601`` is a parent of ``260111``).
+
+    Child: ``our_prefix`` is a strict prefix of ``sibling_prefix`` (e.g.
+    ``260111`` is a child of ``2601``).
+
+    Equal prefixes are NEITHER parent nor child — they're the same node
+    (or a data duplicate that should have been caught by the unique
+    constraint on ``hs_code_material_mappings``).  Such rows are skipped
+    silently.
+    """
+    parents: list[int] = []
+    children: list[int] = []
+    for other_id, other_prefix in siblings:
+        if other_prefix == our_prefix:
+            continue
+        if our_prefix.startswith(other_prefix):
+            parents.append(other_id)
+        elif other_prefix.startswith(our_prefix):
+            children.append(other_id)
+        # Otherwise the prefixes are unrelated (e.g. both 6-digit
+        # codes under the same material, like 260111 and 260112).
+    return parents, children
+
+
+def _get_related_hs_mapping_ids(
+    db: Session,
+    hs_mapping_id: int,
+) -> tuple[set[int], dict]:
+    """Return mapping IDs for parent + child HS codes of the same material.
+
+    Returns ``(set_of_ids, propagation_metadata)``.  The current mapping
+    ID is always included in the set; if no parent/child relations exist
+    the set has exactly one element and the score is unchanged from
+    pre-11.1.A behaviour.
+
+    The same-material filter is intentional: HS 2615 ("Niobium /
+    Tantalum / Vanadium / Zirconium ores") is shared by FOUR distinct
+    mineral mappings.  Without the filter, a tariff tagged to the
+    Vanadium-at-2615 mapping would propagate to Niobium-at-261590 etc.
+    — cross-material contamination.
+    """
+    # Fetch our prefix + material_id in one query.
+    our = db.execute(
+        select(
+            HsCodeMaterialMapping.hs_prefix,
+            HsCodeMaterialMapping.material_id,
+        ).where(HsCodeMaterialMapping.id == hs_mapping_id)
+    ).one_or_none()
+    if our is None or our.material_id is None:
+        return {hs_mapping_id}, {
+            "primary_mapping_id": hs_mapping_id,
+            "parent_mapping_ids": [],
+            "child_mapping_ids": [],
+            "total_propagated": 0,
+            "skipped_reason": "mapping_or_material_missing",
+        }
+
+    our_prefix = (our.hs_prefix or "").replace(".", "").strip()
+    if not our_prefix:
+        return {hs_mapping_id}, {
+            "primary_mapping_id": hs_mapping_id,
+            "parent_mapping_ids": [],
+            "child_mapping_ids": [],
+            "total_propagated": 0,
+            "skipped_reason": "empty_prefix",
+        }
+
+    # Pull every other mapping for the same material.
+    sibling_rows = db.execute(
+        select(
+            HsCodeMaterialMapping.id,
+            HsCodeMaterialMapping.hs_prefix,
+        ).where(
+            HsCodeMaterialMapping.material_id == our.material_id,
+            HsCodeMaterialMapping.id != hs_mapping_id,
+        )
+    ).all()
+    siblings = [
+        (row.id, (row.hs_prefix or "").replace(".", "").strip())
+        for row in sibling_rows
+        if (row.hs_prefix or "").strip()
+    ]
+
+    parents, children = _classify_hs_relations(our_prefix, siblings)
+
+    related = {hs_mapping_id, *parents, *children}
+    return related, {
+        "primary_mapping_id": hs_mapping_id,
+        "parent_mapping_ids": sorted(parents),
+        "child_mapping_ids": sorted(children),
+        "total_propagated": len(parents) + len(children),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Node scorer
 # ---------------------------------------------------------------------------
 
@@ -313,6 +436,18 @@ def score_hs_node_geography(
         ]
         hhi_at_stage = _compute_hhi(share_values)
 
+    # ── 11.1.A (2026-06) ── parent/child HS propagation
+    # Events tagged to a parent (4-digit chapter) or child (6-digit
+    # subheading) of THIS mapping — for the same material — are
+    # in-scope for the current node's score.  Closes the vertical
+    # asymmetry where a FR tariff on ``2601`` previously only lifted
+    # the 4-digit node and not its 6-digit children.  Same-material
+    # filter prevents cross-material contamination on shared chapters
+    # (e.g. HS 2615 covers Nb/Ta/V/Zr).
+    related_mapping_ids, hs_propagation_meta = _get_related_hs_mapping_ids(
+        db, hs_mapping_id,
+    )
+
     # ── 5. Tariff events scoped to this HS code AND this country ────────────
     # G11 (2026-05-06): tariff events are import-side interventions where the
     # implementing country is the importer; the producer being targeted is in
@@ -322,6 +457,10 @@ def score_hs_node_geography(
     # no ``"affected"`` geography row are excluded entirely (strict
     # attribution; no global fallback).  Filter on typed ``event_subtype``
     # column (migration 040), not the ingester-specific ``event_type``.
+    #
+    # 11.1.A: ``hs_mapping_id IN (related_mapping_ids)`` instead of
+    # strict equality so parent + child HS mappings contribute events
+    # at the same material × country.
     tariff_rows = db.execute(
         select(
             RiskEvent.id,
@@ -332,11 +471,12 @@ def score_hs_node_geography(
         .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
         .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
         .where(
-            RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
+            RiskEventHsMapping.hs_mapping_id.in_(related_mapping_ids),
             RiskEvent.event_subtype.in_(_TARIFF_SUBTYPES),
             RiskEventGeography.country_code == country_code,
             RiskEventGeography.geography_context == _TARIFF_GEOGRAPHY_CONTEXT,
         )
+        .distinct()  # events tagged to multiple related mappings count once
     ).all()
 
     # Normalise event_date (DateTime column) to date for the decay function.
@@ -358,6 +498,8 @@ def score_hs_node_geography(
     # whose own producers' supply is being constrained.  A China graphite
     # export ban lifts CN's score on the graphite HS node only, not every
     # country's.
+    #
+    # 11.1.A: same parent/child propagation as tariff query above.
     export_rows = db.execute(
         select(
             RiskEvent.id,
@@ -368,11 +510,12 @@ def score_hs_node_geography(
         .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
         .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
         .where(
-            RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
+            RiskEventHsMapping.hs_mapping_id.in_(related_mapping_ids),
             RiskEvent.event_subtype.in_(_EXPORT_SUBTYPES),
             RiskEventGeography.country_code == country_code,
             RiskEventGeography.geography_context == _EXPORT_GEOGRAPHY_CONTEXT,
         )
+        .distinct()  # events tagged to multiple related mappings count once
     ).all()
 
     export_events = [
@@ -562,6 +705,22 @@ def score_hs_node_geography(
         "score_method":        score_method,    # extended taxonomy 2026-05-09
         "weight_breakdown":    weights_used,
         "scoring_version":     SCORING_VERSION,
+        # 11.1.A (2026-06): which related mappings contributed events to
+        # this node's tariff_exposure / export_restriction values.
+        "hs_propagation":      hs_propagation_meta,
+        # 11.1.D (2026-06): per-component data-presence diagnostic.
+        # Mirrors the 11.6 data_completeness pattern at Level-0 so the
+        # Level-1 rollup can see which Level-0 nodes were thin.  Each
+        # field is True when real data fed the corresponding sub-score,
+        # False when the sub-score defaulted to 0 / None.  ``score_method``
+        # already encodes which scoring path fired; this block makes the
+        # individual component coverage queryable.
+        "data_stage_coverage": {
+            "hhi_data_present":         hhi_at_stage is not None,
+            "tariff_data_present":      bool(tariff_events),
+            "export_data_present":      bool(export_events),
+            "operational_data_present": operational_signal is not None,
+        },
     }
 
     stmt = (

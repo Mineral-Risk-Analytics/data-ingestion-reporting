@@ -115,7 +115,7 @@ _ASSESSED_AT = date(2025, 1, 1)
 #                                   (reflects single-non-EU-country
 #                                   supply concentration risk for
 #                                   strategic materials)
-_SEED_VERSION = "2026-05-17c"
+_SEED_VERSION = "2026-06-06"
 
 # ---------------------------------------------------------------------------
 # 1. Regulation definitions
@@ -147,6 +147,13 @@ _REGULATIONS: list[dict] = [
             "entity_list_url": "https://www.dhs.gov/uflpa-entity-list",
             "battery_materials_focus": ["Natural Graphite", "Cobalt", "Lithium"],
             "rebuttable_presumption": True,
+        },
+        # Producer-country enforcement risk.  Xinjiang-origin rebuttable
+        # presumption — only CN-origin material falls under UFLPA scope;
+        # non-CN producers aren't subject to the presumption.
+        "geography_compliance_weights": {
+            "CN": 1.0,
+            "DEFAULT": 0.0,
         },
     },
     {
@@ -201,6 +208,17 @@ _REGULATIONS: list[dict] = [
                 "garden-variety effective regulation."
             ),
         },
+        # Producer-country enforcement risk.  FEOC binary per Treasury
+        # guidance — materials originating from CN/RU/IR/KP disqualify
+        # battery components from IRA §45X credits.  Non-FEOC producers
+        # are out of scope.
+        "geography_compliance_weights": {
+            "CN": 1.0,
+            "RU": 1.0,
+            "IR": 1.0,
+            "KP": 1.0,
+            "DEFAULT": 0.0,
+        },
     },
     {
         "regulation_key": "CRMA_2024",
@@ -225,6 +243,16 @@ _REGULATIONS: list[dict] = [
             "recycling_target_pct": 25,
             "target_year": 2030,
         },
+        # Producer-country enforcement risk.  CRMA's 65% single-country
+        # cap targets concentration most heavily.  CN faces strongest
+        # pressure (REE, graphite, refined Li/Co/Ni dominance); CD
+        # secondary (cobalt concentration).  DEFAULT 0.3 captures that
+        # any supplier inherits some EU diversification pressure.
+        "geography_compliance_weights": {
+            "CN": 1.0,
+            "CD": 0.5,
+            "DEFAULT": 0.3,
+        },
     },
     {
         "regulation_key": "EU_CBAM",
@@ -246,6 +274,17 @@ _REGULATIONS: list[dict] = [
             "transitional_phase_end": "2025-12-31",
             "full_implementation": "2026-01-01",
             "covered_sectors": ["iron_steel", "aluminium", "cement", "fertilisers", "electricity", "hydrogen", "copper"],
+        },
+        # Producer-country enforcement risk.  Carbon-border certificates
+        # bite hardest where grid carbon intensity is highest.  CN coal-
+        # heavy grid → high-carbon Al / steel / Cu.  IN similar carbon
+        # profile.  RU high-carbon refining footprint.  DEFAULT 0.3
+        # captures baseline certificate cost for cleaner producers.
+        "geography_compliance_weights": {
+            "CN": 1.0,
+            "IN": 1.0,
+            "RU": 0.8,
+            "DEFAULT": 0.3,
         },
     },
     {
@@ -298,6 +337,19 @@ _REGULATIONS: list[dict] = [
             "recycled_content_nickel_2031_pct": 6,
             "battery_passport_effective": "2027-02-18",
         },
+        # Producer-country enforcement risk.  Article 47 due-diligence
+        # obligations on Co/Li/Ni/Graphite.  CD (DRC cobalt) is the
+        # canonical target.  CN dominates Co/Li refining + graphite
+        # processing.  DEFAULT 0.5 reflects baseline due-diligence
+        # exposure for all four scoped materials' producer countries
+        # (AU, CA, CL, ID etc.) — the regulation has broad applicability,
+        # but lower-risk jurisdictions face less scrutiny than the named
+        # high-weight countries.
+        "geography_compliance_weights": {
+            "CD": 1.0,
+            "CN": 0.8,
+            "DEFAULT": 0.5,
+        },
     },
     {
         "regulation_key": "EU_CSDDD",
@@ -320,6 +372,18 @@ _REGULATIONS: list[dict] = [
             "covers_value_chain": True,
             "civil_liability": True,
         },
+        # Producer-country enforcement risk.  Broad human-rights +
+        # environmental due diligence across full value chain.  CD
+        # (DRC artisanal mining), MM (Myanmar REE/tin governance), and
+        # CN (Xinjiang labour + Inner Mongolia environment) carry the
+        # heaviest scrutiny.  DEFAULT 0.5 reflects baseline due-diligence
+        # exposure for the regulation's broad applicability.
+        "geography_compliance_weights": {
+            "CD": 1.0,
+            "MM": 1.0,
+            "CN": 0.8,
+            "DEFAULT": 0.5,
+        },
     },
     {
         "regulation_key": "EU_CONFLICT_MINERALS",
@@ -340,6 +404,17 @@ _REGULATIONS: list[dict] = [
             "celex": "32017R0821",
             "covered_minerals": ["tin", "tantalum", "tungsten", "gold"],
             "due_diligence_framework": "OECD_5_step",
+        },
+        # Producer-country enforcement risk.  3TG sourcing from CAHRAs
+        # (Conflict-Affected and High-Risk Areas).  CD (Eastern DRC)
+        # canonical conflict zone.  RW (Rwanda) smuggling concerns
+        # over CD-origin minerals.  MM (Myanmar) tin from contested
+        # areas.  DEFAULT 0.0 — non-CAHRA sources are out of scope.
+        "geography_compliance_weights": {
+            "CD": 1.0,
+            "RW": 0.7,
+            "MM": 0.7,
+            "DEFAULT": 0.0,
         },
     },
     {
@@ -367,6 +442,14 @@ _REGULATIONS: list[dict] = [
                 "cobalt carbonate",
                 "cobalt diacetate",
             ],
+        },
+        # Producer-country enforcement risk.  REACH SVHC authorisation
+        # applies to the USE of cobalt compounds in EU manufacturing —
+        # it's an origin-agnostic use-side regulation.  All cobalt
+        # producers face uniform downstream EU customer pressure
+        # regardless of source; no named-country differentiation.
+        "geography_compliance_weights": {
+            "DEFAULT": 0.5,
         },
     },
 ]
@@ -936,14 +1019,24 @@ _COMPANY_EXPOSURES: list[dict] = [
 # Seed function
 # ---------------------------------------------------------------------------
 
-def seed_regulations(session: Session) -> dict[str, int]:
+def seed_regulations(session: Session, *, force: bool = False) -> dict[str, int]:
     """Upsert regulations, material scopes, geography scopes, and company exposures.
 
     Four-pass operation:
-      Pass 1: Upsert regulations by regulation_key
+      Pass 1: Upsert regulations by regulation_key (always updates mutable fields)
       Pass 2: Upsert regulation_material_scope (needs regulation_id + material_id)
       Pass 3: Upsert regulation_geography_scope (needs regulation_id)
       Pass 4: Upsert company_regulation_exposure (needs company_id + regulation_id)
+
+    Normal run (force=False):
+        Passes 2–3 skip existing rows — their values in the DB are authoritative.
+        Pass 4 always updates changed fields (compliance status can change over time).
+
+    Force run (force=True):
+        Passes 2–3 overwrite ``scope_type`` and ``notes`` on existing scope rows
+        with the current seed values.  Use after correcting scope classifications
+        in ``_MATERIAL_SCOPES`` or ``_GEOGRAPHY_SCOPES``.
+        Does NOT delete scope rows that exist in the DB but not in the seed.
 
     Returns counts per table.
     """
@@ -959,8 +1052,8 @@ def seed_regulations(session: Session) -> dict[str, int]:
 
     reg_ids: dict[str, int] = {}
     regs_inserted = regs_updated = 0
-    mat_scopes_inserted = mat_scopes_skipped = 0
-    geo_scopes_inserted = geo_scopes_skipped = 0
+    mat_scopes_inserted = mat_scopes_updated = mat_scopes_skipped = 0
+    geo_scopes_inserted = geo_scopes_updated = geo_scopes_skipped = 0
     exposures_inserted = exposures_updated = exposures_skipped = 0
 
     # ── Pass 1: Regulations ──────────────────────────────────────────────────
@@ -994,9 +1087,14 @@ def seed_regulations(session: Session) -> dict[str, int]:
             reg_ids[key] = existing.id
             # Update mutable fields (including verified + metadata_json so
             # rows pre-dating the verified-flag rollout get upgraded on
-            # re-seed).
+            # re-seed).  geography_compliance_weights added 2026-06-06 —
+            # existing DB rows had NULL JSONB for all 8 partner-tier
+            # regulations, so the merge-on-re-seed path needs to update
+            # this field too (otherwise the weights would only flow
+            # through to fresh-environment first-time inserts).
             for field in ("title", "summary", "status", "effective_date",
-                          "metadata_json", "verified"):
+                          "metadata_json", "verified",
+                          "geography_compliance_weights"):
                 if getattr(existing, field) != payload.get(field):
                     setattr(existing, field, payload.get(field))
             regs_updated += 1
@@ -1031,7 +1129,12 @@ def seed_regulations(session: Session) -> dict[str, int]:
                 ))
                 mat_scopes_inserted += 1
             else:
-                mat_scopes_skipped += 1
+                if force:
+                    existing.scope_type = entry.get("scope_type", "covered")
+                    existing.notes = entry.get("notes")
+                    mat_scopes_updated += 1
+                else:
+                    mat_scopes_skipped += 1
 
     session.flush()
 
@@ -1055,7 +1158,11 @@ def seed_regulations(session: Session) -> dict[str, int]:
                 ))
                 geo_scopes_inserted += 1
             else:
-                geo_scopes_skipped += 1
+                if force:
+                    existing.scope_type = entry.get("scope_type", "jurisdiction")
+                    geo_scopes_updated += 1
+                else:
+                    geo_scopes_skipped += 1
 
     session.flush()
 
@@ -1129,8 +1236,10 @@ def seed_regulations(session: Session) -> dict[str, int]:
         "regulations_inserted": regs_inserted,
         "regulations_updated": regs_updated,
         "material_scopes_inserted": mat_scopes_inserted,
+        "material_scopes_updated": mat_scopes_updated,
         "material_scopes_skipped": mat_scopes_skipped,
         "geography_scopes_inserted": geo_scopes_inserted,
+        "geography_scopes_updated": geo_scopes_updated,
         "geography_scopes_skipped": geo_scopes_skipped,
         "exposures_inserted": exposures_inserted,
         "exposures_updated": exposures_updated,

@@ -29,13 +29,16 @@ iea.org data tool, USGS MCS landing page) and run the corresponding
 in the Inngest dashboard.
 
 Comtrade cadence note:
-    Daily backfill lives in ``scoring_jobs.py::ingest_comtrade_job`` (06:00 UTC
-    daily, year × prefix × flow iteration).  Once that job logs
-    ``comtrade_job.backfill_complete``, swap its cron from ``0 6 * * *`` to
-    ``0 6 * * SUN`` (weekly) — Comtrade publishes annual data with a 4-6 month
+    Daily backfill lives in ``scoring_jobs.py::ingest_comtrade_job`` (04:00 UTC
+    daily — midnight EDT — year × prefix × flow iteration).  Once that job logs
+    ``comtrade_job.backfill_complete``, swap its cron from ``0 4 * * *`` to
+    ``0 4 * * SUN`` (weekly) — Comtrade publishes annual data with a 4-6 month
     lag, so weekly is sufficient post-backfill.  No quarterly job here — the
     earlier ``ingest-comtrade-quarterly`` was deleted 2026-05-06 because it
     duplicated the daily job.
+
+    Schedule moved from 06:00 → 04:00 UTC on 2026-06-06 when the 11.2 HS-prefix
+    expansion pushed expected runtime toward ~10-12 hours.
 
 SEC EDGAR cadence note:
     10-K (annual) and 10-Q (quarterly) filings make quarterly ingestion the
