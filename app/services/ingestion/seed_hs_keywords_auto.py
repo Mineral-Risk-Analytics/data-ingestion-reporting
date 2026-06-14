@@ -108,14 +108,8 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'calcium',
         'colemanite',
     ],
-    ("252810", "Boron"): [
-        'boron',
-        'ore and concentrates',
-    ],
-    ("252890", "Boron"): [
-        'boron',
-        'ore and concentrates',
-    ],
+    # 2026-06-11: removed ("252810","Boron") and ("252890","Boron") — both
+    # codes were collapsed into 252800 in HS2022 audit; entries orphaned.
     ("2529", "Fluorspar"): [
         'fluorspar',
         'ore and concentrates',
@@ -344,25 +338,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'ore and concentrates',
         'zirconium ores and concentrates',
     ],
-    ("261500", "Niobium"): [
-        'niobium',
-        'nb',
-        'ore and concentrates',
-    ],
-    ("261500", "Tantalum"): [
-        'tantalum',
-        'ta',
-        'ore and concentrates',
-    ],
-    ("261500", "Vanadium"): [
-        'vanadium',
-        'ore and concentrates',
-    ],
-    ("261500", "Zirconium"): [
-        'zirconium',
-        'zr',
-        'ore and concentrates',
-    ],
     ("261510", "Zirconium"): [
         'zirconium',
         'zr',
@@ -485,10 +460,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'terbium',
         'tb',
         'rare‑earth metals, scandium and yttrium, whether or not intermixed or interalloyed',
-    ],
-    ("280512", "Lithium"): [
-        'lithium',
-        'li',
     ],
     ("280530", "Dysprosium"): [
         'dysprosium',
@@ -791,15 +762,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'sodium phosphates, tribasic',
         'trisodium phosphate',
     ],
-    ("283526", "Sodium"): [
-        'sodium',
-        'na',
-        'battery grade',
-        'battery-grade',
-        'high purity',
-        'sodium phosphates, tribasic',
-        'trisodium phosphate',
-    ],
     ("2836", "Cobalt"): [
         'cobalt',
         'co',
@@ -892,14 +854,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'high purity',
         'other salts of oxometallic or peroxometallic acids, sodium salts',
         'other oxometallic and peroxometallic acid salts',
-    ],
-    ("284169", "Sodium"): [
-        'sodium',
-        'na',
-        'battery grade',
-        'battery-grade',
-        'high purity',
-        'other salts of oxometallic or peroxometallic acids, sodium salts',
     ],
     ("284170", "Molybdenum"): [
         'molybdenum',
@@ -1229,11 +1183,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'cu',
         'refined copper, unwrought',
     ],
-    ("740300", "Copper"): [
-        'copper',
-        'cu',
-        'refined copper, unwrought',
-    ],
     ("740311", "Copper"): [
         'copper',
         'cu',
@@ -1265,10 +1214,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'copper wire rod',
     ],
     ("7501", "Nickel"): [
-        'nickel',
-        'ni',
-    ],
-    ("750100", "Nickel"): [
         'nickel',
         'ni',
     ],
@@ -1419,10 +1364,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'molybdenum',
         'mo',
         'molybdenum metal powders',
-    ],
-    ("810292", "Molybdenum"): [
-        'molybdenum',
-        'mo',
     ],
     ("810294", "Molybdenum"): [
         'molybdenum',

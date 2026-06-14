@@ -882,6 +882,168 @@ def _extract_per_stage_world_production(
     ]
 
 
+# ── Unit normalisation for USGS Salient Price observations ─────────────────
+# USGS reports prices in commodity-specific units (cents/lb for Cu/Al/Ni,
+# $/MT for Li/Ni LME, $/lb for Co, DMTU for W, etc.).  We normalise to
+# USD per metric ton for Financial Pressure pillar scoring so CV /
+# % change calculations are unit-consistent across materials.
+#
+# Constants:
+#   1 metric ton = 2204.622 lb = 1000 kg = 32 150.7 troy oz = 1.10231 short ton
+#
+# DMTU (dry metric ton unit) and MTU are contained-element pricing
+# (1 DMTU = 10 kg of contained WO3 or Mn in the gross-tonnage sense).
+# These don't convert linearly without the contained-element fraction
+# from the same chapter — left unnormalised.
+
+_LB_PER_MT = 2204.622
+_KG_PER_MT = 1000.0
+_TROY_OZ_PER_MT = 32_150.7
+_SHORT_TON_PER_MT = 1.10231
+
+
+def _to_usd_per_metric_ton(value: float, unit_raw: str) -> Optional[float]:
+    """Normalise a USGS Salient Price observation to USD per metric ton.
+
+    Returns ``None`` for DMTU / MTU units (contained-element pricing —
+    needs a contained-element fraction we don't have to hand here).  The
+    raw value + unit are always preserved separately so the partner can
+    do a contained-element conversion offline if needed.
+    """
+    if value is None:
+        return None
+    u = (unit_raw or "").lower()
+    # Order matters: "metric ton unit" must be checked BEFORE "metric ton"
+    # to avoid a substring collision on "dollars per metric ton unit"
+    # falsely matching the plain-MT branch.  DMTU / MTU don't convert
+    # linearly without contained-element context, so they return None.
+    if "metric ton unit" in u:
+        return None
+    if "cents per pound" in u:
+        return value / 100.0 * _LB_PER_MT
+    if "dollars per pound" in u:
+        return value * _LB_PER_MT
+    if "dollars per metric ton" in u:
+        return value
+    if "dollars per kilogram" in u:
+        return value * _KG_PER_MT
+    if "dollars per troy ounce" in u:
+        return value * _TROY_OZ_PER_MT
+    if "dollars per short ton" in u:
+        return value * _SHORT_TON_PER_MT
+    return None
+
+
+def _extract_prices_from_salient(chapter_rows: list[dict]) -> list[dict]:
+    """Extract every annual Price observation from Salient Statistics.
+
+    Companion to ``_extract_price_unit_from_salient`` which only returns
+    the unit string of the first Price row.  This function returns the
+    full time series — one entry per ``(Statistics_detail, Year)`` tuple
+    so that multi-benchmark commodities (Cobalt US-spot + LME, Copper 3
+    benchmarks, Nickel $/MT + $/lb LME quotes) preserve every datum.
+
+    Returns a list of dicts in CSV order::
+
+        {
+            "year": int,                           # 2021, 2022, ...
+            "value_raw": float,                    # as published
+            "unit_raw": str,                       # e.g. "dollars per metric ton"
+            "statistics_detail": str,              # full benchmark descriptor
+            "value_usd_per_mt": float | None,      # normalised, None for DMTU/MTU
+        }
+
+    Caller is expected to write each entry into ``commodity_prices`` with
+    ``source='usgs_mcs'`` and ``price_form=statistics_detail`` so the
+    benchmark identity is preserved.  Pick the first Statistics_detail
+    (the "primary" benchmark USGS leads with) when deriving growth-rate
+    signals to match ``_extract_price_unit_from_salient``'s convention.
+    """
+    out: list[dict] = []
+    for r in chapter_rows:
+        if not _is_salient_section(r.get("Section")):
+            continue
+        if (r.get("Statistics") or "").strip().lower() != "price":
+            continue
+        year_raw = (r.get("Year") or "").strip()
+        value_str = (r.get("Value") or "").strip().replace(",", "")
+        unit_raw = (r.get("Unit") or "").strip()
+        detail = (r.get("Statistics_detail") or "").strip()
+        if not (year_raw and value_str and detail):
+            continue
+        try:
+            year = int(year_raw)
+            value = float(value_str)
+        except (TypeError, ValueError):
+            continue
+        out.append({
+            "year": year,
+            "value_raw": value,
+            "unit_raw": unit_raw,
+            "statistics_detail": detail,
+            "value_usd_per_mt": _to_usd_per_metric_ton(value, unit_raw),
+        })
+    return out
+
+
+def _derive_yoy_and_cagr_from_prices(
+    prices: list[dict],
+) -> tuple[Optional[float], Optional[float]]:
+    """Derive ``(YoY %, CAGR %)`` from a chapter's primary price benchmark.
+
+    Uses the FIRST ``Statistics_detail`` in the price list — same
+    convention as ``_extract_price_unit_from_salient`` for the unit.
+    Output schema matches the existing
+    ``material_criticality_signals.{price_yoy_pct, price_cagr_5yr_pct}``
+    columns that the Fig 10 parser writes today: signed fractions, e.g.
+    ``-0.24`` for a 24% YoY drop, ``+0.18`` for an 18% CAGR.
+
+    Why this matters: the Fig 10 CSV only carries growth rates for
+    commodities with MULTIPLE price sources in their Salient table.  For
+    SINGLE-source commodities (most of them) the Fig 10 CSV is silent,
+    leaving the price-volatility sub-signal at zero.  This function fills
+    that gap by deriving the same metrics from the same Salient prices
+    USGS already gave us.
+
+    Returns ``(None, None)`` when fewer than 2 observations are present.
+    YoY uses the latest pair; CAGR uses the full ``(first, last)`` span.
+    """
+    if not prices:
+        return (None, None)
+    primary_detail = prices[0]["statistics_detail"]
+    series = sorted(
+        (p for p in prices if p["statistics_detail"] == primary_detail),
+        key=lambda x: x["year"],
+    )
+    if len(series) < 2:
+        return (None, None)
+
+    def _v(p: dict) -> Optional[float]:
+        # Prefer the normalised USD/MT value so cross-material math is
+        # unit-consistent.  Fall back to raw for DMTU/MTU benchmarks —
+        # YoY and CAGR are dimensionless so the unit choice doesn't
+        # change the answer as long as we're internally consistent
+        # within the series.
+        return p["value_usd_per_mt"] if p["value_usd_per_mt"] is not None else p["value_raw"]
+
+    first = _v(series[0])
+    prior = _v(series[-2])
+    last = _v(series[-1])
+    if last is None or first is None or first <= 0:
+        return (None, None)
+
+    yoy: Optional[float] = None
+    if prior is not None and prior > 0:
+        yoy = (last - prior) / prior
+
+    years_span = series[-1]["year"] - series[0]["year"]
+    cagr: Optional[float] = None
+    if years_span >= 1 and last > 0:
+        cagr = (last / first) ** (1.0 / years_span) - 1.0
+
+    return (yoy, cagr)
+
+
 def _extract_price_unit_from_salient(chapter_rows: list[dict]) -> Optional[str]:
     """Read the first Price row in Salient Statistics and return the unit.
 
@@ -1354,6 +1516,9 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
           "us_net_import_reliance": float | None,
           "apparent_consumption":  float | None,
           "price_unit_usgs":       str | None,    # "per_lb" / "per_kg" / etc.
+          "prices":                list[dict],     # full Salient Price observations (2026-06-14)
+          "price_yoy_pct_derived":   float | None, # signed fraction from primary benchmark
+          "price_cagr_5yr_pct_derived": float | None,  # signed fraction over chapter's full span
           "production_shares":     list[dict],     # material-level country shares
           "hs_production_shares":  list[dict],     # sub-type splits per `_DETAIL_TO_HS_PREFIX`
           "us_import_sources":     list[dict],     # raw — hs_code_prefix may be ""
@@ -1442,6 +1607,14 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
 
         # ── Price unit derived from USGS Salient Price row ───────────────
         price_unit_usgs = _extract_price_unit_from_salient(chapter_rows)
+        # ── 2026-06-14: capture full Salient Price observations + derived
+        # growth rates.  Was only capturing the unit string; the actual
+        # year-by-year price values were discarded even though the parser
+        # already iterated them.
+        prices = _extract_prices_from_salient(chapter_rows)
+        price_yoy_pct_derived, price_cagr_5yr_pct_derived = (
+            _derive_yoy_and_cagr_from_prices(prices)
+        )
 
         # ── Per-HS-node production shares ─────────────────────────────────
         # Two-path build (refactored 2026-05-09):
@@ -1622,6 +1795,17 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
             "us_net_import_reliance":  salient["net_import_reliance"],
             "apparent_consumption":    salient["apparent_consumption"],
             "price_unit_usgs":         price_unit_usgs,
+            # 2026-06-14: full Salient Price time series + derived growth
+            # rates.  See ``_extract_prices_from_salient`` for the schema
+            # of each entry in ``prices``.  CLI uses these to upsert
+            # ``commodity_prices`` rows (source='usgs_mcs') and to fill
+            # ``material_criticality_signals.{price_yoy_pct,
+            # price_cagr_5yr_pct}`` when the dedicated Fig 10 CSV doesn't
+            # carry growth rates for this commodity (most single-source
+            # chapters).
+            "prices":                  prices,
+            "price_yoy_pct_derived":   price_yoy_pct_derived,
+            "price_cagr_5yr_pct_derived": price_cagr_5yr_pct_derived,
             "production_shares":       production_shares,
             "hs_production_shares":    hs_production_shares,
             "us_import_sources":       us_import_sources,

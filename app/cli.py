@@ -200,12 +200,19 @@ def ingest_cmd(
 @app.command("ingest-usgs")
 def ingest_usgs_cmd(
     filepath: str = typer.Argument(
-        ...,
+        # 2026-06-14: defaults to the current-year USGS MCS long-format
+        # CSV checked into the repo at data/usgs/2026/.  Pass an explicit
+        # path when ingesting a different vintage (e.g. when USGS
+        # publishes MCS2027 in early 2027 and the CSV lands in
+        # data/usgs/2027/).
+        "data/usgs/2026/MCS2026_Commodities_Data.csv",
         help=(
-            "Path to MCS world data CSV. Either MCS2025_World_Data.csv (wide "
-            "format, country×year columns) or MCS2026_Commodities_Data.csv "
-            "(long format, one row per chapter×country×stat×year). Format "
-            "is auto-detected from headers unless --csv-format is set."
+            "Path to MCS world data CSV. Defaults to "
+            "data/usgs/2026/MCS2026_Commodities_Data.csv (the current "
+            "long-format publication checked into the repo). Pass an "
+            "explicit path to ingest an older or different vintage. "
+            "Format is auto-detected from headers unless --csv-format "
+            "is set."
         ),
     ),
     force: bool = typer.Option(
@@ -279,11 +286,16 @@ def ingest_usgs_cmd(
 
     s = _session()
     try:
+        from datetime import date as _date  # local import — narrow blast radius
         from app.models.supply import (
+            CommodityPrice,
             HsCodeMaterialMapping,
             HsCodeProductionShare,
             MaterialCapacityShare,
             MaterialProductionShare,
+        )
+        from app.services.ingestion.normalizers.hs_resolver import (
+            resolve_hs_for_price_descriptor,
         )
 
         resolver = MaterialAliasResolver(s)
@@ -294,6 +306,15 @@ def ingest_usgs_cmd(
         hs_shares_skipped_no_mapping = 0
         us_import_shares_written = 0
         us_import_shares_skipped_no_mapping = 0
+        # 2026-06-14: counters for the USGS Salient Price extraction
+        # (mcs2026_parser.{_extract_prices_from_salient, _derive_yoy_and_cagr_from_prices}).
+        commodity_prices_inserted = 0
+        commodity_prices_skipped_existing = 0
+        criticality_growth_filled = 0
+        criticality_growth_skipped_existing = 0
+        # 2026-06-14: HS-attribution counters (hs_resolver path).
+        commodity_prices_hs_resolved = 0   # benchmark descriptor matched an HS row
+        commodity_prices_hs_fallback = 0   # no match → material-level (hs_mapping_id=NULL)
         resolved_canonicals: list[str] = []
         skipped_aliases: list[str] = []
         unknown_aliases: list[str] = []
@@ -346,6 +367,11 @@ def ingest_usgs_cmd(
             us_net_import_reliance = rec.get("us_net_import_reliance")
             apparent_consumption = rec.get("apparent_consumption")
             price_unit_usgs = rec.get("price_unit_usgs")
+            # 2026-06-14: full Salient Price observations + derived growth
+            # rates.  See mcs2026_parser._extract_prices_from_salient.
+            prices = rec.get("prices") or []
+            price_yoy_pct_derived = rec.get("price_yoy_pct_derived")
+            price_cagr_5yr_pct_derived = rec.get("price_cagr_5yr_pct_derived")
 
             # ── Material-level writes: skip for secondary chapters ────────
             # Secondary chapters share a canonical with a primary sibling
@@ -409,6 +435,126 @@ def ingest_usgs_cmd(
                     merged.update(signal_meta)
                     existing_signal.metadata_json = merged
                     signals_written += 1
+
+                # ── 2026-06-14: fill price_yoy_pct / price_cagr_5yr_pct from
+                # derived Salient prices IF NULL.  Don't overwrite values the
+                # Fig 10 parser already wrote — Fig 10 has authority for
+                # multi-source chapters because USGS publishes the growth
+                # rates explicitly there.  Single-source chapters (most of
+                # them) are silent in Fig 10 and our derivation fills the
+                # gap.  ``force=True`` does NOT overwrite either — partner
+                # can clear the column manually if they want a re-fill.
+                signal_row = s.scalar(
+                    select(MaterialCriticalitySignal).where(
+                        MaterialCriticalitySignal.material_id == material.id,
+                        MaterialCriticalitySignal.source == "usgs_mcs",
+                        MaterialCriticalitySignal.reference_year == mcs_year,
+                    )
+                )
+                if signal_row is not None:
+                    updated_any = False
+                    if (
+                        signal_row.price_yoy_pct is None
+                        and price_yoy_pct_derived is not None
+                    ):
+                        signal_row.price_yoy_pct = price_yoy_pct_derived
+                        updated_any = True
+                    elif price_yoy_pct_derived is not None:
+                        criticality_growth_skipped_existing += 1
+                    if (
+                        signal_row.price_cagr_5yr_pct is None
+                        and price_cagr_5yr_pct_derived is not None
+                    ):
+                        signal_row.price_cagr_5yr_pct = price_cagr_5yr_pct_derived
+                        updated_any = True
+                    if updated_any:
+                        criticality_growth_filled += 1
+
+                # ── 2026-06-14: upsert commodity_prices rows from Salient
+                # Price observations.  One row per (year, benchmark) so
+                # multi-benchmark commodities (Cobalt US-spot + LME, Copper 3
+                # benchmarks) preserve every datum.  Idempotent via the
+                # uq_commodity_price unique constraint
+                # (material_id, price_date, source, hs_mapping_id, price_form).
+                #
+                # price_date is set to Dec 31 of the reporting year — USGS
+                # publishes annual averages, not point-in-time observations,
+                # so any date in the year is defensible.  Year-end keeps the
+                # series chronologically intuitive when plotted alongside
+                # Pink Sheet monthly rows.
+                for p in prices:
+                    pdate = _date(p["year"], 12, 31)
+                    price_form = p["statistics_detail"][:200]  # column limit
+                    value_usd = p["value_usd_per_mt"]
+                    if value_usd is None:
+                        # DMTU / MTU rows — skip insert (no normalised USD
+                        # value to store) but preserve in metadata if we
+                        # land them elsewhere later.
+                        continue
+
+                    # 2026-06-14: HS-attribution via hs_resolver.  Matches
+                    # the USGS Statistics_detail string against the same
+                    # material's hs_code_material_mappings rows by keyword
+                    # + description overlap.  When a row clears the
+                    # confidence floor, the price is HS-attributed (stage-
+                    # scoped); when no candidate clears, hs_mapping_id
+                    # stays None and the row is material-level (same as
+                    # before the resolver landed).  The resolution score +
+                    # method are written into metadata_json["hs_resolution"]
+                    # so partner can audit attribution decisions.
+                    resolved_hs_id, hs_resolve_score, hs_resolve_via = (
+                        resolve_hs_for_price_descriptor(
+                            s, material.id, p["statistics_detail"],
+                        )
+                    )
+                    if resolved_hs_id is not None:
+                        commodity_prices_hs_resolved += 1
+                    else:
+                        commodity_prices_hs_fallback += 1
+
+                    # Idempotency probe: lookup keyed on the same columns
+                    # as the uq_commodity_price constraint so re-runs
+                    # neither duplicate nor flip an HS-attributed row to
+                    # NULL (or vice versa).  IS-comparison for the
+                    # nullable hs_mapping_id column matches Postgres'
+                    # NULL-distinct semantics.
+                    if resolved_hs_id is None:
+                        existing_clause = CommodityPrice.hs_mapping_id.is_(None)
+                    else:
+                        existing_clause = CommodityPrice.hs_mapping_id == resolved_hs_id
+                    existing_price = s.scalar(
+                        select(CommodityPrice).where(
+                            CommodityPrice.material_id == material.id,
+                            CommodityPrice.price_date == pdate,
+                            CommodityPrice.source == "usgs_mcs",
+                            CommodityPrice.price_form == price_form,
+                            existing_clause,
+                        )
+                    )
+                    if existing_price is None:
+                        s.add(CommodityPrice(
+                            material_id=material.id,
+                            price_date=pdate,
+                            price_usd=value_usd,
+                            price_unit="per_mt",   # we normalised
+                            source="usgs_mcs",
+                            price_form=price_form,
+                            hs_mapping_id=resolved_hs_id,
+                            metadata_json={
+                                "raw_value": p["value_raw"],
+                                "raw_unit": p["unit_raw"],
+                                "statistics_detail": p["statistics_detail"],
+                                "mcs_year": mcs_year,
+                                "hs_resolution": {
+                                    "hs_mapping_id": resolved_hs_id,
+                                    "score": round(hs_resolve_score, 2),
+                                    "matched_via": hs_resolve_via,
+                                },
+                            },
+                        ))
+                        commodity_prices_inserted += 1
+                    else:
+                        commodity_prices_skipped_existing += 1
 
                 # ── material_production_shares upsert ─────────────────────
                 for share in production_shares:
@@ -728,7 +874,7 @@ def ingest_usgs_cmd(
         typer.echo(json.dumps({
             "ok": True,
             "source": f"USGS Mineral Commodity Summaries {mcs_year}",
-            "csv_format": detected,
+            "csv_format": csv_format,
             "records_resolved": len(resolved_canonicals),
             "records_skipped_via_alias": len(skipped_aliases),
             "records_unknown": len(unknown_aliases),
@@ -739,6 +885,17 @@ def ingest_usgs_cmd(
             "hs_shares_skipped_no_mapping": hs_shares_skipped_no_mapping,
             "us_import_shares_written": us_import_shares_written,
             "us_import_shares_skipped_no_mapping": us_import_shares_skipped_no_mapping,
+            # 2026-06-14: USGS Salient Price extraction (mcs2026_parser.{_extract_prices_from_salient,
+            # _derive_yoy_and_cagr_from_prices}).  Flows annual unit values from
+            # the Salient Statistics → Price column rows into commodity_prices,
+            # and derives YoY / 5-yr CAGR signals into material_criticality_signals
+            # (only when those columns are NULL — Fig 10 retains authority).
+            "commodity_prices_inserted": commodity_prices_inserted,
+            "commodity_prices_skipped_existing": commodity_prices_skipped_existing,
+            "commodity_prices_hs_resolved": commodity_prices_hs_resolved,
+            "commodity_prices_hs_fallback": commodity_prices_hs_fallback,
+            "criticality_growth_filled": criticality_growth_filled,
+            "criticality_growth_skipped_existing": criticality_growth_skipped_existing,
             "materials": sorted(set(resolved_canonicals)),
             "skipped_via_alias": sorted(set(skipped_aliases)),
             "unknown_source_names": sorted(set(unknown_aliases)),
@@ -2344,22 +2501,32 @@ def ingest_gta_cmd(
             "filtering using its own internal classification codes rather than HS codes."
         ),
     ),
+    use_api: bool = typer.Option(
+        False,
+        "--use-api",
+        help=(
+            "Use the GTA REST API (/api/v2/gta/data/) instead of the bulk CSV. "
+            "Requires settings.gta_api_key (env: GTA_API_KEY).  Applies server-side "
+            "HS-prefix and date filtering — substantially less data over the wire than CSV.  "
+            "Recommended for nightly runs; --local-file remains for offline testing."
+        ),
+    ),
 ) -> None:
     """Ingest Global Trade Alert harmful trade interventions into risk_events.
 
-    GTA now requires registration for bulk data access. Two modes:
+    GTA now requires registration for bulk data access. Three modes:
 
     \b
-    1. Local file (recommended — download from GTA data center):
+    1. API (recommended — needs GTA_API_KEY in env):
+         bdi-ingest ingest-gta --use-api --since-year 2018
+
+    \b
+    2. Local file (offline / no API key):
          bdi-ingest ingest-gta --local-file /path/to/gta_state_acts.csv
 
     \b
-    2. Pre-filtered curated export (e.g. "Batteries" dataset):
+    3. Pre-filtered curated export (e.g. "Batteries" dataset):
          bdi-ingest ingest-gta --local-file /path/to/interventions.csv --skip-hs-filter
-
-    \b
-    3. Direct download (only if GTA restores public bulk access):
-         bdi-ingest ingest-gta --since-year 2018
 
     Ingests Red (harmful) interventions whose affected HS codes match
     battery-critical materials. All events inserted with verified=False.
@@ -2367,7 +2534,7 @@ def ingest_gta_cmd(
     \b
       bdi-ingest seed-materials
       bdi-ingest seed-hs-mappings
-      bdi-ingest ingest-gta --local-file /path/to/gta_state_acts.csv
+      bdi-ingest ingest-gta --use-api --since-year 2018
     """
     from app.services.ingestion.gta import (
         BATTERY_HS_PREFIXES,  # noqa: F401  - re-exported for users running --help
@@ -2375,11 +2542,11 @@ def ingest_gta_cmd(
         ingest_gta,
     )
 
-    if local_file is None and url is None:
+    if not use_api and local_file is None and url is None:
         typer.echo(
-            "Warning: no --local-file provided. Attempting direct download — "
-            "this may fail. Download manually from "
-            "https://globaltradealert.org/data-center and use --local-file.",
+            "Warning: neither --use-api nor --local-file provided. Attempting direct "
+            "download — this will likely fail since the bulk CSV endpoint is gated. "
+            "Use --use-api (with GTA_API_KEY set) or --local-file instead.",
             err=True,
         )
 
@@ -2396,6 +2563,7 @@ def ingest_gta_cmd(
             hs_prefixes=hs_list,
             local_file=local_file,
             skip_hs_filter=skip_hs_filter,
+            use_api=use_api,
         )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:

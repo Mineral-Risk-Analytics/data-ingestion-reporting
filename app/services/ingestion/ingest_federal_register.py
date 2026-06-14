@@ -1953,6 +1953,55 @@ def ingest_federal_register(
                             )
                             seen_mids.add(material.id)
 
+                    # ── Bundle 2 (2026-06-07): Refine basket-fanout attributions ───
+                    # Basket fanout (Layer 3 in _extract_from_title) attributes
+                    # 5 materials at uniform 0.40 relevance for titles matching
+                    # "lithium-ion batteries" and similar patterns.  Now that
+                    # Haiku has read the document via extract_fr_attribution, we
+                    # can confirm or attenuate each basket member based on
+                    # whether the document substantively discusses it.
+                    #
+                    # Three-way refinement when Haiku gave a high-confidence
+                    # scope accept (scope_conf >= 0.5):
+                    #   Haiku confirmed (in materials list, conf >= 0.5) →
+                    #     relevance bumped to max(0.40, 0.60) — confirmed
+                    #   Haiku not mentioning this basket member →
+                    #     relevance downweighted 0.40 → 0.20 (uncertain, NOT
+                    #     dropped — Haiku may have missed a real one).
+                    #   Haiku low-confidence or absent → no refinement (keep
+                    #     0.40 baseline; review queue catches it elsewhere).
+                    if (
+                        haiku_payload is not None
+                        and is_in_scope is True
+                        and scope_conf >= 0.5
+                    ):
+                        haiku_mat_ids: set[int] = set()
+                        for m in haiku_payload.get("materials", []) or []:
+                            mname = (m.get("name") or "").strip()
+                            mconf = float(m.get("confidence") or 0.0)
+                            if not mname or mconf < 0.5:
+                                continue
+                            mat = material_resolver.resolve_by_canonical_name(mname)
+                            if mat is not None:
+                                haiku_mat_ids.add(mat.id)
+                        refined: list = []
+                        for mid, rel, reason, hs_id in detected_materials:
+                            if reason.startswith("title_basket"):
+                                if mid in haiku_mat_ids:
+                                    # Confirmed by Haiku — bump relevance.
+                                    new_rel = max(rel, 0.60)
+                                    new_reason = f"basket_haiku_confirmed:{reason[len('title_basket:'):][:24]}"
+                                    refined.append((mid, new_rel, new_reason[:64], hs_id))
+                                else:
+                                    # Not confirmed — downweight rather than drop
+                                    # (Haiku may have missed a real basket member).
+                                    new_rel = rel * 0.5
+                                    new_reason = f"basket_haiku_unconfirmed:{reason[len('title_basket:'):][:22]}"
+                                    refined.append((mid, new_rel, new_reason[:64], hs_id))
+                            else:
+                                refined.append((mid, rel, reason, hs_id))
+                        detected_materials = refined
+
                     # Merge Haiku-extracted countries into detected_geos.
                     # Existing geo_cache matches keep their context;
                     # Haiku-only countries map to a context derived from

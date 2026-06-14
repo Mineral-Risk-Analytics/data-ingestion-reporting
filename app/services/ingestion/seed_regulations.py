@@ -115,7 +115,7 @@ _ASSESSED_AT = date(2025, 1, 1)
 #                                   (reflects single-non-EU-country
 #                                   supply concentration risk for
 #                                   strategic materials)
-_SEED_VERSION = "2026-06-06"
+_SEED_VERSION = "2026-06-11"
 
 # ---------------------------------------------------------------------------
 # 1. Regulation definitions
@@ -473,6 +473,30 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Natural Graphite", "scope_type": "banned", "notes": "Significant Xinjiang processing concentration. Primary UFLPA battery enforcement focus."},
         {"material": "Cobalt", "scope_type": "banned", "notes": "DRC cobalt routed through Chinese processors with potential Xinjiang exposure."},
         {"material": "Lithium", "scope_type": "banned", "notes": "Some Chinese lithium processing in Xinjiang. Secondary enforcement focus."},
+        # 2026-06-11 partner-direction (REE seed gap): China dominates light-
+        # and heavy-REE processing — separation and oxide manufacture are
+        # concentrated in Inner Mongolia, Sichuan, Jiangxi, and some Xinjiang
+        # adjacents.  Xinjiang-nexus sourcing is a real (if secondary) UFLPA
+        # enforcement path for REE-derived inputs in traction motors and
+        # electronics.  Aggregate REE covers bundle-attributed events; the
+        # four named magnet REEs travel separately for events that name a
+        # specific element.
+        {"material": "Rare Earth Elements", "scope_type": "banned", "notes": "Chinese REE separation/processing has Xinjiang-adjacent exposure (Inner Mongolia, Sichuan, Jiangxi)."},
+        {"material": "Neodymium", "scope_type": "banned", "notes": "Traction-motor magnet REE; Chinese processing dominance creates UFLPA exposure."},
+        {"material": "Praseodymium", "scope_type": "banned", "notes": "Traction-motor magnet REE; Chinese processing dominance creates UFLPA exposure."},
+        {"material": "Dysprosium", "scope_type": "banned", "notes": "Heavy-REE magnet additive; Chinese processing dominance creates UFLPA exposure."},
+        {"material": "Terbium", "scope_type": "banned", "notes": "Heavy-REE magnet additive; Chinese processing dominance creates UFLPA exposure."},
+        # 2026-06-11 broader seed-coverage sweep: Xinjiang concentration is
+        # direct and significant for three more battery-relevant materials.
+        # Silicon (Anode Grade) is the largest gap — Xinjiang produces
+        # 40%+ of global polysilicon and the UFLPA Withhold Release Order
+        # on Hoshine Silicon Industry (June 2021) is the textbook UFLPA
+        # action on a battery-adjacent material.  Xinjiang aluminum
+        # production and ferromanganese / electrolytic-manganese-metal
+        # output are both real but secondary to Silicon.
+        {"material": "Silicon (Anode Grade)", "scope_type": "banned", "notes": "Xinjiang produces 40%+ of global polysilicon; Hoshine Silicon WRO (June 2021) is the textbook UFLPA action on battery-adjacent material."},
+        {"material": "Aluminum", "scope_type": "banned", "notes": "Xinjiang is a major Chinese aluminum-smelting province; coal-fueled smelters there are direct UFLPA enforcement targets."},
+        {"material": "Manganese", "scope_type": "banned", "notes": "Xinjiang ferromanganese and electrolytic manganese metal production create UFLPA exposure for battery-grade Mn supply chains."},
     ],
     "IRA_DOMESTIC": [
         {"material": "Lithium", "scope_type": "covered", "notes": "Critical mineral — FEOC sourcing disqualifies from tax credit."},
@@ -480,6 +504,28 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Nickel", "scope_type": "covered", "notes": "Critical mineral under FEOC rules."},
         {"material": "Manganese", "scope_type": "covered", "notes": "Critical mineral under FEOC rules."},
         {"material": "Natural Graphite", "scope_type": "covered", "notes": "Battery component input — FEOC restrictions apply."},
+        # 2026-06-11 partner-direction (REE seed gap): Nd, Pr, Dy, and Tb
+        # are explicit US critical minerals under DOE/USGS designations, and
+        # NdFeB magnets are core components of EV traction motors that
+        # qualify under §45X manufacturing credits.  FEOC sourcing of these
+        # REEs disqualifies the resulting magnet from credit eligibility.
+        # Aggregate REE covers events that attribute generically.
+        {"material": "Rare Earth Elements", "scope_type": "covered", "notes": "REE supply chain in §45X scope for traction-motor magnet production."},
+        {"material": "Neodymium",   "scope_type": "covered", "notes": "Critical mineral — NdFeB magnet feedstock; FEOC sourcing disqualifies §45X credit."},
+        {"material": "Praseodymium", "scope_type": "covered", "notes": "Critical mineral — NdFeB magnet feedstock; FEOC sourcing disqualifies §45X credit."},
+        {"material": "Dysprosium",  "scope_type": "covered", "notes": "Critical mineral — high-temperature magnet additive; FEOC sourcing disqualifies §45X credit."},
+        {"material": "Terbium",     "scope_type": "covered", "notes": "Critical mineral — magnet additive; FEOC sourcing disqualifies §45X credit."},
+        # 2026-06-11 broader seed-coverage sweep: launch-list materials
+        # that are §45X-eligible battery components but were missing from
+        # the IRA scope.  Aluminum, Copper, and Silicon are all on the
+        # current US critical-minerals list; Phosphate (Battery Grade) is
+        # the LFP cathode active material directly named in §45X eligible
+        # component lists.  FEOC-sourced versions of any of these
+        # disqualify the resulting battery / component from §45X credits.
+        {"material": "Aluminum",                "scope_type": "covered", "notes": "US critical mineral; Al collector foil + casings are §45X-eligible battery components."},
+        {"material": "Copper",                  "scope_type": "covered", "notes": "Added to US critical mineral list (USGS 2024); Cu current-collector foil is a §45X-eligible battery component."},
+        {"material": "Phosphate (Battery Grade)", "scope_type": "covered", "notes": "LFP cathode active material is explicitly §45X-eligible; FEOC-sourced phosphate disqualifies LFP-cathode credit."},
+        {"material": "Silicon (Anode Grade)",   "scope_type": "covered", "notes": "US critical mineral; Si anode active material is a §45X-eligible battery component."},
     ],
     # NOTE: ``EU_BATTERY_REG_2023`` material scopes are defined further down
     # in this dict (after CRMA / CBAM) so the strategic-raw-material context
@@ -507,6 +553,12 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Manganese",              "scope_type": "strategic_raw_material"},
         {"material": "Natural Graphite",       "scope_type": "strategic_raw_material"},
         {"material": "Copper",                 "scope_type": "strategic_raw_material"},
+        # 2026-06-11 broader seed-coverage sweep: CRMA Annex II names
+        # "Bauxite / alumina / aluminium" together as a strategic raw
+        # material — current seed missed it.  EU has binding 2030 benchmarks
+        # against Al concentration (China + Russia dominate primary smelting).
+        {"material": "Aluminum",               "scope_type": "strategic_raw_material",
+         "notes": "CRMA Annex II Strategic Raw Material (bauxite/alumina/aluminium)."},
         # LFP-chemistry materials (2026-05-17 addition)
         {"material": "Phosphate (Battery Grade)", "scope_type": "strategic_raw_material",
          "notes": "LFP cathode active material; closes phosphate coverage gap identified in v2 walkthrough."},
@@ -583,11 +635,41 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Phosphate (Battery Grade)", "scope_type": "restricted", "notes": "LFP cathode active material — regulated under battery-component composition framework."},
         {"material": "Iron Ore (LFP Grade)",      "scope_type": "restricted", "notes": "LFP cathode active material — parallel to phosphate."},
         {"material": "Aluminum",                  "scope_type": "covered",    "notes": "Cell-component coverage (cathode current-collector foil, casings, module structural) — no per-material recycled-content threshold."},
+        # 2026-06-11 broader seed-coverage sweep: parallel to Aluminum
+        # above.  Copper foil is the anode-side current collector; Silicon
+        # is increasingly used in anode active material blends.  Both are
+        # in the battery-component scope of EU 2023/1542 but without per-
+        # material composition thresholds, so 'covered' (not 'restricted').
+        {"material": "Copper",                "scope_type": "covered", "notes": "Anode-side current-collector foil — in battery-component scope; no per-material composition threshold."},
+        {"material": "Silicon (Anode Grade)", "scope_type": "covered", "notes": "Silicon anode active material — in battery-component scope as cells shift to higher Si content."},
     ],
     "EU_CSDDD": [
         {"material": "Cobalt",           "scope_type": "disclosure_required", "notes": "Mandatory human-rights / environmental due diligence across supply chain."},
         {"material": "Lithium",          "scope_type": "disclosure_required"},
         {"material": "Natural Graphite", "scope_type": "disclosure_required"},
+        # 2026-06-11 partner-direction (REE seed gap): CSDDD due-diligence
+        # obligation extends across the EU's strategic-raw-material supply
+        # chain (CRMA-mapped) — REE supply chain is one of the highest-
+        # concentration single-country dependencies and a top CSDDD audit
+        # target.  Includes aggregate REE for bundle-attributed events
+        # plus the four named magnet elements.
+        {"material": "Rare Earth Elements", "scope_type": "disclosure_required", "notes": "Strategic raw material per CRMA — CSDDD due diligence extends to REE supply chain (mining + processing + magnet manufacture)."},
+        {"material": "Neodymium",   "scope_type": "disclosure_required", "notes": "Traction-motor magnet REE — CSDDD due-diligence target."},
+        {"material": "Praseodymium", "scope_type": "disclosure_required", "notes": "Traction-motor magnet REE — CSDDD due-diligence target."},
+        {"material": "Dysprosium",  "scope_type": "disclosure_required", "notes": "Heavy-REE magnet additive — CSDDD due-diligence target."},
+        {"material": "Terbium",     "scope_type": "disclosure_required", "notes": "Heavy-REE magnet additive — CSDDD due-diligence target."},
+        # 2026-06-11 broader seed-coverage sweep: CSDDD applies to large EU
+        # companies' supply chains broadly.  These six battery materials
+        # all have well-documented supply-chain due-diligence concerns
+        # (forced labor, environmental, indigenous-land, artisanal mining)
+        # that are explicit CSDDD audit targets.  Each entry names the
+        # primary concentration of concern.
+        {"material": "Aluminum",                "scope_type": "disclosure_required", "notes": "Bauxite from Guinea (50%+ global bauxite share) — forced-labor and indigenous-land due-diligence concerns."},
+        {"material": "Copper",                  "scope_type": "disclosure_required", "notes": "DRC artisanal copper-cobalt sourcing — child-labor and environmental due-diligence concerns."},
+        {"material": "Nickel",                  "scope_type": "disclosure_required", "notes": "Indonesian laterite nickel HPAL (Sulawesi) — environmental and indigenous-land due-diligence concerns."},
+        {"material": "Manganese",               "scope_type": "disclosure_required", "notes": "South African and Gabonese manganese — labor-rights due-diligence concerns."},
+        {"material": "Phosphate (Battery Grade)", "scope_type": "disclosure_required", "notes": "Western Sahara phosphate (~70% of MA phosphate exports) — occupation / indigenous-rights due-diligence concerns."},
+        {"material": "Silicon (Anode Grade)",   "scope_type": "disclosure_required", "notes": "Xinjiang polysilicon — UFLPA-overlapping forced-labor due-diligence concerns."},
     ],
     "EU_CONFLICT_MINERALS": [
         # 2026-05-17 partner-direction recalibration: the regulation

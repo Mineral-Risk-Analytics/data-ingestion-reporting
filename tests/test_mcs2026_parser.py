@@ -756,3 +756,193 @@ def test_per_stage_empty_bucket_skipped():
     assert len(result) == 1
     stage, _detail, country_prod, _yr, _unit, _dq = result[0]
     assert country_prod == {"CL": 55000.0}
+
+
+# ─── 2026-06-14: Salient Price extraction + YoY/CAGR derivation ──────────
+# Pins down the parser's new ability to preserve the Salient Price values
+# it had been reading-but-discarding.  See mcs2026_parser._extract_prices_from_salient
+# for the schema and _derive_yoy_and_cagr_from_prices for the derivation
+# math.  Failing one of these is almost always a sign of unit-conversion
+# math drift or a parser regression that broke the (Salient → Price)
+# row filtering.
+
+from app.services.ingestion.seeds.mcs2026_parser import (
+    _derive_yoy_and_cagr_from_prices,
+    _extract_prices_from_salient,
+    _to_usd_per_metric_ton,
+)
+
+
+class TestToUsdPerMetricTon:
+    def test_dollars_per_metric_ton_passthrough(self):
+        assert _to_usd_per_metric_ton(11700.0, "dollars per metric ton") == 11700.0
+
+    def test_cents_per_pound(self):
+        # 138.5 cents/lb × 2204.622 lb/MT ÷ 100 = $3,053 / MT
+        result = _to_usd_per_metric_ton(138.5, "cents per pound")
+        assert result is not None
+        assert 3050 < result < 3060
+
+    def test_dollars_per_pound_real_cobalt_2021(self):
+        # $24.21 / lb × 2204.622 lb/MT = $53,374 / MT — Cobalt 2021 US-spot
+        result = _to_usd_per_metric_ton(24.21, "dollars per pound")
+        assert result is not None
+        assert 53370 < result < 53380
+
+    def test_dollars_per_kilogram(self):
+        assert _to_usd_per_metric_ton(5.0, "dollars per kilogram") == 5000.0
+
+    def test_dollars_per_troy_ounce(self):
+        result = _to_usd_per_metric_ton(1998.0, "dollars per troy ounce")
+        assert result is not None
+        assert 64_237_000 < result < 64_238_000
+
+    def test_metric_ton_unit_unsupported(self):
+        # DMTU / MTU don't convert linearly without contained-element fraction
+        assert _to_usd_per_metric_ton(100.0, "dollars per dry metric ton unit") is None
+        assert _to_usd_per_metric_ton(100.0, "dollars per metric ton unit") is None
+
+    def test_unknown_unit_returns_none(self):
+        assert _to_usd_per_metric_ton(100.0, "dollars per furlong") is None
+
+    def test_none_value_returns_none(self):
+        assert _to_usd_per_metric_ton(None, "dollars per metric ton") is None
+
+
+class TestExtractPricesFromSalient:
+    @staticmethod
+    def _price_row(commodity, year, value, unit, detail):
+        return {
+            "Commodity": commodity,
+            "Section": "Salient Statistics—United States",
+            "Statistics": "Price",
+            "Statistics_detail": detail,
+            "Year": str(year),
+            "Value": str(value),
+            "Unit": unit,
+        }
+
+    def test_extracts_single_benchmark_full_series(self):
+        rows = [
+            self._price_row("Lithium", 2021, "11,700",
+                            "dollars per metric ton",
+                            "Price, annual average-real, battery-grade lithium carbonate"),
+            self._price_row("Lithium", 2022, "63,700",
+                            "dollars per metric ton",
+                            "Price, annual average-real, battery-grade lithium carbonate"),
+            self._price_row("Lithium", 2025, "9,000",
+                            "dollars per metric ton",
+                            "Price, annual average-real, battery-grade lithium carbonate"),
+        ]
+        prices = _extract_prices_from_salient(rows)
+        assert len(prices) == 3
+        assert prices[0]["year"] == 2021
+        assert prices[0]["value_raw"] == 11700.0
+        assert prices[0]["value_usd_per_mt"] == 11700.0
+        assert "battery-grade" in prices[0]["statistics_detail"]
+
+    def test_preserves_multi_benchmark_structure(self):
+        # Cobalt has both US-spot and LME — both must come through with
+        # their distinct Statistics_detail strings preserved.
+        rows = [
+            self._price_row("Cobalt", 2021, "24.21", "dollars per pound",
+                            "Price, average, dollars per pound: U.S. spot, cathode"),
+            self._price_row("Cobalt", 2021, "23.17", "dollars per pound",
+                            "Price, average, dollars per pound: London Metal Exchange"),
+        ]
+        prices = _extract_prices_from_salient(rows)
+        assert len(prices) == 2
+        details = {p["statistics_detail"] for p in prices}
+        assert any("U.S. spot" in d for d in details)
+        assert any("London Metal" in d for d in details)
+
+    def test_ignores_non_price_statistics(self):
+        rows = [
+            self._price_row("Lithium", 2025, "9000", "dollars per metric ton",
+                            "Price, annual average"),
+            # Non-price row — should be filtered out
+            {**self._price_row("Lithium", 2025, "10", "metric tons",
+                               "Production"), "Statistics": "Production"},
+        ]
+        prices = _extract_prices_from_salient(rows)
+        assert len(prices) == 1
+        assert prices[0]["statistics_detail"] == "Price, annual average"
+
+    def test_ignores_non_salient_sections(self):
+        rows = [
+            {**self._price_row("X", 2025, "100", "dollars per metric ton",
+                               "Price"), "Section": "World Production"},
+        ]
+        prices = _extract_prices_from_salient(rows)
+        assert prices == []
+
+    def test_skips_malformed_rows(self):
+        rows = [
+            self._price_row("Lithium", "not_a_year", "9000",
+                            "dollars per metric ton", "Price, annual"),
+            self._price_row("Lithium", 2025, "not_a_number",
+                            "dollars per metric ton", "Price, annual"),
+            self._price_row("Lithium", 2025, "", "dollars per metric ton",
+                            "Price, annual"),
+        ]
+        prices = _extract_prices_from_salient(rows)
+        assert prices == []
+
+
+class TestDeriveYoyAndCagrFromPrices:
+    @staticmethod
+    def _p(year, value, detail="Price, annual"):
+        return {
+            "year": year,
+            "value_raw": float(value),
+            "unit_raw": "dollars per metric ton",
+            "statistics_detail": detail,
+            "value_usd_per_mt": float(value),
+        }
+
+    def test_lithium_crash_real_numbers(self):
+        # Real Lithium 2021-2025 series. Expected YoY ≈ -23.7%, CAGR ≈ -6.3%
+        # (matches output seen in the smoke test against the real MCS CSV).
+        prices = [
+            self._p(2021, 11700), self._p(2022, 63700), self._p(2023, 39000),
+            self._p(2024, 11800), self._p(2025, 9000),
+        ]
+        yoy, cagr = _derive_yoy_and_cagr_from_prices(prices)
+        assert yoy is not None and -0.24 < yoy < -0.23
+        assert cagr is not None and -0.064 < cagr < -0.062
+
+    def test_picks_primary_benchmark_only(self):
+        # Cobalt-style multi-benchmark: derivation must use ONLY the first
+        # Statistics_detail, ignoring the secondary benchmark even when
+        # it appears in the same year.
+        prices = [
+            self._p(2021, 100, "US spot"),
+            self._p(2021, 80, "LME"),
+            self._p(2025, 200, "US spot"),
+            self._p(2025, 50, "LME"),
+        ]
+        yoy, cagr = _derive_yoy_and_cagr_from_prices(prices)
+        # YoY of primary = (200-100)/100 = +1.00 (only 2 obs of US spot)
+        # CAGR of primary over 4-year span = (200/100)^(1/4) - 1 = ~0.189
+        assert yoy is not None and abs(yoy - 1.0) < 0.001
+        assert cagr is not None and 0.18 < cagr < 0.20
+
+    def test_too_few_observations(self):
+        assert _derive_yoy_and_cagr_from_prices([]) == (None, None)
+        assert _derive_yoy_and_cagr_from_prices([self._p(2025, 100)]) == (None, None)
+
+    def test_handles_zero_first_value(self):
+        prices = [self._p(2021, 0), self._p(2022, 100)]
+        yoy, cagr = _derive_yoy_and_cagr_from_prices(prices)
+        # Division-by-zero guard returns (None, None) when the baseline is 0
+        assert yoy is None and cagr is None
+
+    def test_falls_back_to_raw_when_normalised_missing(self):
+        # DMTU rows leave value_usd_per_mt = None but value_raw is real;
+        # YoY/CAGR are dimensionless so the result still computes from raw.
+        prices = [
+            {**self._p(2021, 100), "value_usd_per_mt": None},
+            {**self._p(2025, 200), "value_usd_per_mt": None},
+        ]
+        yoy, cagr = _derive_yoy_and_cagr_from_prices(prices)
+        assert yoy is not None and abs(yoy - 1.0) < 0.001

@@ -628,17 +628,33 @@ def _derive_event_type(policy_type_names: list[str]) -> str:
 def _derive_event_subtype(event_type: str) -> str | None:
     """Map an IEA Policy Tracker event_type to a canonical event_subtype.
 
-    Added 2026-05-09 (G-Cov-3 audit fix).  All IEA ``INVESTMENT_PLEDGE``
-    events are subsidy-type by construction — ``_derive_event_type``
-    above already gates the assignment on the same keyword set
-    (invest / financ / fund / grant / subsid).  Tagging them
-    ``EXPORT_SUBSIDY`` lets the Geopolitical pillar route them into the
-    new ``production_subsidy_distortion`` sub-input.  ``POLICY_MILESTONE``
-    events stay event_subtype=None; their downstream scoring path is the
-    Regulatory pillar via the ``regulatory_compliance`` category.
+    2026-06-07 (Methodology correction):  IEA ``INVESTMENT_PLEDGE`` events
+    are now routed to a ``POSITIVE_POLICY`` informational subtype rather
+    than ``EXPORT_SUBSIDY``.  The change closes a directional bug — IEA
+    captures supply-support policies (Canadian critical-minerals tax
+    credits, Indonesian state-backed nickel investments, IRA §45X
+    production guidance, etc.) which RAISED the producer country's
+    geopolitical risk score under the old ``EXPORT_SUBSIDY`` →
+    ``production_subsidy_distortion`` wiring.  From a buyer's
+    perspective these policies REDUCE supply chain risk; treating them
+    as distortion-creating misread the policy direction.
+
+    ``POSITIVE_POLICY`` routes nowhere in the market_aggregator or
+    hs_node_scorer sub-input matchers, so the events are recorded for
+    rationale visibility but do not move scores.  Same pattern as
+    ``EXPORT_DECLINE`` (informational Comtrade-derived) and
+    ``PROCUREMENT_POLICY`` (informational GTA-derived).
+
+    GTA's ``EXPORT_SUBSIDY`` routing is unaffected — GTA captures
+    state-aid / trade-finance interventions in producer countries
+    where the distortion direction is correctly risk-raising.  The
+    subtype-to-pillar mapping in market_aggregator remains correct for
+    GTA-sourced subsidy events.
+
+    ``POLICY_MILESTONE`` events stay event_subtype=None as before.
     """
     if event_type == "INVESTMENT_PLEDGE":
-        return "EXPORT_SUBSIDY"
+        return "POSITIVE_POLICY"
     return None
 
 

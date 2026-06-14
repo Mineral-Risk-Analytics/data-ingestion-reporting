@@ -383,6 +383,66 @@ def _find_or_create_company(
     return company, True
 
 
+# Facility column names whose presence in the partner sheet implies
+# partner authority over that field (so MRDS re-runs should not clobber it
+# — see F-MRDS-2 protection in mrds.py).  Kept narrow on purpose: only
+# fields the partner literally writes through this loader.
+_FACILITY_PARTNER_LOCK_FIELDS = (
+    "name", "facility_type", "region", "city", "status",
+    "latitude", "longitude",
+)
+
+
+def _merge_partner_lock_metadata(
+    existing_metadata: Optional[dict],
+    facility_locks: set[str],
+) -> dict:
+    """Merge partner-curation lock list into existing facility metadata.
+
+    Preserves any annotations (incl. MRDS-side ``source``/``dep_id``
+    bookkeeping) and unions the facility-level locks so subsequent MRDS
+    re-runs respect the partner's authority.  See the F-MRDS-2 pattern
+    documented in ``mrds.py``.
+    """
+    merged = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+    current = merged.get("partner_curated_fields")
+    locked: set[str] = set()
+    if isinstance(current, list):
+        locked = {str(f) for f in current if isinstance(f, str)}
+    locked |= facility_locks
+    if locked:
+        merged["partner_curated_fields"] = sorted(locked)
+    return merged
+
+
+def _merge_link_lock_metadata(
+    facility_metadata: Optional[dict],
+    material_id: int,
+    link_locks: set[str],
+) -> dict:
+    """Same as above, but for per-link locks keyed by material_id.
+
+    Stored at ``Facility.metadata_json["link_partner_curated_fields"]``
+    because ``FacilityMaterialLink`` has no metadata column today.
+    """
+    merged = dict(facility_metadata) if isinstance(facility_metadata, dict) else {}
+    link_map = merged.get("link_partner_curated_fields")
+    if not isinstance(link_map, dict):
+        link_map = {}
+    else:
+        link_map = dict(link_map)
+    key = str(material_id)
+    current = link_map.get(key)
+    locked: set[str] = set()
+    if isinstance(current, list):
+        locked = {str(f) for f in current if isinstance(f, str)}
+    locked |= link_locks
+    if locked:
+        link_map[key] = sorted(locked)
+        merged["link_partner_curated_fields"] = link_map
+    return merged
+
+
 def _find_or_create_facility(
     session: Session,
     name: str,
@@ -396,7 +456,23 @@ def _find_or_create_facility(
     The ``created`` flag is required because ``session.flush()`` clears
     ``session.new`` immediately, so the caller can't distinguish inserts
     from updates by inspecting the session.
+
+    Partner-curation locks (added 2026-06-09): every field the partner
+    actually wrote through the seed (any non-None value in
+    ``_FACILITY_PARTNER_LOCK_FIELDS``) is recorded in
+    ``Facility.metadata_json["partner_curated_fields"]`` so subsequent
+    MRDS re-runs skip those fields rather than reverting them to USGS
+    values.  See F-MRDS-2 in ``mrds.py``.
     """
+    # Compute the set of partner-authoritative fields from this row.
+    facility_locks: set[str] = {
+        f for f in _FACILITY_PARTNER_LOCK_FIELDS
+        if seed.get(f) is not None or (f == "name")
+    }
+    # Facility ``name`` is always partner-authoritative since the loader
+    # ingested the partner's literal facility_name; include it explicitly
+    # in case the seed dict doesn't carry it under that key.
+
     existing = session.scalar(
         select(Facility).where(
             and_(Facility.name == name, Facility.country == country)
@@ -414,6 +490,7 @@ def _find_or_create_facility(
             longitude=seed.get("longitude"),
             data_source=DEFAULT_DATA_SOURCE,
             verified=True,
+            metadata_json=_merge_partner_lock_metadata(None, facility_locks),
         )
         session.add(facility)
         session.flush()
@@ -427,6 +504,13 @@ def _find_or_create_facility(
             updated = True
     if seed.get("facility_type") and existing.facility_type != seed["facility_type"]:
         existing.facility_type = seed["facility_type"]
+        updated = True
+    # Refresh the partner-curation lock list every re-run so newly-added
+    # fields get protected (e.g. partner fills in lat/lon in v2 of the
+    # sheet that was blank in v1).
+    new_meta = _merge_partner_lock_metadata(existing.metadata_json, facility_locks)
+    if new_meta != existing.metadata_json:
+        existing.metadata_json = new_meta
         updated = True
     return existing, False, updated
 
@@ -467,9 +551,17 @@ def _upsert_company_facility(
     return existing, False, updated
 
 
+# FacilityMaterialLink columns whose presence in the partner sheet implies
+# partner authority over that field (so MRDS re-runs should not clobber
+# them — see F-MRDS-2 protection in mrds.py).  Only the two fields MRDS
+# actually touches on re-run (`is_primary_product`, `supply_chain_stage`)
+# are recorded since the others are partner-only anyway.
+_LINK_PARTNER_LOCK_FIELDS = ("is_primary_product", "supply_chain_stage")
+
+
 def _upsert_material_link(
     session: Session,
-    facility_id: Any,
+    facility: Facility,
     material_id: int,
     capacity_tpy: Optional[float],
     capacity_unit: str,
@@ -477,6 +569,23 @@ def _upsert_material_link(
     stage: Optional[str],
     hs_mapping_id: Optional[int],
 ) -> tuple[FacilityMaterialLink, bool, bool]:
+    """Upsert one FacilityMaterialLink row from the partner seed.
+
+    Also records partner-curation locks in
+    ``facility.metadata_json["link_partner_curated_fields"][str(material_id)]``
+    so subsequent MRDS re-runs do not revert ``is_primary_product`` or
+    ``supply_chain_stage`` back to USGS-derived values (F-MRDS-2 pattern).
+    """
+    facility_id = facility.id
+
+    # Compute link-level partner locks based on which sheet fields the
+    # partner actually wrote.  ``stage`` is the seed sheet's
+    # ``supply_chain_stage``; ``is_primary`` comes from
+    # ``is_primary_product`` (always written when row loads).
+    link_locks: set[str] = {"is_primary_product"}
+    if stage is not None:
+        link_locks.add("supply_chain_stage")
+
     existing = session.scalar(
         select(FacilityMaterialLink).where(
             and_(
@@ -485,6 +594,15 @@ def _upsert_material_link(
             )
         )
     )
+
+    # Refresh the link-level lock list on every row regardless of whether
+    # this is an insert or update — newly-written fields get protected.
+    new_meta = _merge_link_lock_metadata(
+        facility.metadata_json, material_id, link_locks,
+    )
+    if new_meta != facility.metadata_json:
+        facility.metadata_json = new_meta
+
     if existing is None:
         link = FacilityMaterialLink(
             facility_id=facility_id,
@@ -714,7 +832,7 @@ def load_partner_facility_seed(
 
         ml, ml_created, ml_updated = _upsert_material_link(
             session,
-            facility_id=facility.id,
+            facility=facility,
             material_id=material.id,
             capacity_tpy=capacity_tpy,
             capacity_unit=capacity_unit,

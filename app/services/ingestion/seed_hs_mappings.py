@@ -217,12 +217,12 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("2804", "Silicon (Anode Grade)",
      "Hydrogen; rare gases; other non-metals — silicon at 2804.61/2804.69",
      # 2804 also covers H, He, N, O, Se, Te at 4-digit level
-     0.7, "refined", 4, "global"),
+     0.33, "refined", 4, "global"),
 
     # ── Tellurium ─────────────────────────────────────────────────────────
     ("2804", "Tellurium",
      "Non-metals — tellurium at 2804.50; shares prefix with Si, Se, S",
-     0.6, "refined", 4, "global"),
+     0.33, "refined", 4, "global"),
 
     # ── Gallium ───────────────────────────────────────────────────────────
     ("8112", "Gallium",
@@ -244,7 +244,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("2617", "Antimony",
      "Other ores and concentrates — antimony ores at 2617.10",
      # 2617.90 (other ores) reduces confidence slightly at 4-digit
-     0.8, "ore", 4, "global"),
+     0.5, "ore", 4, "global"),
     ("8110", "Antimony",
      "Antimony and articles thereof — unwrought metal", 1.0, "refined", 4, "global"),
 
@@ -262,11 +262,11 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("2530", "Lithium",
      "Mineral substances NES — spodumene concentrate at 2530.90 "
      "(multi-material 4-digit; also covers magnesium, fluorspar minerals)",
-     0.7, "ore", 4, "global"),
+     0.5, "ore", 4, "global"),
     ("2825", "Lithium",
      "Lithium oxide and hydroxide — primary processed form for battery electrolyte",
      # 2825.20 is lithium hydroxide specifically; dominant battery-grade Li trade
-     1.0, "battery_grade", 4, "global"),
+     0.5, "battery_grade", 4, "global"),
     ("2836", "Lithium",
      "Carbonates — lithium carbonate at 2836.91; primary cathode precursor form",
      # 2836 covers all carbonates; lithium carbonate is dominant battery Li form
@@ -316,16 +316,16 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     # ── Selenium ──────────────────────────────────────────────────────────
     ("2804", "Selenium",
      "Non-metals — selenium at 2804.50; shares prefix with Si, S, Te",
-     0.6, "refined", 4, "global"),
+     0.33, "refined", 4, "global"),
     # Selenium dioxide (SeO2) is an intermediate inorganic oxide.  Added
     # 2026-05-09 to clear NULL stage on rows the MCS PDF parser created
     # from the US HTS tariff table (HS 2811.29.20.00 → derived 6-digit).
     ("2811", "Selenium",
      "Other inorganic oxides / acids — selenium dioxide at 2811.29",
-     0.7, "intermediate", 4, "global"),
+     0.5, "intermediate", 4, "global"),
     ("281129", "Selenium",
      "Selenium dioxide (SeO2 — intermediate inorganic oxide)",
-     0.9, "intermediate", 6, "global"),
+     0.3, "intermediate", 6, "global"),
 
     # ── Individual motor REEs ─────────────────────────────────────────────
     ("2805", "Neodymium",
@@ -409,7 +409,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Fluorspar, acid grade (>97% CaF2)", 1.0, "concentrate", 6, "global"),
     ("253090", "Fluorspar",
      "Natural cryolite and chiolite (fluorine-bearing minerals)",
-     0.8, "ore", 6, "global"),
+     0.5, "ore", 6, "global"),
     ("281111", "Fluorspar",
      "Hydrogen fluoride (hydrofluoric acid) — processed fluorspar derivative",
      1.0, "intermediate", 6, "global"),
@@ -466,7 +466,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     # may set per-(country, year) shares if needed.
     ("283329", "Manganese",
      "Manganese sulphate (MnSO4·H2O, HPMSM — NCM cathode precursor).",
-     0.5, "battery_grade", 6, "global"),
+     0.2, "battery_grade", 6, "global"),
     ("720211", "Manganese",
      "Ferromanganese, containing >4% carbon (high-carbon)", 1.0, "intermediate", 6, "global"),
     ("720219", "Manganese",
@@ -484,8 +484,10 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("740200", "Copper",
      "Unrefined copper; copper anodes for electrolytic refining",
      1.0, "intermediate", 6, "global"),
-    ("740300", "Copper",
-     "Refined copper and copper alloys, unwrought", 1.0, "refined", 6, "global"),
+    # 2026-06-11 ERROR FIX: removed "740300" → Copper refined row.  HS heading
+    # 7403 requires a 6-digit sub-classification.  Specific subheadings
+    # already in seed below: 740311 (cathodes) + 740319 (other unwrought refined
+    # Cu) + alloy variants 7403.21-29.  No info lost by removal.
     ("740400", "Copper",
      "Copper waste and scrap", 1.0, "scrap", 6, "global"),
     ("740811", "Copper",
@@ -526,13 +528,13 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("283329", "Cobalt",
      "Cobalt sulfate (CoSO4 — battery-grade NMC precursor input)",
      # 283329 covers several sulfates; cobalt sulfate is the dominant battery form
-     0.8, "battery_grade", 6, "global"),
+     0.25, "battery_grade", 6, "global"),
     ("283699", "Cobalt",
      "Cobalt carbonate (CoCO3 — chemical precursor)",
      # 283699 covers many carbonates; cobalt carbonate is a precursor form
-     0.7, "intermediate", 6, "global"),
+     0.5, "intermediate", 6, "global"),
     ("291529", "Cobalt",
-     "Cobalt acetates (Co(CH3COO)2 — chemical precursor)", 0.9, "intermediate", 6, "global"),
+     "Cobalt acetates (Co(CH3COO)2 — chemical precursor)", 0.3, "intermediate", 6, "global"),
     ("810520", "Cobalt",
      "Unwrought cobalt and cobalt alloys (refined metal)", 1.0, "refined", 6, "global"),
     ("810530", "Cobalt",
@@ -588,12 +590,12 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("282590", "Tungsten",
      "Tungsten oxides (WO3, tungstic acid) — primary chemical intermediate",
      # 282590 covers many metal oxides; tungsten oxide is primary traded form
-     0.8, "intermediate", 6, "global"),
+     0.33, "intermediate", 6, "global"),
     ("284180", "Tungsten",
      "Ammonium paratungstate (APT) — key tungsten chemical intermediate",
      1.0, "intermediate", 6, "global"),
     ("284990", "Tungsten",
-     "Tungsten carbides (WC — cemented carbide precursor)", 1.0, "intermediate", 6, "global"),
+     "Tungsten carbides (WC — cemented carbide precursor)", 0.5, "intermediate", 6, "global"),
     ("720280", "Tungsten",
      "Ferrotungsten and ferrosilicon tungsten", 1.0, "intermediate", 6, "global"),
     ("810110", "Tungsten",
@@ -635,7 +637,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("262099", "Titanium",
      "Titanium slag (upgraded ilmenite — primary TiO2 feedstock)",
      # 262099 covers various slags/residues; titanium slag is dominant form
-     0.8, "intermediate", 6, "global"),
+     0.5, "intermediate", 6, "global"),
     ("282300", "Titanium",
      "Titanium oxides (unfinished TiO2 pigment feedstock)", 1.0, "intermediate", 6, "global"),
     ("320611", "Titanium",
@@ -662,7 +664,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("262099", "Vanadium",
      "Vanadium-bearing slag, other residues",
      # 262099 shared with titanium slag entries
-     0.7, "intermediate", 6, "global"),
+     0.5, "intermediate", 6, "global"),
     ("282530", "Vanadium",
      "Vanadium pentoxide (V2O5) and vanadium oxides/hydroxides",
      1.0, "intermediate", 6, "global"),
@@ -673,7 +675,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      0.6, "refined", 6, "global"),
     ("811299", "Vanadium",
      "Other vanadium articles; shares 6-digit with Ge, Nb",
-     0.6, "fabricated", 6, "global"),
+     0.33, "fabricated", 6, "global"),
 
     # ── Niobium (6-digit) ─────────────────────────────────────────────────
     ("261590", "Niobium",
@@ -681,7 +683,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      0.6, "ore", 6, "global"),
     ("282590", "Niobium",
      "Niobium oxide (Nb2O5); shares prefix with other metal oxides",
-     0.8, "intermediate", 6, "global"),
+     0.33, "intermediate", 6, "global"),
     ("720293", "Niobium",
      "Ferroniobium (standard-grade FeNb65)", 1.0, "intermediate", 6, "global"),
     ("811292", "Niobium",
@@ -689,7 +691,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      0.6, "refined", 6, "global"),
     ("811299", "Niobium",
      "Other niobium articles; shares 6-digit with Ge, V",
-     0.6, "fabricated", 6, "global"),
+     0.33, "fabricated", 6, "global"),
 
     # ── Tantalum (6-digit) ────────────────────────────────────────────────
     ("261590", "Tantalum",
@@ -698,10 +700,10 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      0.6, "ore", 6, "global"),
     ("282590", "Tantalum",
      "Tantalum oxide (Ta2O5); shares prefix with other metal oxides",
-     0.8, "intermediate", 6, "global"),
+     0.33, "intermediate", 6, "global"),
     ("282690", "Tantalum",
      "Potassium fluorotantalate (K2TaF7) — primary refining intermediate",
-     0.9, "intermediate", 6, "global"),
+     0.3, "intermediate", 6, "global"),
     ("810320", "Tantalum",
      "Tantalum, unwrought (metal and powders)", 1.0, "refined", 6, "global"),
     ("810330", "Tantalum",
@@ -719,9 +721,9 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      0.8, "intermediate", 6, "global"),
     ("283699", "Zirconium",
      "Zirconium carbonate; shares 6-digit with cobalt and other carbonates",
-     0.7, "intermediate", 6, "global"),
+     0.5, "intermediate", 6, "global"),
     ("720299", "Zirconium",
-     "Ferrozirconium; shares with other minor ferroalloys", 0.8, "intermediate", 6, "global"),
+     "Ferrozirconium; shares with other minor ferroalloys", 0.5, "intermediate", 6, "global"),
     ("810921", "Zirconium",
      "Zirconium, unwrought, not alloyed (nuclear-reactor grade)", 1.0, "refined", 6, "global"),
     ("810929", "Zirconium",
@@ -752,7 +754,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
 
     # ── Gallium (6-digit) ─────────────────────────────────────────────────
     ("285390", "Gallium",
-     "Gallium arsenide wafers, undoped", 1.0, "fabricated", 6, "global"),
+     "Gallium arsenide wafers, undoped", 0.3, "fabricated", 6, "global"),
     ("381800", "Gallium",
      "Gallium arsenide wafers, doped", 1.0, "fabricated", 6, "global"),
     ("811292", "Gallium",
@@ -766,13 +768,13 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("282739", "Germanium",
      "Germanium tetrachloride (GeCl4) — primary refining intermediate; "
      "shares with other unspecified chlorides",
-     0.7, "intermediate", 6, "global"),
+     0.5, "intermediate", 6, "global"),
     ("811292", "Germanium",
      "Germanium metal, unwrought; shares 6-digit with Ga, In, Nb, V",
      0.7, "refined", 6, "global"),
     ("811299", "Germanium",
      "Germanium metal, powder; shares 6-digit with Nb, V",
-     0.7, "refined", 6, "global"),
+     0.33, "refined", 6, "global"),
 
     # ── Indium (6-digit) ──────────────────────────────────────────────────
     ("811292", "Indium",
@@ -795,7 +797,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("253090", "Lithium",
      "Mineral substances NES — spodumene concentrate (Australian hard-rock Li)",
      # See parent ("2530", "Lithium") for confidence rationale.
-     0.7, "ore", 6, "global"),
+     0.5, "ore", 6, "global"),
     ("282520", "Lithium",
      "Lithium oxide and lithium hydroxide (LiOH·H2O — high-Ni cathode grade)",
      1.0, "battery_grade", 6, "global"),
@@ -882,7 +884,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      1.0, "battery_grade", 6, "global"),
     ("283329", "Zinc",
      "Zinc sulfate (ZnSO4) — Zn-ion electrolyte / aqueous battery; shares 6-digit with cobalt sulfate",
-     0.7, "battery_grade", 6, "global"),
+     0.1, "battery_grade", 6, "global"),
 
     # =========================================================================
     # COVERAGE ADDITIONS — May 2026 (partner CSV review)
@@ -936,7 +938,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     # ── P0 — Fluorspar derivatives (electrolyte chemicals) ───────────────
     ("2811", "Fluorspar",
      "Hydrofluoric acid (HF) — battery electrolyte precursor at 281111",
-     0.7, "intermediate", 4, "global"),
+     0.5, "intermediate", 4, "global"),
     ("2826", "Fluorspar",
      "Fluorides — AlF3 (282612), synthetic cryolite (282630) for battery electrolytes",
      0.7, "intermediate", 4, "global"),
@@ -1057,15 +1059,12 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("281512", "Sodium",
      "Sodium hydroxide (caustic soda), aqueous — chemical precursor",
      1.0, "intermediate", 6, "global"),
-    ("283526", "Sodium",
-     "Trisodium phosphate (Na3PO4) — polyanionic NIB cathode precursor",
-     1.0, "battery_grade", 6, "global"),
     ("283620", "Sodium",
      "Disodium carbonate (Na2CO3 / soda ash) — Na-ion cathode precursor",
      1.0, "battery_grade", 6, "global"),
-    ("284169", "Sodium",
-     "Sodium peroxometallates — Na-containing TM oxide precursors",
-     0.7, "battery_grade", 6, "global"),
+    ("284169", "Manganese",
+     "Salts of oxometallic acids; manganates/permanganates — includes Li manganate (LMO cathode chemistry)",
+     0.3, "battery_grade", 6, "global"),
 
     # Bismuth 6-digit
     ("810610", "Bismuth",
@@ -1081,7 +1080,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      1.0, "refined", 6, "global"),
     ("284190", "Rhenium",
      "Ammonium perrhenate — Re precursor",
-     0.5, "intermediate", 6, "global"),
+     0.3, "intermediate", 6, "global"),
 
     # ── Migrated from mcs_pdf_parser._HS_6DIGIT_STAGE_OVERRIDE (May 2026) ──
     # 20 entries that the PDF parser carried as overrides but were
@@ -1097,21 +1096,14 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     # 260111 and 260112 (Iron Ore non/agglomerated) are ALREADY seeded
     # earlier in this list — entries 92/93.  Removed redundant duplicates
     # added during the May 2026 PDF-override migration pass.
-    ("261500", "Vanadium",
-     "Vanadium ores and concentrates (shared 6-digit with Niobium / Tantalum / Zirconium)",
-     1.0, "ore", 6, "global"),
-    ("261500", "Niobium",
-     "Niobium ores and concentrates (shared 6-digit, mixed-material)",
-     1.0, "ore", 6, "global"),
-    ("261500", "Tantalum",
-     "Tantalum ores and concentrates (shared 6-digit, mixed-material)",
-     1.0, "ore", 6, "global"),
-    ("261500", "Zirconium",
-     "Zirconium ores and concentrates (shared 6-digit, mixed-material)",
-     1.0, "ore", 6, "global"),
+    # 2026-06-11 AUDIT FIX: "261500" does not exist in HS2022.  Heading 2615
+    # splits at 6-digit into 261510 (Zirconium-specific, already in seed at
+    # line ~717) and 261590 (Nb/Ta/V shared, already in seed at lines ~658,
+    # 681, 697 with confidence 0.6 each).  No replacement rows added — the
+    # canonical entries already provide coverage.
     ("261790", "Rare Earth Elements",
      "Rare-earth ores and concentrates (other) — bastnäsite / monazite mixed",
-     0.7, "ore", 6, "global"),
+     0.3, "ore", 6, "global"),
     # 283324 Nickel + 283329 Manganese moved to their canonical material
     # sections (Nickel 6-digit + Manganese 6-digit) in the 11.2 audit
     # easy-adds.  Removed duplicates here.  Note: the Manganese mapping
@@ -1125,8 +1117,14 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("740319", "Copper",
      "Refined copper, other unwrought forms",
      1.0, "refined", 6, "global"),
-    ("750100", "Nickel",
-     "Nickel mattes / sinters / oxide sinters — intermediate from sulfide flow",
+    # 2026-06-11 AUDIT FIX: "750100" does not exist in HS2022.  Heading 7501
+    # splits at 6-digit into 750110 (mattes) and 750120 (oxide sinters and
+    # other intermediate products).  Both are intermediate-stage in our taxonomy.
+    ("750110", "Nickel",
+     "Nickel mattes — intermediate sulfide-flow product",
+     1.0, "intermediate", 6, "global"),
+    ("750120", "Nickel",
+     "Nickel oxide sinters and other intermediate products of nickel metallurgy",
      1.0, "intermediate", 6, "global"),
     ("750220", "Nickel",
      "Nickel alloys, unwrought — refined product, partial battery use",
@@ -1137,21 +1135,21 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("810199", "Tungsten",
      "Tungsten, other (refined / wrought)",
      0.7, "refined", 6, "global"),
-    ("810292", "Molybdenum",
-     "Molybdenum, other (intermediate forms — Mo trioxide, etc.)",
-     0.7, "intermediate", 6, "global"),
-    ("252810", "Boron",
-     "Natural sodium borates and concentrates — boron ore stage",
-     1.0, "ore", 6, "global"),
-    ("252890", "Boron",
-     "Other natural borates and concentrates",
-     1.0, "ore", 6, "global"),
+    # 2026-06-11 AUDIT FIX: "810292" was removed in HS2022 reshuffle of Ch.81.
+    # Closest replacement is 810294 (Mo unwrought including sintered bars) —
+    # already in seed at line ~622 as refined-stage @ confidence 1.0.  No new
+    # row added; the canonical entry provides the coverage.
+    # 2026-06-11 AUDIT FIX: HS2022 collapsed 2528 to a single 6-digit
+    # subheading 252800.  Previous 252810 (sodium borates) and 252890 (other)
+    # don't exist in HS2022 — both removed.  Canonical 252800 row already in
+    # seed at line ~864 at confidence 1.0; no replacement row added here.
     ("282739", "Lithium",
      "Other chlorides — includes lithium chloride (LiCl) intermediate",
-     0.6, "intermediate", 6, "global"),
-    ("280512", "Lithium",
-     "Calcium / strontium / barium — shared 6-digit; lithium-adjacent for some refining inputs",
-     0.4, "refined", 6, "global"),
+     0.5, "intermediate", 6, "global"),
+    # 2026-06-11 ERROR FIX: removed prior "280512" → Lithium row.  HS 2805.12
+    # is "Calcium" (not lithium); lithium metal lives at 2805.19 ("other
+    # alkaline-earth metals, n.e.s.").  The 4-digit 2805 umbrella row above
+    # already provides Lithium fallback coverage at confidence 0.7.
 
     # ── Comtrade unresolved-prefix coverage (2026-05-11) ─────────────────
     # Targeted additions for the top-volume HS prefixes that were leaving
@@ -1223,6 +1221,92 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "recycling stream.  CONFLICTS with existing 262040 → Vanadium @ 0.9 (steel-slag "
      "interpretation); this 1.0 entry wins exact-match resolution.  Reconcile with partner.",
      1.0, "scrap", 6, "global"),
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 2026-06-11 HS coverage expansion — Tier 1 (high-leverage gaps)
+    # ─────────────────────────────────────────────────────────────────────
+    # Audit found several launch-mineral × stage cells missing entirely.
+    # Most consequential: Iron Ore (LFP Grade) had no battery_grade or
+    # intermediate stage at all — the LFP cathode precursor (FeSO4) was
+    # invisible to scoring.  Nickel was missing the MHP/MHC battery_grade
+    # input.  Phosphate had no intermediate stage.  Silicon had no ore
+    # stage.  Natural Graphite had no intermediate/refined coverage.
+    #
+    # All additions use 6-digit codes for precise stage attribution.
+
+    # ── Iron Ore (LFP Grade) — battery_grade + intermediate gaps ──────────
+    ("283329", "Iron Ore (LFP Grade)",
+     "Iron(II) sulfate (FeSO4) — LFP cathode precursor (heptahydrate FeSO4·7H2O)",
+     0.4, "battery_grade", 6, "global"),
+    ("284290", "Iron Ore (LFP Grade)",
+     "Other phosphate salts incl. iron(III) phosphate (FePO4) — LFP intermediate",
+     0.3, "intermediate", 6, "global"),
+
+    # ── Nickel — Ni(OH)2 / MHP battery_grade ──────────────────────────────
+    ("282540", "Nickel",
+     "Nickel oxides and hydroxides (NiO, Ni(OH)2) — MHP/MHC battery-grade precursor",
+     1.0, "battery_grade", 6, "global"),
+
+    # ── Phosphate (Battery Grade) — intermediate + battery_grade gaps ────
+    ("283531", "Phosphate (Battery Grade)",
+     "Sodium triphosphate (Na5P3O10) — phosphate intermediate",
+     0.8, "intermediate", 6, "global"),
+    ("283539", "Phosphate (Battery Grade)",
+     "Other polyphosphates — phosphate intermediate (residual; covers K/NH4 polyphosphates too)",
+     0.5, "intermediate", 6, "global"),
+    ("283525", "Phosphate (Battery Grade)",
+     "Calcium hydrogenorthophosphate (dicalcium phosphate) — feed/battery precursor",
+     0.7, "battery_grade", 6, "global"),
+
+    # ── Silicon (Anode Grade) — ore stage entirely missing ────────────────
+    ("250510", "Silicon (Anode Grade)",
+     "Silica sands and quartz sands — silicon metallurgical raw input (ore stage)",
+     0.8, "ore", 6, "global"),
+    ("281122", "Silicon (Anode Grade)",
+     "Silicon dioxide (SiO2) — high-purity quartz feedstock",
+     0.7, "ore", 6, "global"),
+
+    # ── Natural Graphite — intermediate / refined gaps ────────────────────
+    ("380120", "Natural Graphite",
+     "Colloidal / semi-colloidal graphite preparations — intermediate processing",
+     0.6, "intermediate", 6, "global"),
+    ("380190", "Natural Graphite",
+     "Other graphite/carbon preparations — refined graphite forms (residual; carbon-paste mix)",
+     0.4, "refined", 6, "global"),
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 2026-06-11 HS coverage expansion — Tier 2 (lower-impact additions)
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── Aluminum — other Al-foil battery_grade variants ───────────────────
+    # 2026-06-11 AUDIT FIX: removed "760712" — not in HS2022.  Canonical
+    # 760711 (rolled Al foil <0.2mm) already in seed at line ~559.  760719
+    # (other Al foil) below is a valid HS2022 code, keep it.
+    ("760719", "Aluminum",
+     "Aluminum foil, other, <0.2mm — battery-cell foil variants",
+     0.6, "battery_grade", 6, "global"),
+
+    # ── Copper — fabricated wire forms ────────────────────────────────────
+    # 2026-06-11 AUDIT FIX: "740812" not in HS2022 — corrected to 740819
+    # (refined Cu wire, cross-section ≤6mm).  Note 740811 (>6mm) already in
+    # seed at conf 1.0 as the wire-rod "fabricated" entry.
+    ("740819", "Copper",
+     "Refined copper wire, cross-section ≤6mm — battery-pack and motor wiring",
+     0.8, "fabricated", 6, "global"),
+
+    # ── Manganese — additional refined-oxide coverage ─────────────────────
+    # 2026-06-11 AUDIT FIX: removed "281641" → Manganese refined row.  The
+    # code does not exist in HS2022 (2816 only has .10 = Mg and .40 = Sr/Ba).
+    # Mn(OH)2 has no clean 6-digit code; trade volume would report under
+    # 282090 ("other Mn oxides").  Documented gap, no replacement row added.
+
+    # ── Rare Earth Elements — bonded magnets + ferro-REE alloys ───────────
+    ("850519", "Rare Earth Elements",
+     "Other permanent magnets (bonded NdFeB, SmCo, ferrite) — EV motor magnets",
+     0.3, "battery_grade", 6, "global"),
+    ("720299", "Rare Earth Elements",
+     "Other ferro-alloys incl. ferro-rare-earth — REE magnet-feedstock alloys",
+     0.5, "refined", 6, "global"),
 ]
 
 
@@ -1304,6 +1388,18 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "cobalt mattes",
         "cobalt matte",
         "unwrought cobalt",
+        # 2026-06-14: price-source vocabulary added so the hs_resolver
+        # can map USGS / Pink Sheet / future commercial price descriptors
+        # back to this HS row.  LME and U.S. spot cobalt are quoted on
+        # refined cobalt cathode metal, which is 810520 (unwrought
+        # refined cobalt) at the HS-6 level.
+        "LME cobalt",
+        "London Metal Exchange",
+        "U.S. spot",                # 2026-06-14 fix: shorter form matches
+        "U.S. spot cobalt",          # actual USGS phrasing
+        "cobalt cathode",
+        "electrolytic cobalt",
+        "refined cobalt",
     ],
     ("282200", "Cobalt"): [
         "cobalt hydroxide",
@@ -1406,6 +1502,53 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "manganese metal",
     ],
 
+    # ── Phosphate (Battery Grade) ────────────────────────────────────────
+    # 2026-06-14: Added so the hs_resolver can map USGS / Pink Sheet
+    # phosphate-rock benchmarks back to specific HS rows.  USGS Salient
+    # "Price, average value, f.o.b. mine" applies to phosphate rock at
+    # the mine — which is HS 2510.10 (unground) at the canonical stage.
+    # 251020 (ground) covers the post-beneficiation form when downstream
+    # processors quote it.  Partner should adjust if convention shifts.
+    ("251010", "Phosphate (Battery Grade)"): [
+        "phosphate rock",
+        "natural calcium phosphate",
+        "unground phosphate rock",
+        "f.o.b. mine",
+        "FOB mine",
+        "phosphate rock F.O.B.",
+        "rock phosphate",
+    ],
+    ("251020", "Phosphate (Battery Grade)"): [
+        "ground phosphate rock",
+        "beneficiated phosphate rock",
+        "phosphate concentrate",
+        "natural calcium phosphates ground",
+    ],
+
+    # ── Fluorspar ────────────────────────────────────────────────────────
+    # 2026-06-14: Added for fluorspar price benchmarks.  Most US
+    # commercial fluorspar trade is acid-grade (252922) used as HF / EV
+    # battery electrolyte precursor; metallurgical-grade (252921) is for
+    # steel-making flux.  USGS "Price, average unit value of imports" is
+    # weighted by total imports, where acid-grade dominates by value, so
+    # the c.i.f. / imports benchmarks route to 252922 by default.
+    # Met-grade quotes ("metallurgical fluorspar") route to 252921.
+    ("252921", "Fluorspar"): [
+        "metallurgical fluorspar",
+        "metallurgical grade fluorspar",
+        "met-grade fluorspar",
+        "fluorspar metallurgical",
+    ],
+    ("252922", "Fluorspar"): [
+        "acid-grade fluorspar",
+        "acid grade fluorspar",
+        "fluorspar acid grade",
+        "acidspar",
+        "fluorspar imports",
+        "cost insurance and freight",
+        "average unit value of imports",
+    ],
+
     # ── Natural Graphite ─────────────────────────────────────────────────
     ("2504", "Natural Graphite"): [
         "natural graphite",
@@ -1428,6 +1571,15 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "amorphous graphite",
         "spherical graphite",
         "spheroidized graphite",
+        # 2026-06-14: price-source vocabulary so the hs_resolver maps
+        # the USGS "average unit value of imports" benchmark here —
+        # natural-graphite powder / flake is the dominant imported
+        # form for the US battery supply chain.
+        "natural flake graphite",
+        "graphite flake",
+        "graphite powder",
+        "average unit value of imports, dollars per metric ton",
+        "natural graphite imports",
     ],
     ("250490", "Natural Graphite"): [
         "natural graphite, other forms",
@@ -1466,6 +1618,17 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "unwrought aluminum, not alloyed",
         "primary aluminum",
         "P1020",
+        # 2026-06-14: price-source vocabulary so the hs_resolver can
+        # map USGS / Pink Sheet / commercial price descriptors back
+        # here.  LME and U.S. market spot Al prices both quote
+        # unalloyed primary aluminum ingot (HS 7601.10).
+        "LME aluminum",
+        "London Metal Exchange",
+        "ingot",                    # 2026-06-14 fix: standalone "ingot"
+        "aluminum ingot",            # matches USGS "Price, ingot, average..."
+        "aluminum sow",
+        "U.S. market spot",
+        "U.S. spot aluminum",
     ],
     ("760120", "Aluminum"): [
         "unwrought aluminum, alloyed",
@@ -1478,6 +1641,16 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
     ],
     ("260111", "Iron Ore (LFP Grade)"): [
         "iron ore, non-agglomerated",
+        # 2026-06-14: price-source vocabulary for the USGS Salient
+        # "Price, average unit value reported by mines" benchmark and
+        # the SGX / Tianjin spot for iron ore fines.  Non-agglomerated
+        # iron ore is the canonical traded form for these benchmarks.
+        "iron ore fines",
+        "Tianjin iron ore",
+        "average unit value reported by mines",
+        "mine-value iron ore",
+        "CFR iron ore",
+        "SGX iron ore",
     ],
     ("260112", "Iron Ore (LFP Grade)"): [
         "iron ore, agglomerated",
@@ -1710,6 +1883,18 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "copper cathodes",
         "copper cathode",
         "cathode copper",
+        # 2026-06-14: price-source vocabulary so the hs_resolver can
+        # map USGS / Pink Sheet / commercial price descriptors back to
+        # this HS row.  All three benchmarks (LME / COMEX / U.S. producer)
+        # quote refined Grade-A copper cathodes (HS 7403.11).
+        "LME copper",
+        "London Metal Exchange",
+        "COMEX",
+        "COMEX high-grade",
+        "U.S. producer",            # 2026-06-14 fix: shorter form matches
+        "U.S. producer cathode",     # the actual USGS phrasing
+        "U.S. producer copper",
+        "high-grade copper",
     ],
     ("740400", "Copper"): [
         "copper content of scrap",
@@ -1796,12 +1981,20 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
     ],
 
     # ── Nickel ───────────────────────────────────────────────────────────
-    # 750210 already has keywords; extend with 'primary nickel' MCS phrasing.
+    # 750210 already has keywords; extend with 'primary nickel' MCS phrasing
+    # plus 2026-06-14 price-source vocabulary so the hs_resolver maps
+    # LME nickel cash to refined unalloyed nickel (the LME-deliverable form).
     ("750210", "Nickel"): [
         "unwrought nickel, not alloyed",
         "class 1 nickel",
         "Ni briquette",
         "primary nickel",
+        "LME nickel",
+        "London Metal Exchange",
+        "LME cash",
+        "nickel cathode",
+        "refined nickel",
+        "electrolytic nickel",
     ],
     ("750300", "Nickel"): [
         "nickel-containing scrap",

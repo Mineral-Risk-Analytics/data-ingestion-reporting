@@ -97,6 +97,14 @@ HIGH_CONCENTRATION_GEOS = frozenset({"CN", "CD", "RU"})
 #                                 when no CompanyRegulationExposure status is recorded.
 #   covered                 0.40  Indirect coverage (e.g. CBAM carbon certificate); less direct
 #                                 enforcement exposure than a disclosure or restriction obligation.
+#   compliant               0.20  A material the regulation explicitly lists as out-of-concern
+#                                 or exempt.  Added 2026-06-07 to mirror the same entry in
+#                                 ``event_impact.SCOPE_SEVERITY_MULTIPLIER`` (which carries 0.25
+#                                 on the severity side).  Without this entry the relevance
+#                                 multiplier fell through to the 0.50 default — a material
+#                                 listed as 'compliant' was getting the same regulation-scope
+#                                 weight as one listed as 'disclosure_required', which
+#                                 contradicts the partner-curated semantics.
 #   targeted_country        0.50  Used only on geography scopes, not material scopes; included for
 #                                 completeness in case scope_type is ever added there.
 #
@@ -107,6 +115,7 @@ _SCOPE_TYPE_WEIGHT: dict[str, float] = {
     "restricted":             0.60,
     "disclosure_required":    0.50,
     "covered":                0.40,
+    "compliant":              0.20,
 }
 
 

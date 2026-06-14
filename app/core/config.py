@@ -69,6 +69,18 @@ class Settings(BaseSettings):
     # the subscription so we don't silently bottleneck.
     comtrade_max_records: int = 100_000
 
+    # Global Trade Alert API (replaces the bulk CSV download path)
+    # Auth header pattern: ``Authorization: APIKey <key>``.  Account tiers
+    # affect daily / weekly request limits; check /api/v1/usage/ to see the
+    # current tier.  Endpoints used:
+    #   POST /api/v2/gta/data/   — paginated intervention list with filters
+    #   POST /api/v1/gta/ticker/ — incremental update stream since a timestamp
+    #   POST /api/v1/gta/mappings/ — reference taxonomies (intervention types)
+    gta_api_key: str = ""
+    gta_base_url: str = "https://api.globaltradealert.org"
+    gta_rate_limit_delay: float = 0.5    # seconds between calls; UNRESTRICTED tier still benefits from pacing
+    gta_page_size: int = 1000            # API max
+
     # Clerk auth (JWT via JWKS)
     # When clerk_jwks_url is empty AND app_env == "development", auth is bypassed
     # and a stub admin user is injected. Any non-empty value enforces verification.

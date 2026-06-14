@@ -51,6 +51,10 @@ from app.models.regulatory import RiskEvent, RiskEventGeography, RiskEventHsMapp
 from app.models.scoring import HsCodeGeographyRiskScore
 from app.models.supply import HsCodeMaterialMapping, HsCodeProductionShare
 from app.services.scoring.decay import compute_recency_multiplier
+from app.services.scoring.event_impact import (
+    compute_effective_confidence,
+    relevance_score_to_multiplier,
+)
 from app.constants import RiskCategory
 from app.services.scoring.supplier_risk import SCORING_VERSION
 
@@ -127,37 +131,64 @@ def _compute_hhi(shares: list[float]) -> float:
 
 
 def _compute_event_signal(
-    events: list[tuple[float, float, date]],
+    events: list[tuple[float, float, date, float]],
     as_of_date: date,
     category: RiskCategory,
-) -> float:
-    """Convert a list of (severity, confidence, event_date) tuples to a 0–1 signal.
+) -> tuple[float, int]:
+    """Convert (severity, confidence, event_date, relevance_score) tuples to a
+    0–1 signal, returning ``(signal_value, top_n_used)``.
 
-    Uses the standard ``severity × confidence × recency_multiplier`` formula
-    and returns the average of the top-3 non-zero impacts.  Returns 0.0 if
-    no events are present.
+    Uses the canonical ``severity × confidence × recency × relevance`` formula
+    (with the shared 0.60 confidence floor when severity ≥ 0.80) and returns
+    the average of the top-3 non-zero impacts.  Returns ``(0.0, 0)`` if no
+    events are present.
+
+    11.7-HS-F4 (2026-06-07): the relevance multiplier is now applied at the
+    HS-node level via ``relevance_score_to_multiplier``.  Previously the
+    function omitted it, which gave basket-fanout events (raw relevance 0.40
+    → multiplier 0.94) the same node-level weight as direct HS-code matches
+    (raw 0.90 → 1.24).  Aligns the node-level scoring with the same formula
+    every other pillar uses.
+
+    11.7-HS-F3 (2026-06-07): confidence-floor logic delegated to the shared
+    ``compute_effective_confidence`` helper to avoid duplication.
+
+    11.7-HS-F5 (2026-06-07): returns ``(signal_value, top_n_used)`` so the
+    caller can surface in node metadata how many events the top-3 truncation
+    dropped.
 
     Args:
-        events:     List of (severity, confidence, event_date) tuples.
+        events:     (severity, confidence, event_date, relevance_score) tuples.
+                    relevance_score is the raw 0-1 attribution confidence from
+                    the junction row (``RiskEventHsMapping.relevance_score``);
+                    it is mapped to the [0.70, 1.30] multiplier internally.
         as_of_date: Evaluation date for recency computation.
         category:   RiskCategory used to determine the decay function.
+
+    Returns:
+        ``(signal_value, top_n_used)`` — signal in [0, 1+] (typically ≤1.0
+        after recency caps), and the count of impacts that contributed to
+        the top-3 average (0, 1, 2, or 3).
     """
     if not events:
-        return 0.0
+        return 0.0, 0
 
     impacts: list[float] = []
-    for severity, confidence, event_date in events:
-        eff_conf = max(confidence, 0.60) if severity >= 0.80 else confidence
+    for severity, confidence, event_date, relevance_score in events:
+        eff_conf = compute_effective_confidence(severity, confidence)
         recency = compute_recency_multiplier(
             category=category,
             event_date=event_date if event_date is not None else as_of_date,
             as_of_date=as_of_date,
         )
-        impacts.append(severity * eff_conf * recency)
+        relevance_mult = relevance_score_to_multiplier(relevance_score)
+        impacts.append(severity * eff_conf * recency * relevance_mult)
 
     impacts.sort(reverse=True)
     top3 = impacts[:3]
-    return sum(top3) / len(top3) if top3 else 0.0
+    if not top3:
+        return 0.0, 0
+    return sum(top3) / len(top3), len(top3)
 
 
 def _compute_operational_signal(
@@ -306,7 +337,7 @@ def _get_related_hs_mapping_ids(
     # Fetch our prefix + material_id in one query.
     our = db.execute(
         select(
-            HsCodeMaterialMapping.hs_prefix,
+            HsCodeMaterialMapping.hs_code_prefix,
             HsCodeMaterialMapping.material_id,
         ).where(HsCodeMaterialMapping.id == hs_mapping_id)
     ).one_or_none()
@@ -319,7 +350,7 @@ def _get_related_hs_mapping_ids(
             "skipped_reason": "mapping_or_material_missing",
         }
 
-    our_prefix = (our.hs_prefix or "").replace(".", "").strip()
+    our_prefix = (our.hs_code_prefix or "").replace(".", "").strip()
     if not our_prefix:
         return {hs_mapping_id}, {
             "primary_mapping_id": hs_mapping_id,
@@ -333,26 +364,44 @@ def _get_related_hs_mapping_ids(
     sibling_rows = db.execute(
         select(
             HsCodeMaterialMapping.id,
-            HsCodeMaterialMapping.hs_prefix,
+            HsCodeMaterialMapping.hs_code_prefix,
         ).where(
             HsCodeMaterialMapping.material_id == our.material_id,
             HsCodeMaterialMapping.id != hs_mapping_id,
         )
     ).all()
     siblings = [
-        (row.id, (row.hs_prefix or "").replace(".", "").strip())
+        (row.id, (row.hs_code_prefix or "").replace(".", "").strip())
         for row in sibling_rows
-        if (row.hs_prefix or "").strip()
+        if (row.hs_code_prefix or "").strip()
     ]
 
     parents, children = _classify_hs_relations(our_prefix, siblings)
 
-    related = {hs_mapping_id, *parents, *children}
+    # 11.7-HS-F7 (2026-06-07): propagation restricted to parent-to-child only.
+    # Events tagged to a 4-digit parent flow IN to a 6-digit child (the
+    # parent's broader scope subsumes the child).  Events tagged to a
+    # 6-digit child do NOT flow up to the 4-digit parent — a specific
+    # child does not by itself represent the broader category.  This
+    # asymmetric rule matches the handbook's stated propagation direction.
+    #
+    # ``parents`` in this context = mappings whose prefix is a STRICT
+    # prefix of ours (we are at a more specific level, they are at the
+    # broader chapter — their events propagate DOWN to us).
+    # ``children`` = mappings whose prefix WE are a strict prefix of
+    # (they are more specific than us — their events should NOT propagate
+    # UP to us under the asymmetric rule).
+    related = {hs_mapping_id, *parents}
     return related, {
         "primary_mapping_id": hs_mapping_id,
         "parent_mapping_ids": sorted(parents),
-        "child_mapping_ids": sorted(children),
-        "total_propagated": len(parents) + len(children),
+        # 11.7-HS-F7: children are STILL classified for diagnostic
+        # transparency, but they no longer contribute events to this
+        # node's score.  Surfaced so partner can see what would have
+        # propagated under the symmetric rule.
+        "child_mapping_ids_excluded": sorted(children),
+        "total_propagated": len(parents),
+        "propagation_rule": "parent_to_child_only",
     }
 
 
@@ -467,6 +516,12 @@ def score_hs_node_geography(
             RiskEvent.severity_score,
             RiskEvent.confidence_score,
             RiskEvent.event_date,
+            # 11.7-HS-F4 (2026-06-07): pull the per-event relevance from the
+            # junction row so it flows into the standard event-impact formula.
+            # When the same event maps to multiple related HS codes (parent
+            # + own + propagated), the DISTINCT below would otherwise drop
+            # the relevance — wire it explicitly via the junction's value.
+            RiskEventHsMapping.relevance_score.label("relevance_score"),
         )
         .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
         .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
@@ -485,10 +540,11 @@ def score_hs_node_geography(
             row.severity_score,
             row.confidence_score,
             row.event_date.date() if hasattr(row.event_date, "date") else row.event_date,
+            row.relevance_score,
         )
         for row in tariff_rows
     ]
-    tariff_exposure = _compute_event_signal(
+    tariff_exposure, tariff_top_n_used = _compute_event_signal(
         tariff_events, as_of_date, RiskCategory.GEOPOLITICAL_TRADE
     )
 
@@ -506,6 +562,7 @@ def score_hs_node_geography(
             RiskEvent.severity_score,
             RiskEvent.confidence_score,
             RiskEvent.event_date,
+            RiskEventHsMapping.relevance_score.label("relevance_score"),
         )
         .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
         .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
@@ -523,10 +580,11 @@ def score_hs_node_geography(
             row.severity_score,
             row.confidence_score,
             row.event_date.date() if hasattr(row.event_date, "date") else row.event_date,
+            row.relevance_score,
         )
         for row in export_rows
     ]
-    export_restriction = _compute_event_signal(
+    export_restriction, export_top_n_used = _compute_event_signal(
         export_events, as_of_date, RiskCategory.GEOPOLITICAL_TRADE
     )
 
@@ -696,6 +754,14 @@ def score_hs_node_geography(
         "hhi_raw":             round(hhi_at_stage, 4) if hhi_at_stage is not None else None,
         "tariff_event_count":  len(tariff_events),
         "export_event_count":  len(export_events),
+        # 11.7-HS-F5 (2026-06-07): top-3 truncation visibility.  When the
+        # *_used_count is less than the *_event_count the node-level signal
+        # was averaged from the top three events and the remainder were
+        # silently dropped — same family of truncation as the Regulatory
+        # pillar's top-three averaging.  Lets partner see when a long tail
+        # of low-severity events isn't moving the node score.
+        "tariff_top_n_used":   tariff_top_n_used,
+        "export_top_n_used":   export_top_n_used,
         "event_ids_consumed":  event_ids_consumed,
         # G5 (2026-05-09): operational sub-score from facility capacity data
         "operational_signal":  round(operational_signal, 4) if operational_signal is not None else None,
@@ -906,7 +972,60 @@ def score_all_hs_nodes(
         market_scope=market_scope,
     )
 
+    # 2026-06-12: Batch commits with per-pair savepoints + defensive
+    # connection-drop recovery.
+    #
+    # The original per-pair commit (one db.commit() per iteration) paid one
+    # full WAL flush + Neon round-trip per pair (~500ms-2s on cold compute)
+    # and bottlenecked the job to ~1-5 pairs/min instead of ~47/min on the
+    # warm path.  Switching to batch commits gave the speedup but added a
+    # failure mode: Neon serverless can drop the connection mid-batch (even
+    # via the pooler endpoint), leaving the SQLAlchemy session in an
+    # invalid state where every subsequent begin_nested() raises
+    # PendingRollbackError until the outer transaction is rolled back.
+    #
+    # The outer try/except below catches that case: when the savepoint
+    # itself fails to start (or the score function raises a connection
+    # error), we do a full db.rollback() to reset the session, drop the
+    # in-flight batch counter, and continue with the next pair.  Worst case
+    # we lose ``_COMMIT_BATCH_SIZE`` pairs of unflushed work on a single
+    # drop; the UPSERT in score_hs_node_geography makes a re-run idempotent.
+    from sqlalchemy.exc import (
+        DBAPIError,
+        OperationalError,
+        PendingRollbackError,
+        InvalidRequestError,
+    )
+    _CONN_ERRORS: tuple = (
+        DBAPIError, OperationalError, PendingRollbackError, InvalidRequestError,
+    )
+
+    _COMMIT_BATCH_SIZE = 50
+    batch_pending = 0
+
+    def _full_reset_session(reason: str) -> None:
+        """Roll back the outer transaction so SQLAlchemy can reconnect."""
+        nonlocal batch_pending
+        log.warning(
+            "hs_node_scorer.batch.connection_reset",
+            reason=reason,
+            in_flight_batch=batch_pending,
+        )
+        try:
+            db.rollback()
+        except Exception:
+            log.exception("hs_node_scorer.batch.rollback_failed")
+        batch_pending = 0
+
     for hs_mapping_id, country_code in pairs:
+        try:
+            savepoint = db.begin_nested()
+        except _CONN_ERRORS as e:
+            # Outer transaction is in invalid state — most likely a Neon drop.
+            _full_reset_session(f"begin_nested failed: {type(e).__name__}")
+            pairs_skipped += 1
+            continue
+
         try:
             result = score_hs_node_geography(
                 db,
@@ -920,15 +1039,45 @@ def score_all_hs_nodes(
             else:
                 pairs_scored += 1
                 processed_nodes.add(hs_mapping_id)
-            db.commit()
+            savepoint.commit()
+            batch_pending += 1
+        except _CONN_ERRORS as e:
+            # Connection-level error inside the score call.  Savepoint cleanup
+            # will likely also fail; go straight to a full reset.
+            _full_reset_session(f"score call failed: {type(e).__name__}")
+            pairs_skipped += 1
+            continue
         except Exception:
-            db.rollback()
+            # Ordinary pair-level error — savepoint rollback is sufficient.
+            try:
+                savepoint.rollback()
+            except Exception:
+                _full_reset_session("savepoint rollback after pair error failed")
             log.exception(
                 "hs_node_scorer.batch.pair_failed",
                 hs_mapping_id=hs_mapping_id,
                 country_code=country_code,
             )
             pairs_skipped += 1
+            continue
+
+        if batch_pending >= _COMMIT_BATCH_SIZE:
+            try:
+                db.commit()
+                batch_pending = 0
+            except _CONN_ERRORS as e:
+                _full_reset_session(f"batch commit failed: {type(e).__name__}")
+
+    # Flush the trailing partial batch.
+    if batch_pending > 0:
+        try:
+            db.commit()
+        except Exception:
+            log.exception("hs_node_scorer.batch.final_commit_failed")
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
     log.info(
         "hs_node_scorer.batch.complete",

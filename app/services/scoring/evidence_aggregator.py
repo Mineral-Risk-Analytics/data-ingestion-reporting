@@ -135,18 +135,35 @@ def _event_date_as_date(ew: EventWithRelevance, fallback: date) -> date:
 
 
 def _safe_severity(ew: EventWithRelevance) -> float:
+    """Return severity_score for an event, defaulting to 0.0 when NULL.
+
+    11.4-EvA-parity (2026-06-07): defaults from 0.5 (midpoint) to 0.0
+    (no-data-no-signal) to match the market-side fix applied in
+    market_aggregator._event_impact during the 11.4-Op audit.  All current
+    ingesters explicitly set severity_score, but the schema column is
+    nullable; any future parser that forgets to set it now contributes 0
+    impact instead of an inflated midpoint phantom.
+    """
     v = ew.event.severity_score
     if v is None:
         log.warning("evidence_aggregator.missing_severity", event_id=ew.event.id)
-        return 0.5
+        return 0.0
     return float(v)
 
 
 def _safe_confidence(ew: EventWithRelevance) -> float:
+    """Return confidence_score for an event, defaulting to 0.0 when NULL.
+
+    11.4-EvA-parity (2026-06-07): defaults from 0.5 to 0.0 to match the
+    market-side severity treatment.  The confidence-floor logic in
+    ``compute_effective_confidence`` still applies the 0.60 floor when
+    severity ≥ 0.80; a NULL confidence with high severity therefore
+    becomes 0.60, not 0.0.
+    """
     v = ew.event.confidence_score
     if v is None:
         log.warning("evidence_aggregator.missing_confidence", event_id=ew.event.id)
-        return 0.5
+        return 0.0
     return float(v)
 
 
@@ -234,13 +251,17 @@ def derive_material_inputs(
         ``chemistry_intensities`` are both present, each exposure is re-weighted
         by its material's chemistry-aware intensity — so a 100% LFP OEM weights
         cobalt near zero and Li/Fe/P near full strength.
-        Conservative default 0.5 if no exposure records exist.
+        Defaults to 0.0 (no-data-no-signal) if no exposure records exist.
+
+        11.4-EvA-parity (2026-06-07): default changed from 0.5 (midpoint) to
+        0.0 to match the market-side 11.4-A fix in
+        ``market_aggregator._derive_market_material_inputs``.
 
     concentration:
         Proportion of exposures with source_geography in HIGH_CONCENTRATION_GEOS.
         When chemistry weighting is active, the proportion is computed over
         chemistry-relevant exposures (per-exposure weight ≥ baseline).
-        Defaults to 0.5 if no exposures have a source_geography set (data gap).
+        Defaults to 0.0 if no exposures have a source_geography set (data gap).
 
     trade_volatility:
         Average event_impact of GEOPOLITICAL_TRADE events (company-tagged ∪
@@ -260,9 +281,12 @@ def derive_material_inputs(
         return w if w > 0 else _CHEMISTRY_BASELINE_UNMATCHED
 
     # --- criticality ---
+    # 11.4-EvA-parity (2026-06-07): defaults changed 0.5 → 0.0 to match
+    # the market-side 11.4-A fix.  No-data-no-signal rather than midpoint
+    # inflation when company exposure data is thin.
     if not material_exposures:
         log.warning("evidence_aggregator.no_material_exposures")
-        criticality = 0.5
+        criticality = 0.0
     else:
         weighted_num = 0.0
         weight_denom = 0.0
@@ -271,13 +295,13 @@ def derive_material_inputs(
             weighted_num += _normalise_exposure_score(e.exposure_score) * w
             weight_denom += w
         criticality = (
-            weighted_num / weight_denom if weight_denom > 0 else 0.5
+            weighted_num / weight_denom if weight_denom > 0 else 0.0
         )
 
     # --- concentration ---
     geo_tagged = [e for e in material_exposures if e.source_geography]
     if not geo_tagged:
-        concentration = 0.5
+        concentration = 0.0
     else:
         hcg_weight = 0.0
         total_weight = 0.0
@@ -286,7 +310,7 @@ def derive_material_inputs(
             total_weight += w
             if e.source_geography in _HIGH_CONCENTRATION_GEOS:
                 hcg_weight += w
-        concentration = hcg_weight / total_weight if total_weight > 0 else 0.5
+        concentration = hcg_weight / total_weight if total_weight > 0 else 0.0
 
     # --- trade_volatility ---
     all_trade = _dedup_events(
@@ -321,7 +345,11 @@ def derive_geopolitical_inputs(
 
     country_concentration:
         50% from material source-geography HCG share, 50% from facility country
-        HCG share. Either side defaults to 0.5 when no signal exists.
+        HCG share. Either side defaults to 0.0 (no-data-no-signal) when no
+        signal exists.
+
+        11.4-EvA-parity (2026-06-07): defaults changed from 0.5 (midpoint)
+        to 0.0 to match the market-side 11.4-A fix.
 
     export_restriction_exposure / tariff_exposure:
         Average event_impact across the union of company-tagged trade events
@@ -329,6 +357,7 @@ def derive_geopolitical_inputs(
         source-geo or facility countries), classified by subtype/keyword.
     """
     # Source-geography HCG share
+    # 11.4-EvA-parity (2026-06-07): defaults 0.5 → 0.0 to match market-side.
     geo_tagged = [e for e in material_exposures if e.source_geography]
     if geo_tagged:
         hcg_count = sum(
@@ -338,7 +367,7 @@ def derive_geopolitical_inputs(
         )
         source_share = hcg_count / len(geo_tagged)
     else:
-        source_share = 0.5
+        source_share = 0.0
 
     # Facility-country HCG share
     facilities = facilities or []
@@ -349,7 +378,7 @@ def derive_geopolitical_inputs(
         )
         facility_share = fac_hcg / fac_total
     else:
-        facility_share = 0.5
+        facility_share = 0.0
 
     country_concentration = 0.5 * source_share + 0.5 * facility_share
 

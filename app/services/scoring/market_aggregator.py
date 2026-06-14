@@ -2156,7 +2156,7 @@ def _compute_pillar_data_completeness(
     reg_top_event_count: int,
     reg_scope_obligation_count: int,
     # Operational inputs
-    op_structural_dependency: float,
+    op_structural_dependency: Optional[float],
     op_event_count: int,
     # Financial Pressure inputs
     fin_evidence_count: int,
@@ -2217,10 +2217,17 @@ def _compute_pillar_data_completeness(
 
     # ── Operational ──
     # Two inputs: structural_dependency (defaults to 0.3 floor when no
-    # real signal) + operational event impacts (count == 0 when none).
+    # real signal, or None when no signal AND no floor was applied) +
+    # operational event impacts (count == 0 when none).
+    #
+    # 2026-06-13: guard for op_structural_dependency=None.  The pillar
+    # function can return None (not 0.3) when there's no operational
+    # signal at all for the (material, geography) pair — e.g. material
+    # 285 / TZ.  Treat None the same as "default 0.3" → no real signal.
     op_slots = [
-        # struct_dep differs from 0.3 floor → real signal
-        abs(op_structural_dependency - 0.3) > 0.001,
+        # struct_dep differs from 0.3 floor → real signal.
+        op_structural_dependency is not None
+            and abs(op_structural_dependency - 0.3) > 0.001,
         op_event_count > 0,
     ]
     operational_completeness = sum(op_slots) / len(op_slots)
@@ -2470,6 +2477,18 @@ def score_material_geography(
     # HsCodeGeographyRiskScore nodes exist.  Falls back to the legacy
     # material_risk path when Level-0 data is absent (eligible_nodes already
     # computed above so Geopolitical and Material pillars share the query).
+    # 11.7-HS-F8 (2026-06-07): tally the per-node score_method labels so
+    # the partner-facing rationale can show whether the rollup is built
+    # from signal-rich HHI-anchored nodes or from signal-thin
+    # event-only / operational-only nodes.  Histogram is built whether
+    # or not the rollup actually fires — useful even on material_fallback.
+    score_method_breakdown: dict[str, int] = {}
+    for n in eligible_nodes:
+        method = "unknown"
+        if n.metadata_json:
+            method = n.metadata_json.get("score_method", "unknown")
+        score_method_breakdown[method] = score_method_breakdown.get(method, 0) + 1
+
     if len(eligible_nodes) >= _STAGE_ROLLUP_MIN_NODES:
         # Normalised weighted average of composite_node_scores across stages
         weighted_sum = sum(
@@ -2527,6 +2546,14 @@ def score_material_geography(
                 "trade_volatility": trade_vol,
                 "stage_rollup_method": stage_rollup_method,
                 "stage_rollup_count": stage_rollup_count,
+                # 11.7-HS-F8 (2026-06-07): histogram of the per-node
+                # score_method labels across the nodes that contributed
+                # to this rollup.  Lets a partner see whether the
+                # rollup is built from signal-rich HHI-anchored nodes
+                # ({"hhi_anchored": 5}) or from signal-thin event-only
+                # nodes ({"event_only_no_hhi": 5}) or a mix.  Empty
+                # dict when no nodes contributed.
+                "node_score_method_breakdown": score_method_breakdown,
                 # 11.4 (2026-06-04): per-sub-input data-backed flags so the
                 # partner UI can show *which* component of the Material
                 # Concentration pillar lacks real data — not just that the
@@ -2814,7 +2841,42 @@ def score_all_active_materials(
             )
             continue
 
+        # 2026-06-12: Batch commits with per-pair savepoints + defensive
+        # connection-drop recovery — same pattern as
+        # hs_node_scorer.score_all_hs_nodes.  See that function for the
+        # full explanation.  Short version: Neon serverless can drop the
+        # connection mid-batch (even via pooler endpoint), leaving the
+        # session in invalid state where every subsequent begin_nested()
+        # raises PendingRollbackError.  The outer try/except below catches
+        # that and does a full db.rollback() so the loop continues on a
+        # fresh connection.  Worst case: lose ``_COMMIT_BATCH_SIZE`` pairs
+        # of unflushed work; UPSERT semantics make re-run idempotent.
+        from sqlalchemy.exc import (
+            DBAPIError,
+            OperationalError,
+            PendingRollbackError,
+            InvalidRequestError,
+        )
+        _CONN_ERRORS: tuple = (
+            DBAPIError, OperationalError, PendingRollbackError, InvalidRequestError,
+        )
+
+        _COMMIT_BATCH_SIZE = 25  # smaller than HS (50) — pillar composite
+                                 # is heavier; limits drop-blast-radius
         for geo in geos:
+            try:
+                savepoint = db.begin_nested()
+            except _CONN_ERRORS as e:
+                log.warning(
+                    "market_aggregator.batch.connection_reset",
+                    reason=f"begin_nested failed: {type(e).__name__}",
+                )
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                continue
+
             try:
                 score_row = score_material_geography(
                     db,
@@ -2825,14 +2887,55 @@ def score_all_active_materials(
                     persist=True,
                 )
                 results.append(score_row)
-                db.commit()
+                savepoint.commit()
+            except _CONN_ERRORS as e:
+                log.warning(
+                    "market_aggregator.batch.connection_reset",
+                    reason=f"score call failed: {type(e).__name__}",
+                    material_id=material.id,
+                    geography_code=geo,
+                )
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                continue
             except Exception:
-                db.rollback()
+                try:
+                    savepoint.rollback()
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
                 log.exception(
                     "market_aggregator.batch.error",
                     material_id=material.id,
                     geography_code=geo,
                 )
+
+            if (len(results) % _COMMIT_BATCH_SIZE) == 0 and len(results) > 0:
+                try:
+                    db.commit()
+                except _CONN_ERRORS as e:
+                    log.warning(
+                        "market_aggregator.batch.commit_failed",
+                        reason=type(e).__name__,
+                    )
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+
+    # Flush the trailing partial batch.
+    try:
+        db.commit()
+    except Exception:
+        log.exception("market_aggregator.batch.final_commit_failed")
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
     log.info(
         "market_aggregator.batch.done",
