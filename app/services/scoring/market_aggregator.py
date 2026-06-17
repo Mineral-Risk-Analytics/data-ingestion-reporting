@@ -178,6 +178,54 @@ _CRITICALITY_SOURCE_PRIORITY: list[str] = [
 
 
 # ---------------------------------------------------------------------------
+# Step 2026-06-16 — Batch-mode preload cache
+# ---------------------------------------------------------------------------
+# Per-(material × geography) scoring did 30+ SQL roundtrips per row.  At
+# ~1,900 rows that was ~57,000 queries — slow even over fast networks,
+# brutal over WAN / pgbouncer.  This cache hoists the queries whose
+# results depend on ONLY material_id, ONLY country_code, or are constant
+# across the run, so they execute once at the top of
+# ``score_all_active_materials`` instead of once per row.
+#
+# Cached:
+#   criticality_signal_by_material_id  (one row per material)
+#   material_events  by (material_id, category)  (the cheap path through
+#                                                 evidence_query.get_events_for_material,
+#                                                 incl. HS-confidence multiplier)
+#   geo_events       by (country_code, category) (similarly hoists
+#                                                 get_events_for_geographies)
+#   governance_by_country                        (Step 3 WGI overlay lookup)
+#
+# Hot paths still query directly when ``cache`` is None — keeps
+# standalone calls to ``score_material_geography`` working.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field as _dc_field
+
+
+@dataclass
+class ScoringPreloadCache:
+    """Bulk-loaded data shared across a ``score_all_active_materials`` run.
+
+    Always-empty defaults are intentional so a caller can construct an
+    empty cache + selectively prefill fields if they only want a subset.
+    """
+
+    criticality_by_material_id: dict[int, Optional[MaterialCriticalitySignal]] = _dc_field(default_factory=dict)
+    # Cache of get_events_for_material results.  Key shape is
+    # (material_id, category_value_string) — string not enum so call sites
+    # can normalise without re-importing RiskCategory in random places.
+    material_events_by_material_and_category: dict[tuple[int, str], list] = _dc_field(default_factory=dict)
+    # Same for get_events_for_geographies.
+    geo_events_by_country_and_category: dict[tuple[str, str], list] = _dc_field(default_factory=dict)
+    # Step 3 — CountryGovernanceSignal by country_code.  Latest row per country.
+    governance_by_country_code: dict[str, object] = _dc_field(default_factory=dict)
+    # Sentinel marker so the WGI lookup can distinguish "no cache" from
+    # "cache says this country has no row" without re-querying.
+    governance_loaded: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
@@ -185,13 +233,21 @@ def _get_best_criticality_signal(
     db: Session,
     material_id: int,
     as_of_date: date,
+    *,
+    cache: Optional[ScoringPreloadCache] = None,
 ) -> Optional[MaterialCriticalitySignal]:
     """Return the most authoritative MaterialCriticalitySignal for this material.
 
     Selects the latest reference_year row for the highest-priority source that
     has a non-null criticality_score. Falls back through the source hierarchy
     defined in ``_CRITICALITY_SOURCE_PRIORITY``.
+
+    Cache-aware: when ``cache`` is provided and the material_id has been
+    preloaded, returns the cached value without a DB roundtrip.
     """
+    if cache is not None and material_id in cache.criticality_by_material_id:
+        return cache.criticality_by_material_id[material_id]
+
     stmt = (
         select(MaterialCriticalitySignal)
         .where(
@@ -213,6 +269,166 @@ def _get_best_criticality_signal(
 
     # Fallback: return most recent row regardless of source
     return rows[0]
+
+
+def _cached_events_for_material(
+    db: Session,
+    material_id: int,
+    category,
+    as_of_date: date,
+    *,
+    cache: Optional[ScoringPreloadCache] = None,
+):
+    """Cache-aware wrapper around ``get_events_for_material``.
+
+    ``category`` is a ``RiskCategory`` enum; the cache key uses
+    ``category.value`` to avoid importing the enum at every call site.
+    """
+    from app.services.scoring.evidence_query import get_events_for_material
+    if cache is not None:
+        key = (material_id, category.value)
+        cached = cache.material_events_by_material_and_category.get(key)
+        if cached is not None:
+            return cached
+    return get_events_for_material(db, material_id, category, as_of_date)
+
+
+def _cached_events_for_geographies(
+    db: Session,
+    country_code: str,
+    category,
+    as_of_date: date,
+    *,
+    cache: Optional[ScoringPreloadCache] = None,
+):
+    """Cache-aware wrapper around ``get_events_for_geographies`` for a
+    single country code.  Multi-country calls bypass the cache."""
+    from app.services.scoring.evidence_query import get_events_for_geographies
+    if cache is not None:
+        key = (country_code, category.value)
+        cached = cache.geo_events_by_country_and_category.get(key)
+        if cached is not None:
+            return cached
+    return get_events_for_geographies(db, {country_code}, category, as_of_date)
+
+
+def _cached_governance_signal(
+    db: Session,
+    country_code: str,
+    *,
+    cache: Optional[ScoringPreloadCache] = None,
+):
+    """Cache-aware lookup for the latest CountryGovernanceSignal row.
+
+    Returns ``None`` when no signal exists.  When the cache reports
+    ``governance_loaded=True`` it's authoritative — we don't fall back
+    to a DB query even if the country is absent (that absence IS the
+    answer).
+    """
+    if cache is not None and cache.governance_loaded:
+        return cache.governance_by_country_code.get(country_code)
+    from app.models import CountryGovernanceSignal as _CGS
+    return db.execute(
+        select(_CGS)
+        .where(
+            _CGS.country_code == country_code,
+            _CGS.source == "worldbank_wgi",
+        )
+        .order_by(_CGS.reference_year.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def build_scoring_preload_cache(
+    db: Session,
+    materials: list,
+    country_codes: list[str],
+    as_of_date: date,
+) -> ScoringPreloadCache:
+    """Preload the heavy per-row queries once for a full batch run.
+
+    Builds three cache buckets:
+      1. Criticality signal per material_id (priority-resolved).
+      2. Material events per (material_id, category) for GEOPOLITICAL_TRADE
+         and OPERATIONAL — the two categories ``score_material_geography``
+         pulls per row.  Other categories stay uncached because the
+         regulatory / financial derivations have their own narrower
+         query patterns.
+      3. Geography events per (country_code, category) — same two
+         categories as above.
+
+    Plus the Step 3 governance lookup (one row per country with WGI data).
+
+    Returns a fully-populated ``ScoringPreloadCache``.  Callers thread
+    it through ``score_material_geography(..., cache=cache)``.
+    """
+    from app.services.scoring.evidence_query import (
+        get_events_for_material,
+        get_events_for_geographies,
+        RiskCategory,
+    )
+    from app.models import CountryGovernanceSignal as _CGS
+
+    cache = ScoringPreloadCache()
+
+    log.info(
+        "market_aggregator.cache.build_start",
+        material_count=len(materials),
+        country_count=len(country_codes),
+    )
+
+    # ── 1. Criticality signals per material ──────────────────────────────
+    for material in materials:
+        cache.criticality_by_material_id[material.id] = _get_best_criticality_signal(
+            db, material.id, as_of_date,
+        )
+
+    # ── 2. Material events per (material, category) ──────────────────────
+    # GEOPOLITICAL_TRADE and OPERATIONAL are the only categories
+    # ``score_material_geography`` hits per row.  Other pillar
+    # derivations (regulatory, financial) have their own internal
+    # category queries which we don't hoist here.
+    for material in materials:
+        for category in (RiskCategory.GEOPOLITICAL_TRADE, RiskCategory.OPERATIONAL):
+            cache.material_events_by_material_and_category[(material.id, category.value)] = (
+                get_events_for_material(db, material.id, category, as_of_date)
+            )
+
+    # ── 3. Geo events per (country, category) ────────────────────────────
+    for country_code in country_codes:
+        for category in (RiskCategory.GEOPOLITICAL_TRADE, RiskCategory.OPERATIONAL):
+            cache.geo_events_by_country_and_category[(country_code, category.value)] = (
+                get_events_for_geographies(db, {country_code}, category, as_of_date)
+            )
+
+    # ── 4. Country governance signals (Step 3) ──────────────────────────
+    # One SELECT pulls the latest row per (country_code, source) using
+    # DISTINCT ON.  Cleaner + cheaper than the per-row LIMIT 1 query.
+    gov_rows = db.execute(
+        select(_CGS)
+        .where(
+            _CGS.country_code.in_(country_codes),
+            _CGS.source == "worldbank_wgi",
+        )
+        .order_by(_CGS.country_code, _CGS.reference_year.desc())
+    ).scalars().all()
+    # Walk in (country, year desc) order, take the FIRST row per country.
+    seen: set[str] = set()
+    for row in gov_rows:
+        if row.country_code not in seen:
+            cache.governance_by_country_code[row.country_code] = row
+            seen.add(row.country_code)
+    cache.governance_loaded = True
+
+    log.info(
+        "market_aggregator.cache.build_done",
+        criticality_signals=len(cache.criticality_by_material_id),
+        material_event_buckets=len(cache.material_events_by_material_and_category),
+        geo_event_buckets=len(cache.geo_events_by_country_and_category),
+        governance_signals=len(cache.governance_by_country_code),
+    )
+
+    return cache
 
 
 def _event_impact(
@@ -436,15 +652,34 @@ def _derive_market_material_inputs(
     # 11.4.B (2026-06): defaults for prod_hhi / reserve_hhi changed 0.5 → 0.0
     # (no data = no signal) to remove the silent score-inflation for
     # materials where MCS doesn't compute HHI.
+    #
+    # 11.5-MC-A (2026-06 — JRC-aligned cliff mapping): the raw HHI from MCS
+    # was being passed through linearly (0.45 × raw_hhi), which collapsed
+    # the dynamic range — Cobalt's HHI 0.58 contributed ~9 points to the
+    # pillar where the structural reality merits ~40 points.  Spearman ρ
+    # against USGS criticality was -0.16 (slightly inverted ranking).  The
+    # ``hhi_concentration_risk`` helper applies a piecewise-linear cliff
+    # mapping aligned with the DOJ Horizontal Merger Guidelines HHI tiers
+    # before the existing 0.45 / 0.15 weights.  Same input data — same
+    # MCS-derived ``hhi_score`` / ``reserve_hhi_score`` — but the post-
+    # mapping value reaches 0.95+ for true single-supplier dominance
+    # (Cobalt-DRC, Graphite-CN) instead of saturating at the raw HHI value.
+    #
+    # No change to which materials have data backing the score; the
+    # ``prod_hhi_data_backed`` diagnostic still tracks the raw signal's
+    # presence.  See material_risk.hhi_concentration_risk() for the
+    # mapping table and JRC/USGS references.
+    from app.services.scoring.material_risk import hhi_concentration_risk
+
     if sig and sig.hhi_score is not None:
-        prod_hhi = float(sig.hhi_score)
+        prod_hhi = hhi_concentration_risk(float(sig.hhi_score))
         prod_hhi_data_backed = True
     else:
         prod_hhi = 0.0
         prod_hhi_data_backed = False
 
     if sig and sig.reserve_hhi_score is not None:
-        res_hhi = float(sig.reserve_hhi_score)
+        res_hhi = hhi_concentration_risk(float(sig.reserve_hhi_score))
         res_hhi_data_backed = True
     else:
         res_hhi = 0.0
@@ -528,6 +763,7 @@ def _derive_market_geopolitical_inputs(
     as_of_date: date,
     *,
     eligible_nodes: Optional[list["HsCodeGeographyRiskScore"]] = None,
+    cache: Optional["ScoringPreloadCache"] = None,
 ) -> tuple[float, float, float, Optional[float], str, dict]:
     """
     Returns (country_concentration, export_restriction_exposure, tariff_exposure,
@@ -740,6 +976,36 @@ def _derive_market_geopolitical_inputs(
         export_exposure = event_export
         tariff_exposure = event_tariff
 
+    # ── Step 3 (2026-06-15) — JRC-aligned WGI governance overlay ───────────
+    # Apply per-country WGI governance discount on country_concentration.
+    # See geopolitical_risk.apply_wgi_governance_overlay for the formula
+    # rationale.  The overlay is a NO-OP when no WGI signal exists for the
+    # geography (the helper passes the raw value through with a diag
+    # field).  At α=0.5, a well-governed country (Australia, WGI ~93)
+    # sees country_concentration cut nearly in half; DRC (~13) sees
+    # almost no discount.
+    from app.services.scoring.geopolitical_risk import apply_wgi_governance_overlay
+    # Cache-aware: in batch mode the per-country WGI row is preloaded by
+    # ``build_scoring_preload_cache`` so this is a dict lookup instead of
+    # the LIMIT 1 query.  Standalone calls still hit the DB.
+    wgi_row = _cached_governance_signal(db, geography_code, cache=cache)
+    country_concentration, wgi_overlay_diag = apply_wgi_governance_overlay(
+        country_concentration_raw=country_concentration,
+        wgi_composite_pct=(
+            float(wgi_row.composite_pct)
+            if wgi_row is not None and wgi_row.composite_pct is not None
+            else None
+        ),
+        wgi_n_dimensions_present=(
+            wgi_row.n_dimensions_present if wgi_row is not None else None
+        ),
+    )
+    # Carry the reference_year forward so partner UI can show which
+    # year's governance signal was used.
+    wgi_overlay_diag["wgi_reference_year"] = (
+        wgi_row.reference_year if wgi_row is not None else None
+    )
+
     # ── 11.4-Geo (2026-06) — per-sub-input diagnostic ──────────────────────
     # Mirrors the 11.4-Material `sub_input_diagnostic` shape so the partner
     # UI can render both pillars with the same template.
@@ -752,6 +1018,11 @@ def _derive_market_geopolitical_inputs(
             # sense as a real MCS row.
             "data_backed": country_concentration_source == "mcs_share",
             "source": country_concentration_source,  # mcs_share / facility_floor / no_data
+            # Step 3 (2026-06-15): WGI governance overlay diagnostic.
+            # Records whether the overlay fired, the country's composite
+            # percentile, and the multiplier applied.  See
+            # geopolitical_risk.apply_wgi_governance_overlay.
+            "wgi_overlay": wgi_overlay_diag,
         },
         "export_restriction": {
             # data_backed = True iff EITHER path produced a non-zero signal.
@@ -2275,6 +2546,7 @@ def score_material_geography(
     *,
     run_id: Optional[str] = None,
     persist: bool = True,
+    cache: Optional[ScoringPreloadCache] = None,
 ) -> MaterialGeographyRiskScore:
     """
     Compute (and optionally persist) a market risk score for a material × geography pair.
@@ -2311,24 +2583,30 @@ def score_material_geography(
     )
 
     # --- STEP 1: Criticality signal ---
-    criticality_signal = _get_best_criticality_signal(db, material_id, as_of_date)
+    criticality_signal = _get_best_criticality_signal(
+        db, material_id, as_of_date, cache=cache,
+    )
 
     # --- STEP 2: Evidence ---
-    # Trade events: tagged to this material OR this geography
-    material_trade_events = get_events_for_material(
-        db, material_id, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
+    # Trade events: tagged to this material OR this geography.
+    # 2026-06-16: cache-aware wrappers — in batch runs the events were
+    # already preloaded once per (material × category) and once per
+    # (country × category), so these become dict lookups instead of
+    # DB roundtrips.  See ``build_scoring_preload_cache``.
+    material_trade_events = _cached_events_for_material(
+        db, material_id, RiskCategory.GEOPOLITICAL_TRADE, as_of_date, cache=cache,
     )
-    geo_trade_events = get_events_for_geographies(
-        db, {geography_code}, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
+    geo_trade_events = _cached_events_for_geographies(
+        db, geography_code, RiskCategory.GEOPOLITICAL_TRADE, as_of_date, cache=cache,
     )
     all_trade_events = _dedup_events(material_trade_events, geo_trade_events)
 
     # Operational events
-    material_op_events = get_events_for_material(
-        db, material_id, RiskCategory.OPERATIONAL, as_of_date
+    material_op_events = _cached_events_for_material(
+        db, material_id, RiskCategory.OPERATIONAL, as_of_date, cache=cache,
     )
-    geo_op_events = get_events_for_geographies(
-        db, {geography_code}, RiskCategory.OPERATIONAL, as_of_date
+    geo_op_events = _cached_events_for_geographies(
+        db, geography_code, RiskCategory.OPERATIONAL, as_of_date, cache=cache,
     )
     all_op_events = _dedup_events(material_op_events, geo_op_events)
 
@@ -2393,7 +2671,39 @@ def score_material_geography(
     _geo_op_ids = {ew.event.id for ew in geo_op_events}
     _trade_intersect_ids = _mat_trade_ids & _geo_trade_ids
     _op_intersect_ids = _mat_op_ids & _geo_op_ids
-    geo_specific_event_count = len(_trade_intersect_ids | _op_intersect_ids)
+
+    # ── geo_specific_event_count: the analyst-facing "events about this
+    # material in this country" number surfaced in the Country Scores table.
+    #
+    # 2026-06-14: switched from the trade+operational category union to the
+    # TRUE all-category intersection so the column matches its docstring
+    # ("events tagged to BOTH this material AND this country").  Previously
+    # the column reflected only events categorised as GEOPOLITICAL_TRADE or
+    # OPERATIONAL — events tagged with REGULATORY_COMPLIANCE,
+    # FINANCIAL_PRESSURE, or MATERIAL_CONCENTRATION at the same (mat, geo)
+    # pair were excluded, causing the column to under-report when the
+    # dropdown drill-down listed more events.  The category-specific sets
+    # (_trade_intersect_ids, _op_intersect_ids) are kept unchanged because
+    # the trade and operational pillar derivations explicitly need
+    # category filtering — they consume `geo_specific_trade_events` and
+    # `geo_specific_op_events` below, not the full count.
+    # Inline import to match the existing pattern in this file — see the
+    # function-scoped imports at lines 916, 1443, and 2851.
+    from app.models.regulatory import (
+        RiskEventGeography as _REG,
+        RiskEventMaterial as _REM,
+    )
+
+    _all_intersect_ids = db.execute(
+        select(_REM.risk_event_id)
+        .join(_REG, _REG.risk_event_id == _REM.risk_event_id)
+        .where(
+            _REM.material_id == material_id,
+            _REG.country_code == geography_code,
+        )
+        .distinct()
+    ).scalars().all()
+    geo_specific_event_count = len(set(_all_intersect_ids))
 
     # Build the actual intersection event lists for Material / Operational
     # pillar derivation.  Source from material_trade_events / material_op_events
@@ -2460,6 +2770,7 @@ def score_material_geography(
     ) = _derive_market_geopolitical_inputs(
         db, material_id, geography_code, geo_trade_events, as_of_date,
         eligible_nodes=eligible_nodes,
+        cache=cache,
     )
     # 11.4-Op (2026-06-06): _derive_market_operational_inputs now returns
     # a 5-tuple — the 5th element is sub_input_diagnostic, mirroring the
@@ -2489,6 +2800,14 @@ def score_material_geography(
             method = n.metadata_json.get("score_method", "unknown")
         score_method_breakdown[method] = score_method_breakdown.get(method, 0) + 1
 
+    # Step 2B (2026-06-15) — Material-level HHI lift diagnostic.  Always
+    # built so rationale_json carries a consistent shape regardless of
+    # which path fires.  Populated by ``apply_material_hhi_lift`` in the
+    # stage-weighted branch; remains ``None`` in the material_fallback
+    # branch (where the legacy path already uses score_material_exposure
+    # directly — no blending needed).
+    material_hhi_lift_diag: Optional[dict] = None
+
     if len(eligible_nodes) >= _STAGE_ROLLUP_MIN_NODES:
         # Normalised weighted average of composite_node_scores across stages
         weighted_sum = sum(
@@ -2499,9 +2818,29 @@ def score_material_geography(
             STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
             for n in eligible_nodes
         )
-        mat_score = weighted_sum / weight_total if weight_total > 0 else 0.0
+        stage_rollup_score = weighted_sum / weight_total if weight_total > 0 else 0.0
         stage_rollup_method = "stage_weighted"
         stage_rollup_count = len(eligible_nodes)
+
+        # Step 2B — apply material-level HHI lift when most contributing
+        # nodes scored without HHI signal.  This is the bridge that lets
+        # cobalt's DRC dominance / graphite's China dominance reach the
+        # score even when the refined / battery-grade HS nodes have no
+        # share data of their own.  See material_risk.apply_material_hhi_lift
+        # for the blend math + threshold rationale.
+        material_floor_score = material_risk.score_material_exposure(
+            crit, conc, trade_vol
+        )
+        has_material_hhi_signal = (
+            criticality_signal is not None
+            and criticality_signal.hhi_score is not None
+        )
+        mat_score, material_hhi_lift_diag = material_risk.apply_material_hhi_lift(
+            stage_rollup_score=stage_rollup_score,
+            material_floor_score=material_floor_score,
+            score_method_breakdown=score_method_breakdown,
+            has_material_hhi_signal=has_material_hhi_signal,
+        )
     else:
         mat_score = material_risk.score_material_exposure(crit, conc, trade_vol)
         stage_rollup_method = "material_fallback"
@@ -2554,6 +2893,16 @@ def score_material_geography(
                 # nodes ({"event_only_no_hhi": 5}) or a mix.  Empty
                 # dict when no nodes contributed.
                 "node_score_method_breakdown": score_method_breakdown,
+                # Step 2B (2026-06-15): when the stage rollup is built from
+                # mostly event-only nodes (sparse HS-level HHI coverage),
+                # the concentration score gets a material-level HHI floor.
+                # This diagnostic shows whether the lift fired and what
+                # the inputs were so partner UI can explain "score lifted
+                # toward structural material concentration because HS-node
+                # coverage was thin".  None in the material_fallback
+                # branch (the legacy path uses the same floor directly).
+                # See material_risk.apply_material_hhi_lift.
+                "material_hhi_lift": material_hhi_lift_diag,
                 # 11.4 (2026-06-04): per-sub-input data-backed flags so the
                 # partner UI can show *which* component of the Material
                 # Concentration pillar lacks real data — not just that the
@@ -2800,6 +3149,34 @@ def score_all_active_materials(
         geography_filter=geography_codes,
     )
 
+    # 2026-06-16 — build the bulk-preload cache before the per-pair loop.
+    # Discover the geography set we'll touch (union of per-material
+    # producer countries + event-bearing countries) so the geo-events
+    # cache covers everything score_material_geography will look up.
+    # Without this, the cache misses on (geo, category) keys and the
+    # per-row code falls back to DB queries — defeating the cache.
+    from app.models.regulatory import RiskEventGeography as _REG_BUILD, RiskEventMaterial as _REM_BUILD
+    if geography_codes is not None:
+        all_country_codes = sorted({g.upper() for g in geography_codes})
+    else:
+        # Materialise the same per-material geography set computed below,
+        # but at the batch level so we can build one cache for all materials.
+        prod_geos = db.execute(
+            select(MaterialProductionShare.country_code)
+            .where(MaterialProductionShare.production_share > 0)
+            .distinct()
+        ).scalars().all()
+        event_geos = db.execute(
+            select(_REG_BUILD.country_code)
+            .join(_REM_BUILD, _REM_BUILD.risk_event_id == _REG_BUILD.risk_event_id)
+            .distinct()
+        ).scalars().all()
+        all_country_codes = sorted({c.upper() for c in (*prod_geos, *event_geos) if c})
+
+    cache = build_scoring_preload_cache(
+        db, materials, all_country_codes, as_of_date,
+    )
+
     results: list[MaterialGeographyRiskScore] = []
 
     for material in materials:
@@ -2885,6 +3262,7 @@ def score_all_active_materials(
                     as_of_date,
                     run_id=f"{run_id}-{material.id}-{geo}",
                     persist=True,
+                    cache=cache,
                 )
                 results.append(score_row)
                 savepoint.commit()

@@ -26,16 +26,27 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 
+from datetime import datetime, timedelta, timezone
+
 from app.api.deps import get_current_user, get_db
 from app.models.facility import Facility, FacilityMaterialLink
+from app.models.regulatory import RiskEvent, RiskEventGeography, RiskEventMaterial
 from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
 from app.models.supply import Material, MaterialProductionShare
 from app.schemas.common import PaginatedResponse
 from app.schemas.market_scores import (
+    EvidenceFacilityItem,
+    EvidenceRegulationItem,
+    EvidenceRiskEventItem,
+    MarketScoreEvidence,
     MaterialGeographyScoreDetail,
     MaterialGeographyScoreRead,
     MaterialGlobalScoreRead,
     RescoredResult,
+)
+from app.services.scoring.evidence_query import (
+    RISK_EVENT_EVIDENCE_WINDOW_DAYS,
+    get_evidence_for_material_x_geography,
 )
 from app.services.scoring.market_aggregator import score_all_active_materials
 
@@ -185,12 +196,62 @@ def list_material_market_scores(
         country.upper(): count for country, count in facility_count_rows if country
     }
 
+    # --- Live intersection event count: country -> count of distinct events
+    # tagged to BOTH this material AND that country across ALL risk categories.
+    #
+    # Backfills the table's Events column with the analyst-facing intersection
+    # count so it matches what the dropdown evidence drill-down surfaces.
+    # The persisted MaterialGeographyRiskScore.event_count_geo_specific is
+    # populated at scoring time (now also fixed to the all-category
+    # intersection, see market_aggregator.py 2026-06-14 change) but stale rows
+    # from prior scoring runs reflect the narrower trade+operational
+    # intersection.  Overlay with the live count so the dashboard is honest
+    # immediately, without waiting for a full rescore.
+    #
+    # Date filter matches RISK_EVENT_EVIDENCE_WINDOW_DAYS used by the
+    # dropdown's evidence query (730 days, mirroring the longest finite
+    # EVIDENCE_WINDOWS entry) so the column and dropdown counts agree.
+    # Null-date events (sanctions programmes without a single anchor date)
+    # are kept on both sides.
+    cutoff = datetime.now(timezone.utc).date() - timedelta(
+        days=RISK_EVENT_EVIDENCE_WINDOW_DAYS
+    )
+    intersection_count_rows = db.execute(
+        select(
+            RiskEventGeography.country_code,
+            func.count(RiskEventMaterial.risk_event_id.distinct()),
+        )
+        .join(
+            RiskEventMaterial,
+            RiskEventMaterial.risk_event_id == RiskEventGeography.risk_event_id,
+        )
+        .join(
+            RiskEvent,
+            RiskEvent.id == RiskEventMaterial.risk_event_id,
+        )
+        .where(
+            RiskEventMaterial.material_id == material_id,
+            ((RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))),
+        )
+        .group_by(RiskEventGeography.country_code)
+    ).all()
+    intersection_count_by_country: dict[str, int] = {
+        (cc or "").upper(): int(cnt) for cc, cnt in intersection_count_rows if cc
+    }
+
     out: list[MaterialGeographyScoreRead] = []
     for r in rows:
         item = MaterialGeographyScoreRead.model_validate(r)
         cc = (r.geography_code or "").upper()
         item.production_share_pct = share_pct_by_country.get(cc)
         item.facility_count = facility_count_by_country.get(cc, 0)
+        # Overlay live intersection count when available — covers the gap
+        # between the persisted score and current event ingestion state.
+        # Keep the persisted value as a fallback for the (rare) case where
+        # the read-side query returns no row (zero events for this country).
+        live_count = intersection_count_by_country.get(cc)
+        if live_count is not None:
+            item.event_count_geo_specific = live_count
         out.append(item)
     return out
 
@@ -234,6 +295,102 @@ def get_material_market_score_detail(
             ),
         )
     return MaterialGeographyScoreDetail.model_validate(row)
+
+
+# ---------------------------------------------------------------------------
+# GET /materials/{material_id}/market-scores/{geography_code}/evidence
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/materials/{material_id}/market-scores/{geography_code}/evidence",
+    response_model=MarketScoreEvidence,
+)
+def get_material_market_score_evidence(
+    material_id: int,
+    geography_code: str,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MarketScoreEvidence:
+    """Raw evidence — regulations, facilities, risk events — at the strict
+    intersection of (material × country).
+
+    Backs the per-country dropdown drill-down on the material detail page.
+    Returns the same regulations / facilities / events the scoring engine
+    saw when computing this (material, country) pair's pillar scores,
+    constrained to rows tagged to BOTH dimensions so the analyst sees
+    country-specific evidence rather than "global material" events that
+    happen to fall into the country's pillar via the union path.
+
+    See ``evidence_query.get_evidence_for_material_x_geography`` for the
+    full membership semantics + ordering rules.
+    """
+    _ensure_material_exists(db, material_id)
+    cc = geography_code.upper()
+
+    bundle = get_evidence_for_material_x_geography(db, material_id, cc)
+
+    regulations = [
+        EvidenceRegulationItem(
+            id=r.id,
+            regulation_key=r.regulation_key,
+            title=r.title,
+            issuing_body=r.issuing_body,
+            status=r.status,
+            effective_date=r.effective_date,
+            summary=r.summary,
+            material_scope_type=getattr(r, "material_scope_type", "covered"),
+            geography_scope_type=getattr(r, "geography_scope_type", "jurisdiction"),
+            geography_compliance_weight=(
+                (r.geography_compliance_weights or {}).get(cc)
+                if r.geography_compliance_weights
+                else None
+            ),
+        )
+        for r in bundle.regulations
+    ]
+
+    facilities = [
+        EvidenceFacilityItem(
+            id=str(f.id),
+            name=f.name,
+            facility_type=f.facility_type,
+            status=f.status,
+            region=f.region,
+            city=f.city,
+            capacity_notes=f.capacity_notes,
+            is_primary_product=getattr(f, "link_is_primary_product", True),
+            annual_capacity_tpy=getattr(f, "link_annual_capacity_tpy", None),
+            supply_chain_stage=getattr(f, "link_supply_chain_stage", None),
+        )
+        for f in bundle.facilities
+    ]
+
+    risk_events = [
+        EvidenceRiskEventItem(
+            id=ev.id,
+            title=ev.title,
+            event_type=ev.event_type,
+            event_subtype=ev.event_subtype,
+            severity_score=ev.severity_score,
+            confidence_score=ev.confidence_score,
+            event_date=ev.event_date.date() if ev.event_date else None,
+            summary=ev.summary,
+            source_system=getattr(ev, "source_system", None),
+        )
+        for ev in bundle.risk_events
+    ]
+
+    return MarketScoreEvidence(
+        material_id=material_id,
+        geography_code=cc,
+        regulations=regulations,
+        facilities=facilities,
+        risk_events=risk_events,
+        regulation_total=bundle.regulation_total,
+        facility_total=bundle.facility_total,
+        risk_event_total=bundle.risk_event_total,
+        risk_event_window_days=RISK_EVENT_EVIDENCE_WINDOW_DAYS,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -300,7 +300,13 @@ class TestDiagnosticShape:
             geo_trade_events=[], as_of_date=AS_OF, eligible_nodes=None,
         )
         diag = result[5]
-        assert set(diag["country_concentration"].keys()) == {"data_backed", "source"}
+        # Step 3 (2026-06-15): WGI overlay added under "wgi_overlay" alongside
+        # the existing data_backed / source keys.  The overlay diagnostic is
+        # always populated (no-op shape when no WGI signal exists) for shape
+        # stability — see geopolitical_risk.apply_wgi_governance_overlay.
+        assert set(diag["country_concentration"].keys()) == {
+            "data_backed", "source", "wgi_overlay",
+        }
 
     def test_subsidy_inner_keys(self, sqlite_session):
         result = _derive_market_geopolitical_inputs(

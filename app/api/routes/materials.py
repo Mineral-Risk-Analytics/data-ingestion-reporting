@@ -17,7 +17,14 @@ from app.api.deps import get_current_user, get_db
 from app.models.battery_chemistry import BatteryChemistry
 from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.facility import FacilityMaterialLink
-from app.models.regulatory import RiskEvent, RiskEventHsMapping, RiskEventMaterial
+from app.models.documents import SourceDocument
+from app.models.regulatory import (
+    RiskEvent,
+    RiskEventGeography,
+    RiskEventHsMapping,
+    RiskEventMaterial,
+)
+from app.models.source import Source
 from app.models.reporting import AnalystNote
 from app.models.scoring import HsCodeGeographyRiskScore, MaterialGlobalRiskScore
 from app.models.country import Country
@@ -42,6 +49,11 @@ from app.schemas.materials import (
     MaterialListPillarScore,
 )
 from app.schemas.note import AnalystNoteCreate, AnalystNoteRead
+from app.schemas.regulatory import (
+    MaterialRiskEventRow,
+    MaterialRiskEventsResponse,
+    MaterialRiskEventsSummary,
+)
 
 router = APIRouter(tags=["materials"])
 
@@ -563,6 +575,17 @@ def list_materials(
     # ── Risk-event count per material in the last 90 days ─────────────
     # Matches the coverage matrix window so the Materials page and the
     # dashboard tell the same story.
+    #
+    # 2026-06-14 bugfix: filter by event_date (when the event occurred)
+    # instead of created_at (when the row was ingested).  The badge label
+    # says "90D" — analysts read that as "events from the last 90 days",
+    # not "events ingested in the last 90 days".  Pre-fix the badge was
+    # equivalent to "all events tagged to this material" because a recent
+    # re-ingestion put every row's created_at within the 90-day window
+    # (Cobalt showed 741 = total ever, vs. 31 actually within 90d).
+    # event_date can be NULL for events without a single anchor date
+    # (sanctions programmes, multi-year regulations) — those are excluded
+    # here so the count reflects strictly date-anchored recent activity.
     cutoff = datetime.now(timezone.utc) - timedelta(
         days=_MATERIALS_LIST_EVENT_WINDOW_DAYS,
     )
@@ -576,7 +599,7 @@ def list_materials(
             .join(RiskEvent, RiskEvent.id == RiskEventMaterial.risk_event_id)
             .where(
                 RiskEventMaterial.material_id.in_(material_ids),
-                RiskEvent.created_at >= cutoff,
+                RiskEvent.event_date >= cutoff,
             )
             .group_by(RiskEventMaterial.material_id)
         ).all()
@@ -703,6 +726,11 @@ def get_material(
 
     # Risk events in last 90 days mapped via RiskEventMaterial — matches
     # the same window the dashboard uses everywhere else.
+    #
+    # 2026-06-14 bugfix: filter by event_date (occurrence) not created_at
+    # (ingestion).  See the parallel fix on the list endpoint above for
+    # context.  event_date NULL rows are excluded so the count reflects
+    # strictly date-anchored recent activity.
     recent_events_n = int(
         db.scalar(
             select(func.count())
@@ -713,7 +741,7 @@ def get_material(
             )
             .where(
                 RiskEventMaterial.material_id == material_id,
-                RiskEvent.created_at >= cutoff_90d,
+                RiskEvent.event_date >= cutoff_90d,
             )
         )
         or 0
@@ -774,6 +802,285 @@ def get_material(
     detail.facility_count = facility_n
     detail.score_trend_7d = score_trend
     return detail
+
+
+# ---------------------------------------------------------------------------
+# GET /materials/{id}/risk-events
+# ---------------------------------------------------------------------------
+#
+# Powers the Risk events tab on the material detail page.  Returns:
+#   - signal summary (counts respect the window + active filters)
+#   - filtered event rows enriched with pillars_affected, source_system,
+#     source_url, and geography_codes (so the row + drawer can render
+#     without a follow-up fetch per event)
+#
+# Filters compose as additional WHERE clauses — passing none yields the
+# 365-day default window the analyst tier uses for the tab.
+
+_TAB_HIGH_SEVERITY_THRESHOLD = 0.75
+"""Severity scores >= 0.75 (out of 1.0) count as 'high' in the signal
+summary card.  Matches the band threshold used by the table chip
+``pillarColorClass`` (>= 75/100) so the analyst sees consistent banding
+between the summary card and the per-event row."""
+
+
+def _coerce_pillars(raw) -> list[str]:
+    """Decode RiskEvent.risk_categories_json → list[str] of pillar slugs.
+
+    Tolerant to the few shapes the ingesters produce: list[str],
+    dict[str, anything] (keys are pillar slugs), or None / empty.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x) for x in raw if x]
+    if isinstance(raw, dict):
+        return [str(k) for k in raw.keys() if k]
+    return []
+
+
+_SORTABLE_FIELDS = {
+    "title",
+    "event_type",
+    "source_system",
+    "severity_score",
+    "event_date",
+}
+"""Whitelist for the ``sort_by`` query param.  Anything else falls back to
+the ``event_date`` default.  pillars_affected and geography_codes are
+omitted because they're arrays — sorting on them would require picking
+a representative element which would be confusing."""
+
+
+@router.get(
+    "/materials/{material_id}/risk-events",
+    response_model=MaterialRiskEventsResponse,
+)
+def list_material_risk_events(
+    material_id: int,
+    window_days: int = Query(365, ge=1, le=3650),
+    pillar: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+    event_type: Optional[str] = Query(None),
+    severity_min: Optional[float] = Query(None, ge=0.0, le=1.0),
+    verified_only: bool = Query(False),
+    search: Optional[str] = Query(None),
+    sort_by: str = Query("event_date"),
+    sort_dir: str = Query("desc"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MaterialRiskEventsResponse:
+    """Per-material risk events feed for the analyst Risk events tab.
+
+    Query parameters:
+    - ``window_days`` (default 365): the analyst-tier default agreed for
+      the tab.  Frontend exposes a select with 30 / 90 / 365 / 730 / all
+      (all = 3650).
+    - ``pillar``: filter to events whose risk_categories_json contains
+      this pillar slug.  Multi-pillar events match if the slug appears
+      in their list.
+    - ``source``: filter by Source.name (e.g. ``global_trade_alert``,
+      ``federal_register``).
+    - ``event_type``: exact match on RiskEvent.event_type.
+    - ``severity_min`` (0.0–1.0): minimum severity threshold.
+    - ``verified_only``: when true, only analyst-verified rows.
+    - ``search``: case-insensitive title/summary substring.
+    - ``sort_by`` / ``sort_dir``: one of title | event_type |
+      source_system | severity_score | event_date, asc | desc.  Default
+      ``event_date desc`` (newest first).  Unknown values fall back to
+      the default.  Null values for the chosen column always sort to
+      the end regardless of direction.
+    - ``page`` / ``limit``: pagination.
+    """
+    _get_material_or_404(db, material_id)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+
+    # Base query: events tagged to this material, within the window.
+    # event_date NULL events (some sanctions programmes) are excluded
+    # from the tab so the date column is always populated — matches the
+    # signal-card label of "Trailing N days" being a date-anchored
+    # promise.
+    base = (
+        select(RiskEvent)
+        .join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
+        .where(
+            RiskEventMaterial.material_id == material_id,
+            RiskEvent.event_date >= cutoff,
+        )
+    )
+
+    # Filter composition — applied to both the summary stats and the
+    # paginated list so the cards stay in sync with the table.
+    if source:
+        base = (
+            base.join(SourceDocument, SourceDocument.id == RiskEvent.source_document_id)
+            .join(Source, Source.id == SourceDocument.source_id)
+            .where(Source.name == source)
+        )
+    if event_type:
+        base = base.where(RiskEvent.event_type == event_type)
+    if severity_min is not None:
+        base = base.where(RiskEvent.severity_score >= severity_min)
+    if verified_only:
+        base = base.where(RiskEvent.verified.is_(True))
+    if search:
+        like = f"%{search}%"
+        base = base.where(
+            or_(RiskEvent.title.ilike(like), RiskEvent.summary.ilike(like))
+        )
+
+    # Pillar filter — applied to risk_categories_json.  PostgreSQL ?
+    # operator checks "does the top-level JSONB contain this key/element"
+    # which works for both list[str] and dict[str, anything] shapes used
+    # by the ingesters.
+    if pillar:
+        base = base.where(RiskEvent.risk_categories_json.op("?")(pillar))
+
+    # Materialise distinct events once.  We use this set both for the
+    # summary stats and for the paginated row list — avoiding two near-
+    # identical queries.
+    # Eager-load source_document + source when the caller wants to sort
+    # by source_system — otherwise the sort comparator would N+1 fetch
+    # per event.  Cheap because the only extra cost is two extra
+    # selectinload queries (one for SourceDocuments, one for Sources)
+    # regardless of result size.
+    if sort_by == "source_system":
+        base = base.options(
+            selectinload(RiskEvent.source_document).selectinload(
+                SourceDocument.source
+            )
+        )
+
+    distinct_events = base.distinct(RiskEvent.id).order_by(RiskEvent.id)
+    all_events = list(db.scalars(distinct_events).all())
+
+    total = len(all_events)
+
+    # ── Signal summary ───────────────────────────────────────────────
+    high_severity = sum(
+        1 for e in all_events
+        if (e.severity_score or 0.0) >= _TAB_HIGH_SEVERITY_THRESHOLD
+    )
+    verified = sum(1 for e in all_events if e.verified)
+
+    pillar_counts: dict[str, int] = {}
+    for e in all_events:
+        for p in _coerce_pillars(e.risk_categories_json):
+            pillar_counts[p] = pillar_counts.get(p, 0) + 1
+
+    summary = MaterialRiskEventsSummary(
+        window_days=window_days,
+        total_events=total,
+        high_severity_count=high_severity,
+        verified_count=verified,
+        events_by_pillar=pillar_counts,
+    )
+
+    # ── Sort the paginated row list ─────────────────────────────────
+    # Defaults: event_date desc (newest first).  Unknown sort_by falls
+    # back to event_date.  Null values for the chosen column always sort
+    # to the end regardless of direction — the analyst should never have
+    # to scroll past blank rows to find data.
+    if sort_by not in _SORTABLE_FIELDS:
+        sort_by = "event_date"
+    if sort_dir not in {"asc", "desc"}:
+        sort_dir = "desc"
+    descending = sort_dir == "desc"
+
+    def _is_null(ev: RiskEvent) -> bool:
+        if sort_by == "title":
+            return not (ev.title or "").strip()
+        if sort_by == "event_type":
+            return not (ev.event_type or "").strip()
+        if sort_by == "source_system":
+            sd = ev.source_document
+            return sd is None or sd.source is None
+        if sort_by == "severity_score":
+            return ev.severity_score is None
+        if sort_by == "event_date":
+            return ev.event_date is None
+        return False
+
+    def _value(ev: RiskEvent):
+        if sort_by == "title":
+            return (ev.title or "").lower()
+        if sort_by == "event_type":
+            return (ev.event_type or "").lower()
+        if sort_by == "source_system":
+            sd = ev.source_document
+            return (sd.source.name if sd and sd.source else "").lower()
+        if sort_by == "severity_score":
+            return ev.severity_score or 0.0
+        if sort_by == "event_date":
+            # Use a comparable epoch number so NULL handling is symmetric.
+            return ev.event_date.timestamp() if ev.event_date else 0.0
+        return 0
+
+    # Partition into has-value + nulls so nulls always trail.
+    with_value = [e for e in all_events if not _is_null(e)]
+    null_value = [e for e in all_events if _is_null(e)]
+    with_value.sort(key=_value, reverse=descending)
+    all_events = with_value + null_value
+
+    start = (page - 1) * limit
+    page_events = all_events[start:start + limit]
+    page_event_ids = [e.id for e in page_events]
+
+    # Bulk-fetch geographies + source for the page slice only — avoids
+    # the N+1 that would happen if we eager-loaded on the materialised
+    # set up top (we'd be loading source_document for events not on the
+    # current page).
+    geo_by_event: dict[int, list[str]] = {}
+    if page_event_ids:
+        geo_rows = db.execute(
+            select(RiskEventGeography.risk_event_id, RiskEventGeography.country_code)
+            .where(RiskEventGeography.risk_event_id.in_(page_event_ids))
+        ).all()
+        for eid, cc in geo_rows:
+            geo_by_event.setdefault(eid, []).append((cc or "").upper())
+
+    source_meta_by_event: dict[int, tuple[Optional[str], Optional[str]]] = {}
+    if page_event_ids:
+        meta_rows = db.execute(
+            select(RiskEvent.id, Source.name, SourceDocument.url)
+            .join(SourceDocument, SourceDocument.id == RiskEvent.source_document_id)
+            .join(Source, Source.id == SourceDocument.source_id)
+            .where(RiskEvent.id.in_(page_event_ids))
+        ).all()
+        for eid, sname, surl in meta_rows:
+            source_meta_by_event[eid] = (sname, surl)
+
+    rows: list[MaterialRiskEventRow] = []
+    for e in page_events:
+        sname, surl = source_meta_by_event.get(e.id, (None, None))
+        rows.append(
+            MaterialRiskEventRow(
+                id=e.id,
+                title=e.title,
+                summary=e.summary,
+                event_type=e.event_type,
+                event_subtype=e.event_subtype,
+                severity_score=e.severity_score,
+                confidence_score=e.confidence_score,
+                event_date=e.event_date,
+                verified=e.verified,
+                pillars_affected=_coerce_pillars(e.risk_categories_json),
+                source_system=sname,
+                source_url=surl,
+                geography_codes=geo_by_event.get(e.id, []),
+            )
+        )
+
+    return MaterialRiskEventsResponse(
+        summary=summary,
+        events=rows,
+        total=total,
+        page=page,
+        limit=limit,
+    )
 
 
 # ---------------------------------------------------------------------------

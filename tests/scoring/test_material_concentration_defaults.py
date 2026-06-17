@@ -347,6 +347,12 @@ class TestThinDataProfiles:
         # Lithium typically has hhi but not reserve_hhi or capacity_utilization.
         # Concentration should reflect ONLY the hhi component, not borrow
         # 0.5 midpoints for the other slots.
+        #
+        # Step 1 update (2026-06-15): the raw hhi_score now flows through
+        # ``hhi_concentration_risk`` (DOJ-aligned cliff mapping) before
+        # weighting.  Raw 0.6 → cliff value in the "very highly concentrated"
+        # band.  Expected formula: 0.45 × hhi_concentration_risk(0.6).
+        from app.services.scoring.material_risk import hhi_concentration_risk
         _, conc, _, diag = _derive_market_material_inputs(
             sqlite_session,
             material_id=1,
@@ -355,8 +361,9 @@ class TestThinDataProfiles:
             trade_events=[],
             as_of_date=AS_OF,
         )
-        # Only hhi contributes: 0.45 × 0.6 = 0.27
-        assert conc == pytest.approx(0.27)
+        # Only hhi contributes: 0.45 × cliff(0.6)
+        expected_conc = 0.45 * hhi_concentration_risk(0.6)
+        assert conc == pytest.approx(expected_conc, abs=1e-4)
         # Diagnostic confirms only one of the five components was real.
         real_flags = [
             diag["concentration"]["production_hhi_data_backed"],

@@ -121,6 +121,221 @@ _EXPORT_GEOGRAPHY_CONTEXT = "primary"
 _TARIFF_GEOGRAPHY_CONTEXT = "affected"
 
 
+# ---------------------------------------------------------------------------
+# 2026-06-16 — Batch-mode preload cache
+# ---------------------------------------------------------------------------
+# The hot loop in ``score_all_hs_nodes`` calls ``score_hs_node_geography``
+# for every (hs_mapping_id × country) pair.  Per pair we previously did
+# ~6 SQL roundtrips, four of which depend ONLY on hs_mapping_id (not on
+# country):
+#
+#   1. latest reference_year for production shares
+#   2. all production shares for that year
+#   3. the mapping's (material_id, supply_chain_stage)
+#   4. _get_related_hs_mapping_ids — 2 sub-queries per call
+#
+# At ~4,500 pairs × 6 queries = ~27,000 roundtrips.  Hoisting (1)-(4) once
+# per mapping (~500-1,000 mappings) cuts that to ~4,000 cache-build queries
+# plus 2-3 per pair = ~14,000 — roughly 50% fewer queries.
+#
+# Cache is in memory for the duration of one batch run, then garbage
+# collected.  Cache misses fall back to the original per-row queries so
+# standalone ``score_hs_node_geography(..., cache=None)`` keeps working.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass as _dc, field as _dc_field
+
+
+@_dc
+class HsNodeScoringCache:
+    """Bulk-loaded per-mapping data shared across a batch run.
+
+    Each field is keyed by ``hs_mapping_id`` and depends only on the
+    mapping (not on the country) — so the same value is reused across
+    every (mapping × country) pair the loop visits for that mapping.
+    """
+
+    # Mapping metadata: (material_id, supply_chain_stage, hs_code_prefix).
+    mapping_meta_by_id: dict[int, tuple] = _dc_field(default_factory=dict)
+    # Latest reference_year that has production_share data for this mapping
+    # in the requested market_scope.  ``None`` value means "we checked,
+    # there are no shares" so the cache miss path is unnecessary.
+    latest_year_by_mapping_id: dict[int, Optional[int]] = _dc_field(default_factory=dict)
+    # All shares for (mapping_id, latest_year, market_scope).  Empty list
+    # when no rows exist.
+    shares_by_mapping_id: dict[int, list] = _dc_field(default_factory=dict)
+    # Result of _get_related_hs_mapping_ids — (related_ids_set, meta_dict).
+    related_by_mapping_id: dict[int, tuple[set[int], dict]] = _dc_field(default_factory=dict)
+    # Flag the cache was fully populated — distinguishes "cache built,
+    # this mapping legitimately missing" from "cache wasn't given".
+    built: bool = False
+
+
+def build_hs_node_scoring_cache(
+    db: Session,
+    hs_mapping_ids: list[int],
+    market_scope: str,
+    as_of_date: date,
+) -> HsNodeScoringCache:
+    """Preload the per-mapping queries that ``score_hs_node_geography``
+    repeats for every country during a batch run.
+
+    Build pattern: ONE bulk SELECT per kind, walk rows in Python to
+    populate dict.  Total cost is O(N_mappings) queries instead of
+    O(N_pairs × 4).
+    """
+    cache = HsNodeScoringCache()
+    if not hs_mapping_ids:
+        cache.built = True
+        return cache
+
+    log.info(
+        "hs_node_scorer.cache.build_start",
+        mapping_count=len(hs_mapping_ids),
+        market_scope=market_scope,
+    )
+
+    # ── 1. Mapping metadata (one query) ─────────────────────────────────
+    meta_rows = db.execute(
+        select(
+            HsCodeMaterialMapping.id,
+            HsCodeMaterialMapping.material_id,
+            HsCodeMaterialMapping.supply_chain_stage,
+            HsCodeMaterialMapping.hs_code_prefix,
+        ).where(HsCodeMaterialMapping.id.in_(hs_mapping_ids))
+    ).all()
+    for r in meta_rows:
+        cache.mapping_meta_by_id[r.id] = (r.material_id, r.supply_chain_stage, r.hs_code_prefix)
+
+    # ── 2. Latest year per mapping (one query) ──────────────────────────
+    # GROUP BY mapping_id gives us the max year for each in a single
+    # roundtrip instead of one MAX() per pair.
+    year_rows = db.execute(
+        select(
+            HsCodeProductionShare.hs_mapping_id,
+            func.max(HsCodeProductionShare.reference_year).label("latest_year"),
+        )
+        .where(
+            HsCodeProductionShare.hs_mapping_id.in_(hs_mapping_ids),
+            HsCodeProductionShare.market_scope == market_scope,
+        )
+        .group_by(HsCodeProductionShare.hs_mapping_id)
+    ).all()
+    for r in year_rows:
+        cache.latest_year_by_mapping_id[r.hs_mapping_id] = r.latest_year
+    # Fill missing entries with None so the lookup is unambiguous.
+    for mid in hs_mapping_ids:
+        cache.latest_year_by_mapping_id.setdefault(mid, None)
+
+    # ── 3. All shares for each (mapping, latest_year) (one query) ───────
+    # Build (mapping_id, year) tuples we care about, then SELECT in one
+    # round-trip.  Most mappings share the same latest_year so this is
+    # heavily compressed.
+    by_mapping_and_year = [
+        (mid, yr) for mid, yr in cache.latest_year_by_mapping_id.items() if yr is not None
+    ]
+    if by_mapping_and_year:
+        # Pull all shares for the relevant (mapping, year) pairs in one shot.
+        # ``filter`` on the composite is cleanest via a tuple-in-VALUES list.
+        mapping_ids_with_year = [mid for mid, _ in by_mapping_and_year]
+        share_rows = db.execute(
+            select(HsCodeProductionShare).where(
+                HsCodeProductionShare.hs_mapping_id.in_(mapping_ids_with_year),
+                HsCodeProductionShare.market_scope == market_scope,
+            )
+        ).scalars().all()
+        # Group in Python: only keep the rows matching each mapping's
+        # latest_year.
+        for share in share_rows:
+            target_year = cache.latest_year_by_mapping_id.get(share.hs_mapping_id)
+            if share.reference_year == target_year:
+                cache.shares_by_mapping_id.setdefault(share.hs_mapping_id, []).append(share)
+    # Fill empties so the consumer doesn't have to .get() with default.
+    for mid in hs_mapping_ids:
+        cache.shares_by_mapping_id.setdefault(mid, [])
+
+    # ── 4. Related mapping IDs per mapping (parent/child propagation) ───
+    # _get_related_hs_mapping_ids does TWO queries per call: one for our
+    # row, one for siblings.  Hoist both into a single sibling-by-material
+    # SELECT.  First, group our cached mappings by material_id.
+    mappings_by_material: dict[int, list[tuple[int, str]]] = {}
+    for mid, (material_id, _stage, prefix) in cache.mapping_meta_by_id.items():
+        if material_id is None:
+            cache.related_by_mapping_id[mid] = (
+                {mid},
+                {
+                    "primary_mapping_id": mid,
+                    "parent_mapping_ids": [],
+                    "child_mapping_ids_excluded": [],
+                    "total_propagated": 0,
+                    "skipped_reason": "mapping_or_material_missing",
+                    "propagation_rule": "parent_to_child_only",
+                },
+            )
+            continue
+        mappings_by_material.setdefault(material_id, []).append(
+            (mid, (prefix or "").replace(".", "").strip())
+        )
+
+    # ALL siblings for ALL relevant materials in one query — keyed by
+    # material_id so the per-mapping classification stays cheap.
+    relevant_material_ids = list(mappings_by_material.keys())
+    sibling_index: dict[int, list[tuple[int, str]]] = {}
+    if relevant_material_ids:
+        sibling_rows = db.execute(
+            select(
+                HsCodeMaterialMapping.id,
+                HsCodeMaterialMapping.material_id,
+                HsCodeMaterialMapping.hs_code_prefix,
+            ).where(HsCodeMaterialMapping.material_id.in_(relevant_material_ids))
+        ).all()
+        for r in sibling_rows:
+            prefix = (r.hs_code_prefix or "").replace(".", "").strip()
+            if not prefix:
+                continue
+            sibling_index.setdefault(r.material_id, []).append((r.id, prefix))
+
+    # Now classify each mapping using its material's sibling list.
+    for material_id, mappings in mappings_by_material.items():
+        full_siblings = sibling_index.get(material_id, [])
+        for mid, our_prefix in mappings:
+            if not our_prefix:
+                cache.related_by_mapping_id[mid] = (
+                    {mid},
+                    {
+                        "primary_mapping_id": mid,
+                        "parent_mapping_ids": [],
+                        "child_mapping_ids_excluded": [],
+                        "total_propagated": 0,
+                        "skipped_reason": "empty_prefix",
+                        "propagation_rule": "parent_to_child_only",
+                    },
+                )
+                continue
+            # Exclude self from siblings before classifying.
+            siblings_for_us = [(sid, sp) for sid, sp in full_siblings if sid != mid]
+            parents, children = _classify_hs_relations(our_prefix, siblings_for_us)
+            cache.related_by_mapping_id[mid] = (
+                {mid, *parents},
+                {
+                    "primary_mapping_id": mid,
+                    "parent_mapping_ids": sorted(parents),
+                    "child_mapping_ids_excluded": sorted(children),
+                    "total_propagated": len(parents),
+                    "propagation_rule": "parent_to_child_only",
+                },
+            )
+
+    cache.built = True
+    log.info(
+        "hs_node_scorer.cache.build_done",
+        mapping_meta=len(cache.mapping_meta_by_id),
+        share_buckets=len(cache.shares_by_mapping_id),
+        related_buckets=len(cache.related_by_mapping_id),
+    )
+    return cache
+
+
 def _compute_hhi(shares: list[float]) -> float:
     """Herfindahl-Hirschman Index from a list of fractional production shares.
 
@@ -416,6 +631,7 @@ def score_hs_node_geography(
     as_of_date: date,
     *,
     market_scope: str = "global",
+    cache: Optional[HsNodeScoringCache] = None,
 ) -> Optional[HsCodeGeographyRiskScore]:
     """Compute and persist a Level-0 score for one (HS node × country) pair.
 
@@ -453,27 +669,46 @@ def score_hs_node_geography(
     """
     # ── 1. Find the most recent reference year with production share data ──
     # May be None — that triggers the event-only fallback path below.
-    latest_year: Optional[int] = db.scalar(
-        select(func.max(HsCodeProductionShare.reference_year)).where(
-            HsCodeProductionShare.hs_mapping_id == hs_mapping_id,
-            HsCodeProductionShare.market_scope == market_scope,
+    # 2026-06-16: cache-aware.  In batch mode the latest_year and the
+    # full share list are preloaded once per mapping by
+    # ``build_hs_node_scoring_cache``, so the per-pair code becomes a
+    # dict lookup instead of two DB roundtrips.
+    if cache is not None and cache.built and hs_mapping_id in cache.latest_year_by_mapping_id:
+        latest_year = cache.latest_year_by_mapping_id[hs_mapping_id]
+    else:
+        latest_year = db.scalar(
+            select(func.max(HsCodeProductionShare.reference_year)).where(
+                HsCodeProductionShare.hs_mapping_id == hs_mapping_id,
+                HsCodeProductionShare.market_scope == market_scope,
+            )
         )
-    )
 
     # ── 2. Load production shares (only if a year exists) ───────────────────
     all_shares: list[HsCodeProductionShare] = []
     production_share: float = 0.0
-    hhi_at_stage: Optional[float] = None
+    # Step 1.5 (2026-06-15): keep raw and cliff-mapped HHI as separate
+    # variables.  Raw value goes into ``metadata.hhi_raw`` for transparency
+    # (was the only field before this commit); cliff value is what feeds
+    # the composite_node_score below.  Composite math used raw HHI prior
+    # to this fix, which systematically under-scored producer countries
+    # with structural concentration — e.g. cobalt × DRC at raw HHI 0.59
+    # → composite 29.5, where the cliff mapping (per DOJ HMG tiers)
+    # gives 0.97 → composite 48.5.  See material_risk.hhi_concentration_risk.
+    hhi_raw_value: Optional[float] = None  # truly raw HHI from share squared sum
+    hhi_at_stage: Optional[float] = None   # cliff-mapped — used in scoring
     if latest_year is not None:
-        all_shares = list(
-            db.scalars(
-                select(HsCodeProductionShare).where(
-                    HsCodeProductionShare.hs_mapping_id == hs_mapping_id,
-                    HsCodeProductionShare.reference_year == latest_year,
-                    HsCodeProductionShare.market_scope == market_scope,
-                )
-            ).all()
-        )
+        if cache is not None and cache.built and hs_mapping_id in cache.shares_by_mapping_id:
+            all_shares = list(cache.shares_by_mapping_id[hs_mapping_id])
+        else:
+            all_shares = list(
+                db.scalars(
+                    select(HsCodeProductionShare).where(
+                        HsCodeProductionShare.hs_mapping_id == hs_mapping_id,
+                        HsCodeProductionShare.reference_year == latest_year,
+                        HsCodeProductionShare.market_scope == market_scope,
+                    )
+                ).all()
+            )
         # ── 3. This country's production share (0.0 if not in dataset) ──
         country_row = next(
             (s for s in all_shares if s.country_code == country_code), None
@@ -483,7 +718,13 @@ def score_hs_node_geography(
         share_values = [
             s.production_share for s in all_shares if s.production_share > 0
         ]
-        hhi_at_stage = _compute_hhi(share_values)
+        hhi_raw_value = _compute_hhi(share_values)
+        # Step 1.5 (2026-06-15): apply DOJ-aligned HHI cliff before the
+        # composite uses this value.  Without this, raw HHI 0.59 (cobalt
+        # at the cobalt-ore HS node) contributes only 29.5 to composite
+        # when the structural concentration story merits ~48.
+        from app.services.scoring.material_risk import hhi_concentration_risk
+        hhi_at_stage = hhi_concentration_risk(hhi_raw_value)
 
     # ── 11.1.A (2026-06) ── parent/child HS propagation
     # Events tagged to a parent (4-digit chapter) or child (6-digit
@@ -493,9 +734,14 @@ def score_hs_node_geography(
     # the 4-digit node and not its 6-digit children.  Same-material
     # filter prevents cross-material contamination on shared chapters
     # (e.g. HS 2615 covers Nb/Ta/V/Zr).
-    related_mapping_ids, hs_propagation_meta = _get_related_hs_mapping_ids(
-        db, hs_mapping_id,
-    )
+    # 2026-06-16: cache-aware.  Batch runs preload the parent/child
+    # propagation set once per mapping.
+    if cache is not None and cache.built and hs_mapping_id in cache.related_by_mapping_id:
+        related_mapping_ids, hs_propagation_meta = cache.related_by_mapping_id[hs_mapping_id]
+    else:
+        related_mapping_ids, hs_propagation_meta = _get_related_hs_mapping_ids(
+            db, hs_mapping_id,
+        )
 
     # ── 5. Tariff events scoped to this HS code AND this country ────────────
     # G11 (2026-05-06): tariff events are import-side interventions where the
@@ -600,14 +846,19 @@ def score_hs_node_geography(
     # the facility query — load them once here.  ``stage_for_op`` is None
     # when the mapping pre-dates the stage column or wasn't seeded with
     # one; in that case operational stays None too.
-    mapping_row = db.execute(
-        select(
-            HsCodeMaterialMapping.material_id,
-            HsCodeMaterialMapping.supply_chain_stage,
-        ).where(HsCodeMaterialMapping.id == hs_mapping_id)
-    ).one_or_none()
-    material_id = mapping_row.material_id if mapping_row else None
-    stage_for_op = mapping_row.supply_chain_stage if mapping_row else None
+    # 2026-06-16: cache-aware.  Mapping metadata is preloaded once per
+    # mapping in batch runs.
+    if cache is not None and cache.built and hs_mapping_id in cache.mapping_meta_by_id:
+        material_id, stage_for_op, _prefix_unused = cache.mapping_meta_by_id[hs_mapping_id]
+    else:
+        mapping_row = db.execute(
+            select(
+                HsCodeMaterialMapping.material_id,
+                HsCodeMaterialMapping.supply_chain_stage,
+            ).where(HsCodeMaterialMapping.id == hs_mapping_id)
+        ).one_or_none()
+        material_id = mapping_row.material_id if mapping_row else None
+        stage_for_op = mapping_row.supply_chain_stage if mapping_row else None
     operational_signal: Optional[float] = None
     op_facility_count: int = 0
     op_at_risk: float = 0.0
@@ -751,7 +1002,13 @@ def score_hs_node_geography(
     metadata: dict = {
         "reference_year":      latest_year,    # None on event-only fallback
         "share_country_count": len(all_shares),
-        "hhi_raw":             round(hhi_at_stage, 4) if hhi_at_stage is not None else None,
+        # Step 1.5 (2026-06-15): ``hhi_raw`` is the truly raw Σ share².
+        # ``hhi_cliff`` is the DOJ-aligned cliff-mapped value that ACTUALLY
+        # feeds composite_node_score below.  Pre-1.5 ``hhi_raw`` carried
+        # the raw value and the composite math also used the raw value;
+        # we now split them so consumers can see both without ambiguity.
+        "hhi_raw":             round(hhi_raw_value, 4) if hhi_raw_value is not None else None,
+        "hhi_cliff":           round(hhi_at_stage, 4) if hhi_at_stage is not None else None,
         "tariff_event_count":  len(tariff_events),
         "export_event_count":  len(export_events),
         # 11.7-HS-F5 (2026-06-07): top-3 truncation visibility.  When the
@@ -972,6 +1229,16 @@ def score_all_hs_nodes(
         market_scope=market_scope,
     )
 
+    # 2026-06-16 — preload per-mapping data once before the per-pair loop.
+    # Without this each pair re-issues ~4 metadata queries (latest_year,
+    # all_shares, related mappings, mapping meta) that depend only on
+    # hs_mapping_id.  See ``build_hs_node_scoring_cache`` for what's
+    # cached and the math behind the speedup.
+    distinct_mapping_ids = sorted({mid for mid, _ in pairs})
+    cache = build_hs_node_scoring_cache(
+        db, distinct_mapping_ids, market_scope, as_of_date,
+    )
+
     # 2026-06-12: Batch commits with per-pair savepoints + defensive
     # connection-drop recovery.
     #
@@ -1033,6 +1300,7 @@ def score_all_hs_nodes(
                 country_code=country_code,
                 as_of_date=as_of_date,
                 market_scope=market_scope,
+                cache=cache,
             )
             if result is None:
                 pairs_skipped += 1

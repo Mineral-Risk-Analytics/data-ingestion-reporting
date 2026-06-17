@@ -6,7 +6,7 @@ import json
 from typing import Optional
 
 import typer
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.logging import configure_logging
@@ -304,6 +304,18 @@ def ingest_usgs_cmd(
         capacity_shares_written = 0
         hs_shares_written = 0
         hs_shares_skipped_no_mapping = 0
+        # ── Same-stage HHI propagation counters (Step 2A, 2026-06) ──────────
+        # MCS publishes country production shares at the material × stage
+        # level, but the parser writes them to only the ONE hs_code_material_
+        # mappings row resolved as that stage's anchor.  Result: cobalt has
+        # 24 HS mappings but only 1 with shares (4% coverage), so 96% of
+        # cobalt HS nodes fall to ``event_only_no_hhi`` in hs_node_scorer.
+        # Fix: after writing the anchor row, replicate the same country
+        # distribution to every OTHER same-material same-stage mapping that
+        # has no production-share data, tagged with source='usgs_mcs_propagated'
+        # so consumers can tell propagated rows from primary ones.
+        hs_shares_propagated = 0
+        hs_shares_propagation_targets_skipped = 0
         us_import_shares_written = 0
         us_import_shares_skipped_no_mapping = 0
         # 2026-06-14: counters for the USGS Salient Price extraction
@@ -628,6 +640,16 @@ def ingest_usgs_cmd(
             #     Looks up by (material_id, prefix, scope=global).  Used for
             #     sub-type overrides where multiple HS prefixes share a stage
             #     (Silicon ferrosilicon vs silicon metal — both refined).
+            # Step 2A (2026-06) — track each (stage → anchor) we write so we
+            # can fan out the same country distribution to sibling HS
+            # mappings after the loop ends.  Keyed by supply_chain_stage so
+            # we only propagate within the same stage of the material.
+            # ``stage_anchors`` value shape:
+            #   {stage: {"anchor_mapping_id": int,
+            #            "type_substring": str,
+            #            "shares": [(country_code, share, volume), ...]}}
+            stage_anchors: dict[str, dict] = {}
+
             for hs_share in hs_production_shares:
                 hs_prefix = hs_share.get("hs_code_prefix") or ""
                 stage = hs_share.get("stage")
@@ -694,6 +716,118 @@ def ingest_usgs_cmd(
                     existing_hs_share.production_share = hs_share["production_share"]
                     existing_hs_share.production_volume = hs_share["production_volume"]
                     hs_shares_written += 1
+
+                # Step 2A — collect for same-stage propagation.  We propagate
+                # only when ``supply_chain_stage`` is known on the resolved
+                # anchor mapping (parser ``stage`` field may be empty for
+                # prefix-resolved rows; fall back to the DB column).
+                anchor_stage = hs_mapping.supply_chain_stage or stage
+                if anchor_stage is None:
+                    continue
+                bucket = stage_anchors.setdefault(anchor_stage, {
+                    "anchor_mapping_id": hs_mapping.id,
+                    "type_substring": hs_share.get("type_substring", ""),
+                    "shares": [],
+                })
+                # If multiple sub-types resolve to the same stage via
+                # DIFFERENT anchor mappings (e.g. ferrosilicon vs silicon
+                # metal — both "refined"), keep only the first anchor.
+                # The other sub-types remain primary rows on their own
+                # mappings; we just don't fan their distribution out a
+                # second time on top of the first anchor's fan-out.
+                if bucket["anchor_mapping_id"] == hs_mapping.id:
+                    bucket["shares"].append((
+                        hs_share["country_code"],
+                        hs_share["production_share"],
+                        hs_share.get("production_volume"),
+                    ))
+
+            # ── Step 2A — same-stage HHI propagation ────────────────────
+            # For each (material, stage) anchor that received primary share
+            # data, copy the SAME country distribution to every OTHER
+            # hs_code_material_mappings row for this material with the same
+            # supply_chain_stage that has NO existing production share data
+            # for this reference year.  Rows are written with
+            # source='usgs_mcs_propagated' so the unique constraint
+            # (..., source) allows primary + propagated rows to coexist for
+            # the same (hs_mapping, country, year, scope) if both ever apply,
+            # and so consumers can distinguish them.
+            #
+            # Why this exists: MCS publishes a single country distribution
+            # per (material × stage), and the parser writes it to one anchor
+            # mapping.  For cobalt with 24 HS mappings that produces 4%
+            # coverage, leaving 96% of cobalt HS nodes to fall back to
+            # event_only_no_hhi in hs_node_scorer.  Same-stage propagation
+            # is the cheapest bridge to lift coverage without inventing
+            # numbers: the country mix at the anchor's stage is methodo-
+            # logically the closest available proxy for siblings at the
+            # same stage.  Cross-stage propagation is NOT done — that's a
+            # bigger assumption (mining mix ≠ refining mix).
+            if force and stage_anchors:
+                # Clear stale propagated rows for this material before
+                # refanning.  Primary 'usgs_mcs' rows are NOT touched.
+                s.execute(
+                    delete(HsCodeProductionShare)
+                    .where(
+                        HsCodeProductionShare.source == "usgs_mcs_propagated",
+                        HsCodeProductionShare.reference_year == mcs_year,
+                        HsCodeProductionShare.market_scope == "global",
+                        HsCodeProductionShare.hs_mapping_id.in_(
+                            select(HsCodeMaterialMapping.id).where(
+                                HsCodeMaterialMapping.material_id == material.id
+                            )
+                        ),
+                    )
+                )
+
+            for stage_name, bucket in stage_anchors.items():
+                anchor_id = bucket["anchor_mapping_id"]
+                anchor_shares = bucket["shares"]
+                if not anchor_shares:
+                    continue
+                sibling_mappings = list(s.scalars(
+                    select(HsCodeMaterialMapping).where(
+                        HsCodeMaterialMapping.material_id == material.id,
+                        HsCodeMaterialMapping.supply_chain_stage == stage_name,
+                        HsCodeMaterialMapping.market_scope == "global",
+                        HsCodeMaterialMapping.id != anchor_id,
+                    )
+                ).all())
+                for sibling in sibling_mappings:
+                    # Skip siblings that already carry data of any source
+                    # for this (year, scope) — don't clobber genuine data.
+                    has_existing = s.scalar(
+                        select(HsCodeProductionShare.id).where(
+                            HsCodeProductionShare.hs_mapping_id == sibling.id,
+                            HsCodeProductionShare.reference_year == mcs_year,
+                            HsCodeProductionShare.market_scope == "global",
+                        ).limit(1)
+                    )
+                    if has_existing is not None:
+                        hs_shares_propagation_targets_skipped += 1
+                        continue
+                    for country_code, share, _volume in anchor_shares:
+                        s.add(HsCodeProductionShare(
+                            hs_mapping_id=sibling.id,
+                            country_code=country_code,
+                            reference_year=mcs_year,
+                            production_share=share,
+                            # production_volume intentionally NULL on
+                            # propagated rows — the country MIX is what
+                            # propagates defensibly, not absolute tonnages.
+                            production_volume=None,
+                            market_scope="global",
+                            source="usgs_mcs_propagated",
+                            notes=(
+                                f"Propagated from anchor hs_mapping_id={anchor_id} "
+                                f"(stage={stage_name!r}, sub-type="
+                                f"{bucket['type_substring']!r}).  Country mix "
+                                f"only — volumes intentionally omitted.  HHI "
+                                f"is methodologically valid; absolute tonnage "
+                                f"comparisons are not."
+                            ),
+                        ))
+                        hs_shares_propagated += 1
 
             # ── US import-source rows (market_scope='us', 2026 only) ──────
             # Each Import Sources row tells us what fraction of US imports
@@ -883,6 +1017,10 @@ def ingest_usgs_cmd(
             "capacity_shares_written": capacity_shares_written,
             "hs_shares_written": hs_shares_written,
             "hs_shares_skipped_no_mapping": hs_shares_skipped_no_mapping,
+            # Step 2A (2026-06): same-stage HHI propagation — see CLI
+            # initialisation block for full rationale.
+            "hs_shares_propagated": hs_shares_propagated,
+            "hs_shares_propagation_targets_skipped": hs_shares_propagation_targets_skipped,
             "us_import_shares_written": us_import_shares_written,
             "us_import_shares_skipped_no_mapping": us_import_shares_skipped_no_mapping,
             # 2026-06-14: USGS Salient Price extraction (mcs2026_parser.{_extract_prices_from_salient,
@@ -2704,6 +2842,115 @@ def ingest_sec_edgar_cmd(
         s.close()
 
 
+@app.command("sec-body-fetch")
+def sec_body_fetch_cmd(
+    cik: Optional[str] = typer.Option(
+        None,
+        "--cik",
+        help=(
+            "Comma-separated list of CIKs to limit fetching to.  "
+            "Mutually exclusive with --launch-list (CIK list wins if both)."
+        ),
+    ),
+    launch_list: bool = typer.Option(
+        False,
+        "--launch-list",
+        help=(
+            "Restrict to companies linked to launch-list materials via "
+            "CompanyMaterialExposure or CompanyFacility.  Falls back to "
+            "ALL CIK-having companies if both tables are empty (today's "
+            "state) with a warning."
+        ),
+    ),
+    forms: str = typer.Option(
+        "10-K,20-F",
+        "--forms",
+        help=(
+            "Comma-separated form codes to process.  Default 10-K,20-F.  "
+            "10-Q + 8-K body extraction deferred to v1.1."
+        ),
+    ),
+    max_filings: Optional[int] = typer.Option(
+        None,
+        "--max-filings",
+        help="Cap on number of filings processed (useful for dry-runs).",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "Re-parse filings that already have FilingBodySection rows.  "
+            "Default: skip filings where every target section is already "
+            "present (idempotent re-runs)."
+        ),
+    ),
+) -> None:
+    """Fetch SEC filing bodies and parse them into filing_body_sections.
+
+    SEC Workstream B (migration 049, 2026-06).  Walks existing SEC
+    SourceDocument rows, fetches each filing's primary_document_url
+    with the SEC-required User-Agent, runs the three-layer section
+    parser (edgartools → regex → LLM-locator stub), and upserts the
+    extracted sections.
+
+    Prerequisites:
+    \b
+      bdi-ingest ingest-sec-edgar         # populate SourceDocument metadata
+      bdi-ingest backfill-cik-map         # link Companies to CIKs
+
+    Examples:
+    \b
+      bdi-ingest sec-body-fetch --launch-list --max-filings 10  # smoke test
+      bdi-ingest sec-body-fetch --launch-list                   # full launch-10 backfill
+      bdi-ingest sec-body-fetch --cik 0000915779 --force        # re-parse Albemarle
+      bdi-ingest sec-body-fetch --forms 10-K                    # 10-K only
+
+    Per filing the fetcher commits independently so a crash mid-batch
+    preserves partial progress.  Rate-limited at ~6.7 req/s (under SEC's
+    10 req/s ceiling).
+    """
+    from app.services.ingestion.sec_body_fetcher import (
+        DEFAULT_TARGET_FORMS,
+        fetch_filing_bodies,
+    )
+
+    target_forms = frozenset(
+        {f.strip() for f in forms.split(",") if f.strip()}
+    )
+    if not target_forms:
+        target_forms = DEFAULT_TARGET_FORMS
+
+    cik_filter: Optional[list[str]] = None
+    if cik:
+        cik_filter = [
+            c.strip().zfill(10) for c in cik.split(",") if c.strip()
+        ]
+
+    s = _session()
+    try:
+        summary = fetch_filing_bodies(
+            s,
+            target_forms=target_forms,
+            cik_filter=cik_filter,
+            launch_list_only=launch_list and cik_filter is None,
+            max_filings=max_filings,
+            force=force,
+        )
+        # Final commit is a safety net — fetch_filing_bodies commits per
+        # filing internally, so this is usually a no-op.
+        s.commit()
+        typer.echo(json.dumps(summary.to_dict(), indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(
+            json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}),
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
 @app.command("ingest-gleif")
 def ingest_gleif_cmd(
     rate_limit_delay: float = typer.Option(
@@ -2796,6 +3043,65 @@ def ingest_worldbank_cmd(
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("ingest-wgi")
+def ingest_wgi_cmd(
+    local_path: Optional[str] = typer.Option(
+        None,
+        "--local-path",
+        help=(
+            "Path to a local WGI file (.xlsx OR .csv).  Recommended over "
+            "--url since the World Bank rotates the published URL each "
+            "January.  Long-format CSV is the most reliable input — see "
+            "the module docstring for the expected column layout."
+        ),
+    ),
+    url: Optional[str] = typer.Option(
+        None,
+        "--url",
+        help=(
+            "Override the World Bank WGI bulk-Excel URL.  Defaults to "
+            "WORLDBANK_WGI_URL env var or the module's documented default."
+        ),
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="UPDATE existing country-year-source rows in place.",
+    ),
+) -> None:
+    """Ingest World Bank Worldwide Governance Indicators (WGI) per country.
+
+    Populates ``country_governance_signals``.  Used by Step 3's
+    Geopolitical-pillar governance overlay.  Six WGI dimensions per
+    country × reference_year, plus a denormalised composite percentile.
+
+    Examples:
+
+    \b
+      bdi-ingest ingest-wgi --local-path data/governance/wgi_2024_long.csv
+      bdi-ingest ingest-wgi --url https://example.com/wgi.xlsx
+      bdi-ingest ingest-wgi --local-path wgi.xlsx --force
+    """
+    from app.services.ingestion.ingest_worldbank_wgi import ingest_worldbank_wgi
+
+    s = _session()
+    try:
+        summary = ingest_worldbank_wgi(
+            s, local_path=local_path, url=url, force=force,
+        )
+        s.commit()
+        typer.echo(json.dumps(summary, indent=2, default=str))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(
+            json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}),
+            err=True,
+        )
         raise typer.Exit(code=1)
     finally:
         s.close()
