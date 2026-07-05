@@ -104,7 +104,7 @@ _MCS_2026_CSV: list[_AliasRow] = [
     ("mcs_2026_csv", "GERMANIUM",                      "Germanium"),
     ("mcs_2026_csv", "GRAPHITE (NATURAL)",             "Natural Graphite"),
     ("mcs_2026_csv", "INDIUM",                         "Indium"),
-    ("mcs_2026_csv", "IRON ORE",                       "Iron Ore (LFP Grade)"),
+    ("mcs_2026_csv", "IRON ORE",                       "Iron Ore"),
     ("mcs_2026_csv", "LITHIUM",                        "Lithium"),
     ("mcs_2026_csv", "MAGNESIUM COMPOUNDS",            None, "Partner: use MAGNESIUM METAL chapter for the canonical."),
     ("mcs_2026_csv", "MAGNESIUM METAL",                "Magnesium"),
@@ -112,7 +112,7 @@ _MCS_2026_CSV: list[_AliasRow] = [
     ("mcs_2026_csv", "MOLYBDENUM",                     "Molybdenum"),
     ("mcs_2026_csv", "NICKEL",                         "Nickel"),
     ("mcs_2026_csv", "NIOBIUM (COLUMBIUM)",            "Niobium"),
-    ("mcs_2026_csv", "PHOSPHATE ROCK",                 "Phosphate (Battery Grade)"),
+    ("mcs_2026_csv", "PHOSPHATE ROCK",                 "Phosphate"),
     ("mcs_2026_csv", "PLATINUM-GROUP METALS",          "Platinum-Group Metals"),
     ("mcs_2026_csv", "RARE EARTHS",                    "Rare Earth Elements"),
     ("mcs_2026_csv", "RHENIUM",                        "Rhenium"),
@@ -153,7 +153,7 @@ _MCS_2026_CSV: list[_AliasRow] = [
     ("mcs_2026_csv", "GYPSUM",                    None, "Wallboard / cement additive — not battery-relevant."),
     ("mcs_2026_csv", "HELIUM AND RARE GASES",     None, "Inert gases — not battery-relevant."),
     ("mcs_2026_csv", "IODINE",                    None, "Pharma / X-ray contrast — not battery-relevant."),
-    ("mcs_2026_csv", "IRON AND STEEL",            None, "Bulk steel — Iron Ore (LFP Grade) is the battery-relevant canonical, fed from IRON ORE chapter."),
+    ("mcs_2026_csv", "IRON AND STEEL",            None, "Bulk steel — Iron Ore is the battery-relevant canonical, fed from IRON ORE chapter."),
     ("mcs_2026_csv", "IRON AND STEEL SCRAP",      None, "Bulk recycle — not in scope; battery scrap is tracked separately."),
     ("mcs_2026_csv", "IRON AND STEEL SLAG",       None, "Construction aggregate — not battery-relevant."),
     ("mcs_2026_csv", "IRON OXIDE PIGMENTS",       None, "Coatings/pigments — not battery-relevant."),
@@ -214,14 +214,14 @@ _MCS_2025_CSV: list[_AliasRow] = [
     ("mcs_2025_csv", "Gemanium",                       "Germanium"),  # USGS typo, sic
     ("mcs_2025_csv", "Graphite",                       "Natural Graphite"),
     ("mcs_2025_csv", "Indium",                         "Indium"),
-    ("mcs_2025_csv", "Iron Ore  ",                     "Iron Ore (LFP Grade)"),
+    ("mcs_2025_csv", "Iron Ore  ",                     "Iron Ore"),
     ("mcs_2025_csv", "Lithium ",                       "Lithium"),
     ("mcs_2025_csv", "Magnesium Compounds",            "Magnesium"),
     ("mcs_2025_csv", "Manganese",                      "Manganese"),
     ("mcs_2025_csv", "Molybdenum ",                    "Molybdenum"),
     ("mcs_2025_csv", "Nickel",                         "Nickel"),
     ("mcs_2025_csv", "Niobium",                        "Niobium"),
-    ("mcs_2025_csv", "Phosphate rock ",                "Phosphate (Battery Grade)"),
+    ("mcs_2025_csv", "Phosphate rock ",                "Phosphate"),
     ("mcs_2025_csv", "Platinum-Group metals",          "Platinum-Group Metals"),
     ("mcs_2025_csv", "Rare earths",                    "Rare Earth Elements"),
     ("mcs_2025_csv", "Rhenium",                        "Rhenium"),
@@ -261,14 +261,14 @@ _MCS_PDF: list[_AliasRow] = [
     ("mcs_pdf", "GERMANIUM",                      "Germanium"),
     ("mcs_pdf", "GRAPHITE (NATURAL)",             "Natural Graphite"),
     ("mcs_pdf", "INDIUM",                         "Indium"),
-    ("mcs_pdf", "IRON ORE",                       "Iron Ore (LFP Grade)"),
+    ("mcs_pdf", "IRON ORE",                       "Iron Ore"),
     ("mcs_pdf", "LITHIUM",                        "Lithium"),
     ("mcs_pdf", "MAGNESIUM",                      "Magnesium"),
     ("mcs_pdf", "MANGANESE",                      "Manganese"),
     ("mcs_pdf", "MOLYBDENUM",                     "Molybdenum"),
     ("mcs_pdf", "NICKEL",                         "Nickel"),
     ("mcs_pdf", "NIOBIUM",                        "Niobium"),
-    ("mcs_pdf", "PHOSPHATE ROCK",                 "Phosphate (Battery Grade)"),
+    ("mcs_pdf", "PHOSPHATE ROCK",                 "Phosphate"),
     ("mcs_pdf", "PLATINUM-GROUP METALS",          "Platinum-Group Metals"),
     ("mcs_pdf", "RARE EARTHS",                    "Rare Earth Elements"),
     ("mcs_pdf", "RHENIUM",                        "Rhenium"),
@@ -317,7 +317,7 @@ _FIG10_PRICES: list[_AliasRow] = [
     ("fig10_prices", "Manganese",                                  "Manganese"),
     ("fig10_prices", "Nickel",                                     "Nickel"),
     ("fig10_prices", "Niobium, ferroniobium",                      "Niobium"),
-    ("fig10_prices", "Phosphate",                                  "Phosphate (Battery Grade)"),
+    ("fig10_prices", "Phosphate",                                  "Phosphate"),
     ("fig10_prices", "Rhenium, metal",                             "Rhenium"),
     ("fig10_prices", "Silicon, metal",                             "Silicon (Anode Grade)"),
     ("fig10_prices", "Silver",                                     "Silver"),
@@ -416,7 +416,7 @@ _WORLDBANK_PINKSHEET: list[_AliasRow] = [
     ("worldbank_pinksheet", "Palladium",        None, "Bundled into Platinum-Group Metals; would collide with Platinum on the unique constraint."),
     ("worldbank_pinksheet", "Rhodium",          None, "Bundled into Platinum-Group Metals (see Palladium reasoning)."),
     ("worldbank_pinksheet", "Lead",             None, "Not battery-relevant in our scope."),
-    ("worldbank_pinksheet", "Iron ore, cfr spot", None, "Iron ore is tracked at LFP-grade only via material 'Iron Ore (LFP Grade)'; Pink Sheet's 62% Fe spot is the wrong basis for LFP signal."),
+    ("worldbank_pinksheet", "Iron ore, cfr spot", None, "Iron ore is tracked at LFP-grade only via material 'Iron Ore'; Pink Sheet's 62% Fe spot is the wrong basis for LFP signal."),
     ("worldbank_pinksheet", "Tungsten",         None, "No reliable Pink Sheet benchmark; stays material-level via USGS only."),
 ]
 
@@ -533,16 +533,16 @@ _MRDS: list[_AliasRow] = [
     ("mrds", "Silicon metal",          "Silicon (Anode Grade)"),
     ("mrds", "Si",                     "Silicon (Anode Grade)"),
 
-    # ── Phosphate (Battery Grade) ────────────────────────────────────────
-    ("mrds", "Phosphate",              "Phosphate (Battery Grade)"),
-    ("mrds", "Phosphorite",            "Phosphate (Battery Grade)"),
-    ("mrds", "Phosphate rock",         "Phosphate (Battery Grade)"),
-    ("mrds", "P",                      "Phosphate (Battery Grade)"),
+    # ── Phosphate ────────────────────────────────────────
+    ("mrds", "Phosphate",              "Phosphate"),
+    ("mrds", "Phosphorite",            "Phosphate"),
+    ("mrds", "Phosphate rock",         "Phosphate"),
+    ("mrds", "P",                      "Phosphate"),
     # USGS MRDS uses this hyphenated string for every phosphate-bearing
     # row — discovered 2026-05-12 when the dev DB had 0 phosphate facility
     # links despite ~3,100 MRDS rows mentioning phosphate.  See parallel
     # entry in MRDS_COMMODITY_MAP in mrds.py.
-    ("mrds", "Phosphorus-Phosphates",  "Phosphate (Battery Grade)"),
+    ("mrds", "Phosphorus-Phosphates",  "Phosphate"),
 
     # ── Chromium (incl. chromite ore alias) ──────────────────────────────
     ("mrds", "Chromium",               "Chromium"),
@@ -574,10 +574,10 @@ _MRDS: list[_AliasRow] = [
     ("mrds", "Zircon",                 "Zirconium"),
     ("mrds", "Zr",                     "Zirconium"),
 
-    # ── Iron Ore (LFP Grade) ─────────────────────────────────────────────
-    ("mrds", "Iron",                   "Iron Ore (LFP Grade)"),
-    ("mrds", "Iron ore",               "Iron Ore (LFP Grade)"),
-    ("mrds", "Fe",                     "Iron Ore (LFP Grade)"),
+    # ── Iron Ore ─────────────────────────────────────────────
+    ("mrds", "Iron",                   "Iron Ore"),
+    ("mrds", "Iron ore",               "Iron Ore"),
+    ("mrds", "Fe",                     "Iron Ore"),
 
     # ── Magnesium (incl. magnesite ore alias) ────────────────────────────
     ("mrds", "Magnesium",              "Magnesium"),
@@ -714,9 +714,9 @@ _FEDERAL_REGISTER_TOPICS: list[_AliasRow] = [
 
     # Generic→specific: FR uses the generic mineral name; we resolve to
     # our battery-grade canonical (the only one in the materials roster).
-    ("federal_register_topic", "iron",        "Iron Ore (LFP Grade)"),
-    ("federal_register_topic", "iron ore",    "Iron Ore (LFP Grade)"),
-    ("federal_register_topic", "phosphate",   "Phosphate (Battery Grade)"),
+    ("federal_register_topic", "iron",        "Iron Ore"),
+    ("federal_register_topic", "iron ore",    "Iron Ore"),
+    ("federal_register_topic", "phosphate",   "Phosphate"),
 
     # REE spelling variants — FR uses all three forms across documents.
     ("federal_register_topic", "rare earth",   "Rare Earth Elements"),

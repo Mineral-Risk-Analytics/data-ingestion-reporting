@@ -86,8 +86,8 @@ class TestJunctionRowsData:
     def test_lfp_has_lithium_iron_phosphate(self):
         lfp_materials = {row[1] for row in _JUNCTION_ROWS if row[0] == "lfp"}
         assert "Lithium" in lfp_materials
-        assert "Iron Ore (LFP Grade)" in lfp_materials
-        assert "Phosphate (Battery Grade)" in lfp_materials
+        assert "Iron Ore" in lfp_materials
+        assert "Phosphate" in lfp_materials
 
     def test_sodium_ion_does_not_use_lithium(self):
         nai_materials = {row[1] for row in _JUNCTION_ROWS if row[0] == "sodium_ion"}
@@ -212,8 +212,8 @@ class TestSeedBatteryChemistryJunctions:
         chems = [_make_chemistry("lfp", 1)]
         mats = [
             _make_material("Lithium", 1),
-            _make_material("Iron Ore (LFP Grade)", 2),
-            _make_material("Phosphate (Battery Grade)", 3),
+            _make_material("Iron Ore", 2),
+            _make_material("Phosphate", 3),
             _make_material("Natural Graphite", 4),
             _make_material("Copper", 5),
             _make_material("Aluminum", 6),
@@ -230,8 +230,8 @@ class TestSeedBatteryChemistryJunctions:
         chems = [_make_chemistry("lfp", 1)]
         mats = [
             _make_material("Lithium", 1),
-            _make_material("Iron Ore (LFP Grade)", 2),
-            _make_material("Phosphate (Battery Grade)", 3),
+            _make_material("Iron Ore", 2),
+            _make_material("Phosphate", 3),
             _make_material("Natural Graphite", 4),
             _make_material("Copper", 5),
             _make_material("Aluminum", 6),
@@ -264,8 +264,8 @@ class TestSeedBatteryChemistryJunctions:
         chems = [_make_chemistry("lfp", 1)]
         mats = [
             _make_material("Lithium", 1),
-            _make_material("Iron Ore (LFP Grade)", 2),
-            _make_material("Phosphate (Battery Grade)", 3),
+            _make_material("Iron Ore", 2),
+            _make_material("Phosphate", 3),
             _make_material("Natural Graphite", 4),
             _make_material("Copper", 5),
             _make_material("Aluminum", 6),

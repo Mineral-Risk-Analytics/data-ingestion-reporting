@@ -366,7 +366,7 @@ ranked by feasibility:**
 | Source | Coverage | Cost | Stage-aware? | Path |
 |---|---|---|---|---|
 | **USGS MRDS** (auto-stage from `dev_stat`/`oper_type`) | US-heavy + some global, historical | Free | After mapping (N4 fix) | Already partially integrated; close N4 to enable |
-| **GEM Iron Ore Mines Tracker** | Iron ore only — relevant to LFP cathodes | Free | Yes | One-off ingester for `Iron Ore (LFP Grade)` material |
+| **GEM Iron Ore Mines Tracker** | Iron ore only — relevant to LFP cathodes | Free | Yes | One-off ingester for `Iron Ore` material |
 | **Manually curated partner facility list** | Whatever partner can curate by hand | Free (partner labour) | Yes | Spreadsheet → seed file pattern |
 | **Benchmark Mineral Intelligence** | Battery-grade Li / Co / Ni / graphite, comprehensive | $$$ paid sub | Yes (their core product) | Subscription decision |
 | **S&P Global Market Intelligence — Metals & Mining** | Comprehensive global asset-level | $$$$ paid sub | Yes | Subscription decision |

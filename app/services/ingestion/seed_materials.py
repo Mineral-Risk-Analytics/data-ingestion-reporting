@@ -149,6 +149,19 @@ _MATERIALS: list[dict] = [
         "notes": "Borate electrolyte additives (LiBOB, LiBF4). Geographically concentrated in Turkey/USA.",
     },
     {
+        "canonical_name": "Bromine",
+        "category": "component",
+        "symbol_or_code": "Br",
+        "hs_codes": ["2801", "2811"],
+        "is_ira_critical_mineral": False,
+        "is_eu_crma_critical": False,
+        "notes": "Bromine + brominated compounds. Not battery-primary but tracked because Albemarle "
+                 "Specialties segment (Arkansas brine + Dead Sea via Jordan Bromine Company JV) uses it as "
+                 "core input for fire-safety chemicals + specialty compounds. Also used in lithium-metal "
+                 "battery R&D. Supply concentrated in USA (Arkansas), Dead Sea basin (Israel + Jordan), "
+                 "and China.",
+    },
+    {
         "canonical_name": "Chromium",
         "category": "component",
         "symbol_or_code": "Cr",
@@ -212,7 +225,7 @@ _MATERIALS: list[dict] = [
         "notes": "BMS / power-electronics indium-tin-oxide. Limited direct cell role.",
     },
     {
-        "canonical_name": "Iron Ore (LFP Grade)",
+        "canonical_name": "Iron Ore",
         "category": "cathode_active",
         "symbol_or_code": "Fe",
         "hs_codes": ["2601"],
@@ -284,7 +297,7 @@ _MATERIALS: list[dict] = [
         "notes": "NbTi-O fast-charge anode candidate. Brazilian CBMM holds ~85% of primary supply.",
     },
     {
-        "canonical_name": "Phosphate (Battery Grade)",
+        "canonical_name": "Phosphate",
         "category": "cathode_active",
         "symbol_or_code": "P",
         "hs_codes": ["2510"],
@@ -560,8 +573,8 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     # LFP (Lithium Iron Phosphate)
     # ------------------------------------------------------------------
     ("lfp", "Lithium",              "cathode_active",    0.90, False),
-    ("lfp", "Iron Ore (LFP Grade)", "cathode_active",    0.90, False),
-    ("lfp", "Phosphate (Battery Grade)", "cathode_active", 0.90, False),
+    ("lfp", "Iron Ore", "cathode_active",    0.90, False),
+    ("lfp", "Phosphate", "cathode_active", 0.90, False),
     ("lfp", "Natural Graphite",     "anode",             0.85, True),
     ("lfp", "Copper",               "current_collector", 0.30, True),
     ("lfp", "Aluminum",             "current_collector", 0.30, True),
@@ -582,9 +595,9 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     # LFMP (Lithium Iron Manganese Phosphate)
     # ------------------------------------------------------------------
     ("lfmp", "Lithium",              "cathode_active",    0.90, False),
-    ("lfmp", "Iron Ore (LFP Grade)", "cathode_active",    0.70, False),
+    ("lfmp", "Iron Ore", "cathode_active",    0.70, False),
     ("lfmp", "Manganese",            "cathode_active",    0.30, False),
-    ("lfmp", "Phosphate (Battery Grade)", "cathode_active", 0.90, False),
+    ("lfmp", "Phosphate", "cathode_active", 0.90, False),
     ("lfmp", "Natural Graphite",     "anode",             0.85, True),
     ("lfmp", "Copper",               "current_collector", 0.30, True),
     ("lfmp", "Aluminum",             "current_collector", 0.30, True),
@@ -596,7 +609,7 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     # Materials more geographically distributed, reducing concentration risk.
     # ------------------------------------------------------------------
     ("sodium_ion", "Sodium",              "cathode_active",    0.90, False),
-    ("sodium_ion", "Iron Ore (LFP Grade)","cathode_active",    0.70, True),   # NFPP variant
+    ("sodium_ion", "Iron Ore","cathode_active",    0.70, True),   # NFPP variant
     ("sodium_ion", "Manganese",           "cathode_active",    0.50, True),   # layered oxide
     ("sodium_ion", "Natural Graphite",    "anode",             0.50, True),   # hard carbon better
     ("sodium_ion", "Aluminum",            "current_collector", 0.50, True),   # can replace Cu

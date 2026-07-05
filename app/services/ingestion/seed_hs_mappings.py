@@ -78,9 +78,9 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Natural graphite — all forms", 1.0, "ore", 4, "global"),
 
     # ── Phosphate ─────────────────────────────────────────────────────────
-    ("2510", "Phosphate (Battery Grade)",
+    ("2510", "Phosphate",
      "Natural calcium phosphates and phosphatic chalk", 1.0, "ore", 4, "global"),
-    ("2809", "Phosphate (Battery Grade)",
+    ("2809", "Phosphate",
      "Diphosphorus pentaoxide; phosphoric acid (processed phosphate)",
      0.9, "battery_grade", 4, "global"),
 
@@ -95,8 +95,8 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("8104", "Magnesium",
      "Magnesium and articles thereof — unwrought metal", 1.0, "refined", 4, "global"),
 
-    # ── Iron Ore (LFP Grade) ──────────────────────────────────────────────
-    ("2601", "Iron Ore (LFP Grade)",
+    # ── Iron Ore ──────────────────────────────────────────────
+    ("2601", "Iron Ore",
      "Iron ores and concentrates, including roasted iron pyrites", 1.0, "ore", 4, "global"),
 
     # ── Manganese ─────────────────────────────────────────────────────────
@@ -393,12 +393,12 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Carbonaceous pastes for electrodes (anode-side cell input).",
      0.6, "battery_grade", 6, "global"),
 
-    # ── Phosphate (Battery Grade) (6-digit) ──────────────────────────────
-    ("251010", "Phosphate (Battery Grade)",
+    # ── Phosphate (6-digit) ──────────────────────────────
+    ("251010", "Phosphate",
      "Natural calcium phosphates, unground", 1.0, "ore", 6, "global"),
-    ("251020", "Phosphate (Battery Grade)",
+    ("251020", "Phosphate",
      "Natural calcium phosphates, ground", 1.0, "ore", 6, "global"),
-    ("280920", "Phosphate (Battery Grade)",
+    ("280920", "Phosphate",
      "Phosphoric acid and polyphosphoric acids (battery-grade H3PO4 precursor)",
      0.9, "battery_grade", 6, "global"),
 
@@ -444,13 +444,13 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("810490", "Magnesium",
      "Wrought magnesium and magnesium articles", 1.0, "fabricated", 6, "global"),
 
-    # ── Iron Ore (LFP Grade) (6-digit) ───────────────────────────────────
-    ("260111", "Iron Ore (LFP Grade)",
+    # ── Iron Ore (6-digit) ───────────────────────────────────
+    ("260111", "Iron Ore",
      "Iron ores and concentrates, non-agglomerated", 1.0, "ore", 6, "global"),
-    ("260112", "Iron Ore (LFP Grade)",
+    ("260112", "Iron Ore",
      "Iron ores and concentrates, agglomerated (pellets, sinter feed)",
      1.0, "ore", 6, "global"),
-    ("260120", "Iron Ore (LFP Grade)",
+    ("260120", "Iron Ore",
      "Roasted iron pyrites (iron sinter)", 0.9, "concentrate", 6, "global"),
 
     # ── Manganese (6-digit) ───────────────────────────────────────────────
@@ -1226,7 +1226,7 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     # 2026-06-11 HS coverage expansion — Tier 1 (high-leverage gaps)
     # ─────────────────────────────────────────────────────────────────────
     # Audit found several launch-mineral × stage cells missing entirely.
-    # Most consequential: Iron Ore (LFP Grade) had no battery_grade or
+    # Most consequential: Iron Ore had no battery_grade or
     # intermediate stage at all — the LFP cathode precursor (FeSO4) was
     # invisible to scoring.  Nickel was missing the MHP/MHC battery_grade
     # input.  Phosphate had no intermediate stage.  Silicon had no ore
@@ -1234,11 +1234,11 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     #
     # All additions use 6-digit codes for precise stage attribution.
 
-    # ── Iron Ore (LFP Grade) — battery_grade + intermediate gaps ──────────
-    ("283329", "Iron Ore (LFP Grade)",
+    # ── Iron Ore — battery_grade + intermediate gaps ──────────
+    ("283329", "Iron Ore",
      "Iron(II) sulfate (FeSO4) — LFP cathode precursor (heptahydrate FeSO4·7H2O)",
      0.4, "battery_grade", 6, "global"),
-    ("284290", "Iron Ore (LFP Grade)",
+    ("284290", "Iron Ore",
      "Other phosphate salts incl. iron(III) phosphate (FePO4) — LFP intermediate",
      0.3, "intermediate", 6, "global"),
 
@@ -1247,14 +1247,14 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Nickel oxides and hydroxides (NiO, Ni(OH)2) — MHP/MHC battery-grade precursor",
      1.0, "battery_grade", 6, "global"),
 
-    # ── Phosphate (Battery Grade) — intermediate + battery_grade gaps ────
-    ("283531", "Phosphate (Battery Grade)",
+    # ── Phosphate — intermediate + battery_grade gaps ────
+    ("283531", "Phosphate",
      "Sodium triphosphate (Na5P3O10) — phosphate intermediate",
      0.8, "intermediate", 6, "global"),
-    ("283539", "Phosphate (Battery Grade)",
+    ("283539", "Phosphate",
      "Other polyphosphates — phosphate intermediate (residual; covers K/NH4 polyphosphates too)",
      0.5, "intermediate", 6, "global"),
-    ("283525", "Phosphate (Battery Grade)",
+    ("283525", "Phosphate",
      "Calcium hydrogenorthophosphate (dicalcium phosphate) — feed/battery precursor",
      0.7, "battery_grade", 6, "global"),
 
@@ -1502,14 +1502,14 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "manganese metal",
     ],
 
-    # ── Phosphate (Battery Grade) ────────────────────────────────────────
+    # ── Phosphate ────────────────────────────────────────
     # 2026-06-14: Added so the hs_resolver can map USGS / Pink Sheet
     # phosphate-rock benchmarks back to specific HS rows.  USGS Salient
     # "Price, average value, f.o.b. mine" applies to phosphate rock at
     # the mine — which is HS 2510.10 (unground) at the canonical stage.
     # 251020 (ground) covers the post-beneficiation form when downstream
     # processors quote it.  Partner should adjust if convention shifts.
-    ("251010", "Phosphate (Battery Grade)"): [
+    ("251010", "Phosphate"): [
         "phosphate rock",
         "natural calcium phosphate",
         "unground phosphate rock",
@@ -1518,7 +1518,7 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "phosphate rock F.O.B.",
         "rock phosphate",
     ],
-    ("251020", "Phosphate (Battery Grade)"): [
+    ("251020", "Phosphate"): [
         "ground phosphate rock",
         "beneficiated phosphate rock",
         "phosphate concentrate",
@@ -1634,12 +1634,12 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "unwrought aluminum, alloyed",
     ],
 
-    # ── Iron Ore (LFP Grade) ─────────────────────────────────────────────
-    ("2601", "Iron Ore (LFP Grade)"): [
+    # ── Iron Ore ─────────────────────────────────────────────
+    ("2601", "Iron Ore"): [
         "iron ore",
         "iron pyrites",
     ],
-    ("260111", "Iron Ore (LFP Grade)"): [
+    ("260111", "Iron Ore"): [
         "iron ore, non-agglomerated",
         # 2026-06-14: price-source vocabulary for the USGS Salient
         # "Price, average unit value reported by mines" benchmark and
@@ -1652,7 +1652,7 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "CFR iron ore",
         "SGX iron ore",
     ],
-    ("260112", "Iron Ore (LFP Grade)"): [
+    ("260112", "Iron Ore"): [
         "iron ore, agglomerated",
     ],
 

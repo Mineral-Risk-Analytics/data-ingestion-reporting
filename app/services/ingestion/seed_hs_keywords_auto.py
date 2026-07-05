@@ -60,18 +60,18 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'ore and concentrates',
         'graphite, natural, other',
     ],
-    ("2510", "Phosphate (Battery Grade)"): [
+    ("2510", "Phosphate"): [
         'phosphate (battery grade)',
         'ore and concentrates',
         'natural calcium phosphates, unground',
         'natural calcium phosphates, ground',
     ],
-    ("251010", "Phosphate (Battery Grade)"): [
+    ("251010", "Phosphate"): [
         'phosphate (battery grade)',
         'ore and concentrates',
         'natural calcium phosphates, unground',
     ],
-    ("251020", "Phosphate (Battery Grade)"): [
+    ("251020", "Phosphate"): [
         'phosphate (battery grade)',
         'ore and concentrates',
         'natural calcium phosphates, ground',
@@ -140,7 +140,7 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'ore and concentrates',
         'natural cryolite',
     ],
-    ("2601", "Iron Ore (LFP Grade)"): [
+    ("2601", "Iron Ore"): [
         'iron ore (lfp grade)',
         'fe',
         'ore and concentrates',
@@ -151,14 +151,14 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'sinter',
         'roasted iron pyrites',
     ],
-    ("260111", "Iron Ore (LFP Grade)"): [
+    ("260111", "Iron Ore"): [
         'iron ore (lfp grade)',
         'fe',
         'ore and concentrates',
         'iron ores',
         'coarse',
     ],
-    ("260112", "Iron Ore (LFP Grade)"): [
+    ("260112", "Iron Ore"): [
         'iron ore (lfp grade)',
         'fe',
         'ore and concentrates',
@@ -167,7 +167,7 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'briquettes',
         'sinter',
     ],
-    ("260120", "Iron Ore (LFP Grade)"): [
+    ("260120", "Iron Ore"): [
         'iron ore (lfp grade)',
         'fe',
         'roasted iron pyrites',
@@ -487,13 +487,13 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'tb',
         'rare‑earth metals, scandium and yttrium, whether or not intermixed or interalloyed',
     ],
-    ("2809", "Phosphate (Battery Grade)"): [
+    ("2809", "Phosphate"): [
         'phosphate (battery grade)',
         'battery grade',
         'battery-grade',
         'high purity',
     ],
-    ("280920", "Phosphate (Battery Grade)"): [
+    ("280920", "Phosphate"): [
         'phosphate (battery grade)',
         'battery grade',
         'battery-grade',

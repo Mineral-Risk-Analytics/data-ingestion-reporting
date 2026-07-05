@@ -40,7 +40,7 @@ TYPE_B_CALIBRATIONS = [
     ("2617", "Antimony",                   0.50),
     ("2617", "Rare Earth Elements",        0.50),
     # 283329 ("other sulphates" — Fe/Co/Mn/Zn, market-share-weighted)
-    ("283329", "Iron Ore (LFP Grade)",     0.40),
+    ("283329", "Iron Ore",     0.40),
     ("283329", "Cobalt",                   0.25),
     ("283329", "Manganese",                0.20),
     ("283329", "Zinc",                     0.10),
@@ -85,7 +85,7 @@ TYPE_B_CALIBRATIONS = [
 TYPE_C_CALIBRATIONS = [
     ("291529", "Cobalt",                   0.30),
     ("285390", "Gallium",                  0.30),
-    ("284290", "Iron Ore (LFP Grade)",     0.30),
+    ("284290", "Iron Ore",     0.30),
     ("261790", "Rare Earth Elements",      0.30),
     ("850519", "Rare Earth Elements",      0.30),
     ("284190", "Rhenium",                  0.30),

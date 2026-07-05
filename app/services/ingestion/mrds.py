@@ -205,11 +205,11 @@ MRDS_COMMODITY_MAP: dict[str, str] = {
     "silicon metal":                "Silicon (Anode Grade)",
     "si":                           "Silicon (Anode Grade)",
 
-    # ── Phosphate (Battery Grade) ─────────────────────────────────────────────
-    "phosphate":                    "Phosphate (Battery Grade)",
-    "phosphorite":                  "Phosphate (Battery Grade)",
-    "phosphate rock":               "Phosphate (Battery Grade)",
-    "p":                            "Phosphate (Battery Grade)",
+    # ── Phosphate ─────────────────────────────────────────────
+    "phosphate":                    "Phosphate",
+    "phosphorite":                  "Phosphate",
+    "phosphate rock":               "Phosphate",
+    "p":                            "Phosphate",
     # USGS MRDS uses this single hyphenated string for phosphate-bearing rows
     # — discovered 2026-05-12 when the DB showed 0 Phosphate facilities
     # despite ~3,100 MRDS rows mentioning phosphate.  Without this entry the
@@ -217,7 +217,7 @@ MRDS_COMMODITY_MAP: dict[str, str] = {
     # runs.  Many of these rows tag phosphate as a co-product in uranium/REE
     # deposits — those get is_primary_product=False on the link, which is
     # the right semantic.
-    "phosphorus-phosphates":        "Phosphate (Battery Grade)",
+    "phosphorus-phosphates":        "Phosphate",
 
     # ── Chromium ─────────────────────────────────────────────────────────────
     "chromium":                     "Chromium",
@@ -249,10 +249,10 @@ MRDS_COMMODITY_MAP: dict[str, str] = {
     "zircon":                       "Zirconium",
     "zr":                           "Zirconium",
 
-    # ── Iron Ore (LFP Grade) ─────────────────────────────────────────────────
-    "iron":                         "Iron Ore (LFP Grade)",
-    "iron ore":                     "Iron Ore (LFP Grade)",
-    "fe":                           "Iron Ore (LFP Grade)",
+    # ── Iron Ore ─────────────────────────────────────────────────
+    "iron":                         "Iron Ore",
+    "iron ore":                     "Iron Ore",
+    "fe":                           "Iron Ore",
 
     # ── Magnesium ────────────────────────────────────────────────────────────
     "magnesium":                    "Magnesium",

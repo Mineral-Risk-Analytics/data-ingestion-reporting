@@ -57,8 +57,8 @@ BATTERY_BASKET: list[str] = [
 # this when the source text explicitly names LFP / lithium-iron-phosphate
 # chemistry rather than blanket "lithium-ion".
 EV_BATTERY_BASKET_LFP: list[str] = BATTERY_BASKET + [
-    "Phosphate (Battery Grade)",
-    "Iron Ore (LFP Grade)",
+    "Phosphate",
+    "Iron Ore",
 ]
 
 # Cathode-only — when the source names the cathode active material (CAM)

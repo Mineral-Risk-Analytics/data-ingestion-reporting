@@ -1295,7 +1295,7 @@ def seed_country_material_relevance_cmd(
     Comtrade import shares once that data is fully backfilled.
 
     Scope: the 10 launch-list materials (Lithium, Cobalt, Nickel,
-    Manganese, Natural Graphite, Phosphate (Battery Grade), Iron Ore
+    Manganese, Natural Graphite, Phosphate, Iron Ore
     (LFP Grade), Copper, Aluminum, Rare Earth Elements).
 
     Prerequisites: seed-materials, seed-countries, ingest-usgs (so
@@ -2084,6 +2084,72 @@ def seed_companies_cmd() -> None:
         raise typer.Exit(code=1)
     finally:
         s.close()
+
+
+@app.command("load-manual-risk-events")
+def load_manual_risk_events_cmd(
+    seed_path: str = typer.Option(
+        ...,
+        "--seed-path",
+        help="Path to manual_risk_events.xlsx (relative or absolute).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Validate everything; do not write to DB or spreadsheet.",
+    ),
+    reload: bool = typer.Option(
+        False,
+        "--reload",
+        help="Re-process rows even if load_status=loaded "
+             "(idempotency still applies via content_hash).",
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Per-row status output."
+    ),
+) -> None:
+    """Load manually-extracted risk events from xlsx into risk_events + junctions.
+
+    Reads the "Risk Events" sheet in the given xlsx, validates each row,
+    resolves FK references (companies, materials, facilities, regulations)
+    against seed tables, and writes to risk_events + junction tables.
+
+    Idempotent via content_hash. Writes load_status back to the spreadsheet
+    so you can see what landed.
+
+    Example:
+        bdi-ingest load-manual-risk-events \\
+            --seed-path "Automotive Data Solutions/manual_risk_events.xlsx" \\
+            --dry-run --verbose
+    """
+    from pathlib import Path
+    from scripts.load_manual_risk_events import load
+
+    path = Path(seed_path).expanduser().resolve()
+    if not path.exists():
+        typer.echo(json.dumps({"ok": False, "error": f"file_not_found:{path}"}), err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        counts = load(
+            seed_path=path,
+            dry_run=dry_run,
+            only_new=not reload,
+            verbose=verbose,
+        )
+        typer.echo(json.dumps({
+            "ok": True,
+            "mode": "dry-run" if dry_run else "load",
+            "seed_path": str(path),
+            **counts,
+        }, indent=2))
+        if counts.get("error", 0) > 0:
+            raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
 
 
 @app.command("seed-facilities")

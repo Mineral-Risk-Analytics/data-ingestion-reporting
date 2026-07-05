@@ -87,7 +87,7 @@ _ASSESSED_AT = date(2025, 1, 1)
 #   EU_CONFLICT_MINERALS         : Cobalt removed (mis-scoped),
 #                                   Tin/Tantalum/Tungsten added at
 #                                   disclosure_required (3TG actual scope)
-#   EU_CBAM                      : Iron Ore (LFP Grade) added at covered
+#   EU_CBAM                      : Iron Ore added at covered
 #
 # 2026-05-17 (later same session) — Section 3 material-scope expansions:
 #   IRA_DOMESTIC                 : metadata_json severity_overrides
@@ -96,13 +96,13 @@ _ASSESSED_AT = date(2025, 1, 1)
 #   CRMA_2024                    : Nd/Pr/Dy/Tb promoted strategic →
 #                                   restricted (already in 65%-cap
 #                                   violation today, bite is real)
-#                                : Phosphate (Battery Grade) +
+#                                : Phosphate +
 #                                   Rare Earth Elements (bundled)
 #                                   added at strategic_raw_material
 #                                   (closes phosphate + bundled-REE
 #                                   coverage gaps)
-#   EU_BATTERY_REG_2023          : Phosphate (Battery Grade) +
-#                                   Iron Ore (LFP Grade) added at
+#   EU_BATTERY_REG_2023          : Phosphate +
+#                                   Iron Ore added at
 #                                   restricted; Aluminum added at
 #                                   covered (cell-component coverage,
 #                                   no recycled-content threshold)
@@ -518,13 +518,13 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         # 2026-06-11 broader seed-coverage sweep: launch-list materials
         # that are §45X-eligible battery components but were missing from
         # the IRA scope.  Aluminum, Copper, and Silicon are all on the
-        # current US critical-minerals list; Phosphate (Battery Grade) is
+        # current US critical-minerals list; Phosphate is
         # the LFP cathode active material directly named in §45X eligible
         # component lists.  FEOC-sourced versions of any of these
         # disqualify the resulting battery / component from §45X credits.
         {"material": "Aluminum",                "scope_type": "covered", "notes": "US critical mineral; Al collector foil + casings are §45X-eligible battery components."},
         {"material": "Copper",                  "scope_type": "covered", "notes": "Added to US critical mineral list (USGS 2024); Cu current-collector foil is a §45X-eligible battery component."},
-        {"material": "Phosphate (Battery Grade)", "scope_type": "covered", "notes": "LFP cathode active material is explicitly §45X-eligible; FEOC-sourced phosphate disqualifies LFP-cathode credit."},
+        {"material": "Phosphate", "scope_type": "covered", "notes": "LFP cathode active material is explicitly §45X-eligible; FEOC-sourced phosphate disqualifies LFP-cathode credit."},
         {"material": "Silicon (Anode Grade)",   "scope_type": "covered", "notes": "US critical mineral; Si anode active material is a §45X-eligible battery component."},
     ],
     # NOTE: ``EU_BATTERY_REG_2023`` material scopes are defined further down
@@ -560,7 +560,7 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Aluminum",               "scope_type": "strategic_raw_material",
          "notes": "CRMA Annex II Strategic Raw Material (bauxite/alumina/aluminium)."},
         # LFP-chemistry materials (2026-05-17 addition)
-        {"material": "Phosphate (Battery Grade)", "scope_type": "strategic_raw_material",
+        {"material": "Phosphate", "scope_type": "strategic_raw_material",
          "notes": "LFP cathode active material; closes phosphate coverage gap identified in v2 walkthrough."},
         # Industrial / electronics
         {"material": "Boron",                  "scope_type": "strategic_raw_material"},
@@ -596,14 +596,14 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         # iron/steel, aluminium, fertilisers, electricity, hydrogen, plus
         # copper from 2026 under the aluminium-sector expansion.  We seed
         # the battery-relevant materials only.
-        # 2026-05-17 partner-direction addition: Iron Ore (LFP Grade)
+        # 2026-05-17 partner-direction addition: Iron Ore
         # added to reflect CBAM's iron/steel coverage.  LFP-chemistry
         # companies have meaningful CBAM exposure on the iron-ore side
         # that was missing from the previous seed.
         {"material": "Aluminum",              "scope_type": "covered"},
         {"material": "Nickel",                "scope_type": "covered"},
         {"material": "Copper",                "scope_type": "covered", "notes": "Copper included under aluminium sector extension from 2026."},
-        {"material": "Iron Ore (LFP Grade)",  "scope_type": "covered", "notes": "CBAM covers iron and steel imports — relevant to LFP-chemistry supply chains."},
+        {"material": "Iron Ore",  "scope_type": "covered", "notes": "CBAM covers iron and steel imports — relevant to LFP-chemistry supply chains."},
     ],
     "EU_BATTERY_REG_2023": [
         # 2026-05-17 partner-direction recalibration: scope_type bumped
@@ -617,9 +617,9 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         # per-material event impact by ~2.2× (1.10× multiplier vs 0.50×).
         #
         # 2026-05-17 partner-direction additions:
-        #   * Phosphate (Battery Grade): LFP cathode-active material —
+        #   * Phosphate: LFP cathode-active material —
         #     closes phosphate coverage gap identified in v2 walkthrough
-        #   * Iron Ore (LFP Grade): LFP cathode-active material —
+        #   * Iron Ore: LFP cathode-active material —
         #     parallel to phosphate addition above
         #   * Aluminum: cell-component (current-collector foil, cell
         #     casings, module structural) — `covered` not `restricted`
@@ -632,8 +632,8 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Nickel",                    "scope_type": "restricted", "notes": "Battery passport + due diligence from 2025. Recycled-content target 6% by 2031."},
         {"material": "Manganese",                 "scope_type": "restricted", "notes": "Battery passport + due diligence from 2025."},
         {"material": "Natural Graphite",          "scope_type": "restricted", "notes": "Battery passport + due diligence from 2025."},
-        {"material": "Phosphate (Battery Grade)", "scope_type": "restricted", "notes": "LFP cathode active material — regulated under battery-component composition framework."},
-        {"material": "Iron Ore (LFP Grade)",      "scope_type": "restricted", "notes": "LFP cathode active material — parallel to phosphate."},
+        {"material": "Phosphate", "scope_type": "restricted", "notes": "LFP cathode active material — regulated under battery-component composition framework."},
+        {"material": "Iron Ore",      "scope_type": "restricted", "notes": "LFP cathode active material — parallel to phosphate."},
         {"material": "Aluminum",                  "scope_type": "covered",    "notes": "Cell-component coverage (cathode current-collector foil, casings, module structural) — no per-material recycled-content threshold."},
         # 2026-06-11 broader seed-coverage sweep: parallel to Aluminum
         # above.  Copper foil is the anode-side current collector; Silicon
@@ -668,7 +668,7 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Copper",                  "scope_type": "disclosure_required", "notes": "DRC artisanal copper-cobalt sourcing — child-labor and environmental due-diligence concerns."},
         {"material": "Nickel",                  "scope_type": "disclosure_required", "notes": "Indonesian laterite nickel HPAL (Sulawesi) — environmental and indigenous-land due-diligence concerns."},
         {"material": "Manganese",               "scope_type": "disclosure_required", "notes": "South African and Gabonese manganese — labor-rights due-diligence concerns."},
-        {"material": "Phosphate (Battery Grade)", "scope_type": "disclosure_required", "notes": "Western Sahara phosphate (~70% of MA phosphate exports) — occupation / indigenous-rights due-diligence concerns."},
+        {"material": "Phosphate", "scope_type": "disclosure_required", "notes": "Western Sahara phosphate (~70% of MA phosphate exports) — occupation / indigenous-rights due-diligence concerns."},
         {"material": "Silicon (Anode Grade)",   "scope_type": "disclosure_required", "notes": "Xinjiang polysilicon — UFLPA-overlapping forced-labor due-diligence concerns."},
     ],
     "EU_CONFLICT_MINERALS": [
