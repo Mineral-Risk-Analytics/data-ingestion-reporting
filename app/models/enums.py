@@ -57,13 +57,32 @@ class SupplyChainStage(str, Enum):
 
 
 class FacilityType(str, Enum):
-    MINE = "mine"
-    REFINERY = "refinery"
+    """Physical facility classification, ordered roughly upstream → downstream.
+
+    Extended 2026-07-07 to unify three previously divergent taxonomies:
+    this enum (7 values), seed_facilities_partner._FACILITY_TYPES (11 values),
+    and the MRDS ingester's granular types (mine / concentrator / smelter /
+    refinery / leach / processing).  The partner loader now derives its
+    allowed set from this enum — extend HERE, not there.
+    """
+
+    MINE = "mine"                                # extraction: open pit / underground / brine / well
+    CONCENTRATOR = "concentrator"                # mill / flotation -> concentrate
+    LEACH = "leach"                              # heap / tank leach, hydromet (MRDS conservative)
+    PROCESSING = "processing"                    # ambiguous mid-stream plant (prefer a granular type)
+    SMELTER = "smelter"                          # concentrate -> matte / blister / crude metal
+    REFINERY = "refinery"                        # -> refined metal / battery-grade chemical
+    FABRICATION = "fabrication"                  # metal / alloy / magnet / component manufacture (e.g. NdFeB)
     CELL_FACTORY = "cell_factory"
     PACK_PLANT = "pack_plant"
     RECYCLING = "recycling"
+    PORT = "port"                                # logistics node (export terminal, rail port)
+    EXPLORATION_PROJECT = "exploration_project"  # pre-development; pair with status=planned
+    INTEGRATED = "integrated"                    # multi-stage site (mine+smelter+refinery); prefer
+    #                                              splitting into per-stage rows where data allows
     R_AND_D = "r_and_d"
     HQ = "hq"
+    OTHER = "other"
 
 
 class FacilityStatus(str, Enum):
@@ -72,6 +91,13 @@ class FacilityStatus(str, Enum):
     UNDER_CONSTRUCTION = "under_construction"
     MOTHBALLED = "mothballed"
     CLOSED = "closed"
+    # Added 2026-07-07: accepted by seed_facilities_partner since inception
+    # but missing here; distinct from mothballed (active preservation,
+    # restart-ready — e.g. Albemarle Kemerton trains, BHP WA Nickel).
+    CARE_MAINTENANCE = "care_maintenance"
+    SUSPENDED = "suspended"  # involuntary/indefinite halt (strike, flooding, court order)
+    DIVESTED = "divested"    # company-facility link ended by sale; facility may
+    #                          continue operating under the new owner
 
 
 class ComplianceStatus(str, Enum):

@@ -59,6 +59,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from app.models.company import Company
+from app.models.enums import FacilityStatus, FacilityType
 from app.models.facility import CompanyFacility, Facility, FacilityMaterialLink
 from app.models.supply import HsCodeMaterialMapping, Material
 
@@ -70,15 +71,10 @@ log = structlog.get_logger(__name__)
 # here must also be added to facility_seed_template.xlsx so the partner
 # sees them in her Excel drop-down.
 
-_FACILITY_TYPES = {
-    "mine", "refinery", "smelter", "concentrator",
-    "processing", "recycling", "cell_factory", "pack_plant",
-    "r_and_d", "hq", "other",
-}
-_STATUSES = {
-    "operating", "planned", "under_construction",
-    "mothballed", "closed", "care_maintenance",
-}
+# Derived from the FacilityType enum (single source of truth) since
+# 2026-07-07 — extend app.models.enums.FacilityType, not this set.
+_FACILITY_TYPES = {ft.value for ft in FacilityType}
+_STATUSES = {fs.value for fs in FacilityStatus}
 _STAGES = {
     "ore", "concentrate", "intermediate", "refined",
     "battery_grade", "fabricated", "scrap",

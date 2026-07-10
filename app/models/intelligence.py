@@ -24,7 +24,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -82,6 +82,11 @@ class InsightPost(Base):
         nullable=True,
         comment="Array of ISO2 country codes, e.g. ['CN', 'CD', 'CL']",
     )
+    tags: Mapped[Optional[Any]] = mapped_column(
+        ARRAY(String),
+        nullable=True,
+        comment="Free-form searchable topic tags, e.g. ['IRA', 'FEOC'] (052)",
+    )
 
     # ---- content ----
     summary: Mapped[Optional[str]] = mapped_column(
@@ -121,6 +126,18 @@ class InsightPost(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    pinned: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", index=False,
+        comment=(
+            "Editorial top-of-feed placement (analysis/signal/news only; "
+            "reports use the latest-published featured convention). 051."
+        ),
+    )
+    hero_image_url: Mapped[Optional[str]] = mapped_column(
+        String(1024), nullable=True,
+        comment="Hero image for the Analysis layout shell (051)",
+    )
+
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

@@ -33,6 +33,11 @@ dependencies = [
     # filing_body_parser falls back to regex + LLM-locator when the
     # library can't find a target section.
     "edgartools>=4.0.0",
+    # Insight-post docx ingestion (scripts/ingest_insight_docx.py, 2026-07-08):
+    # partner authors in Word; mammoth converts docx→HTML with image
+    # extraction, markdownify produces the Markdown body for insight_posts.
+    "mammoth>=1.6",
+    "markdownify>=0.11",
 ]
 
 [project.optional-dependencies]

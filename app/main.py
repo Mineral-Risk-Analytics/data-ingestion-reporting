@@ -17,6 +17,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.routes.chart_data import router as chart_data_router
+from app.api.routes.content_assets import router as content_assets_router
 from app.api.routes.chemistries import router as chemistries_router
 from app.api.routes.companies import router as companies_router
 from app.api.routes.dashboard import router as dashboard_router
@@ -111,6 +113,10 @@ app.include_router(market_scores_router, prefix="/api/v1")
 
 # Foundation Phase 4 — Intelligence Hub (public content site backend)
 app.include_router(intelligence_router, prefix="/api/v1")
+# Public chart-data series for insight-post dataRef charts (2026-07-08)
+app.include_router(chart_data_router, prefix="/api/v1")
+# Insight-post images — served at /content-assets/* (no /api/v1: URLs live in article bodies)
+app.include_router(content_assets_router)
 
 # Foundation Phase 3 — Inngest scheduled scoring jobs.
 # Serves the standard ``/api/inngest`` discovery + invocation endpoint that

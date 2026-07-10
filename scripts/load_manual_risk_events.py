@@ -88,7 +88,7 @@ from app.services.ingestion import feature_flags
 # Canonical source row for all manually-entered events.
 _MANUAL_SOURCE_NAME = "manual_walkthrough"
 _MANUAL_SOURCE_TYPE = "manual"
-_MANUAL_SOURCE_PHASE = "manual_curation"
+_MANUAL_SOURCE_PHASE = "curated"  # 7 chars — Source.phase = String(8) constraint
 
 
 # ---------------------------------------------------------------------------

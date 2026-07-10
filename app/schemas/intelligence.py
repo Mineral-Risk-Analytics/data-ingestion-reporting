@@ -56,6 +56,9 @@ class InsightPostListItem(BaseModel):
     author: Optional[str] = None
     published_at: Optional[datetime] = None
     pdf_url: Optional[str] = None  # non-null for ``content_type == "report"``
+    pinned: bool = False
+    hero_image_url: Optional[str] = None
+    tags: Optional[list[str]] = None
 
 
 class InsightPostDetail(InsightPostListItem):
@@ -88,6 +91,7 @@ class InsightPostCreate(BaseModel):
     read_time_minutes: Optional[int] = None
     author: Optional[str] = None
     metadata_json: Optional[dict[str, Any]] = None
+    tags: Optional[list[str]] = None
 
 
 class InsightPostUpdate(BaseModel):
@@ -112,6 +116,8 @@ class InsightPostUpdate(BaseModel):
 # ---------------------------------------------------------------------------
 # Risk summary — sidebar risk indicator bars
 # ---------------------------------------------------------------------------
+    hero_image_url: Optional[str] = None
+    tags: Optional[list[str]] = None
 
 
 class MaterialRiskBar(BaseModel):

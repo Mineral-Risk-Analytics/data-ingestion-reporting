@@ -28,15 +28,17 @@ slug param is a string and would otherwise greedy-match the literal "drafts".
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import get_current_user, get_db, require_admin
 from app.models.intelligence import InsightPost
+from app.services.content.docx_convert import convert_docx_stream
 from app.models.scoring import MaterialGeographyRiskScore
 from app.models.supply import Material
 from app.schemas.common import PaginatedResponse
@@ -96,6 +98,9 @@ def list_published_posts(
     geography: Optional[str] = Query(
         None, description="Match where geography (ISO2) is in the post's geographies array"
     ),
+    tag: Optional[str] = Query(
+        None, description="Match where tag is in the post's free-form tags array"
+    ),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -111,10 +116,13 @@ def list_published_posts(
         q = q.where(_array_contains(InsightPost.materials, material))
     if geography is not None:
         q = q.where(_array_contains(InsightPost.geographies, geography.upper()))
+    if tag:
+        q = q.where(_array_contains(InsightPost.tags, tag))
 
     total = db.scalar(select(func.count()).select_from(q.subquery()))
     rows = db.scalars(
         q.order_by(
+            InsightPost.pinned.desc(),  # pinned posts surface first (051)
             InsightPost.published_at.desc().nullslast(),
             InsightPost.id.desc(),
         )
@@ -418,6 +426,128 @@ def archive_post(
     """Soft-delete a post. Row is preserved so old URLs can 301-redirect."""
     post = _get_post_or_404(db, post_id)
     post.status = "archived"
+    db.commit()
+    db.refresh(post)
+    return InsightPostDetail.model_validate(post)
+
+
+# ---------------------------------------------------------------------------
+# POST /intelligence/posts/upload-docx  (admin UI, added 2026-07-08)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/posts/upload-docx",
+    response_model=InsightPostDetail,
+    status_code=status.HTTP_201_CREATED,
+)
+def upload_docx(
+    file: UploadFile = File(...),
+    slug: str = Form(...),
+    content_type: str = Form(...),
+    title: Optional[str] = Form(None),
+    author: Optional[str] = Form(None),
+    _user: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> InsightPostDetail:
+    """Convert a partner-authored .docx into a draft InsightPost.
+
+    Runs the shared mammoth→markdownify pipeline (images extracted to
+    storage under ``insights/{slug}/``; ``[[chart: name]]`` placeholders
+    become unconfigured chart blocks for the editor's ChartConfigForm).
+    Upserts by slug; refuses to overwrite a published post.
+    """
+    if content_type not in {"analysis", "signal", "report", "news"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"invalid content_type '{content_type}'",
+        )
+    try:
+        result = convert_docx_stream(file.file, slug)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+
+    existing = db.execute(
+        select(InsightPost).where(InsightPost.slug == slug)
+    ).scalar_one_or_none()
+    if existing is not None and existing.status == "published":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"post '{slug}' is published — archive it or use a new slug",
+        )
+
+    post = existing or InsightPost(slug=slug)
+    # Filename fallback: strip extension + prettify ("first-article.docx"
+    # -> "First article") — never surface raw filenames as public titles.
+    fallback = Path(file.filename or slug).stem.replace("-", " ").replace("_", " ").strip()
+    fallback = fallback[:1].upper() + fallback[1:] if fallback else slug
+    post.title = title or result.title or fallback
+    post.content_type = content_type
+    post.body = result.markdown
+    post.read_time_minutes = (
+        result.read_time_minutes if content_type in ("analysis", "report") else None
+    )
+    if author:
+        post.author = author
+    post.status = "draft"
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return InsightPostDetail.model_validate(post)
+
+
+@router.get("/posts/by-id/{post_id}", response_model=InsightPostDetail)
+def get_post_any_status(
+    post_id: int,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> InsightPostDetail:
+    """Fetch a post regardless of status — admin editor needs draft bodies.
+
+    (``GET /posts/{slug}`` is the public route and only serves published.)
+    """
+    return InsightPostDetail.model_validate(_get_post_or_404(db, post_id))
+
+
+# ---------------------------------------------------------------------------
+# Pinning (editorial top-of-feed placement — Nicole 2026-07-08)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/posts/{post_id}/pin", response_model=InsightPostDetail)
+def pin_post(
+    post_id: int,
+    _user: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> InsightPostDetail:
+    """Pin a post above the date-ordered feed.
+
+    Reports are not pinnable — the Featured slot (latest published report)
+    is their placement mechanism; two competing mechanisms would conflict.
+    """
+    post = _get_post_or_404(db, post_id)
+    if post.content_type == "report":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="reports use the featured slot and cannot be pinned",
+        )
+    post.pinned = True
+    db.commit()
+    db.refresh(post)
+    return InsightPostDetail.model_validate(post)
+
+
+@router.post("/posts/{post_id}/unpin", response_model=InsightPostDetail)
+def unpin_post(
+    post_id: int,
+    _user: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> InsightPostDetail:
+    """Return a post to its natural date position in the feed."""
+    post = _get_post_or_404(db, post_id)
+    post.pinned = False
     db.commit()
     db.refresh(post)
     return InsightPostDetail.model_validate(post)
