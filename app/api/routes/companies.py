@@ -462,7 +462,10 @@ def get_company_events(
     stmt = (
         select(RiskEvent, RiskEventCompany)
         .join(RiskEventCompany, RiskEventCompany.risk_event_id == RiskEvent.id)
-        .where(RiskEventCompany.company_id == company_id)
+        .where(
+            RiskEventCompany.company_id == company_id,
+            RiskEvent.duplicate_of_id.is_(None),  # 055
+        )
         .order_by(desc(RiskEvent.event_date))
         .limit(limit)
     )

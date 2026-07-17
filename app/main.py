@@ -26,6 +26,7 @@ from app.api.routes.facilities import router as facilities_router
 from app.api.routes.health import router as health_router
 from app.api.routes.ingestion import router as ingestion_router
 from app.api.routes.intelligence import router as intelligence_router
+from app.api.routes.intelligence_entities import router as intelligence_entities_router
 from app.api.routes.market_scores import router as market_scores_router
 from app.api.routes.materials import router as materials_router
 from app.api.routes.regulations import router as regulations_router
@@ -113,6 +114,7 @@ app.include_router(market_scores_router, prefix="/api/v1")
 
 # Foundation Phase 4 — Intelligence Hub (public content site backend)
 app.include_router(intelligence_router, prefix="/api/v1")
+app.include_router(intelligence_entities_router, prefix="/api/v1")
 # Public chart-data series for insight-post dataRef charts (2026-07-08)
 app.include_router(chart_data_router, prefix="/api/v1")
 # Insight-post images — served at /content-assets/* (no /api/v1: URLs live in article bodies)

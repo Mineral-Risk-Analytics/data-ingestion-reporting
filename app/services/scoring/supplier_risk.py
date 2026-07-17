@@ -16,7 +16,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-SCORING_VERSION = "3.0"
+# 3.1 (2026-07-15): L0 concentration fix — hhi-anchored paths require
+# production_share > 0 (Fix A) and the composite's HHI component is
+# share-weighted, hhi × sqrt(share) (Fix B, partner-approved sqrt shape).
+# See docs/design/concentration_share_weighting.md.  Chemistry rollup
+# keeps its own methodology_version=2.0 tag (unrelated axis).
+SCORING_VERSION = "3.1"
 
 PILLAR_WEIGHTS: dict[str, float] = {
     "material":                  0.25,

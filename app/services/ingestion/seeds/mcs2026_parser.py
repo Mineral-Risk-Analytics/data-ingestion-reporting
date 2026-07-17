@@ -167,9 +167,16 @@ _DETAIL_STAGE_PATTERNS: list[tuple[str, str]] = [
     ("crude ore",           "ore"),           # BORON ore form
     ("datolite ore",        "ore"),           # BORON ore form
     ("ulexite",             "ore"),           # BORON ore mineral
-    ("refined borates",     "refined"),       # BORON refined
-    ("boric oxide",         "refined"),       # BORON refined (B2O3)
-    ("compounds",           "refined"),       # BORON refined; only chapter using "compounds" in production details
+    # 2026-07-13: retagged 'refined' → 'intermediate'.  Boron's mapping
+    # ladder has NO 'refined' stage (ore 2528 → intermediate 2810 boric
+    # oxide/acids → battery_grade 2840 refined borates), so these buckets
+    # were silently dropped at write time (hs_shares_skipped_no_mapping).
+    # The consolidated bucket's unit basis is "boric oxide equivalent",
+    # which IS the 2810 line — intermediate is the semantically exact
+    # home.  Recovers the TR ~0.85 / CN ~0.13 concentration signal.
+    ("refined borates",     "intermediate"),  # BORON → 2810 ladder
+    ("boric oxide",         "intermediate"),  # BORON B2O3 → 2810
+    ("compounds",           "intermediate"),  # BORON; only chapter using "compounds" in production details
 
     # ── GALLIUM, TITANIUM: byproduct/sponge stages ────────────────────
     # GALLIUM is recovered as a byproduct of bauxite/zinc refining — no

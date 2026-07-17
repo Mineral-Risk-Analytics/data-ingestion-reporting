@@ -600,6 +600,8 @@ def list_materials(
             .where(
                 RiskEventMaterial.material_id.in_(material_ids),
                 RiskEvent.event_date >= cutoff,
+                RiskEvent.duplicate_of_id.is_(None),  # 055
+                RiskEventMaterial.is_direct.is_(True),  # 056
             )
             .group_by(RiskEventMaterial.material_id)
         ).all()
@@ -742,6 +744,8 @@ def get_material(
             .where(
                 RiskEventMaterial.material_id == material_id,
                 RiskEvent.event_date >= cutoff_90d,
+                RiskEvent.duplicate_of_id.is_(None),  # 055
+                RiskEventMaterial.is_direct.is_(True),  # 056
             )
         )
         or 0
@@ -864,6 +868,13 @@ def list_material_risk_events(
     event_type: Optional[str] = Query(None),
     severity_min: Optional[float] = Query(None, ge=0.0, le=1.0),
     verified_only: bool = Query(False),
+    include_broad: bool = Query(
+        False,
+        description="Include broad multi-material measures (is_direct=False). "
+                    "Default off — material pages show material-specific "
+                    "events only; broad measures live in the industry-events "
+                    "surface (056).",
+    ),
     search: Optional[str] = Query(None),
     sort_by: str = Query("event_date"),
     sort_dir: str = Query("desc"),
@@ -909,8 +920,11 @@ def list_material_risk_events(
         .where(
             RiskEventMaterial.material_id == material_id,
             RiskEvent.event_date >= cutoff,
+            RiskEvent.duplicate_of_id.is_(None),  # 055
         )
     )
+    if not include_broad:
+        base = base.where(RiskEventMaterial.is_direct.is_(True))  # 056
 
     # Filter composition — applied to both the summary stats and the
     # paginated list so the cards stay in sync with the table.

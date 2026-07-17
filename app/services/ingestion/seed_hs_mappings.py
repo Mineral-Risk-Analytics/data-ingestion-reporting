@@ -61,6 +61,7 @@ _STAGE_SEQUENCE: dict[str, int] = {
     "battery_grade": 5,
     "fabricated": 6,
     "scrap": 7,
+
 }
 
 # ---------------------------------------------------------------------------
@@ -900,9 +901,14 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     # =========================================================================
 
     # ── P0 — Cobalt cathode precursors (multi-material 4-digit, mid confidence) ─
+    # 2026-07-15: stage battery_grade → intermediate.  The 4-digit parent
+    # was staged battery_grade while its 6-digit child 282200 is
+    # intermediate — same code family, contradictory stages.  Hydroxide is
+    # refinery FEEDSTOCK (DRC crude Co(OH)2 / Indonesian MHP), not a
+    # battery-grade output; intermediate matches the child and reality.
     ("2822", "Cobalt",
      "Cobalt oxides and hydroxides — Co(OH)2 cathode precursor at 282200",
-     1.0, "battery_grade", 4, "global"),
+     1.0, "intermediate", 4, "global"),
     ("2833", "Cobalt",
      "Sulphates — cobalt sulfate (CoSO4) at 283329; cathode precursor (multi-material 4-digit)",
      0.4, "battery_grade", 4, "global"),
@@ -1242,6 +1248,19 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Other phosphate salts incl. iron(III) phosphate (FePO4) — LFP intermediate",
      0.3, "intermediate", 6, "global"),
 
+    # ── Synthetic Graphite (restored 2026-07-13; authored 2026-07-10 —
+    #    the device commit never landed; reconstructed from live DB) ──
+    ("271312", "Synthetic Graphite",
+     "Calcined petroleum coke incl. needle coke - synthetic graphite feedstock. "
+     "Code dominated by fuel/aluminium-grade CPC; needle coke has no dedicated "
+     "HS line, hence low confidence.",
+     0.4, "intermediate", 6, "global"),
+    ("380110", "Synthetic Graphite",
+     "Artificial graphite - synthetic anode material. DUAL-MAPPED with Natural "
+     "Graphite (natural AAM also ships under this code in trade practice, e.g. "
+     "Vidalia); HS definition is artificial.",
+     0.7, "battery_grade", 6, "global"),
+
     # ── Nickel — Ni(OH)2 / MHP battery_grade ──────────────────────────────
     ("282540", "Nickel",
      "Nickel oxides and hydroxides (NiO, Ni(OH)2) — MHP/MHC battery-grade precursor",
@@ -1427,11 +1446,40 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "high-purity manganese sulphate",
         "HPMSM",
     ],
+    # 2026-07-13: the two LFP-iron tuples (added to _MAPPINGS under the
+    # original LFP-grade scoping) only started resolving after the Iron
+    # Ore identity fix — they landed in the DB keywordless, breaking the
+    # zero-keywordless invariant from the 07-10 backfill.  Iron-specific
+    # vocabulary only; the sulfate-family overlap across 283329's four
+    # materials (Co/Mn/Zn/Fe) is handled by IDF downweighting.
+    # Deliberately NO "lithium iron phosphate"/"LFP" tokens — that is the
+    # cathode PRODUCT, not the precursor salt these nodes carry.
+    ("283329", "Iron Ore"): [
+        "iron sulfate",
+        "iron sulphate",
+        "ferrous sulfate",
+        "ferrous sulphate",
+        "FeSO4",
+        "iron(II) sulfate",
+        "copperas",
+        "battery-grade iron sulphate",
+    ],
+    ("284290", "Iron Ore"): [
+        "iron phosphate",
+        "ferric phosphate",
+        "iron(III) phosphate",
+        "FePO4",
+        "ferric orthophosphate",
+    ],
     ("380110", "Natural Graphite"): [
-        "synthetic graphite",
-        "artificial graphite",
+        "natural graphite anode material",
+        "spherical graphite",
+        "spheronized graphite",
+        "purified spherical graphite",
+        "coated spherical purified graphite",
+        "CSPG",
+        "natural AAM",
         "anode-grade graphite",
-        "synthetic anode material",
     ],
     ("380130", "Natural Graphite"): [
         "electrode paste",
@@ -1483,7 +1531,16 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
     ("750210", "Nickel"): [
         "unwrought nickel, not alloyed",
         "class 1 nickel",
-        "Ni briquette",
+        "ni briquette",
+        "primary nickel",
+        "lme nickel",
+        "london metal exchange",
+        "lme cash",
+        "nickel cathode",
+        "refined nickel",
+        "electrolytic nickel",
+        "nickel",
+        "ni",
     ],
 
     # ── Manganese ────────────────────────────────────────────────────────
@@ -1593,6 +1650,12 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
     ("260300", "Copper"): [
         "copper ores",
         "copper concentrate",
+        "copper content of ore and concentrate",
+        "copper ore and concentrate",
+        "copper",
+        "cu",
+        "ore and concentrates",
+        "copper ore and concentrates",
     ],
     ("7402", "Copper"): [
         "blister copper",
@@ -1638,22 +1701,29 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
     ("2601", "Iron Ore"): [
         "iron ore",
         "iron pyrites",
+        "iron ores and concentrates",
+        "hematite",
+        "magnetite",
+        "itabirite",
     ],
     ("260111", "Iron Ore"): [
         "iron ore, non-agglomerated",
-        # 2026-06-14: price-source vocabulary for the USGS Salient
-        # "Price, average unit value reported by mines" benchmark and
-        # the SGX / Tianjin spot for iron ore fines.  Non-agglomerated
-        # iron ore is the canonical traded form for these benchmarks.
         "iron ore fines",
         "Tianjin iron ore",
         "average unit value reported by mines",
         "mine-value iron ore",
         "CFR iron ore",
         "SGX iron ore",
+        "iron ore lump",
+        "direct shipping ore",
+        "DSO",
     ],
     ("260112", "Iron Ore"): [
         "iron ore, agglomerated",
+        "iron ore pellets",
+        "pellet feed",
+        "sinter feed",
+        "DR-grade pellets",
     ],
 
     # ── Rare Earth Elements ──────────────────────────────────────────────
@@ -1733,6 +1803,11 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
     ("810820", "Titanium"): [
         "unwrought titanium",
         "titanium sponge",
+        "titanium sponge metal",
+        "titanium metal",
+        "titanium",
+        "ti",
+        "titanium, unwrought",
     ],
 
     # ── Tungsten ─────────────────────────────────────────────────────────
@@ -1904,12 +1979,6 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
     # 260300 already has 'copper ores', 'copper concentrate' — extend with
     # the MCS-specific phrasing.  Note: this overrides the existing entry,
     # so we re-list the prior keywords too.
-    ("260300", "Copper"): [
-        "copper ores",
-        "copper concentrate",
-        "copper content of ore and concentrate",
-        "copper ore and concentrate",
-    ],
 
     # ── Germanium ────────────────────────────────────────────────────────
     ("282560", "Germanium"): [
@@ -1984,18 +2053,6 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
     # 750210 already has keywords; extend with 'primary nickel' MCS phrasing
     # plus 2026-06-14 price-source vocabulary so the hs_resolver maps
     # LME nickel cash to refined unalloyed nickel (the LME-deliverable form).
-    ("750210", "Nickel"): [
-        "unwrought nickel, not alloyed",
-        "class 1 nickel",
-        "Ni briquette",
-        "primary nickel",
-        "LME nickel",
-        "London Metal Exchange",
-        "LME cash",
-        "nickel cathode",
-        "refined nickel",
-        "electrolytic nickel",
-    ],
     ("750300", "Nickel"): [
         "nickel-containing scrap",
         "nickel scrap",
@@ -2071,12 +2128,6 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
     ],
     # 810820 already has 'unwrought titanium', 'titanium sponge'; extend
     # with the MCS phrasing variant.
-    ("810820", "Titanium"): [
-        "unwrought titanium",
-        "titanium sponge",
-        "titanium sponge metal",
-        "titanium metal",
-    ],
 
     # ── Vanadium ─────────────────────────────────────────────────────────
     ("282530", "Vanadium"): [
@@ -2137,6 +2188,261 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "zirconium, wrought",
         "wrought zirconium",
         "zirconium articles",
+    ],
+
+    # ── Restored 2026-07-13 from the live DB: the 2026-07-10 keyword
+    #    backfill (36 nodes) + Synthetic Graphite entries were dual-
+    #    written to the DB but the device commit of this file never
+    #    landed.  Includes entries for PDF-derived nodes that only
+    #    exist after ingest-mcs-pdf — harmless no-ops until then. ──
+    ("250510", "Silicon (Anode Grade)"): [
+        "silica sand",
+        "quartz sand",
+        "industrial sand",
+    ],
+    ("2530", "Lithium"): [
+        "spodumene",
+        "spodumene concentrate",
+        "lithium concentrate",
+        "SC6",
+        "lepidolite concentrate",
+        "petalite",
+        "lithium ore",
+    ],
+    ("253090", "Lithium"): [
+        "spodumene",
+        "spodumene concentrate",
+        "lithium concentrate",
+        "SC6",
+        "6% spodumene",
+    ],
+    ("261610", "Silver"): [
+        "silver ores",
+        "silver concentrate",
+        "argentiferous concentrate",
+    ],
+    ("262030", "Copper"): [
+        "copper slag",
+        "copper dross",
+        "copper residues",
+        "secondary copper",
+    ],
+    ("262040", "Aluminum"): [
+        "aluminium dross",
+        "aluminum dross",
+        "salt slag",
+        "aluminium residues",
+        "secondary aluminium",
+    ],
+    ("271312", "Synthetic Graphite"): [
+        "calcined petroleum coke",
+        "needle coke",
+        "petroleum needle coke",
+        "CPC",
+        "coal tar pitch coke",
+        "graphitization feedstock",
+    ],
+    ("280450", "Tellurium"): [
+        "tellurium",
+        "tellurium metal",
+        "refined tellurium",
+    ],
+    ("280490", "Selenium"): [
+        "selenium",
+        "selenium metal",
+        "refined selenium",
+    ],
+    ("2811", "Selenium"): [
+        "selenium dioxide",
+        "SeO2",
+        "selenious acid",
+    ],
+    ("281122", "Silicon (Anode Grade)"): [
+        "silicon dioxide",
+        "SiO2",
+        "high purity quartz",
+        "fumed silica",
+        "precipitated silica",
+    ],
+    ("281129", "Selenium"): [
+        "selenium dioxide",
+        "SeO2",
+    ],
+    ("2818", "Aluminum"): [
+        "alumina",
+        "aluminium oxide",
+        "aluminum oxide",
+        "Al2O3",
+        "smelter grade alumina",
+        "calcined alumina",
+        "aluminium hydroxide",
+    ],
+    ("281810", "Aluminum"): [
+        "artificial corundum",
+        "fused alumina",
+        "fused aluminium oxide",
+        "corundum",
+    ],
+    ("281830", "Aluminum"): [
+        "aluminium hydroxide",
+        "aluminum hydroxide",
+        "alumina trihydrate",
+        "Al(OH)3",
+        "aluminium hydrate",
+    ],
+    ("282540", "Nickel"): [
+        "nickel hydroxide",
+        "nickel oxide",
+        "Ni(OH)2",
+        "NiO",
+        "battery grade nickel hydroxide",
+    ],
+    ("283525", "Phosphate"): [
+        "dicalcium phosphate",
+        "calcium hydrogenorthophosphate",
+        "DCP",
+        "calcium hydrogen phosphate",
+    ],
+    ("283526", "Sodium"): [
+        "sodium",
+        "na",
+        "battery grade",
+        "battery-grade",
+        "high purity",
+        "sodium phosphates, tribasic",
+        "trisodium phosphate",
+    ],
+    ("283531", "Phosphate"): [
+        "sodium triphosphate",
+        "sodium tripolyphosphate",
+        "STPP",
+        "Na5P3O10",
+    ],
+    ("283539", "Phosphate"): [
+        "polyphosphates",
+        "sodium polyphosphate",
+        "phosphate salts",
+    ],
+    ("284169", "Manganese"): [
+        "manganate",
+        "permanganate",
+        "potassium permanganate",
+        "manganese salts of oxometallic acids",
+    ],
+    ("360690", "Rare Earth Elements"): [
+        "ferrocerium",
+        "mischmetal",
+        "pyrophoric alloys",
+        "cerium alloy",
+    ],
+    ("380110", "Synthetic Graphite"): [
+        "synthetic graphite",
+        "artificial graphite",
+        "synthetic anode material",
+        "graphitized anode material",
+        "graphitization",
+        "synthetic AAM",
+    ],
+    ("380120", "Natural Graphite"): [
+        "colloidal graphite",
+        "semi-colloidal graphite",
+        "graphite dispersion",
+        "graphite preparations colloidal",
+    ],
+    ("380190", "Natural Graphite"): [
+        "graphite preparations",
+        "purified graphite",
+        "micronized graphite",
+        "expandable graphite",
+        "graphite paste",
+    ],
+    ("710691", "Silver"): [
+        "silver bullion",
+        "silver unwrought",
+        "fine silver",
+        "silver metal",
+    ],
+    ("720250", "Chromium"): [
+        "ferrosilicochromium",
+        "ferro-silico-chromium",
+        "FeSiCr",
+        "silicochromium",
+    ],
+    ("720299", "Rare Earth Elements"): [
+        "ferro rare earth",
+        "rare earth ferroalloy",
+        "mischmetal ferroalloy",
+        "neodymium iron alloy",
+        "NdFe alloy",
+    ],
+    ("740819", "Copper"): [
+        "copper wire",
+        "refined copper wire",
+        "winding wire",
+        "magnet wire",
+    ],
+    ("750110", "Nickel"): [
+        "nickel matte",
+        "nickel mattes",
+        "high grade nickel matte",
+        "low grade nickel matte",
+    ],
+    ("750120", "Nickel"): [
+        "nickel oxide sinter",
+        "nickel oxide sinters",
+        "intermediate products of nickel metallurgy",
+        "nickel intermediates",
+        "mixed hydroxide precipitate",
+        "MHP",
+        "mixed hydroxide cake",
+        "MHC",
+        "mixed sulphide precipitate",
+        "MSP",
+    ],
+    ("760719", "Aluminum"): [
+        "aluminium foil",
+        "aluminum foil",
+        "battery foil",
+        "cathode foil",
+        "current collector foil",
+    ],
+    ("790111", "Zinc"): [
+        "special high grade zinc",
+        "SHG zinc",
+        "zinc 99.99",
+        "refined zinc unwrought",
+    ],
+    ("790112", "Zinc"): [
+        "casting grade zinc",
+        "high grade zinc",
+        "zinc unwrought not alloyed",
+    ],
+    ("790120", "Zinc"): [
+        "zinc alloys",
+        "zamak",
+        "zinc die casting alloy",
+    ],
+    ("811231", "Zirconium"): [
+        "hafnium",
+        "hafnium unwrought",
+        "hafnium powder",
+    ],
+    ("811239", "Zirconium"): [
+        "hafnium wrought",
+        "hafnium other",
+    ],
+    ("811249", "Rhenium"): [
+        "rhenium",
+        "rhenium metal",
+        "rhenium wrought",
+    ],
+    ("850519", "Rare Earth Elements"): [
+        "bonded NdFeB",
+        "bonded neodymium magnet",
+        "ferrite magnet",
+        "SmCo magnet",
+        "samarium cobalt magnet",
+        "permanent magnets other",
     ],
 }
 

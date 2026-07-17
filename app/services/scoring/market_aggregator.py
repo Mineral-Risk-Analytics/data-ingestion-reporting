@@ -639,6 +639,10 @@ def _derive_market_material_inputs(
             .where(
                 FacilityMaterialLink.material_id == material_id,
                 Facility.country == geography_code,
+                # 2026-07-17: floor requires a LIVE production asset —
+                # closed/planned facilities no longer fabricate presence
+                # (MRDS status triage made closures meaningful).
+                Facility.status.in_(_PRODUCTION_ASSET_STATUSES),
             )
             .limit(1)
         )
@@ -883,6 +887,10 @@ def _derive_market_geopolitical_inputs(
             .where(
                 FacilityMaterialLink.material_id == material_id,
                 Facility.country == geography_code,
+                # 2026-07-17: floor requires a LIVE production asset —
+                # closed/planned facilities no longer fabricate presence
+                # (MRDS status triage made closures meaningful).
+                Facility.status.in_(_PRODUCTION_ASSET_STATUSES),
             )
             .limit(1)
         )
@@ -1316,8 +1324,10 @@ def _derive_market_regulatory_inputs(
 # forever" with "mine temporarily idled."  The N4 audit fix (2026-05-06)
 # also stops ingesting closed MRDS rows, so for new data this is moot;
 # kept here as defense for any older rows still in the DB.
-_AT_RISK_STATUSES = frozenset({"mothballed"})
-_PRODUCTION_ASSET_STATUSES = frozenset({"operating", "mothballed"})
+_AT_RISK_STATUSES = frozenset({"mothballed", "care_maintenance", "suspended"})
+_PRODUCTION_ASSET_STATUSES = frozenset({
+    "operating", "mothballed", "care_maintenance", "suspended",
+})
 
 
 def _facility_structural_dependency(
@@ -2694,12 +2704,18 @@ def score_material_geography(
         RiskEventMaterial as _REM,
     )
 
+    from app.models.regulatory import RiskEvent as _RE_dup
     _all_intersect_ids = db.execute(
         select(_REM.risk_event_id)
         .join(_REG, _REG.risk_event_id == _REM.risk_event_id)
+        .join(_RE_dup, _RE_dup.id == _REM.risk_event_id)
         .where(
             _REM.material_id == material_id,
             _REG.country_code == geography_code,
+            # 055: confirmed cross-source duplicates don't count — this is
+            # the partner-facing "events about this material in this
+            # country" number (was 3 for one event on the DRC export ban).
+            _RE_dup.duplicate_of_id.is_(None),
         )
         .distinct()
     ).scalars().all()
@@ -2729,6 +2745,26 @@ def score_material_geography(
         n for n in hs_nodes
         if n.composite_node_score is not None
         and n.hs_mapping.supply_chain_stage in STAGE_ROLLUP_WEIGHTS
+    ]
+
+    # ── Concentration-purity filter (2026-07-15) ──────────────────────────
+    # The Material Concentration stage rollup consumes ONLY hhi-anchored
+    # Level-0 rows (score_method "hhi_anchored" / "hhi_anchored_with_
+    # operational").  Event-only and operational-only rows carry no
+    # concentration evidence — their composite is 50/50 tariff+export (or
+    # facility signal), and those same tariff/export sub-scores already
+    # reach the Geopolitical pillar via the G2 HS-node aggregate path
+    # below (which continues to use the FULL ``eligible_nodes`` list).
+    # Before this filter, an event-only node fed the same event twice:
+    # once into Geopolitical (correct) and once into Material
+    # Concentration (mislabeled — a tariff is not concentration).
+    # Materials × geographies with zero hhi-anchored nodes now fall back
+    # to the legacy material-level path instead of building a
+    # "concentration" score out of event exposure.
+    concentration_nodes = [
+        n for n in eligible_nodes
+        if n.metadata_json
+        and str(n.metadata_json.get("score_method", "")).startswith("hhi_anchored")
     ]
 
     # --- STEP 4: Derive sub-inputs ---
@@ -2799,6 +2835,18 @@ def score_material_geography(
         if n.metadata_json:
             method = n.metadata_json.get("score_method", "unknown")
         score_method_breakdown[method] = score_method_breakdown.get(method, 0) + 1
+    # Purity filter (2026-07-15): the rollup below uses only
+    # ``concentration_nodes``, so its own breakdown is by construction
+    # all hhi-anchored.  The full histogram above is kept in rationale
+    # so partners can still see what other node types exist for the pair.
+    concentration_method_breakdown: dict[str, int] = {}
+    for n in concentration_nodes:
+        method = "unknown"
+        if n.metadata_json:
+            method = n.metadata_json.get("score_method", "unknown")
+        concentration_method_breakdown[method] = (
+            concentration_method_breakdown.get(method, 0) + 1
+        )
 
     # Step 2B (2026-06-15) — Material-level HHI lift diagnostic.  Always
     # built so rationale_json carries a consistent shape regardless of
@@ -2808,19 +2856,20 @@ def score_material_geography(
     # directly — no blending needed).
     material_hhi_lift_diag: Optional[dict] = None
 
-    if len(eligible_nodes) >= _STAGE_ROLLUP_MIN_NODES:
+    if len(concentration_nodes) >= _STAGE_ROLLUP_MIN_NODES:
         # Normalised weighted average of composite_node_scores across stages
+        # — hhi-anchored nodes only (purity filter, 2026-07-15).
         weighted_sum = sum(
             n.composite_node_score * STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
-            for n in eligible_nodes
+            for n in concentration_nodes
         )
         weight_total = sum(
             STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
-            for n in eligible_nodes
+            for n in concentration_nodes
         )
         stage_rollup_score = weighted_sum / weight_total if weight_total > 0 else 0.0
         stage_rollup_method = "stage_weighted"
-        stage_rollup_count = len(eligible_nodes)
+        stage_rollup_count = len(concentration_nodes)
 
         # Step 2B — apply material-level HHI lift when most contributing
         # nodes scored without HHI signal.  This is the bridge that lets
@@ -2838,13 +2887,18 @@ def score_material_geography(
         mat_score, material_hhi_lift_diag = material_risk.apply_material_hhi_lift(
             stage_rollup_score=stage_rollup_score,
             material_floor_score=material_floor_score,
-            score_method_breakdown=score_method_breakdown,
+            # Purity filter (2026-07-15): pass the breakdown of the nodes
+            # that actually fed the rollup.  Post-filter these are all
+            # hhi-anchored, so the lift's "mostly event-only rollup"
+            # trigger no longer fires from this branch — pairs with thin
+            # HHI coverage now reach the material_fallback branch instead.
+            score_method_breakdown=concentration_method_breakdown,
             has_material_hhi_signal=has_material_hhi_signal,
         )
     else:
         mat_score = material_risk.score_material_exposure(crit, conc, trade_vol)
         stage_rollup_method = "material_fallback"
-        stage_rollup_count = len(eligible_nodes)  # 0 or 1
+        stage_rollup_count = len(concentration_nodes)  # 0 (purity filter)
 
     geo_score = geopolitical_risk.score_geopolitical_trade(
         ctry_conc, exp_rest, tariff,
@@ -2893,6 +2947,12 @@ def score_material_geography(
                 # nodes ({"event_only_no_hhi": 5}) or a mix.  Empty
                 # dict when no nodes contributed.
                 "node_score_method_breakdown": score_method_breakdown,
+                # Purity filter (2026-07-15): how many of those nodes were
+                # hhi-anchored and therefore actually fed the concentration
+                # rollup.  eligible-vs-concentration delta = event-only /
+                # operational-only nodes that now reach ONLY the
+                # Geopolitical pillar (G2 path).
+                "concentration_nodes_used": len(concentration_nodes),
                 # Step 2B (2026-06-15): when the stage rollup is built from
                 # mostly event-only nodes (sparse HS-level HHI coverage),
                 # the concentration score gets a material-level HHI floor.

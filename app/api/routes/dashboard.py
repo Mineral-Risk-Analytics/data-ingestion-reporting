@@ -583,7 +583,10 @@ def _compute_recent_risk_events_30d(
         )
         .join(SourceDocument, SourceDocument.id == RiskEvent.source_document_id)
         .join(Source, Source.id == SourceDocument.source_id)
-        .where(RiskEvent.created_at >= cutoff_30d)
+        .where(
+            RiskEvent.created_at >= cutoff_30d,
+            RiskEvent.duplicate_of_id.is_(None),  # 055
+        )
         .group_by(Source.name)
         .order_by(func.count(RiskEvent.id).desc())
         .limit(5)
@@ -682,6 +685,8 @@ def _compute_coverage_gaps(db: Session, *, now: datetime) -> CoverageGaps:
         .where(
             RiskEventMaterial.material_id.in_(materials_by_name.values()),
             RiskEvent.created_at >= cutoff_events,
+            RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEventMaterial.is_direct.is_(True),  # 056
         )
         .group_by(RiskEventMaterial.material_id)
     ).all()
@@ -833,6 +838,8 @@ def coverage_matrix(
         .join(SourceDocument, SourceDocument.id == RiskEvent.source_document_id)
         .join(Source, Source.id == SourceDocument.source_id)
         .where(
+            RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEventMaterial.is_direct.is_(True),  # 056
             RiskEventMaterial.material_id.in_(all_mat_ids or [-1]),
             RiskEvent.created_at >= cutoff,
         )

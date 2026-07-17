@@ -618,6 +618,55 @@ def parse_policy_tracker_file(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Policy direction taxonomy (2026-07-13)
+# ---------------------------------------------------------------------------
+# The tracker mixes supply-SUPPORTIVE policies (tax credits, financing,
+# permitting reform) with supply-RESTRICTIVE ones (export controls) and
+# neutral machinery (strategic lists, reporting standards).  Every event
+# previously carried metadata positive_policy=true — wrong for export
+# controls, and it blocks any future wiring of positive effects into
+# scoring (you cannot give "positive policies" a positive effect if the
+# label lies).
+#
+# Direction semantics:
+#   supportive  — reduces supply-chain risk from a buyer's perspective
+#                 (adds/diversifies supply, lowers cost of non-incumbent
+#                 capacity).  Gets POSITIVE_POLICY subtype when the event
+#                 type is INVESTMENT_PLEDGE (unchanged 2026-06-07 wiring)
+#                 and feeds the future mitigation-signal design.
+#   restrictive — constrains supply (export controls/restrictions).
+#                 STAYS informational (subtype None): GTA is the
+#                 authoritative risk-raising source for trade measures,
+#                 and giving IEA copies EXPORT_RESTRICTION subtype would
+#                 double-count the same measure in the export sub-score
+#                 (cross-source dedup does not exist).
+#   neutral     — lists, stockpiling, standards, R&D strategy machinery.
+#
+# Matching is on policyType names first (structured), then a narrow
+# keyword scan of the names string.  Order: restrictive checked BEFORE
+# supportive so "export financing restrictions" cannot land supportive.
+_RESTRICTIVE_POLICY_KEYWORDS: tuple[str, ...] = (
+    "export control", "export restriction", "export ban", "export tax",
+    "export licens", "export quota", "import ban", "import restriction",
+)
+_SUPPORTIVE_POLICY_KEYWORDS: tuple[str, ...] = (
+    "invest", "financ", "fund", "grant", "subsid", "tax credit",
+    "incentive", "permitting", "exploration", "innovation",
+    "recycling",  # capacity-adding from the buyer's perspective
+)
+
+
+def _derive_direction(policy_type_names: list[str]) -> str:
+    """supportive | restrictive | neutral — see taxonomy note above."""
+    combined = " ".join(policy_type_names).lower()
+    if any(kw in combined for kw in _RESTRICTIVE_POLICY_KEYWORDS):
+        return "restrictive"
+    if any(kw in combined for kw in _SUPPORTIVE_POLICY_KEYWORDS):
+        return "supportive"
+    return "neutral"
+
+
 def _derive_event_type(policy_type_names: list[str]) -> str:
     combined = " ".join(policy_type_names).lower()
     if any(kw in combined for kw in ("invest", "financ", "fund", "grant", "subsid")):
@@ -941,6 +990,7 @@ def ingest_policy_tracker(
 
             policy_type_names = rec["policy_type_names"]
             event_type = _derive_event_type(policy_type_names)
+            direction  = _derive_direction(policy_type_names)
             category   = _derive_category(policy_type_names)
             severity   = _derive_severity(rec["status"])
 
@@ -962,7 +1012,14 @@ def ingest_policy_tracker(
             event = RiskEvent(
                 source_document_id=source_document_id,
                 event_type=event_type,
-                event_subtype=_derive_event_subtype(event_type),
+                # 2026-07-13: POSITIVE_POLICY only when the direction
+                # taxonomy agrees — "export financing restrictions" derives
+                # INVESTMENT_PLEDGE from the 'financ' keyword but is
+                # restrictive; it must not carry a positive subtype.
+                event_subtype=(
+                    _derive_event_subtype(event_type)
+                    if direction == "supportive" else None
+                ),
                 event_date=event_date,
                 title=title,
                 summary=summary,
@@ -983,7 +1040,10 @@ def ingest_policy_tracker(
                     "tech_basket_minerals": rec["tech_basket_minerals"],
                     "countries_raw": rec["countries_raw"],
                     "run_id": run_id,
-                    "positive_policy": True,
+                    # 2026-07-13: direction-aware — was hardcoded True for
+                    # every event, mislabelling export controls as positive.
+                    "positive_policy": direction == "supportive",
+                    "policy_direction": direction,
                     # 2026-05-12: events with no confident material
                     # attribution are preserved with these flags so an
                     # analyst can triage them later in a dedicated review
@@ -991,8 +1051,15 @@ def ingest_policy_tracker(
                     "needs_material_review": needs_material_review,
                     "review_reason": review_reason,
                     "note": (
-                        "Low-severity positive-policy event. Contributes minimally to risk "
-                        "scores; primary value is rationale context."
+                        "Low-severity supportive-policy event. Contributes minimally to "
+                        "risk scores; primary value is rationale context."
+                        if direction == "supportive" else
+                        "Restrictive policy recorded informationally — GTA is the "
+                        "authoritative risk-raising source for trade measures; scoring "
+                        "this copy would double-count."
+                        if direction == "restrictive" else
+                        "Neutral policy machinery (lists/standards/stockpiling). "
+                        "Rationale context only."
                     ),
                 },
             )
@@ -1023,12 +1090,22 @@ def ingest_policy_tracker(
             # "keyword_scan:<kw>"; if Haiku ran, the classifier prepends
             # "llm_confirmed:" so we can tell LLM-verified attributions
             # apart from raw ones in downstream queries.
+            # Breadth discount + direct/broad flag (migration 056) — same
+            # rule as the GTA ingester and the 056 backfill: n <= 3
+            # distinct materials keeps full weight and is_direct=True;
+            # broader policies get relevance * 3/n per material and are
+            # excluded from material-scoped UI surfaces.
+            _n_materials = len({c[0] for c in refined_candidates})
+            _breadth = min(1.0, 3.0 / _n_materials) if _n_materials else 1.0
+            _is_direct = _n_materials <= 3
+
             seen_hs_mapping_ids: set[int] = set()
             for mat_id, relevance, matched_kw, hs_mapping_id in refined_candidates:
                 session.add(RiskEventMaterial(
                     risk_event_id=event.id,
                     material_id=mat_id,
-                    relevance_score=relevance,
+                    relevance_score=relevance * _breadth,
+                    is_direct=_is_direct,
                     match_reason=matched_kw[:64],
                 ))
                 material_links += 1
@@ -1040,7 +1117,7 @@ def ingest_policy_tracker(
                     session.add(RiskEventHsMapping(
                         risk_event_id=event.id,
                         hs_mapping_id=hs_mapping_id,
-                        relevance_score=relevance,
+                        relevance_score=relevance * _breadth,
                         match_reason=matched_kw[:64],
                     ))
                     hs_mapping_links += 1

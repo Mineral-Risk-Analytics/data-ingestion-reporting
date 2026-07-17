@@ -42,7 +42,9 @@ def list_risk_events(
     _user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[RiskEventRead]:
-    q = select(RiskEvent)
+    # 055: confirmed cross-source duplicates are hidden from the list —
+    # the canonical row carries the event.
+    q = select(RiskEvent).where(RiskEvent.duplicate_of_id.is_(None))
 
     if search:
         q = q.where(

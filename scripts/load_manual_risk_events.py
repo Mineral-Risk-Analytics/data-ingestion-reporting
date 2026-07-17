@@ -84,6 +84,15 @@ from app.models.source import Source
 from app.models.supply import Material
 from app.services.ingestion import feature_flags
 
+import structlog
+
+# 2026-07-13: the semicolon _split_csv patch (2026-07-10) added a
+# log.warning() legacy-comma hint but never defined `log` — every cell
+# containing a comma with no semicolon (single legal names like
+# "Sumitomo Metal Mining Co., Ltd.") raised NameError and hard-failed
+# its row (47 rows in the 07-13 dry-run).
+log = structlog.get_logger(__name__)
+
 
 # Canonical source row for all manually-entered events.
 _MANUAL_SOURCE_NAME = "manual_walkthrough"
@@ -150,10 +159,27 @@ CANONICAL_RISK_CATEGORIES = {
 
 
 def _split_csv(value: Any) -> list[str]:
-    """Split a comma-separated cell value into trimmed strings."""
+    """Split a SEMICOLON-separated cell value into trimmed strings.
+
+    2026-07-10: separator changed from comma to semicolon. Company canonical
+    and legal names legitimately contain commas ("Sumitomo Metal Mining Co.,
+    Ltd."), so comma-splitting shattered them into unresolvable fragments.
+    The workbook's list columns (companies / materials / facilities /
+    secondary_countries / risk_categories) were normalized to "; " the same
+    day. A comma with no semicolon present now logs a hint rather than
+    silently mis-splitting.
+    """
     if value is None or str(value).strip() == "":
         return []
-    return [s.strip() for s in str(value).split(",") if s.strip()]
+    raw = str(value)
+    if ";" not in raw and "," in raw:
+        log.warning(
+            "load_events.legacy_comma_list",
+            value=raw[:80],
+            hint="list columns are semicolon-separated since 2026-07-10; "
+                 "treating whole cell as ONE name",
+        )
+    return [s.strip() for s in raw.split(";") if s.strip()]
 
 
 def _coerce_date(value: Any) -> Optional[datetime]:
@@ -267,10 +293,20 @@ def _resolve_companies(
     """Return (resolved_companies, unresolved_names)."""
     resolved: list[Company] = []
     unresolved: list[str] = []
+    from app.models.company import CompanyAlias
     for name in names:
         company = session.scalar(
             select(Company).where(Company.canonical_name == name)
         )
+        if company is None:
+            # 2026-07-10: alias fallback — partner workbooks use full legal
+            # names ("Vale S.A.") while engine canon is short ("Vale");
+            # company_aliases carries alias_type='legal_name' rows for these.
+            company = session.scalar(
+                select(Company)
+                .join(CompanyAlias, CompanyAlias.company_id == Company.id)
+                .where(CompanyAlias.alias == name)
+            )
         if company is None:
             unresolved.append(name)
         else:

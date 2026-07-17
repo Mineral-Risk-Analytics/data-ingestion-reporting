@@ -360,6 +360,30 @@ _MATERIALS: list[dict] = [
         "notes": "Conductive paste (limited use). Solid-state cell candidates explored Ag-rich anodes; not at scale.",
     },
     {
+        # Restored 2026-07-13: authored 2026-07-10 (Nicole's decision —
+        # full launch-scored material, NOT a Natural Graphite variant,
+        # because its upstream is genuinely different: petroleum needle
+        # coke, no mine) but the device commit of that edit never landed.
+        # Reconstructed from the live DB row (materials.id=326).
+        "canonical_name": "Synthetic Graphite",
+        "category": "anode_active",
+        "symbol_or_code": "C",
+        "hs_codes": ["3801"],
+        "is_ira_critical_mineral": True,   # IRA 45X graphite spec is purity-based, incl. synthetic
+        "is_eu_crma_critical": False,      # EU CRMA lists natural graphite only
+        "notes": (
+            "Majority anode material (~60-70% of anode market). No mine: "
+            "feedstock = calcined petroleum/needle coke (2713.12, "
+            "oil-refining byproduct; competes with EAF electrode demand) "
+            "-> graphitization ~3,000C (electricity-intensive; China "
+            "~90%+ incl. Inner Mongolia/Sichuan/Yunnan). Converges with "
+            "Natural Graphite at anode stage; mutually substitutable. "
+            "IRA 45X graphite spec is purity-based (incl. synthetic; "
+            "Treasury FEOC transition to 2027); EU CRMA lists natural "
+            "graphite only. Added 2026-07-10 per Nicole."
+        ),
+    },
+    {
         # Briefly renamed to "Sodium Carbonate (Battery Grade)" then reverted
         # back to "Sodium" after partner review.  The narrower name didn't
         # fit the actual scoring scope — partner's curated HS code list
@@ -561,6 +585,7 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     ("nmc", "Manganese",        "cathode_active",    0.20, False),
     ("nmc", "Cobalt",           "cathode_active",    0.20, False),
     ("nmc", "Natural Graphite", "anode",             0.85, True),   # can use synthetic
+    ("nmc", "Synthetic Graphite", "anode",           0.85, True),   # mirror of natural (mutually substitutable)
     ("nmc", "Copper",           "current_collector", 0.30, True),
     ("nmc", "Aluminum",         "current_collector", 0.30, True),
     ("nmc", "Fluorspar",        "electrolyte",       0.20, False),
@@ -576,6 +601,7 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     ("lfp", "Iron Ore", "cathode_active",    0.90, False),
     ("lfp", "Phosphate", "cathode_active", 0.90, False),
     ("lfp", "Natural Graphite",     "anode",             0.85, True),
+    ("lfp", "Synthetic Graphite",   "anode",             0.85, True),
     ("lfp", "Copper",               "current_collector", 0.30, True),
     ("lfp", "Aluminum",             "current_collector", 0.30, True),
     ("lfp", "Fluorspar",            "electrolyte",       0.20, False),
@@ -588,6 +614,7 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     ("nca", "Cobalt",           "cathode_active",    0.15, False),
     ("nca", "Aluminum",         "cathode_active",    0.05, False),  # structural doping
     ("nca", "Natural Graphite", "anode",             0.85, True),
+    ("nca", "Synthetic Graphite", "anode",           0.85, True),
     ("nca", "Copper",           "current_collector", 0.30, True),
     ("nca", "Fluorspar",        "electrolyte",       0.20, False),
 
@@ -599,6 +626,7 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     ("lfmp", "Manganese",            "cathode_active",    0.30, False),
     ("lfmp", "Phosphate", "cathode_active", 0.90, False),
     ("lfmp", "Natural Graphite",     "anode",             0.85, True),
+    ("lfmp", "Synthetic Graphite",   "anode",             0.85, True),
     ("lfmp", "Copper",               "current_collector", 0.30, True),
     ("lfmp", "Aluminum",             "current_collector", 0.30, True),
     ("lfmp", "Fluorspar",            "electrolyte",       0.20, False),
@@ -612,6 +640,7 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     ("sodium_ion", "Iron Ore","cathode_active",    0.70, True),   # NFPP variant
     ("sodium_ion", "Manganese",           "cathode_active",    0.50, True),   # layered oxide
     ("sodium_ion", "Natural Graphite",    "anode",             0.50, True),   # hard carbon better
+    ("sodium_ion", "Synthetic Graphite",  "anode",             0.50, True),   # hard carbon better
     ("sodium_ion", "Aluminum",            "current_collector", 0.50, True),   # can replace Cu
     ("sodium_ion", "Copper",              "current_collector", 0.20, True),
     ("sodium_ion", "Fluorspar",           "electrolyte",       0.20, False),

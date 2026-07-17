@@ -44,7 +44,7 @@ from typing import Optional
 
 import structlog
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, defer, selectinload
 
 from app.constants import RiskCategory
 from app.models.battery_chemistry import (
@@ -233,8 +233,15 @@ def get_events_for_company(
         .where(
             RiskEventCompany.company_id == company_id,
             RiskEventCompany.review_status != "excluded",
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.risk_categories_json.contains([category.value]),
         )
+        # 2026-07-15 EGRESS: defer Text columns that scoring never reads —
+        # traced callers (orchestrator → evidence_aggregator) touch title,
+        # metadata_json, event_date, severity/confidence_score, event_type,
+        # event_subtype, id — never summary or review_note. See
+        # feedback_scoring_egress memory.
+        .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc())
     )
     if cutoff is not None:
@@ -398,10 +405,13 @@ def get_active_compliance_obligations(
         .join(RiskEventCompany, RiskEventCompany.risk_event_id == RiskEvent.id)
         .where(
             RiskEventCompany.company_id == company_id,
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.risk_categories_json.contains(
                 [RiskCategory.REGULATORY_COMPLIANCE.value]
             ),
         )
+        # 2026-07-15 EGRESS: this loop only reads ev.title — defer Text cols.
+        .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc())
         .limit(100)
     )
@@ -437,10 +447,13 @@ def get_filing_signals(
         .where(
             RiskEventCompany.company_id == company_id,
             RiskEventCompany.review_status != "excluded",
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.risk_categories_json.contains(
                 [RiskCategory.FINANCIAL_PRESSURE.value]
             ),
         )
+        # 2026-07-15 EGRESS: defer Text cols (title/metadata_json used, summary/review_note not).
+        .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc().nullslast())
         .limit(max_quarters)
     )
@@ -553,6 +566,7 @@ def get_events_for_material(
         .join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
         .where(
             RiskEventMaterial.material_id == material_id,
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.risk_categories_json.contains([category.value]),
         )
         .order_by(RiskEvent.event_date.desc())
@@ -639,8 +653,11 @@ def get_events_for_geographies(
         )
         .where(
             RiskEventGeography.country_code.in_(country_codes),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.risk_categories_json.contains([category.value]),
         )
+        # 2026-07-15 EGRESS: defer Text cols summary + review_note.
+        .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc())
     )
     if cutoff is not None:
@@ -742,6 +759,7 @@ def get_events_for_materials(
         )
         .where(
             RiskEventMaterial.material_id.in_(material_ids),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.risk_categories_json.contains([category.value]),
         )
         .order_by(RiskEvent.event_date.desc())
@@ -813,6 +831,7 @@ def get_events_for_hs_mapping(
         )
         .where(
             RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.risk_categories_json.contains([category.value]),
         )
         .order_by(RiskEvent.event_date.desc())
@@ -953,10 +972,13 @@ def get_events_for_regulations(
         .where(
             Regulation.regulation_key.in_(regulation_keys),
             Regulation.verified.is_(True),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.risk_categories_json.contains(
                 [RiskCategory.REGULATORY_COMPLIANCE.value]
             ),
         )
+        # 2026-07-15 EGRESS: defer Text cols summary + review_note.
+        .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc())
     )
     if cutoff is not None:
@@ -1445,6 +1467,11 @@ class MarketScoreEvidenceBundle:
     regulation_total: int
     facility_total: int
     risk_event_total: int
+    # 056: broad multi-material measures (is_direct=False) matching this
+    # (material × country) that are EXCLUDED from the list above.  Scoring
+    # still consumes them at breadth-discounted relevance; the UI can show
+    # "+ N broad measures" without listing them.  See migration 056.
+    risk_event_broad_total: int = 0
 
 
 # Per-list caps for the dropdown.  Tuned so the panel stays short
@@ -1604,6 +1631,8 @@ def get_evidence_for_material_x_geography(
         .where(
             RiskEventMaterial.material_id == material_id,
             RiskEventGeography.country_code == cc,
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
+            RiskEventMaterial.is_direct.is_(True),  # 056: list direct only
         )
         # Window filter: events with no event_date are kept (sanctions
         # programs often lack a single anchor date) but cutoff applies to
@@ -1612,12 +1641,49 @@ def get_evidence_for_material_x_geography(
         # Two-hop selectinload: SourceDocument → Source so we can name the
         # ingester (global_trade_alert / federal_register / eurlex / iea /
         # opensanctions / sec_edgar) without an N+1 follow-up.
-        .options(selectinload(RiskEvent.source_document).selectinload(SourceDocument.source))
+        #
+        # 2026-07-15 EGRESS FIX: defer SourceDocument.raw_text (full ingested
+        # source payload — Federal Register HTML, GTA notice, IEA doc, EUR-Lex
+        # text; 5–100 KB per event) and metadata_json.  This call site only
+        # touches ``sd.source.name`` (see ``ev.source_system = ...`` below) so
+        # neither field is ever read — but SQLAlchemy was materializing them
+        # anyway, driving multi-GB egress per rescore against remote Neon.
+        # If any downstream caller of ``get_evidence_for_material_x_geography``
+        # later needs raw_text, load it explicitly instead of un-deferring here.
+        .options(
+            # RiskEvent-level defers: caller uses id, event_date, event_type,
+            # event_subtype, severity_score, source_document (below).  Never
+            # summary or review_note.
+            defer(RiskEvent.summary),
+            selectinload(RiskEvent.source_document)
+                .options(
+                    defer(SourceDocument.raw_text),
+                    defer(SourceDocument.metadata_json),
+                )
+                .selectinload(SourceDocument.source),
+        )
         .distinct(RiskEvent.id)
         .order_by(RiskEvent.id)
     )
     ev_rows = list(db.scalars(ev_stmt).all())
     risk_event_total = len(ev_rows)
+
+    # 056: count (don't list) the broad multi-material measures excluded
+    # above — scoring consumed them at discounted relevance, so the panel
+    # can honestly say "+ N broad measures" without the sift burden.
+    risk_event_broad_total = db.scalar(
+        select(func.count(func.distinct(RiskEvent.id)))
+        .select_from(RiskEvent)
+        .join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
+        .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
+        .where(
+            RiskEventMaterial.material_id == material_id,
+            RiskEventGeography.country_code == cc,
+            RiskEvent.duplicate_of_id.is_(None),
+            RiskEventMaterial.is_direct.is_(False),
+            or_(RiskEvent.event_date >= cutoff, RiskEvent.event_date.is_(None)),
+        )
+    ) or 0
 
     # In-memory sort: newest first (NULL event_date goes to end).
     ev_rows_sorted = sorted(
@@ -1644,6 +1710,7 @@ def get_evidence_for_material_x_geography(
         regulation_total=regulation_total,
         facility_total=facility_total,
         risk_event_total=risk_event_total,
+        risk_event_broad_total=risk_event_broad_total,
     )
 
 

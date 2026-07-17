@@ -214,6 +214,10 @@ class MarketScoreEvidence(BaseModel):
     compare to know how much was hidden."""
     facility_total: int
     risk_event_total: int
+    # 056: broad multi-material measures excluded from the risk_events list
+    # (scoring consumed them at breadth-discounted relevance).  Frontend
+    # renders "+ N broad measures" when > 0.
+    risk_event_broad_total: int = 0
 
     risk_event_window_days: int
     """How many days back risk events were drawn from.  Matches the longest

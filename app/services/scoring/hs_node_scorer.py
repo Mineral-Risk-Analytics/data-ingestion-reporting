@@ -49,7 +49,7 @@ from sqlalchemy.orm import Session
 from app.models.facility import Facility, FacilityMaterialLink
 from app.models.regulatory import RiskEvent, RiskEventGeography, RiskEventHsMapping
 from app.models.scoring import HsCodeGeographyRiskScore
-from app.models.supply import HsCodeMaterialMapping, HsCodeProductionShare
+from app.models.supply import HsCodeMaterialMapping, HsCodeProductionShare, TradeFlow
 from app.services.scoring.decay import compute_recency_multiplier
 from app.services.scoring.event_impact import (
     compute_effective_confidence,
@@ -119,6 +119,36 @@ _EXPORT_SUBTYPES = frozenset({"EXPORT_RESTRICTION"})
 # ``app/services/ingestion/gta.py`` ``ingest_gta`` for the writer side.
 _EXPORT_GEOGRAPHY_CONTEXT = "primary"
 _TARIFF_GEOGRAPHY_CONTEXT = "affected"
+
+# ── Trade-participation gate for event-only pairs (2026-07-15) ────────────
+# The event-pair source enumerates every (mapping × country) a tariff /
+# export event touches — ~21k pairs with no production share and no
+# facility.  Scoring a material × geography with zero evidence the country
+# PARTICIPATES in that node's market is misleading (Austria scored on
+# cobalt ore because an EU-wide tariff listed it).  An event-derived pair
+# with no share and no facility is kept only when the country's export
+# trade on the node clears BOTH:
+#   * relative:  ≥ ``_TRADE_GATE_MIN_NODE_SHARE`` of the 4-digit HS
+#     FAMILY's global export value in ``trade_flows`` (guards
+#     multi-material HS baskets like 2833 where a flat dollar floor lets
+#     incidental exporters in), and
+#   * absolute:  ≥ ``_TRADE_GATE_FLOOR_USD`` (guards tiny nodes where 1%%
+#     is pocket change).
+# GRANULARITY: trade evidence is matched at the 4-DIGIT FAMILY level
+# (``left(trade_flows.hs_code, 4)`` vs ``left(mapping.hs_code_prefix, 4)``),
+# NOT by exact hs_mapping_id.  Comtrade was ingested at 4-digit
+# aggregation (verified 2026-07-15: every flow's hs_code is 4 digits), so
+# exact-mapping matching would find zero trade for every 6-digit mapping —
+# and 6-digit mappings carry most of the events (810520: 413 events,
+# trade only on parent 8105).  Family matching keeps 1,495 of 21,452
+# event-only pairs (vs 162 under exact matching, which wrongly gated
+# CN's cobalt/lithium 6-digit rows).
+# Values are summed across all ingested periods (2023-2025 annual,
+# partner=WLD only, export flag).  Countries absent from trade_flows fail
+# the gate by construction — no participation evidence, no score row.
+# Share- or facility-anchored pairs are NEVER gated.
+_TRADE_GATE_MIN_NODE_SHARE = 0.01
+_TRADE_GATE_FLOOR_USD = 5_000_000.0
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +804,7 @@ def score_hs_node_geography(
         .where(
             RiskEventHsMapping.hs_mapping_id.in_(related_mapping_ids),
             RiskEvent.event_subtype.in_(_TARIFF_SUBTYPES),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEventGeography.country_code == country_code,
             RiskEventGeography.geography_context == _TARIFF_GEOGRAPHY_CONTEXT,
         )
@@ -815,6 +846,7 @@ def score_hs_node_geography(
         .where(
             RiskEventHsMapping.hs_mapping_id.in_(related_mapping_ids),
             RiskEvent.event_subtype.in_(_EXPORT_SUBTYPES),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEventGeography.country_code == country_code,
             RiskEventGeography.geography_context == _EXPORT_GEOGRAPHY_CONTEXT,
         )
@@ -896,7 +928,8 @@ def score_hs_node_geography(
     # fires.  Each weight set sums to 1.0.
     has_events = bool(tariff_events) or bool(export_events)
     has_operational = operational_signal is not None
-    if hhi_at_stage is None and not has_events and not has_operational:
+    if (hhi_at_stage is None or production_share <= 0.0) \
+            and not has_events and not has_operational:
         # Truly nothing to score.  Pre-fix this branch was the entire
         # short-circuit at top of function.
         log.debug(
@@ -914,10 +947,39 @@ def score_hs_node_geography(
         "hhi": None, "tariff": None, "export": None, "operational": None,
     }
 
-    if hhi_at_stage is not None and has_operational:
+    # Fix A (2026-07-15): the hhi-anchored paths additionally require the
+    # country to actually HOLD production share.  hhi_at_stage is a MARKET
+    # property (Σ share² across all countries); crediting it at full weight
+    # to zero-share countries — whose L0 pair exists only because an event
+    # touched them — produced inversions like Austria (share 0.000)
+    # scoring 73.2 on the cobalt ore node vs DRC (share 0.753) at 67.6.
+    # Zero-share countries now route to the event-only / operational paths,
+    # where their evidence is weighted consistently with other event-only
+    # rows.  Share-weighting the HHI component AMONG producers (Fix B,
+    # hhi × f(share)) is a separate partner-methodology decision — see
+    # docs/design/concentration_share_weighting.md.
+    country_holds_share = production_share > 0.0
+
+    # Fix B (2026-07-15, partner decision: sqrt): among producers, the HHI
+    # component is share-weighted — ``hhi × √share`` — so concentration
+    # risk accrues to the geographies that ARE the concentration.  Before
+    # this, every producer inherited the full market HHI (CN at 4% cobalt
+    # share scored the same concentration component as CD at 75%), and
+    # RU-cobalt (3% share + sanctions events) outscored CD.  √share keeps
+    # mid-tier producers visible (linear was evaluated and rejected — it
+    # empties the HIGH band; see docs/design/concentration_share_weighting.md
+    # for the full pre-computed scenario grid).  Fix A above guarantees
+    # production_share > 0 on these paths, so the sqrt is well-defined.
+    hhi_share_weighted: Optional[float] = (
+        hhi_at_stage * math.sqrt(production_share)
+        if hhi_at_stage is not None and country_holds_share
+        else None
+    )
+
+    if hhi_at_stage is not None and country_holds_share and has_operational:
         # HHI-anchored 4-component path
         components = {
-            "hhi":         hhi_at_stage * 100,
+            "hhi":         hhi_share_weighted * 100,
             "tariff":      tariff_exposure * 100,
             "export":      export_restriction * 100,
             "operational": (operational_signal or 0.0) * 100,
@@ -929,10 +991,10 @@ def score_hs_node_geography(
             "operational": _OPERATIONAL_WEIGHT,
         }
         score_method = "hhi_anchored_with_operational"
-    elif hhi_at_stage is not None:
+    elif hhi_at_stage is not None and country_holds_share:
         # HHI-anchored canonical (no operational data — most common today)
         components = {
-            "hhi":    hhi_at_stage * 100,
+            "hhi":    hhi_share_weighted * 100,
             "tariff": tariff_exposure * 100,
             "export": export_restriction * 100,
         }
@@ -1065,6 +1127,11 @@ def score_hs_node_geography(
             constraint="uq_hs_geo_score",
             set_={
                 "production_share":     production_share,
+                # Fix B provenance: the composite's hhi component is
+                # hhi_at_stage × √production_share; the hhi_at_stage
+                # COLUMN keeps the unweighted market value.
+                "hhi_share_weighted":   hhi_share_weighted,
+                "share_weighting":      "sqrt",
                 "hhi_at_stage":         hhi_at_stage,
                 "tariff_exposure":      tariff_exposure,
                 "export_restriction":   export_restriction,
@@ -1168,6 +1235,7 @@ def score_all_hs_nodes(
         .join(RiskEvent, RiskEvent.id == RiskEventHsMapping.risk_event_id)
         .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
         .where(
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             (
                 (RiskEvent.event_subtype.in_(_TARIFF_SUBTYPES))
                 & (RiskEventGeography.geography_context == _TARIFF_GEOGRAPHY_CONTEXT)
@@ -1216,9 +1284,80 @@ def score_all_hs_nodes(
     share_pairs = db.execute(share_pair_stmt).all()
     event_pairs = db.execute(event_pair_stmt).all()
     facility_pairs = db.execute(facility_pair_stmt).all()
-    pairs = list({
-        (mid, cc) for mid, cc in (*share_pairs, *event_pairs, *facility_pairs)
-    })
+
+    # ── Trade-participation gate (2026-07-15) ────────────────────────────
+    # Event-derived pairs with no share and no facility must show real
+    # export participation on the node before they earn a score row.  See
+    # the ``_TRADE_GATE_*`` constants for rationale and thresholds.
+    anchored_pairs = {(mid, cc) for mid, cc in (*share_pairs, *facility_pairs)}
+    raw_event_pairs = {(mid, cc) for mid, cc in event_pairs}
+    event_only_pairs = raw_event_pairs - anchored_pairs
+
+    gated_out: set = set()
+    if event_only_pairs:
+        # Trade evidence at the 4-digit family level — see the
+        # ``_TRADE_GATE_*`` comment block for why exact-mapping matching
+        # is wrong here (Comtrade ingested at 4-digit aggregation).
+        _family = func.substr(TradeFlow.hs_code, 1, 4).label("family")
+        _family_exports = (
+            select(
+                _family,
+                TradeFlow.reporter_country.label("country_code"),
+                func.sum(TradeFlow.trade_value_usd).label("export_value_usd"),
+            )
+            .where(
+                TradeFlow.import_export_flag == "export",
+                TradeFlow.hs_code.is_not(None),
+                TradeFlow.trade_value_usd.is_not(None),
+            )
+            .group_by(_family, TradeFlow.reporter_country)
+            .subquery()
+        )
+        _with_family_total = (
+            select(
+                _family_exports.c.family,
+                _family_exports.c.country_code,
+                _family_exports.c.export_value_usd,
+                func.sum(_family_exports.c.export_value_usd)
+                .over(partition_by=_family_exports.c.family)
+                .label("family_total_usd"),
+            )
+            .subquery()
+        )
+        trade_qualified_stmt = select(
+            _with_family_total.c.family,
+            _with_family_total.c.country_code,
+        ).where(
+            _with_family_total.c.export_value_usd >= _TRADE_GATE_FLOOR_USD,
+            _with_family_total.c.export_value_usd
+            >= _with_family_total.c.family_total_usd * _TRADE_GATE_MIN_NODE_SHARE,
+        )
+        trade_qualified = {
+            (fam, cc) for fam, cc in db.execute(trade_qualified_stmt).all()
+        }
+        # Map each event-only pair's mapping to its 4-digit family.
+        _eo_mapping_ids = sorted({mid for mid, _ in event_only_pairs})
+        _prefix_rows = db.execute(
+            select(HsCodeMaterialMapping.id, HsCodeMaterialMapping.hs_code_prefix)
+            .where(HsCodeMaterialMapping.id.in_(_eo_mapping_ids))
+        ).all()
+        _mapping_family = {mid: (prefix or "")[:4] for mid, prefix in _prefix_rows}
+        gated_out = {
+            (mid, cc)
+            for mid, cc in event_only_pairs
+            if (_mapping_family.get(mid, ""), cc) not in trade_qualified
+        }
+        log.info(
+            "hs_node_scorer.batch.trade_gate",
+            event_pairs_total=len(raw_event_pairs),
+            event_only_pairs=len(event_only_pairs),
+            kept_by_trade=len(event_only_pairs) - len(gated_out),
+            gated_out=len(gated_out),
+            min_node_share=_TRADE_GATE_MIN_NODE_SHARE,
+            floor_usd=_TRADE_GATE_FLOOR_USD,
+        )
+
+    pairs = list((anchored_pairs | raw_event_pairs) - gated_out)
     pairs_scored = pairs_skipped = 0
     processed_nodes: set[int] = set()
 

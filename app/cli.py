@@ -1488,6 +1488,16 @@ def rescore_hs_nodes_cmd(
         "--market-scope",
         help="'global' (default) or 'us'. Must match the scope of the production share data.",
     ),
+    material_id: Optional[int] = typer.Option(
+        None,
+        "--material-id",
+        help=(
+            "Restrict scoring to the HS mappings belonging to this material. "
+            "Useful for iterative validation runs that avoid a full rescore. "
+            "Resolves to the set of ``hs_code_material_mappings.id`` rows where "
+            "``material_id`` matches, and passes that set to score_all_hs_nodes."
+        ),
+    ),
 ) -> None:
     """Compute and persist Level-0 HS node geography scores.
 
@@ -1502,6 +1512,7 @@ def rescore_hs_nodes_cmd(
       bdi-ingest rescore-hs-nodes
       bdi-ingest rescore-hs-nodes --as-of 2025-01-01
       bdi-ingest rescore-hs-nodes --market-scope us
+      bdi-ingest rescore-hs-nodes --material-id 3          # score Copper's HS nodes only
 
     Pipeline order:
       bdi-ingest rescore-hs-nodes    ← Level 0 (this command)
@@ -1510,13 +1521,58 @@ def rescore_hs_nodes_cmd(
     """
     import datetime
 
+    from sqlalchemy import select
+
+    from app.models.supply import HsCodeMaterialMapping, Material
     from app.services.scoring.hs_node_scorer import score_all_hs_nodes
 
     as_of_date = datetime.date.fromisoformat(as_of) if as_of else datetime.date.today()
     s = _session()
     try:
-        typer.echo(f"Scoring HS nodes as of {as_of_date} (market_scope={market_scope}) ...")
-        result = score_all_hs_nodes(s, as_of_date, market_scope=market_scope)
+        hs_mapping_ids: Optional[list[int]] = None
+        material_name: Optional[str] = None
+        if material_id is not None:
+            # Resolve the material row so we can log its name and confirm it exists
+            # before scoping the HS mapping lookup.
+            material = s.get(Material, material_id)
+            if material is None:
+                typer.echo(
+                    f"rescore-hs-nodes failed: no material with id={material_id}",
+                    err=True,
+                )
+                raise typer.Exit(code=2)
+            material_name = material.canonical_name
+            mapping_ids = list(
+                s.scalars(
+                    select(HsCodeMaterialMapping.id).where(
+                        HsCodeMaterialMapping.material_id == material_id
+                    )
+                ).all()
+            )
+            if not mapping_ids:
+                typer.echo(
+                    f"rescore-hs-nodes: no HS mappings for material id={material_id} "
+                    f"({material_name}); nothing to score.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            hs_mapping_ids = mapping_ids
+            typer.echo(
+                f"Scoping to material_id={material_id} ({material_name}) — "
+                f"{len(mapping_ids)} HS mapping(s)."
+            )
+
+        typer.echo(
+            f"Scoring HS nodes as of {as_of_date} (market_scope={market_scope}"
+            + (f", material={material_name}" if material_name else "")
+            + ") ..."
+        )
+        result = score_all_hs_nodes(
+            s,
+            as_of_date,
+            market_scope=market_scope,
+            hs_mapping_ids=hs_mapping_ids,
+        )
         typer.echo(
             f"Done. pairs_scored={result['pairs_scored']}, "
             f"pairs_skipped={result['pairs_skipped']}, "
@@ -2233,6 +2289,213 @@ def seed_facilities_partner_cmd(
             raise typer.Exit(code=2)
     except typer.Exit:
         raise
+    except Exception as exc:
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("find-duplicate-events")
+def find_duplicate_events_cmd(
+    out_path: str = typer.Option(
+        "duplicate_events_review.xlsx", "--out",
+        help="Path for the xlsx review sheet.",
+    ),
+    material: str = typer.Option(
+        None, "--material",
+        help="Limit to one material (canonical name, e.g. 'Cobalt').",
+    ),
+    min_similarity: float = typer.Option(
+        0.35, "--min-similarity",
+        help="Title-similarity floor for candidate pairs (0-1).",
+    ),
+) -> None:
+    """Cross-source duplicate-event similarity report (migration 055).
+
+    Pairs canonical events from DIFFERENT sources that share a material +
+    geography, have compatible subtypes and dates, and similar titles.
+    Writes an xlsx with a blank ``confirm`` column — review it, set
+    confirm=Y on real duplicates (swap ids if the suggested canonical is
+    wrong; manual-walkthrough rows are suggested canonical by default),
+    then run ``mark-duplicate-events``.  Nothing is flagged automatically.
+    """
+    from app.services.ingestion.event_dedupe import find_duplicate_candidates
+
+    s = _session()
+    try:
+        report = find_duplicate_candidates(
+            s, out_path, material=material, min_similarity=min_similarity,
+        )
+        typer.echo(json.dumps(report, indent=2, default=str))
+    finally:
+        s.close()
+
+
+@app.command("mark-duplicate-events")
+def mark_duplicate_events_cmd(
+    xlsx_path: str = typer.Argument(
+        ..., help="Reviewed duplicate_events_review.xlsx (confirm column set).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Validate and report without committing.",
+    ),
+) -> None:
+    """Apply confirmed duplicate marks from the reviewed similarity report.
+
+    Sets ``risk_events.duplicate_of_id`` for rows with confirm=Y.  Flagged
+    events are excluded from scoring, event counts, and public listings;
+    the canonical row carries the event.  All-or-nothing: any validation
+    error (self-marks, conflicting marks, cycles, unknown ids) aborts the
+    whole apply.  Rescore afterwards for scores to reflect the change.
+    """
+    from app.services.ingestion.event_dedupe import apply_duplicate_marks
+
+    s = _session()
+    try:
+        result = apply_duplicate_marks(s, xlsx_path, dry_run=dry_run)
+        typer.echo(json.dumps(result, indent=2, default=str))
+        if result["errors"]:
+            raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("seed-benchmark-shares")
+def seed_benchmark_shares_cmd(
+    xlsx_path: str = typer.Argument(
+        ...,
+        help="Path to the benchmark shares workbook (benchmark_shares.xlsx).",
+    ),
+    sheet: str = typer.Option(
+        "Benchmark Shares", "--sheet",
+        help="Sheet name containing the share rows.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Validate and report without committing any changes.",
+    ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Update existing benchmark rows in place (default: skip).",
+    ),
+) -> None:
+    """Load human-audited benchmark production shares (gap-coverage).
+
+    Fills hs_code_production_shares for midstream / battery-grade nodes
+    that USGS MCS does not cover — see
+    docs/design/concentration_coverage_gaps.md.  Rows load ONLY when
+    audited == "Y"; every row must cite basis + source_org + source_url.
+    DB source becomes benchmark_<org> so MCS re-runs never touch these
+    rows.  All-or-nothing per file: any validation error aborts the load.
+
+    \b
+    Run order (cobalt pilot):
+      bdi-ingest seed-hs-mappings                    # 2822 stage fix
+      bdi-ingest seed-benchmark-shares <file.xlsx> --dry-run
+      bdi-ingest seed-benchmark-shares <file.xlsx>
+      bdi-ingest rescore-hs-nodes && bdi-ingest rescore-market ...
+    """
+    from app.services.ingestion.seed_benchmark_shares import (
+        seed_benchmark_shares,
+    )
+
+    s = _session()
+    try:
+        report = seed_benchmark_shares(
+            session=s,
+            xlsx_path=xlsx_path,
+            sheet=sheet,
+            dry_run=dry_run,
+            force=force,
+        )
+        typer.echo(json.dumps(report.as_dict(), indent=2, default=str))
+        if report.errors:
+            raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("seed-company-workbook")
+def seed_company_workbook_cmd(
+    xlsx_path: str = typer.Argument(
+        ...,
+        help="Path to the partner company-seed workbook "
+             "(company_seed_expanded_v32.xlsx or later — must have the "
+             "'publish' column).",
+    ),
+    sheet: str = typer.Option(
+        "Company Seed", "--sheet",
+        help="Company identity/enrichment sheet name.",
+    ),
+    cme_sheet: str = typer.Option(
+        "Company Material Exposure", "--cme-sheet",
+        help="Material-exposure sheet name.",
+    ),
+    sr_sheet: str = typer.Option(
+        "Supply Relationships", "--sr-sheet",
+        help="Supply-relationships sheet name.",
+    ),
+    skip_exposures: bool = typer.Option(
+        False, "--skip-exposures",
+        help="Do not load the Company Material Exposure tab.",
+    ),
+    skip_relationships: bool = typer.Option(
+        False, "--skip-relationships",
+        help="Do not load the Supply Relationships tab.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Report without committing any changes.",
+    ),
+) -> None:
+    """Load the partner company-seed workbook (G4d) — enrichment layer.
+
+    Company Seed tab: enriches companies already created by
+    ``seed-companies`` (cik/lei/sic/duns/tickers/compliance flags/notes),
+    resolving via canonical name OR alias; creates only publish=TRUE rows
+    that resolve nowhere. Never renames, never re-parents a company whose
+    parent is already set.
+
+    Company Material Exposure tab: loads filing facts + hybrid
+    exposure_score (curated seed dict where the pair exists, else derived
+    from revenue_share_pct at low confidence — flagged via
+    score_derivation for partner review). Gated on the company's publish
+    flag.
+
+    Supply Relationships tab: loads agreement detail; publish gates
+    company CREATION only — rows between companies already in the DB load
+    regardless of their publish flag. Never creates a company from this
+    tab.
+
+    Idempotent: re-running on the same file updates in place.
+
+    \b
+    Run order:
+      bdi-ingest seed-companies                     # identity layer first
+      bdi-ingest seed-company-workbook <file.xlsx>  # this command
+      bdi-ingest seed-facilities-partner <file.xlsx>
+      python scripts/load_manual_risk_events.py <file.xlsx>
+    """
+    from app.services.ingestion.seed_company_workbook import (
+        seed_company_workbook,
+    )
+
+    s = _session()
+    try:
+        report = seed_company_workbook(
+            session=s,
+            xlsx_path=xlsx_path,
+            sheet=sheet,
+            cme_sheet=cme_sheet,
+            sr_sheet=sr_sheet,
+            load_exposures=not skip_exposures,
+            load_relationships=not skip_relationships,
+            dry_run=dry_run,
+        )
+        out = report.as_dict()
+        out["dry_run"] = dry_run
+        typer.echo(json.dumps({"ok": True, **out}, indent=2, default=str))
     except Exception as exc:
         typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
         raise typer.Exit(code=1)
@@ -4832,8 +5095,26 @@ def reingest_all_events_cmd(
         help=(
             "Path to a locally-downloaded GTA CSV file.  GTA requires "
             "registration for bulk access, so the file path must be passed "
-            "explicitly.  If omitted, the GTA step is skipped with a warning."
+            "explicitly.  If omitted (and --gta-use-api is not set), the "
+            "GTA step is skipped with a warning."
         ),
+    ),
+    gta_use_api: bool = typer.Option(
+        False,
+        "--gta-use-api",
+        help=(
+            "Run the GTA step via the REST API (ingest-gta --use-api) "
+            "instead of a local CSV.  Requires GTA_API_KEY in the "
+            "environment.  Takes precedence over --gta-file when both are "
+            "set.  Server-side HS-prefix + date filtering — equivalent to "
+            "the HS-filtered bulk path, NOT the --skip-hs-filter curated-"
+            "export path."
+        ),
+    ),
+    gta_since_year: int = typer.Option(
+        2018,
+        "--gta-since-year",
+        help="since-year passed to ingest-gta in API mode.  Default 2018.",
     ),
     iea_file: Optional[str] = typer.Option(
         None,
@@ -4983,12 +5264,21 @@ def reingest_all_events_cmd(
     if not _maybe_skip("eurlex"):
         _run("ingest-eurlex", ["ingest-eurlex"])
 
-    # ── 3. GTA (requires --gta-file) ─────────────────────────────────────
+    # ── 3. GTA (requires --gta-use-api or --gta-file) ────────────────────
     if not _maybe_skip(
         "gta",
-        reason="--gta-file not provided" if not gta_file else None,
+        reason=(
+            "--gta-file / --gta-use-api not provided"
+            if not (gta_file or gta_use_api) else None
+        ),
     ):
-        _run("ingest-gta", ["ingest-gta", "--local-file", gta_file])
+        if gta_use_api:
+            _run("ingest-gta", [
+                "ingest-gta", "--use-api",
+                "--since-year", str(gta_since_year),
+            ])
+        else:
+            _run("ingest-gta", ["ingest-gta", "--local-file", gta_file])
 
     # ── 4. IEA Policy Tracker (requires --iea-file) ──────────────────────
     if not _maybe_skip(

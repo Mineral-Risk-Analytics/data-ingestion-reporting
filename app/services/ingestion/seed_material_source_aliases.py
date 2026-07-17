@@ -98,6 +98,11 @@ _MCS_2026_CSV: list[_AliasRow] = [
     ("mcs_2026_csv", "BORON",                          "Boron"),
     ("mcs_2026_csv", "CHROMIUM",                       "Chromium"),
     ("mcs_2026_csv", "COBALT",                         "Cobalt"),
+    # 2026-07-10: enabled per Nicole — iron ore HS nodes (2601 family) now
+    # exist; bulk-vs-LFP scoping is handled by battery_grade_relevance, not
+    # by skipping ingestion. IRON AND STEEL / SCRAP / SLAG / PIGMENTS below
+    # remain skipped.
+    ("mcs_2026_csv", "IRON ORE",                       "Iron Ore"),
     ("mcs_2026_csv", "COPPER",                         "Copper"),
     ("mcs_2026_csv", "FLUORSPAR",                      "Fluorspar"),
     ("mcs_2026_csv", "GALLIUM",                        "Gallium"),
@@ -203,6 +208,7 @@ _MCS_2026_CSV: list[_AliasRow] = [
 
 _MCS_2025_CSV: list[_AliasRow] = [
     ("mcs_2025_csv", "Aluminum",                       "Aluminum"),
+    ("mcs_2025_csv", "Iron ore",                       "Iron Ore"),  # 2026-07-10, see mcs_2026 note
     ("mcs_2025_csv", "Antimony",                       "Antimony"),
     ("mcs_2025_csv", "Bismuth",                        "Bismuth"),
     ("mcs_2025_csv", "Boron ",                         "Boron"),
@@ -255,6 +261,7 @@ _MCS_PDF: list[_AliasRow] = [
     ("mcs_pdf", "BORON",                          "Boron"),
     ("mcs_pdf", "CHROMIUM",                       "Chromium"),
     ("mcs_pdf", "COBALT",                         "Cobalt"),
+    ("mcs_pdf", "IRON ORE",                        "Iron Ore"),  # 2026-07-10
     ("mcs_pdf", "COPPER",                         "Copper"),
     ("mcs_pdf", "FLUORSPAR",                      "Fluorspar"),
     ("mcs_pdf", "GALLIUM",                        "Gallium"),

@@ -721,8 +721,37 @@ def fetch_gta_interventions_api(
                 "offset":       offset,
                 "request_data": request_filters,
             }
-            response = client.post(url, headers=headers, json=body)
-            response.raise_for_status()
+            # ── 429 / transient-5xx backoff (2026-07-13) ──────────────
+            # GTA rate-limits per key (observed account-level 429 after a
+            # few same-day runs).  Honor Retry-After when present, else
+            # exponential backoff 30s → 60s → 120s → 240s → 480s.  Other
+            # 4xx (auth, bad request) still raise immediately — retrying
+            # those wastes quota.
+            _RETRYABLE = {429, 500, 502, 503, 504}
+            attempt = 0
+            while True:
+                response = client.post(url, headers=headers, json=body)
+                if response.status_code not in _RETRYABLE:
+                    response.raise_for_status()
+                    break
+                attempt += 1
+                if attempt > 5:
+                    response.raise_for_status()  # exhausted — surface the error
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    wait_s = max(1.0, float(retry_after)) if retry_after else 30.0 * (2 ** (attempt - 1))
+                except ValueError:
+                    wait_s = 30.0 * (2 ** (attempt - 1))
+                wait_s = min(wait_s, 600.0)
+                log.warning(
+                    "gta.api.fetch.rate_limited",
+                    status=response.status_code,
+                    attempt=attempt,
+                    wait_seconds=wait_s,
+                    retry_after_header=retry_after,
+                )
+                import time as _t
+                _t.sleep(wait_s)
             chunk = response.json()
             pages_fetched += 1
 
@@ -829,10 +858,12 @@ def parse_gta_api_response(
 
         # ── 4. Country resolution — API gives ISO3, downstream wants ISO2 ──
         implementing_iso2 = _resolve_iso3_jurisdiction(
-            row.get("implementing_jurisdictions") or []
+            row.get("implementing_jurisdictions") or [],
+            country_name_map,
         )
         affected_iso2_list = _resolve_iso3_list(
-            row.get("affected_jurisdictions") or []
+            row.get("affected_jurisdictions") or [],
+            country_name_map,
         )
 
         # ── 5. Intervention type → subtype/category ─────────────────────────
@@ -971,34 +1002,52 @@ def parse_gta_api_response(
     return parsed
 
 
+def _resolve_api_jurisdiction_entry(
+    entry: dict,
+    country_name_map: Optional[dict[str, str]] = None,
+) -> Optional[str]:
+    """Resolve one API jurisdiction dict ``{id, name, iso}`` to ISO2.
+
+    Resolution order (fixed 2026-07-13 — the original implementation
+    ignored the API's own ``iso`` field AND called the name resolver
+    without the DB map, so it fell back to the hardcoded name list and
+    dropped ~16% of interventions as unknown-country):
+
+      1. ``iso`` (ISO3) via the ISO3→ISO2 entries that
+         _build_country_name_map now includes — spelling-proof.
+      2. ``name`` via the full DB-backed resolver (common_names +
+         hardcoded fallback) — covers EU ('European Union', iso3 NULL)
+         and any row missing iso3.
+    """
+    if not isinstance(entry, dict):
+        return None
+    iso3 = (entry.get("iso") or "").strip().upper()
+    if iso3 and country_name_map:
+        hit = country_name_map.get(iso3)
+        if hit:
+            return hit
+    name = entry.get("name") or ""
+    return _resolve_country(name, country_name_map) or None
+
+
 def _resolve_iso3_jurisdiction(
     jurisdiction_list: list[dict],
+    country_name_map: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
-    """Extract the first implementing-country ISO2 from an API jurisdiction list.
-
-    API returns ISO3 codes in ``{id, name, iso}``.  We convert to ISO2 by
-    way of the existing ``_resolve_country`` name-based map for now.  A
-    direct ISO3→ISO2 map would be cleaner; this is a follow-up.
-    """
+    """Extract the first implementing-country ISO2 from an API jurisdiction list."""
     if not jurisdiction_list:
         return None
-    first = jurisdiction_list[0]
-    if not isinstance(first, dict):
-        return None
-    name = first.get("name") or ""
-    # Use the existing name-based resolver; works for all 50+ jurisdictions
-    # we currently care about.
-    return _resolve_country(name) or None
+    return _resolve_api_jurisdiction_entry(jurisdiction_list[0], country_name_map)
 
 
-def _resolve_iso3_list(jurisdiction_list: list[dict]) -> list[str]:
+def _resolve_iso3_list(
+    jurisdiction_list: list[dict],
+    country_name_map: Optional[dict[str, str]] = None,
+) -> list[str]:
     """Same as _resolve_iso3_jurisdiction but returns the full list."""
     out: list[str] = []
     for j in jurisdiction_list:
-        if not isinstance(j, dict):
-            continue
-        name = j.get("name") or ""
-        iso = _resolve_country(name)
+        iso = _resolve_api_jurisdiction_entry(j, country_name_map)
         if iso and iso not in out:
             out.append(iso)
     return out
@@ -1318,6 +1367,12 @@ def _build_country_name_map(session: Session) -> dict[str, str]:
     for row in rows:
         # Always map the canonical name itself.
         name_map[row.name] = row.iso2
+        # ISO3 → ISO2 (2026-07-13): the GTA API supplies ISO3 in every
+        # jurisdiction record; 3-letter upper keys cannot collide with
+        # country-name keys.  129/130 rows carry iso3 (EU is NULL — it
+        # resolves via its name/common_names instead).
+        if getattr(row, "iso3", None):
+            name_map[row.iso3.strip().upper()] = row.iso2
         if row.common_names:
             for alias in row.common_names:
                 if alias:
@@ -2335,12 +2390,26 @@ def ingest_gta(
                 if prev_hs is None or scaled > prev_hs:
                     hs_mapping_best_rel[hs_mapping_id] = scaled
 
+        # ── Breadth discount + direct/broad flag (migration 056) ────────
+        # An intervention tagged to many materials via a long HS list is,
+        # per material, weak evidence: 43% of GTA events are single-
+        # material, but omnibus measures carry 13-34 tags and previously
+        # counted at full relevance on every one of them.  n <= 3 keeps
+        # full weight and is_direct=True (material pages show these);
+        # broader events get relevance * 3/n and route to the cross-
+        # material industry-events surface only.  Same values as the
+        # migration-056 backfill, so re-ingests are idempotent.
+        _n_materials = len(material_best_rel)
+        _breadth = min(1.0, 3.0 / _n_materials) if _n_materials else 1.0
+        _is_direct = _n_materials <= 3
+
         for material_id, relevance in material_best_rel.items():
             session.add(
                 RiskEventMaterial(
                     risk_event_id=event.id,
                     material_id=material_id,
-                    relevance_score=relevance,
+                    relevance_score=relevance * _breadth,
+                    is_direct=_is_direct,
                     match_reason="hs_code",
                 )
             )
@@ -2350,7 +2419,7 @@ def ingest_gta(
                 RiskEventHsMapping(
                     risk_event_id=event.id,
                     hs_mapping_id=hs_mapping_id,
-                    relevance_score=relevance,
+                    relevance_score=relevance * _breadth,
                     match_reason="hs_code",
                 )
             )

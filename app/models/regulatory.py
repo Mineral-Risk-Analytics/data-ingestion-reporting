@@ -268,6 +268,17 @@ class RiskEvent(Base):
     event_date: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), index=True
     )
+    # Cross-source duplicate suppression (migration 055, 2026-07-15).
+    # NULL = canonical event (the default).  Non-NULL = confirmed
+    # duplicate of the referenced canonical row — EXCLUDED from scoring
+    # and event counts.  Set only via the human-confirmed
+    # ``mark-duplicate-events`` flow; never at ingest.  Convention: the
+    # manual-walkthrough row is canonical when present.
+    duplicate_of_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("risk_events.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     title: Mapped[str] = mapped_column(String(1024), nullable=False)
     summary: Mapped[Optional[str]] = mapped_column(Text)
     severity_score: Mapped[Optional[float]] = mapped_column(Float)  # 0.0–1.0
@@ -385,6 +396,17 @@ class RiskEventMaterial(Base):
         ForeignKey("materials.id", ondelete="CASCADE"), nullable=False, index=True
     )
     relevance_score: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    # Direct-vs-broad distinction (migration 056, 2026-07-15).  TRUE when
+    # the event is tagged to <= 3 materials — a material-specific measure.
+    # FALSE = broad measure (omnibus tariff list, cleantech subsidy, ...)
+    # whose HS list happens to include this material.  Material-scoped UI
+    # surfaces show is_direct rows only; broad events stay visible in the
+    # cross-material industry-events surface.  Scoring uses ALL rows but
+    # broad links carry breadth-discounted relevance (min(1, 3/n) folded
+    # in at ingest for GTA/IEA).
+    is_direct: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, index=True,
+    )
     match_reason: Mapped[Optional[str]] = mapped_column(String(64))
     # named_material | hs_code | keyword_match
     # Copied from RegulationMaterialScope.scope_type when the junction is

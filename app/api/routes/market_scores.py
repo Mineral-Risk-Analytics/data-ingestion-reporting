@@ -231,6 +231,8 @@ def list_material_market_scores(
         )
         .where(
             RiskEventMaterial.material_id == material_id,
+            RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEventMaterial.is_direct.is_(True),  # 056
             ((RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))),
         )
         .group_by(RiskEventGeography.country_code)
@@ -389,6 +391,7 @@ def get_material_market_score_evidence(
         regulation_total=bundle.regulation_total,
         facility_total=bundle.facility_total,
         risk_event_total=bundle.risk_event_total,
+        risk_event_broad_total=bundle.risk_event_broad_total,
         risk_event_window_days=RISK_EVENT_EVIDENCE_WINDOW_DAYS,
     )
 
