@@ -812,9 +812,19 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      0.8, "refined", 6, "global"),
     ("284610", "Rare Earth Elements",
      "Cerium compounds (CeO2, CeCl3)", 0.9, "intermediate", 6, "global"),
+    # 284690 reclassified intermediate→battery_grade 2026-07-18 (Nicole):
+    # HS 284690 trade is dominated by SEPARATED rare-earth oxides / precursor
+    # chemicals feeding NdFeB magnets (EV traction motors) + minor cathode
+    # additives — the last specialty-chemical stage before the drivetrain
+    # component.  Placed at battery_grade by parallel with lithium, where IEA
+    # "refining" (carbonate/hydroxide) is likewise our battery_grade.  This
+    # also removes the parent/child inversion vs the 2846 (4-digit) parent,
+    # which is already battery_grade.  Note: at 6 digits 284690 cannot split
+    # mixed carbonate from separated oxides; the separated-oxide trade
+    # dominates the code, which justifies the later stage.
     ("284690", "Rare Earth Elements",
-     "Other rare-earth compounds (oxides, chlorides, carbonates of La, Nd, Pr, Dy, Tb…)",
-     0.8, "intermediate", 6, "global"),
+     "Separated rare-earth oxides / precursor chemicals (Nd, Pr, Dy, Tb…) — NdFeB magnet + cathode-additive feedstock",
+     0.8, "battery_grade", 6, "global"),
     # Added 2026-05-09 to clear NULL stage on a row inserted by the MCS PDF
     # parser: ferrocerium is a refined mischmetal alloy (~70% Ce + La/Nd/Pr)
     # used industrially as flint material — refined-stage REE product.
@@ -840,26 +850,26 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
      "Rare-earth metals — neodymium metal unwrought; shares with all REEs",
      0.6, "refined", 6, "global"),
     ("284690", "Neodymium",
-     "Other rare-earth compounds — neodymium compounds (Nd2O3, NdCl3)",
-     0.6, "intermediate", 6, "global"),
+     "Separated neodymium compounds (Nd2O3, NdCl3) — magnet feedstock",
+     0.6, "battery_grade", 6, "global"),
     ("280530", "Praseodymium",
      "Rare-earth metals — praseodymium metal unwrought; shares with all REEs",
      0.6, "refined", 6, "global"),
     ("284690", "Praseodymium",
-     "Other rare-earth compounds — praseodymium compounds",
-     0.6, "intermediate", 6, "global"),
+     "Separated praseodymium compounds — magnet feedstock",
+     0.6, "battery_grade", 6, "global"),
     ("280530", "Dysprosium",
      "Rare-earth metals — dysprosium metal unwrought; shares with all REEs",
      0.6, "refined", 6, "global"),
     ("284690", "Dysprosium",
-     "Other rare-earth compounds — dysprosium compounds (Dy2O3)",
-     0.6, "intermediate", 6, "global"),
+     "Separated dysprosium compounds (Dy2O3) — magnet feedstock",
+     0.6, "battery_grade", 6, "global"),
     ("280530", "Terbium",
      "Rare-earth metals — terbium metal unwrought; shares with all REEs",
      0.6, "refined", 6, "global"),
     ("284690", "Terbium",
-     "Other rare-earth compounds — terbium compounds (Tb4O7)",
-     0.6, "intermediate", 6, "global"),
+     "Separated terbium compounds (Tb4O7) — magnet feedstock",
+     0.6, "battery_grade", 6, "global"),
 
     # ── Boron (6-digit) ───────────────────────────────────────────────────
     ("252800", "Boron",

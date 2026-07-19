@@ -20,6 +20,7 @@ from app.services.scoring.global_rollup import (
     compute_meaningful_pillar_count,
     compute_overall_from_pillars,
     compute_per_pillar_weighted_average,
+    compute_production_weighted_pillar,
 )
 
 
@@ -236,3 +237,50 @@ class TestMeaningfulPillarCount:
     def test_threshold_constant_value(self):
         # Locks in the threshold value so any future change is intentional.
         assert MEANINGFUL_SIGNAL_THRESHOLD == 5.0
+
+
+# ---------------------------------------------------------------------------
+# compute_production_weighted_pillar — geopolitical supply-origin weighting
+# (2026-07-18): geopolitical rolls up by MINE-stage production share, not
+# trade value, and non-producers must not move it.
+# ---------------------------------------------------------------------------
+
+class TestProductionWeightedPillar:
+    def test_weights_by_production_share(self):
+        # CD 75% at geopol 41.1 dominates; ID 14.4% at 16.7 next.
+        ore = {"CD": 0.75, "ID": 0.144, "RU": 0.025}
+        vals = {"CD": 41.1, "ID": 16.7, "RU": 18.0}
+        got = compute_production_weighted_pillar(ore, vals)
+        exp = (0.75*41.1 + 0.144*16.7 + 0.025*18.0) / (0.75 + 0.144 + 0.025)
+        assert got == pytest.approx(exp)
+
+    def test_non_producers_excluded_even_if_high_risk(self):
+        # Syria/Belarus/Iran are politically unstable but produce ZERO cobalt,
+        # so they are absent from ore_weights and cannot move the result — the
+        # whole point of the fix.  A trade-weighted average WOULD include them.
+        ore = {"CD": 0.75, "ID": 0.144}
+        vals = {"CD": 41.1, "ID": 16.7, "SY": 28.1, "BY": 28.0, "IR": 23.0}
+        got = compute_production_weighted_pillar(ore, vals)
+        exp = (0.75*41.1 + 0.144*16.7) / (0.75 + 0.144)
+        assert got == pytest.approx(exp)
+        # And the dominant producer anchors it well above the trade-avg (~25.6)
+        assert got > 35.0
+
+    def test_missing_pillar_value_skipped(self):
+        # A producer with no geopolitical score contributes nothing (not a 0).
+        ore = {"CD": 0.75, "ID": 0.25}
+        vals = {"CD": 40.0, "ID": None}
+        assert compute_production_weighted_pillar(ore, vals) == pytest.approx(40.0)
+
+    def test_zero_and_negative_weights_ignored(self):
+        ore = {"CD": 0.75, "XX": 0.0, "YY": -0.3}
+        vals = {"CD": 40.0, "XX": 99.0, "YY": 99.0}
+        assert compute_production_weighted_pillar(ore, vals) == pytest.approx(40.0)
+
+    def test_no_producer_contributes_returns_none(self):
+        # No overlap between producers and scored geos → None so the caller
+        # keeps its existing (trade-weighted) value.
+        ore = {"CD": 0.75}
+        vals = {"US": 20.0}
+        assert compute_production_weighted_pillar(ore, vals) is None
+        assert compute_production_weighted_pillar({}, {"CD": 40.0}) is None

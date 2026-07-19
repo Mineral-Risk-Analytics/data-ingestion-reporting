@@ -139,30 +139,15 @@ def _sync_score_material_geos(
             log.warning("scoring_jobs.step.geo.no_material", material_id=material_id)
             return {"material_id": material_id, "pairs_scored": 0, "skipped": True}
 
-        # Derive geographies: production share countries + any geo with events.
-        # primary_producing_countries was removed in migration 023; use
-        # material_production_shares as the authoritative source instead.
-        prod_share_geos = list(session.scalars(
-            select(MaterialProductionShare.country_code)
-            .where(
-                MaterialProductionShare.material_id == material.id,
-                MaterialProductionShare.production_share > 0,
-            )
-            .distinct()
-        ).all())
-        geos: list[str] = [g.upper() for g in prod_share_geos]
-
-        event_geo_stmt = (
-            select(RiskEventGeography.country_code)
-            .join(
-                RiskEventMaterial,
-                RiskEventMaterial.risk_event_id == RiskEventGeography.risk_event_id,
-            )
-            .where(RiskEventMaterial.material_id == material.id)
-            .distinct()
+        # V1 (4.0, 2026-07-18): scored-geography universe = producers +
+        # trade-gate exporters.  Event-only geographies are skipped — zero
+        # concentration by definition, zero L2 trade weight by
+        # construction, and they were ~85% of pairs (cobalt: 127 -> ~24).
+        # See stage_concentration.derive_scoring_geographies.
+        from app.services.scoring.stage_concentration import (
+            derive_scoring_geographies,
         )
-        event_geos = [row[0] for row in session.execute(event_geo_stmt).all()]
-        geos = list({*geos, *event_geos})
+        geos: list[str] = derive_scoring_geographies(session, material.id)
 
         if not geos:
             log.debug(

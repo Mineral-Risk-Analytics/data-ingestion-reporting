@@ -59,6 +59,11 @@ from app.models.supply import (
     TradeFlow,
 )
 from app.models.vehicle import CompanyVehicleModel, VehicleModelChemistry
+from app.models.wmd import (  # noqa: F401
+    WmdCommodity,
+    WmdGroupProduction,
+    WmdProduction,
+)
 
 __all__ = [
     # Battery chemistry
@@ -136,4 +141,8 @@ __all__ = [
     # Vehicle (chemistry mix)
     "CompanyVehicleModel",
     "VehicleModelChemistry",
+    # World Mining Data (migration 060) — cross-check layer, never feeds scoring
+    "WmdCommodity",
+    "WmdProduction",
+    "WmdGroupProduction",
 ]

@@ -118,6 +118,8 @@ curated operational events──►  Operational pillar   ─┘         (4 pill
 
 **History/trend:** score rows are kept per as-of date; the time series of full recomputes is the trend line, and any two runs diff cleanly to explain movement (evidence added/aged/corrected between them).
 
+**Scored-geography universe (added 2026-07-18, Nicole's call):** a (material × geography) pair is scored only when the geography is a **producer** (material-level or stage-level share > 0) or a **trade-gate exporter** (≥ 1% of the 4-digit-family export total AND ≥ $5M — the same thresholds as the L0 participation gate). Event-only geographies are not scored: their concentration is 0 by definition and their weight in the L2 trade-flow rollup is 0 by construction, so skipping them changes no number anyone sees while cutting ~85% of pairs (cobalt: 127 → ~24). Implementation: `stage_concentration.derive_scoring_geographies`, used by all three scoring entry points. Events tagged to unscored jurisdictions remain fully visible in event views — they just don't generate score rows.
+
 ## 8. What's deleted, and why (bug ledger)
 
 | Removed | Was | Why |

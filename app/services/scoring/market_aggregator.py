@@ -71,6 +71,7 @@ from app.services.scoring.evidence_query import (
     get_hs_nodes_for_material,
 )
 from app.services.scoring.supplier_risk import SCORING_VERSION
+from app.services.scoring.stage_concentration import score_material_concentration
 
 log = structlog.get_logger(__name__)
 
@@ -84,11 +85,19 @@ log = structlog.get_logger(__name__)
 #   financial 0.10  →  sum = 0.85  →  renormalise each by /0.85
 # ---------------------------------------------------------------------------
 MARKET_PILLAR_WEIGHTS: dict[str, float] = {
-    "material":      0.25 / 0.85,   # ≈ 0.294
-    "geopolitical":  0.20 / 0.85,   # ≈ 0.235
-    "regulatory":    0.20 / 0.85,   # ≈ 0.235
-    "operational":   0.10 / 0.85,   # ≈ 0.118
-    "financial":     0.10 / 0.85,   # ≈ 0.118
+    # V1 (4.0, 2026-07-17): financial removed from the geography-level
+    # aggregate — its per-geo value carried no geographic information
+    # (flat 56.2 across every cobalt geography).  Weight redistributed
+    # pro-rata across the four remaining pillars (spec §7).  The key
+    # stays at 0.0 so every MARKET_PILLAR_WEIGHTS["financial"] consumer
+    # (completeness, L2 rescale, chemistry composite) degrades cleanly:
+    # financial_pressure_score is still computed, persisted, and shown
+    # as material-level context — it just doesn't move overall scores.
+    "material":      0.25 / 0.75,   # ≈ 0.333
+    "geopolitical":  0.20 / 0.75,   # ≈ 0.267
+    "regulatory":    0.20 / 0.75,   # ≈ 0.267
+    "operational":   0.10 / 0.75,   # ≈ 0.133
+    "financial":     0.0,
 }
 
 # ---------------------------------------------------------------------------
@@ -1555,70 +1564,20 @@ def _derive_market_operational_inputs(
     stage_breakdown: Optional[dict] = None
     struct_dep: Optional[float] = None
 
-    # Tier 1: geography-specific MRDS stage-weighted fraction
-    geo_result = _facility_structural_dependency(db, material_id, geography_code)
-    if geo_result is not None:
-        struct_dep = geo_result["weighted"]
-        stage_breakdown = geo_result
-        dep_source = "mrds_geography_stage_weighted"
-
-    # Tier 2 (DISABLED 2026-05-12, Step 2 audit Fix B): global MRDS
-    # stage-weighted fraction × 0.5.  This path imputed a global structural-
-    # dependency value to countries with no per-material facility data,
-    # which mathematically produces JP-style inversions (a country with no
-    # graphite mines inheriting the global graphite mothballed-fraction).
-    # Currently the fallback returns 0 because no facility in the DB carries
-    # a mothballed status — Tier 2 is therefore moot in practice — but the
-    # principled fix is to skip it: countries with no facility data should
-    # surface as a coverage gap (Tier 3 / default), not be imputed.  When
-    # the MRDS parser fix (ticket #61) lands status-diverse data, this gate
-    # prevents accidental cross-country contamination on day one.
-    #
-    # If a future analysis wants a global comparison baseline, prefer
-    # rendering it as a UI annotation rather than folding it into the
-    # per-country score.
-
-    # Tier 3: event-derived baseline — when no MRDS data exists for this material
-    if struct_dep is None:
-        struct_events = [
-            ew for ew in operational_events
-            if (ew.event.event_subtype or "") in (  # typed col (migration 040)
-                "SINGLE_SOURCE", "CAPACITY_CONSTRAINT"
-            ) or any(
-                kw in (ew.event.title or "").lower()
-                for kw in ("single source", "single-source", "capacity constraint")
-            )
-        ]
-        if struct_events:
-            # 11.4-Op (2026-06-06): same severity-default fix as line 226.
-            struct_dep = sum(
-                float(ew.event.severity_score or 0.0) for ew in struct_events
-            ) / len(struct_events)
-            dep_source = "event_derived"
-        else:
-            # Final tier: no MRDS data AND no capacity-constraint events.
-            # 2026-05-12 (Step 2 audit follow-up): switched from default
-            # 0.3 placeholder to None.  The placeholder was contributing a
-            # silent 12-point ghost (0.40 weight × 0.3 default × 100) to
-            # every (material, country) pair lacking facility data, which
-            # for the current launch list means every pair.  None signals
-            # honest "we don't have the data to score this," and
-            # _score_operational_market redistributes the operational
-            # pillar to 100% event-component when struct_dep is None.
-            # Revisit once curated facility data (G4c track) populates
-            # status-diverse MRDS rows.
-            struct_dep = None
-            dep_source = "no_signal"
-            log.debug(
-                "market_aggregator.structural_dependency_missing",
-                material_id=material_id,
-                geography_code=geography_code,
-                note=(
-                    "No MRDS facility data and no capacity-constraint events; "
-                    "structural_dependency = None.  Operational pillar will "
-                    "score from events only."
-                ),
-            )
+    # ── V1 (4.0, 2026-07-17) — event-only operational pillar ─────────────
+    # Spec: docs/design/scoring_v1_spec.md §6.  structural_dependency is
+    # forced to None: the MRDS-derived Tier-1 is retired (statuses are
+    # unvetted/stale outside the cobalt triage and carry no production
+    # weighting — Nicole's call: score only from facilities we've vetted),
+    # and the Tier-3 capacity-constraint baseline double-used events as
+    # pseudo-structural signal.  ``_score_operational_market``'s
+    # struct_dep=None path (100% curated-event component) is now the ONLY
+    # path.  Facility structural dependency returns as a versioned upgrade
+    # once the vetted watchlist + mining data feed land.
+    # ``_facility_structural_dependency`` is retained in the module for
+    # that future path but is no longer called here.
+    struct_dep = None
+    dep_source = "v1_event_only"
 
     weighted_event_impacts = [
         _event_impact(ew, RiskCategory.OPERATIONAL, as_of_date)
@@ -2747,25 +2706,11 @@ def score_material_geography(
         and n.hs_mapping.supply_chain_stage in STAGE_ROLLUP_WEIGHTS
     ]
 
-    # ── Concentration-purity filter (2026-07-15) ──────────────────────────
-    # The Material Concentration stage rollup consumes ONLY hhi-anchored
-    # Level-0 rows (score_method "hhi_anchored" / "hhi_anchored_with_
-    # operational").  Event-only and operational-only rows carry no
-    # concentration evidence — their composite is 50/50 tariff+export (or
-    # facility signal), and those same tariff/export sub-scores already
-    # reach the Geopolitical pillar via the G2 HS-node aggregate path
-    # below (which continues to use the FULL ``eligible_nodes`` list).
-    # Before this filter, an event-only node fed the same event twice:
-    # once into Geopolitical (correct) and once into Material
-    # Concentration (mislabeled — a tariff is not concentration).
-    # Materials × geographies with zero hhi-anchored nodes now fall back
-    # to the legacy material-level path instead of building a
-    # "concentration" score out of event exposure.
-    concentration_nodes = [
-        n for n in eligible_nodes
-        if n.metadata_json
-        and str(n.metadata_json.get("score_method", "")).startswith("hhi_anchored")
-    ]
+    # V1 (4.0, 2026-07-17): the concentration-purity filter and the
+    # concentration_nodes list are gone — Level-0 node composites no longer
+    # feed the Material Concentration pillar at all (see the stage-max call
+    # in STEP 5).  ``eligible_nodes`` is retained solely for the G2
+    # Geopolitical HS-node aggregate path below.
 
     # --- STEP 4: Derive sub-inputs ---
     # Event-list-choice contract (2026-05-12, Step 2 audit Fix A/B):
@@ -2835,70 +2780,27 @@ def score_material_geography(
         if n.metadata_json:
             method = n.metadata_json.get("score_method", "unknown")
         score_method_breakdown[method] = score_method_breakdown.get(method, 0) + 1
-    # Purity filter (2026-07-15): the rollup below uses only
-    # ``concentration_nodes``, so its own breakdown is by construction
-    # all hhi-anchored.  The full histogram above is kept in rationale
-    # so partners can still see what other node types exist for the pair.
-    concentration_method_breakdown: dict[str, int] = {}
-    for n in concentration_nodes:
-        method = "unknown"
-        if n.metadata_json:
-            method = n.metadata_json.get("score_method", "unknown")
-        concentration_method_breakdown[method] = (
-            concentration_method_breakdown.get(method, 0) + 1
-        )
-
-    # Step 2B (2026-06-15) — Material-level HHI lift diagnostic.  Always
-    # built so rationale_json carries a consistent shape regardless of
-    # which path fires.  Populated by ``apply_material_hhi_lift`` in the
-    # stage-weighted branch; remains ``None`` in the material_fallback
-    # branch (where the legacy path already uses score_material_exposure
-    # directly — no blending needed).
-    material_hhi_lift_diag: Optional[dict] = None
-
-    if len(concentration_nodes) >= _STAGE_ROLLUP_MIN_NODES:
-        # Normalised weighted average of composite_node_scores across stages
-        # — hhi-anchored nodes only (purity filter, 2026-07-15).
-        weighted_sum = sum(
-            n.composite_node_score * STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
-            for n in concentration_nodes
-        )
-        weight_total = sum(
-            STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
-            for n in concentration_nodes
-        )
-        stage_rollup_score = weighted_sum / weight_total if weight_total > 0 else 0.0
-        stage_rollup_method = "stage_weighted"
-        stage_rollup_count = len(concentration_nodes)
-
-        # Step 2B — apply material-level HHI lift when most contributing
-        # nodes scored without HHI signal.  This is the bridge that lets
-        # cobalt's DRC dominance / graphite's China dominance reach the
-        # score even when the refined / battery-grade HS nodes have no
-        # share data of their own.  See material_risk.apply_material_hhi_lift
-        # for the blend math + threshold rationale.
-        material_floor_score = material_risk.score_material_exposure(
-            crit, conc, trade_vol
-        )
-        has_material_hhi_signal = (
-            criticality_signal is not None
-            and criticality_signal.hhi_score is not None
-        )
-        mat_score, material_hhi_lift_diag = material_risk.apply_material_hhi_lift(
-            stage_rollup_score=stage_rollup_score,
-            material_floor_score=material_floor_score,
-            # Purity filter (2026-07-15): pass the breakdown of the nodes
-            # that actually fed the rollup.  Post-filter these are all
-            # hhi-anchored, so the lift's "mostly event-only rollup"
-            # trigger no longer fires from this branch — pairs with thin
-            # HHI coverage now reach the material_fallback branch instead.
-            score_method_breakdown=concentration_method_breakdown,
-            has_material_hhi_signal=has_material_hhi_signal,
-        )
+    # ── V1 (4.0, 2026-07-17) — stage-max structural concentration ─────
+    # Spec: docs/design/scoring_v1_spec.md §3.  The pillar is computed
+    # directly from the per-stage share tables (stage_concentration.py):
+    # sub = hhi_cliff(HHI_stage) × √share × 100, pillar = max across
+    # FRESH stages (§7b freshness gate).  Replaces the 3.x chain
+    # (stage-weighted node rollup → material-HHI lift → legacy
+    # material_fallback), whose averaging diluted structural signal and
+    # whose non-producer fallback scored Belarus above DRC for cobalt.
+    # Non-producers score 0 — no material-level fallback.
+    # NOTE: crit/conc/trade_vol above are retained as rationale context
+    # only; they no longer participate in the concentration score.
+    conc_result = score_material_concentration(db, material_id, as_of_date)
+    geo_conc = conc_result.per_geo.get(geography_code)
+    if geo_conc is not None:
+        mat_score = geo_conc.score
+        stage_rollup_method = "stage_max"
+        stage_rollup_count = len(geo_conc.sub_scores)
     else:
-        mat_score = material_risk.score_material_exposure(crit, conc, trade_vol)
-        stage_rollup_method = "material_fallback"
-        stage_rollup_count = len(concentration_nodes)  # 0 (purity filter)
+        mat_score = 0.0
+        stage_rollup_method = "no_share_data"
+        stage_rollup_count = 0
 
     geo_score = geopolitical_risk.score_geopolitical_trade(
         ctry_conc, exp_rest, tariff,
@@ -2947,22 +2849,23 @@ def score_material_geography(
                 # nodes ({"event_only_no_hhi": 5}) or a mix.  Empty
                 # dict when no nodes contributed.
                 "node_score_method_breakdown": score_method_breakdown,
-                # Purity filter (2026-07-15): how many of those nodes were
-                # hhi-anchored and therefore actually fed the concentration
-                # rollup.  eligible-vs-concentration delta = event-only /
-                # operational-only nodes that now reach ONLY the
-                # Geopolitical pillar (G2 path).
-                "concentration_nodes_used": len(concentration_nodes),
-                # Step 2B (2026-06-15): when the stage rollup is built from
-                # mostly event-only nodes (sparse HS-level HHI coverage),
-                # the concentration score gets a material-level HHI floor.
-                # This diagnostic shows whether the lift fired and what
-                # the inputs were so partner UI can explain "score lifted
-                # toward structural material concentration because HS-node
-                # coverage was thin".  None in the material_fallback
-                # branch (the legacy path uses the same floor directly).
-                # See material_risk.apply_material_hhi_lift.
-                "material_hhi_lift": material_hhi_lift_diag,
+                # V1 (4.0): per-stage structural sub-scores for THIS
+                # geography and the stage driving the pillar (UI labels the
+                # driving stage — Nicole 2026-07-17).  stale_stages lists
+                # (stage, reference_year) snapshots excluded by the §7b
+                # freshness gate: display-only, never scored.
+                "driving_stage": geo_conc.driving_stage if geo_conc else None,
+                "stage_sub_scores": dict(geo_conc.sub_scores) if geo_conc else {},
+                "stage_detail": {
+                    s: {
+                        "hhi_raw": round(d.hhi_raw, 4),
+                        "hhi_cliff": round(d.hhi_cliff, 4),
+                        "reference_year": d.reference_year,
+                        "share": d.shares.get(geography_code),
+                    }
+                    for s, d in conc_result.stages.items()
+                },
+                "stale_stages": conc_result.stale_stages,
                 # 11.4 (2026-06-04): per-sub-input data-backed flags so the
                 # partner UI can show *which* component of the Material
                 # Concentration pillar lacks real data — not just that the
@@ -3244,31 +3147,14 @@ def score_all_active_materials(
         if geography_codes is not None:
             geos = [g.upper() for g in geography_codes]
         else:
-            # Derive from material_production_shares (replaces removed
-            # primary_producing_countries column dropped in migration 023)
-            prod_share_geos = list(db.scalars(
-                select(MaterialProductionShare.country_code)
-                .where(
-                    MaterialProductionShare.material_id == material.id,
-                    MaterialProductionShare.production_share > 0,
-                )
-                .distinct()
-            ).all())
-            geos: list[str] = [g.upper() for g in prod_share_geos]
-
-            # Supplement with any geography that has events for this material
-            from app.models.regulatory import RiskEventGeography, RiskEventMaterial
-            event_geo_stmt = (
-                select(RiskEventGeography.country_code)
-                .join(
-                    RiskEventMaterial,
-                    RiskEventMaterial.risk_event_id == RiskEventGeography.risk_event_id,
-                )
-                .where(RiskEventMaterial.material_id == material.id)
-                .distinct()
+            # V1 (4.0, 2026-07-18): producers + trade-gate exporters only —
+            # event-only geographies skipped (zero concentration, zero L2
+            # trade weight; were ~85% of pairs).  See
+            # stage_concentration.derive_scoring_geographies.
+            from app.services.scoring.stage_concentration import (
+                derive_scoring_geographies,
             )
-            event_geos = [row[0] for row in db.execute(event_geo_stmt).all()]
-            geos = list({*geos, *event_geos})
+            geos: list[str] = derive_scoring_geographies(db, material.id)
 
         if not geos:
             log.debug(

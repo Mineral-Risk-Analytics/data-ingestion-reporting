@@ -1667,27 +1667,14 @@ def rescore_market_cmd(
             if geo_filter is not None:
                 geos: list[str] = list(geo_filter)
             else:
-                # primary_producing_countries removed in migration 023; query
-                # material_production_shares as the authoritative geo seed.
-                prod_share_geos = list(s.scalars(
-                    select(MaterialProductionShare.country_code)
-                    .where(
-                        MaterialProductionShare.material_id == mat.id,
-                        MaterialProductionShare.production_share > 0,
-                    )
-                    .distinct()
-                ).all())
-                geos = [g.upper() for g in prod_share_geos]
-                event_geo_rows = s.execute(
-                    select(RiskEventGeography.country_code)
-                    .join(
-                        RiskEventMaterial,
-                        RiskEventMaterial.risk_event_id == RiskEventGeography.risk_event_id,
-                    )
-                    .where(RiskEventMaterial.material_id == mat.id)
-                    .distinct()
-                ).all()
-                geos = sorted({*geos, *(row[0] for row in event_geo_rows if row[0])})
+                # V1 (4.0, 2026-07-18): producers + trade-gate exporters
+                # only — event-only geographies are skipped (zero
+                # concentration, zero L2 trade weight; were ~85% of
+                # pairs).  See stage_concentration.derive_scoring_geographies.
+                from app.services.scoring.stage_concentration import (
+                    derive_scoring_geographies,
+                )
+                geos = derive_scoring_geographies(s, mat.id)
 
             if not geos:
                 typer.echo(
@@ -5324,6 +5311,87 @@ def reingest_all_events_cmd(
             "to material / chemistry / company scoring."
         ),
     }, indent=2))
+
+
+@app.command("ingest-wmd")
+def ingest_wmd_cmd(
+    data_dir: str = typer.Option(
+        "data/world-mining", "--dir",
+        help="Folder containing the WMD xlsx files (6.4 required; 6.3c/6.3d optional).",
+    ),
+    edition: int = typer.Option(
+        2026, "--edition", help="WMD edition year (2026 edition = 2020-2024 data).",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """Load World Mining Data xlsx files (production + stability/bloc groups).
+
+    All-or-nothing on validation failures (Total mismatch, unmapped country,
+    unknown sheet layout).  Idempotent upserts by (commodity, country, year);
+    re-running a newer edition revises prior years in place.
+    WMD is the CROSS-CHECK layer — it never feeds scoring (USGS canonical).
+    """
+    import json
+
+    from app.services.ingestion.wmd import ingest_wmd
+
+    s = _session()
+    try:
+        report = ingest_wmd(s, data_dir, edition=edition, dry_run=dry_run)
+        typer.echo(json.dumps(report.to_dict(), indent=2))
+        if report.errors:
+            raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("wmd-crosscheck")
+def wmd_crosscheck_cmd(
+    year: int = typer.Option(2024, "--year", help="WMD reference year to compare against."),
+    threshold_pp: float = typer.Option(
+        2.0, "--threshold-pp",
+        help="Ignore share differences below this many percentage points.",
+    ),
+    out: str = typer.Option(
+        "data/world-mining/wmd_usgs_crosscheck.html", "--out",
+        help="HTML report path (readable outside the terminal).",
+    ),
+) -> None:
+    """USGS vs WMD production-share crosscheck -> HTML report.
+
+    WMD's 2020-2024 series is the vintage control for the ~1-year-newer USGS
+    estimate: gaps on the trajectory = timing (ignored); gaps off the whole
+    series = definitional (flagged INVESTIGATE). WMD never feeds scoring.
+    Run after every USGS or WMD load.
+    """
+    import datetime as _dt
+    from pathlib import Path
+
+    from app.services.ingestion.wmd_crosscheck import render_html, run_crosscheck
+
+    s = _session()
+    try:
+        generated = _dt.date.today().isoformat()
+        reports, skipped = run_crosscheck(
+            s, year=year, threshold_pp=threshold_pp, generated=generated,
+        )
+        if not reports:
+            typer.echo("No WMD data loaded (run `ingest-wmd` first) or no mapped materials.")
+            raise typer.Exit(code=1)
+        html = render_html(reports, year=year, threshold_pp=threshold_pp,
+                           generated=generated, skipped=skipped)
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text(html)
+        total_unexpl = sum(m.counts().get("unexplained", 0) for m in reports)
+        typer.echo(f"crosscheck: {len(reports)} materials, {total_unexpl} INVESTIGATE flags")
+        for m in sorted(reports, key=lambda x: -x.counts().get("unexplained", 0)):
+            n = m.counts().get("unexplained", 0)
+            if n:
+                typer.echo(f"  {m.material}: {n} INVESTIGATE")
+        typer.echo(f"\nreport written: {out}")
+    finally:
+        s.close()
+
 
 
 def main() -> None:

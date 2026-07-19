@@ -40,6 +40,7 @@ from sqlalchemy.orm import Session
 from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
 from app.models.supply import (
     HsCodeMaterialMapping,
+    HsCodeProductionShare,
     Material,
     MaterialProductionShare,
     TradeFlow,
@@ -49,7 +50,7 @@ from app.services.scoring.supplier_risk import SCORING_VERSION
 
 log = structlog.get_logger(__name__)
 
-ROLLUP_VERSION = "1.0"
+ROLLUP_VERSION = "1.1"  # 1.1 (2026-07-18): concentration pillar rolls up as MAX across geos, not trade-weighted average
 
 # Pillar column names on MaterialGeographyRiskScore — used for generic weighted
 # averaging so adding a sixth pillar later only requires touching this list.
@@ -60,6 +61,30 @@ _PILLAR_COLS = [
     "operational_score",
     "financial_pressure_score",
 ]
+
+# Pillars that roll up to the global view as the MAX across geographies
+# rather than a trade-weighted average.  Concentration is a *structural*
+# risk — "how dominated is this supply chain?" — and a weighted mean of
+# per-geo concentration scores dilutes exactly the signal it should
+# surface: the dominant chokepoint gets averaged against many low/zero-
+# concentration trade-hub geos.  Max = the worst chokepoint, weight-
+# independent.  Geopolitical is deliberately NOT here: its risk is tied to
+# *where the material is produced*, so a zero-production but politically
+# unstable transit geo (Syria/Belarus/Iran for cobalt) must not define it —
+# that pillar needs production-weighting, not max.  (2026-07-18, Nicole)
+_MAX_ROLLUP_PILLARS = {"material_concentration_score"}
+
+# Pillars weighted by MINE-stage production share (where the material is
+# produced) rather than by trade-flow export value.  Supply-origin risk —
+# geopolitical exposure — must track the jurisdictions that actually produce
+# the material: a zero-production but politically unstable transit/re-export
+# geo (Syria/Belarus/Iran for cobalt) must not move the number.  Trade-value
+# weighting also underweights raw-material chokepoints that export a low-value
+# crude form (DRC ships cobalt hydroxide, not refined metal).  Weights come
+# from hs_code_production_shares ore stage — the clean, stage-aware table —
+# NOT the legacy stage-less material_production_shares (which carries
+# refined/smelter numbers for copper/titanium/aluminium).  (2026-07-18)
+_PRODUCTION_WEIGHTED_PILLARS = {"geopolitical_trade_score"}
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +273,59 @@ def _trade_weights_for_granularity(
     return out, periods_to_use
 
 
+def _ore_production_weights(
+    db: Session,
+    material_id: int,
+) -> dict[str, float]:
+    """Mine-stage production shares from ``hs_code_production_shares`` keyed by
+    country — the clean, stage-aware source for supply-origin weighting.
+
+    Reads the ``ore`` stage at the latest reference year, ``market_scope=
+    'global'``.  Parent/child HS duplicates (e.g. 2603 and 260300 both mapped
+    to copper ore) and the usgs_mcs / usgs_mcs_propagated pair express the same
+    underlying production, so they are de-duplicated by taking the MAX share
+    per country (summing would double count).  Preferred over
+    ``MaterialProductionShare``, which is stage-less and holds refined/smelter
+    shares for a few materials (copper CN 33.7%% vs true mine CL 26.5%%).
+    Returns {} when the material has no ore-stage global shares — callers then
+    keep the trade-weighted average.
+    """
+    base = (
+        select(HsCodeProductionShare.country_code, HsCodeProductionShare.production_share,
+               HsCodeProductionShare.reference_year)
+        .join(HsCodeMaterialMapping,
+              HsCodeMaterialMapping.id == HsCodeProductionShare.hs_mapping_id)
+        .where(
+            HsCodeMaterialMapping.material_id == material_id,
+            HsCodeMaterialMapping.supply_chain_stage == "ore",
+            HsCodeProductionShare.market_scope == "global",
+        )
+    )
+    latest_year = db.scalar(
+        select(sqlfunc.max(HsCodeProductionShare.reference_year))
+        .join(HsCodeMaterialMapping,
+              HsCodeMaterialMapping.id == HsCodeProductionShare.hs_mapping_id)
+        .where(
+            HsCodeMaterialMapping.material_id == material_id,
+            HsCodeMaterialMapping.supply_chain_stage == "ore",
+            HsCodeProductionShare.market_scope == "global",
+        )
+    )
+    if latest_year is None:
+        return {}
+    rows = db.execute(
+        base.where(HsCodeProductionShare.reference_year == latest_year)
+    ).all()
+    out: dict[str, float] = {}
+    for cc, share, _yr in rows:
+        if share is None:
+            continue
+        v = float(share)
+        if cc not in out or v > out[cc]:
+            out[cc] = v
+    return out
+
+
 def _production_share_weights(
     db: Session,
     material_id: int,
@@ -357,6 +435,33 @@ def compute_per_pillar_weighted_average(
         pillar_contributing_geos,
         pillar_meaningful_geos,
     )
+
+
+def compute_production_weighted_pillar(
+    ore_weights: dict[str, float],
+    per_geo_value: dict[str, Optional[float]],
+) -> Optional[float]:
+    """Production-share-weighted mean of one pillar over PRODUCING geos.
+
+    ``ore_weights``   : {country_code: mine-stage share} (need not sum to 1).
+    ``per_geo_value`` : {country_code: pillar_value_or_None}.
+
+    Only geos present in ``ore_weights`` with a positive weight AND a non-None
+    pillar value contribute.  A politically unstable geo that produces nothing
+    is absent from ``ore_weights`` and therefore contributes nothing.  Returns
+    None when no producer contributed, so the caller keeps whatever value it
+    already had (the trade-weighted average).
+    """
+    num = den = 0.0
+    for cc, w in ore_weights.items():
+        if w <= 0:
+            continue
+        v = per_geo_value.get(cc)
+        if v is None:
+            continue
+        num += w * float(v)
+        den += w
+    return (num / den) if den > 0 else None
 
 
 def compute_meaningful_pillar_count(
@@ -615,6 +720,45 @@ def score_material_global_rollup(
         pillar_meaningful_geos,   # F-GR-6
     ) = compute_per_pillar_weighted_average(per_geo_pillars, _PILLAR_COLS)
 
+    # Track which operator actually produced each pillar's global value, so
+    # the rationale reflects what happened (a production-weighted pillar that
+    # fell back to trade-weighting is labelled honestly).
+    pillar_operators = {col: "trade_weighted_avg" for col in _PILLAR_COLS}
+
+    # Override A — MAX-rollup pillars (see _MAX_ROLLUP_PILLARS) take the worst
+    # chokepoint across geographies instead of the trade-weighted average.
+    # Weight-independent and includes every geo that has a value (a producer
+    # that does not export is still a concentration chokepoint); geos whose
+    # value is 0.0 simply do not affect the max.
+    for _mcol in _MAX_ROLLUP_PILLARS:
+        _mvals = [
+            float(getattr(gs, _mcol))
+            for gs in geo_scores
+            if getattr(gs, _mcol) is not None
+        ]
+        pillar_values[_mcol] = max(_mvals) if _mvals else None
+        pillar_operators[_mcol] = "max"
+
+    # Override B — production-weighted pillars (see _PRODUCTION_WEIGHTED_PILLARS)
+    # are weighted by mine-stage production share instead of trade value, so
+    # supply-origin risk tracks producing jurisdictions.  Non-producers carry
+    # no weight and drop out.  Falls back to the trade-weighted average already
+    # in pillar_values when the material has no ore-stage shares.
+    _ore_weights = _ore_production_weights(db, material_id)
+    if _ore_weights:
+        for _pcol in _PRODUCTION_WEIGHTED_PILLARS:
+            _val_by_code = {
+                gs.geography_code: (
+                    float(getattr(gs, _pcol))
+                    if getattr(gs, _pcol) is not None else None
+                )
+                for gs in geo_scores
+            }
+            _pw = compute_production_weighted_pillar(_ore_weights, _val_by_code)
+            if _pw is not None:
+                pillar_values[_pcol] = _pw
+                pillar_operators[_pcol] = "production_weighted_avg"
+
     # Step 4: Overall score using MARKET_PILLAR_WEIGHTS, rescaled across
     # pillars that have data.  If material_concentration is None, its
     # weight is redistributed proportionally to the remaining pillars.
@@ -770,6 +914,8 @@ def score_material_global_rollup(
             col: (round(v, 2) if v is not None else None)
             for col, v in pillar_values.items()
         },
+        # Which operator produced each pillar's global value (2026-07-18).
+        "pillar_rollup_operators": dict(pillar_operators),
         "pillar_contributing_geos": dict(pillar_contributing_geos),  # how many geos populated each pillar
         "data_quality": {
             "n_geographies_total":              n_geos_total,
