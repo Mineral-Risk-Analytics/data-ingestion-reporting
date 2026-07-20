@@ -15,6 +15,27 @@ log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 export APP_ENV="${APP_ENV:-production}"
 log "DB host: $(echo "$DATABASE_URL" | sed -E 's#.*@([^/?]+).*#\1#')   APP_ENV=$APP_ENV"
 
+# ── Railway healthcheck workaround ──────────────────────────────────────────
+# This is a JOB (runs then exits) but Railway treats every service as an HTTP
+# server: railway.toml sets healthcheckPath=/api/v1/health, and if nothing
+# answers on $PORT within the timeout Railway KILLS the container mid-run (this
+# is what failed the first attempt). Start a trivial 200-responder so the deploy
+# goes healthy and stays up while the rescore runs; a trap kills it on exit so
+# the container terminates cleanly when scoring finishes.
+if [ -n "${PORT:-}" ]; then
+  python3 -c "
+import http.server, os
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(s): s.send_response(200); s.end_headers(); s.wfile.write(b'ok')
+    def do_HEAD(s): s.send_response(200); s.end_headers()
+    def log_message(s, *a): pass
+http.server.HTTPServer(('0.0.0.0', int(os.environ['PORT'])), H).serve_forever()
+" &
+  HEALTH_PID=$!
+  trap 'kill "$HEALTH_PID" 2>/dev/null || true' EXIT
+  log "health responder up on :$PORT (pid $HEALTH_PID) — keeps the Railway healthcheck green while the job runs"
+fi
+
 log "── migrations (alembic upgrade head) ──"
 alembic upgrade head
 
