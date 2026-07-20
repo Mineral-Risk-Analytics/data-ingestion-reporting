@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.db.base import Base
 
@@ -285,6 +285,15 @@ class RiskEvent(Base):
     confidence_score: Mapped[Optional[float]] = mapped_column(Float)  # 0.0–1.0
     risk_categories_json: Mapped[Optional[Any]] = mapped_column(JSONB)
     # array of RiskCategory values: ["material_concentration", "geopolitical_trade"]
+
+    @validates("risk_categories_json")
+    def _normalise_categories(self, key, value):
+        # Normalise category strings to the RiskCategory taxonomy on every
+        # write path (all ingesters assign this attribute), so a mis-typed
+        # category (e.g. "geopolitical" → "geopolitical_trade") can't silently
+        # hide an event from a scoring pillar.  See constants.normalise_risk_categories.
+        from app.constants import normalise_risk_categories
+        return normalise_risk_categories(value) if value is not None else value
     geography_json: Mapped[Optional[Any]] = mapped_column(JSONB)
     # {"primary": "CN", "secondary": ["RU", "CD"]}
     content_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)

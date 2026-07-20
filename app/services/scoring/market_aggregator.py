@@ -993,35 +993,21 @@ def _derive_market_geopolitical_inputs(
         export_exposure = event_export
         tariff_exposure = event_tariff
 
-    # ── Step 3 (2026-06-15) — JRC-aligned WGI governance overlay ───────────
-    # Apply per-country WGI governance discount on country_concentration.
-    # See geopolitical_risk.apply_wgi_governance_overlay for the formula
-    # rationale.  The overlay is a NO-OP when no WGI signal exists for the
-    # geography (the helper passes the raw value through with a diag
-    # field).  At α=0.5, a well-governed country (Australia, WGI ~93)
-    # sees country_concentration cut nearly in half; DRC (~13) sees
-    # almost no discount.
-    from app.services.scoring.geopolitical_risk import apply_wgi_governance_overlay
-    # Cache-aware: in batch mode the per-country WGI row is preloaded by
-    # ``build_scoring_preload_cache`` so this is a dict lookup instead of
-    # the LIMIT 1 query.  Standalone calls still hit the DB.
-    wgi_row = _cached_governance_signal(db, geography_code, cache=cache)
-    country_concentration, wgi_overlay_diag = apply_wgi_governance_overlay(
-        country_concentration_raw=country_concentration,
-        wgi_composite_pct=(
-            float(wgi_row.composite_pct)
-            if wgi_row is not None and wgi_row.composite_pct is not None
-            else None
-        ),
-        wgi_n_dimensions_present=(
-            wgi_row.n_dimensions_present if wgi_row is not None else None
-        ),
-    )
-    # Carry the reference_year forward so partner UI can show which
-    # year's governance signal was used.
-    wgi_overlay_diag["wgi_reference_year"] = (
-        wgi_row.reference_year if wgi_row is not None else None
-    )
+    # ── 4.1 (2026-07-20) — WGI overlay REMOVED from this pillar ────────────
+    # Through 4.0, a JRC-aligned WGI governance overlay discounted
+    # country_concentration here (well-governed suppliers cut up to ~half;
+    # see geopolitical_risk.apply_wgi_governance_overlay, retained for
+    # reference).  In 4.1 governance moved INTO the Material Concentration
+    # pillar as a production-share-anchored instability AMPLIFIER
+    # (stage_concentration.apply_governance_amplifier), which answers
+    # "how much, in how bad a place" far more directly.  Keeping the
+    # overlay here too would double-count instability across two pillars,
+    # so this pillar now uses the RAW country_concentration and captures
+    # only the ACUTE signals: export restrictions, tariffs, subsidies.
+    wgi_overlay_diag = {
+        "applied": False,
+        "reason": "removed_in_4.1_governance_moved_to_concentration_pillar",
+    }
 
     # ── 11.4-Geo (2026-06) — per-sub-input diagnostic ──────────────────────
     # Mirrors the 11.4-Material `sub_input_diagnostic` shape so the partner
@@ -2856,6 +2842,11 @@ def score_material_geography(
                 # freshness gate: display-only, never scored.
                 "driving_stage": geo_conc.driving_stage if geo_conc else None,
                 "stage_sub_scores": dict(geo_conc.sub_scores) if geo_conc else {},
+                # 4.1: governance amplifier diagnostics (None when the geo
+                # had no usable WGI row or amplifier is disabled).  raw =
+                # pre-amplifier stage-max; score above is the amplified value.
+                "governance_amplifier": geo_conc.governance if geo_conc else None,
+                "raw_stage_max": round(geo_conc.raw_score, 2) if geo_conc else None,
                 "stage_detail": {
                     s: {
                         "hhi_raw": round(d.hhi_raw, 4),

@@ -6,6 +6,16 @@ SCORING_VERSION 4.0 replaces the 3.x stage-weighted node rollup with:
     sub_score(stage, geo) = hhi_cliff(HHI_stage) x sqrt(share_geo_stage) x 100
     pillar(geo)           = max over fresh stages of sub_score(stage, geo)
 
+SCORING_VERSION 4.1 (2026-07-20, Nicole) adds the EU-CRMA-aligned
+**governance amplifier**: the per-geo pillar value is amplified by that
+geography's jurisdiction instability (1 - WGI composite percentile/100),
+so the same concentration scores HIGHER in an unstable country than a
+stable one ("75% in DRC is worse than 75% in Australia").  See
+``apply_governance_amplifier`` for the bounded soft-ceiling form.  As part
+of the same change the WGI overlay was REMOVED from the geopolitical
+pillar's country_concentration input (market_aggregator) so instability
+is not double-counted; geopolitical is now events + tariff/export only.
+
 Design rules implemented here:
 
 * **Stage sub-scores live only in this pillar.**  Evidence is the per-stage
@@ -49,6 +59,44 @@ CONCENTRATION_STAGES: frozenset[str] = frozenset({
 # publish with ~5-month lag, so the current report is always fresh).
 FRESHNESS_YEARS: int = 2
 
+# 4.1 governance amplifier strength (beta).  0.15 chosen from the 2026-07-20
+# prototype across the launch list: cobalt (75% mined in CD, WGI ~27) rises
+# ~+5-7 concentration points and CD overtakes CN as driving geo, while
+# stable-base materials (iron ore / AU) move <1 point.  0 disables.
+GOVERNANCE_AMPLIFIER_BETA: float = 0.15
+
+# Mirror of geopolitical_risk._WGI_MIN_DIMENSIONS_FOR_OVERLAY: a country's
+# WGI composite is usable only when at least 4 of 6 dimensions are present.
+_WGI_MIN_DIMENSIONS: int = 4
+
+
+def apply_governance_amplifier(
+    score01: float,
+    instability: Optional[float],
+    beta: float = GOVERNANCE_AMPLIFIER_BETA,
+) -> float:
+    """Amplify a [0,1] concentration score by jurisdiction instability.
+
+    Form (bounded soft-ceiling; ``p`` = score01, ``a`` = beta x instability):
+
+        p' = p + (1 - p) * (1 - exp(-a * p / (1 - p)))
+
+    Properties: p'=p when instability is 0/None (stable or unknown -> no-op);
+    for small amplification it reduces to the linear p*(1 + a) of the EU
+    HHI x WGI form; as p -> 1 the gain compresses smoothly into the ceiling,
+    so near-max materials stay DIFFERENTIATED instead of pinning at 100
+    (the flaw of a hard min(100, .) cap).  Monotonic in both p and
+    instability; never exceeds 1.
+    """
+    if instability is None or instability <= 0.0 or beta <= 0.0 or score01 <= 0.0:
+        return score01
+    p = min(score01, 1.0)
+    d = 1.0 - p
+    if d <= 1e-9:
+        return 1.0
+    a = beta * min(max(instability, 0.0), 1.0)
+    return p + d * (1.0 - math.exp(-(a * p) / d))
+
 
 @dataclass(frozen=True)
 class ShareRow:
@@ -79,9 +127,11 @@ class StageDetail:
 class GeoConcentration:
     """Per-geography pillar result."""
 
-    score: float                        # max across fresh stages, 0-100
+    score: float                        # max across fresh stages, 0-100 (4.1: governance-amplified)
     driving_stage: str                  # stage that produced the max
-    sub_scores: dict[str, float]        # stage -> sub_score (fresh stages only)
+    sub_scores: dict[str, float]        # stage -> sub_score (fresh stages only, RAW)
+    raw_score: float = 0.0              # pre-amplifier stage-max (== score when no amplifier)
+    governance: Optional[dict] = None   # 4.1 amplifier diagnostics (None = not applied)
 
 
 @dataclass
@@ -95,12 +145,18 @@ class StageConcentrationResult:
 def compute_stage_concentration(
     rows: list[ShareRow],
     as_of_date: date,
+    wgi_by_geo: Optional[dict[str, float]] = None,
 ) -> StageConcentrationResult:
     """Pure computation: share rows -> per-stage sub-scores -> per-geo max.
 
     ``rows`` may contain parent/child duplicates and multiple reference
     years per stage; this function performs the year selection, freshness
     gate, and dedupe described in the module docstring.
+
+    ``wgi_by_geo`` (4.1): optional {country_code: WGI composite percentile
+    0-100}.  When provided, each geo's stage-max is passed through
+    ``apply_governance_amplifier`` with instability = 1 - pct/100.  Geos
+    absent from the map (or None) are left unamplified — data-honest no-op.
     """
     from app.services.scoring.material_risk import hhi_concentration_risk
 
@@ -168,6 +224,27 @@ def compute_stage_concentration(
                     existing.score = sub
                     existing.driving_stage = stage
 
+    # 4.1 governance amplifier: amplify each geo's stage-max by its
+    # jurisdiction instability.  Monotonic in the score, so amplifying the
+    # max is equivalent to amplifying every stage then taking the max;
+    # sub_scores stay RAW for display honesty.
+    for geo, gc in per_geo.items():
+        gc.raw_score = gc.score
+        pct = (wgi_by_geo or {}).get(geo)
+        if pct is None:
+            continue
+        inst = 1.0 - (min(max(float(pct), 0.0), 100.0) / 100.0)
+        amplified = apply_governance_amplifier(gc.score / 100.0, inst) * 100.0
+        gc.governance = {
+            "applied": True,
+            "beta": GOVERNANCE_AMPLIFIER_BETA,
+            "wgi_composite_pct": round(float(pct), 2),
+            "instability": round(inst, 4),
+            "raw_score": round(gc.raw_score, 2),
+            "amplified_score": round(amplified, 2),
+        }
+        gc.score = amplified
+
     return StageConcentrationResult(
         stages=stages,
         per_geo=per_geo,
@@ -230,17 +307,43 @@ def load_share_rows(
     ]
 
 
+def _load_wgi_by_geo(db, geos: set[str]) -> dict[str, float]:
+    """Latest usable WGI composite percentile per country (4.1 amplifier).
+
+    Usable = composite_pct present AND >= _WGI_MIN_DIMENSIONS of 6
+    dimensions reported (mirrors the old geopolitical overlay's gate).
+    Countries with no usable row are simply absent (amplifier no-op).
+    """
+    if not geos:
+        return {}
+    from sqlalchemy import select
+    from app.models import CountryGovernanceSignal as _CGS
+
+    rows = db.execute(
+        select(_CGS.country_code, _CGS.composite_pct, _CGS.n_dimensions_present)
+        .where(_CGS.country_code.in_(sorted(geos)))
+        .order_by(_CGS.country_code, _CGS.reference_year.desc())
+    ).all()
+    out: dict[str, float] = {}
+    for cc, pct, ndim in rows:
+        if cc in out:            # first row per country = latest year
+            continue
+        if pct is None or (ndim is not None and ndim < _WGI_MIN_DIMENSIONS):
+            continue
+        out[cc] = float(pct)
+    return out
+
+
 def score_material_concentration(
     db,
     material_id: int,
     as_of_date: date,
     market_scope: str = "global",
 ) -> StageConcentrationResult:
-    """DB-facing entry point: load + compute in one call."""
-    return compute_stage_concentration(
-        load_share_rows(db, material_id, market_scope=market_scope),
-        as_of_date,
-    )
+    """DB-facing entry point: load + compute (incl. 4.1 governance amplifier)."""
+    rows = load_share_rows(db, material_id, market_scope=market_scope)
+    wgi = _load_wgi_by_geo(db, {r.country_code for r in rows})
+    return compute_stage_concentration(rows, as_of_date, wgi_by_geo=wgi)
 
 
 def derive_scoring_geographies(db, material_id: int) -> list[str]:

@@ -17,6 +17,8 @@ from datetime import date
 import pytest
 
 from app.services.scoring.stage_concentration import (
+    GOVERNANCE_AMPLIFIER_BETA,
+    apply_governance_amplifier,
     FRESHNESS_YEARS,
     ShareRow,
     compute_stage_concentration,
@@ -162,3 +164,72 @@ class TestPolicyEdges:
     def test_empty_input(self):
         result = compute_stage_concentration([], AS_OF)
         assert result.stages == {} and result.per_geo == {}
+
+
+# ---------------------------------------------------------------------------
+# 4.1 governance amplifier — "75% in DRC is worse than 75% in Australia"
+# ---------------------------------------------------------------------------
+
+class TestGovernanceAmplifier:
+    def test_no_wgi_is_a_pure_noop(self):
+        # Without wgi_by_geo the 4.0 acceptance values must be untouched.
+        rows = [ShareRow("ore", "CD", 0.7529, 2026, 6, 1)]
+        base = compute_stage_concentration(rows, AS_OF)
+        with_none = compute_stage_concentration(rows, AS_OF, wgi_by_geo=None)
+        assert with_none.per_geo["CD"].score == base.per_geo["CD"].score
+        assert with_none.per_geo["CD"].governance is None
+        assert with_none.per_geo["CD"].raw_score == base.per_geo["CD"].score
+
+    def test_unstable_geo_amplified_stable_geo_lightly(self):
+        rows = [
+            ShareRow("ore", "CD", 0.75, 2026, 6, 1),
+            ShareRow("ore", "AU", 0.75, 2026, 6, 1),
+        ]
+        # identical share -> identical raw score; only governance differs
+        res = compute_stage_concentration(
+            rows, AS_OF, wgi_by_geo={"CD": 27.4, "AU": 83.2}
+        )
+        cd, au = res.per_geo["CD"], res.per_geo["AU"]
+        assert cd.raw_score == pytest.approx(au.raw_score)
+        assert cd.score > au.score              # DRC now scores HIGHER
+        assert cd.score > cd.raw_score          # amplified upward
+        assert au.score > au.raw_score          # mildly (inst 0.168)
+        assert cd.governance["applied"] and cd.governance["beta"] == GOVERNANCE_AMPLIFIER_BETA
+
+    def test_geo_missing_from_wgi_map_not_amplified(self):
+        rows = [ShareRow("ore", "CD", 0.75, 2026, 6, 1)]
+        res = compute_stage_concentration(rows, AS_OF, wgi_by_geo={"XX": 30.0})
+        assert res.per_geo["CD"].governance is None
+        assert res.per_geo["CD"].score == res.per_geo["CD"].raw_score
+
+    def test_sub_scores_stay_raw(self):
+        rows = [ShareRow("ore", "CD", 0.75, 2026, 6, 1)]
+        res = compute_stage_concentration(rows, AS_OF, wgi_by_geo={"CD": 27.4})
+        raw_sub = res.per_geo["CD"].sub_scores["ore"]
+        assert raw_sub == pytest.approx(res.per_geo["CD"].raw_score)
+        assert res.per_geo["CD"].score > raw_sub
+
+    # pure-function behaviour ------------------------------------------------
+    def test_amplifier_bounds_and_monotonicity(self):
+        f = apply_governance_amplifier
+        assert f(0.5, 0.0) == 0.5 and f(0.5, None) == 0.5      # stable/unknown no-op
+        assert f(0.0, 0.9) == 0.0                              # zero stays zero
+        assert f(1.0, 0.9) == 1.0                              # ceiling exact
+        assert f(0.99, 0.7) < 1.0                              # no hard pin near top
+        assert f(0.83, 0.73) > f(0.83, 0.48) > f(0.83, 0.10)   # monotonic in instability
+        assert f(0.9, 0.5) > f(0.8, 0.5) > f(0.5, 0.5)         # monotonic in score
+
+    def test_amplifier_matches_linear_form_at_low_scores(self):
+        # For small p the soft-ceiling reduces to the EU linear p*(1+beta*inst).
+        p, inst = 0.10, 0.70
+        linear = p * (1 + GOVERNANCE_AMPLIFIER_BETA * inst)
+        assert apply_governance_amplifier(p, inst) == pytest.approx(linear, rel=0.02)
+
+    def test_cobalt_acceptance_values_4_1(self):
+        # Pinned 4.1 acceptance: CD (raw 83.23, WGI 27.4) amplifies to ~90.2
+        # and OVERTAKES CN (raw 84.96, WGI 51.7 -> ~90.0) as driving geo.
+        cd = apply_governance_amplifier(0.8323, 1 - 0.274) * 100
+        cn = apply_governance_amplifier(0.8496, 1 - 0.517) * 100
+        assert cd == pytest.approx(90.23, abs=0.05)
+        assert cn == pytest.approx(90.01, abs=0.05)
+        assert cd > cn
