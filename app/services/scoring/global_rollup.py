@@ -50,7 +50,7 @@ from app.services.scoring.supplier_risk import SCORING_VERSION
 
 log = structlog.get_logger(__name__)
 
-ROLLUP_VERSION = "1.1"  # 1.1 (2026-07-18): concentration pillar rolls up as MAX across geos, not trade-weighted average
+ROLLUP_VERSION = "1.2"  # 1.1: concentration=MAX across geos. 1.2 (2026-07-20): geopolitical production-weights fall through the stage ladder when ore is absent (by-products/synthetic)
 
 # Pillar column names on MaterialGeographyRiskScore — used for generic weighted
 # averaging so adding a sixth pillar later only requires touching this list.
@@ -271,6 +271,69 @@ def _trade_weights_for_granularity(
             # the reporter actually has data for.
             out[row.reporter_country] = total / n
     return out, periods_to_use
+
+
+_STAGE_LADDER_ORDER = (
+    "ore", "concentrate", "intermediate", "refined", "battery_grade",
+)
+
+
+def _supply_origin_weights(
+    db: Session,
+    material_id: int,
+) -> tuple[dict[str, float], Optional[str]]:
+    """Production shares for supply-origin weighting, with stage-ladder fallback.
+
+    Prefers the most UPSTREAM stage that has global share rows: ore first
+    (mined materials), else concentrate/intermediate/refined/battery_grade in
+    order.  By-product metals (gallium, tellurium, indium, bismuth...) and
+    synthetic graphite have no ore stage - their production IS the downstream
+    stage, and weighting by it is the honest supply-origin signal.  Without
+    this fallback the geopolitical pillar silently reverted to trade-weighted
+    averaging for exactly these materials (gallium: CN geo 58.9 diluted to a
+    global 16.0 across ~100 trade geos).
+
+    Returns ({country: share}, stage_used) - ({}, None) when the material has
+    no global stage shares at all (callers keep the trade-weighted average).
+    Within the chosen stage: latest reference_year only, max share per country
+    (parent/child mapping dedupe).  _ore_production_weights below keeps its
+    original ore-only 1.1 behaviour for any external callers.
+    """
+    rows = db.execute(
+        select(
+            HsCodeMaterialMapping.supply_chain_stage,
+            HsCodeProductionShare.country_code,
+            HsCodeProductionShare.production_share,
+            HsCodeProductionShare.reference_year,
+        )
+        .join(HsCodeMaterialMapping,
+              HsCodeMaterialMapping.id == HsCodeProductionShare.hs_mapping_id)
+        .where(
+            HsCodeMaterialMapping.material_id == material_id,
+            HsCodeProductionShare.market_scope == "global",
+            HsCodeProductionShare.production_share > 0,
+        )
+    ).all()
+    if not rows:
+        return {}, None
+    by_stage: dict[str, list] = {}
+    for stage, cc, share, yr in rows:
+        by_stage.setdefault(stage, []).append((cc, share, yr))
+    stage_used = next(
+        (st for st in _STAGE_LADDER_ORDER if st in by_stage), None
+    )
+    if stage_used is None:
+        return {}, None
+    stage_rows = by_stage[stage_used]
+    latest = max(yr for _, _, yr in stage_rows)
+    out: dict[str, float] = {}
+    for cc, share, yr in stage_rows:
+        if yr != latest or share is None:
+            continue
+        v = float(share)
+        if cc not in out or v > out[cc]:
+            out[cc] = v
+    return out, stage_used
 
 
 def _ore_production_weights(
@@ -744,7 +807,7 @@ def score_material_global_rollup(
     # supply-origin risk tracks producing jurisdictions.  Non-producers carry
     # no weight and drop out.  Falls back to the trade-weighted average already
     # in pillar_values when the material has no ore-stage shares.
-    _ore_weights = _ore_production_weights(db, material_id)
+    _ore_weights, _origin_stage = _supply_origin_weights(db, material_id)
     if _ore_weights:
         for _pcol in _PRODUCTION_WEIGHTED_PILLARS:
             _val_by_code = {
@@ -916,6 +979,10 @@ def score_material_global_rollup(
         },
         # Which operator produced each pillar's global value (2026-07-18).
         "pillar_rollup_operators": dict(pillar_operators),
+        # 1.2: which stage's shares weighted the production-weighted pillars
+        # (ore for mined materials; refined/battery_grade for by-products and
+        # synthetic graphite; None = no shares -> trade-weighted fallback).
+        "production_weight_stage": _origin_stage,
         "pillar_contributing_geos": dict(pillar_contributing_geos),  # how many geos populated each pillar
         "data_quality": {
             "n_geographies_total":              n_geos_total,

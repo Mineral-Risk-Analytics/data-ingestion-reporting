@@ -255,6 +255,12 @@ class MaterialListItem(BaseModel):
     """Count of RiskEvent rows created in the last 90 days that map to
     this material via RiskEventMaterial.  Matches the coverage matrix
     and Coverage Gaps KPI window for consistency."""
+    concentration_scored: bool = True
+    """False when the material's concentration pillar has NO share data
+    (score exactly 0 at the global level — e.g. Germanium, the individual
+    REE elements, Sodium, Rhenium).  Drives the insufficient-data band
+    gate: the UI shows "Insufficient data" instead of a false-green LOW
+    chip (2026-07-20 band recalibration)."""
 
 
 class MaterialDetail(BaseModel):

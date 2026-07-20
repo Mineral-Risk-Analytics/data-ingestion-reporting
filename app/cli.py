@@ -4087,12 +4087,8 @@ def show_scores_cmd(
             typer.echo(header)
             typer.echo("-" * len(header))
             for name, sc in rows:
-                band = (
-                    "CRIT" if sc.overall_risk_score >= 75
-                    else "HIGH" if sc.overall_risk_score >= 55
-                    else "MOD " if sc.overall_risk_score >= 35
-                    else "LOW "
-                )
+                from app.services.scoring.bands import score_to_band
+                band = f"{score_to_band(sc.overall_risk_score) or '—':<4}"
                 prop = sc.supply_chain_propagation_score
                 prop_str = f"{prop:>5.1f}" if prop is not None else "    —"
                 typer.echo(

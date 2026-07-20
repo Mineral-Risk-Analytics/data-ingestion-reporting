@@ -625,6 +625,11 @@ def list_materials(
         item.recent_event_count_90d = recent_event_counts.get(mat.id, 0)
 
         pillar_data = latest_score_data.get(mat.id, {})
+        # Insufficient-data gate (2026-07-20): global concentration is a MAX
+        # over producers, so a scored material is always > 0; exactly 0 (or
+        # absent) means the pillar has no share data at all.
+        _conc = pillar_data.get("material_concentration_score")
+        item.concentration_scored = bool(_conc is not None and _conc > 0)
         item.pillar_scores = [
             MaterialListPillarScore(
                 name=col_name,
