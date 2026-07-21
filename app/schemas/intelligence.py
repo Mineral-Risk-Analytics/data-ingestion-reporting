@@ -33,6 +33,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict
 
+from app.schemas.intelligence_entities import RiskBandOut
+
 
 # ---------------------------------------------------------------------------
 # InsightPost — read views
@@ -123,24 +125,30 @@ class InsightPostUpdate(BaseModel):
 class MaterialRiskBar(BaseModel):
     """One row of the public sidebar's risk indicator strip.
 
-    ``top_geography`` is the geography with the highest ``overall_risk_score``
-    for the material as of ``RiskSummary.as_of_date``. Materials with no
-    ``MaterialGeographyRiskScore`` rows are excluded from the parent
-    ``RiskSummary`` entirely.
+    2026-07-21 rewrite: sourced from the latest ``MaterialGlobalRiskScore``
+    (L2 rollup) per material — the SAME number the platform materials page
+    shows — replacing the old max-geography-L1 shape (``top_geography`` /
+    ``top_geography_score``), which predated the global rollup and publicly
+    disagreed with the platform (cobalt: CD geo 90.2 vs rollup 64.8).
+
+    ``band`` carries label ("Critical") / level token for CSS ("crit") /
+    score (0-100, 1dp) from ``bands.py`` cuts — see RiskBandOut.
     """
 
     material_id: int
     material_name: str
-    overall_risk_score: Optional[float] = None
-    top_geography: Optional[str] = None  # ISO2 code
-    top_geography_score: Optional[float] = None
+    band: RiskBandOut
 
 
 class RiskSummary(BaseModel):
     """Payload for ``GET /intelligence/risk-summary`` — sidebar feed.
 
-    ``as_of_date`` is the most recent ``MaterialGeographyRiskScore.as_of_date``
-    across all materials. Bars are ordered by ``overall_risk_score DESC``.
+    ``as_of_date`` is the most recent contributing rollup ``as_of_date``.
+    Bars are ordered by score DESC (name ASC tiebreak); the frontend picks
+    its display subset (hybrid: top-risk cluster + core battery set).
+    Materials failing the insufficient-data gate (concentration pillar
+    unscored) are excluded server-side — banding them would read
+    false-low in public (e.g. Germanium).
     """
 
     as_of_date: Optional[date] = None

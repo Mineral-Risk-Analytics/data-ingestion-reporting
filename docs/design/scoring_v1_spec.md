@@ -41,13 +41,15 @@ curated operational events──►  Operational pillar   ─┘         (4 pill
 
 **Formula:** per stage `s` with share data: `sub_s = hhi_cliff(HHI_s) × √share_geo,s × 100`. Pillar = `max_s(sub_s)`. Non-producers score 0 — import dependence is a different product story, not producer concentration.
 
+**4.1 governance amplifier (2026-07-20, Nicole — revises the §10 Q2 decision):** the per-geo stage-max is then amplified by that geography's jurisdiction instability (`inst = 1 − WGI_composite_pct/100`), EU-CRMA-aligned ("75% in DRC is worse than 75% in Australia"): `p' = p + (1−p)·(1−e^(−β·inst·p/(1−p)))` with `β = 0.15`, `p` = score/100. Bounded soft-ceiling: no-op at inst 0 or missing WGI; ≈ linear `p·(1+β·inst)` mid-range; compresses smoothly near 100 so near-max materials stay differentiated (no hard-cap pinning). Stage sub-scores stay RAW; `raw_stage_max` + `governance_amplifier` recorded in rationale. Acceptance: cobalt CD 83.2→90.2 **overtakes** CN 85.0→90.0 as driving geo. As part of the same change the WGI overlay was **removed from the geopolitical pillar** (no double-count) — see §4.
+
 | | |
 |---|---|
 | **Evidence in** | Per-stage global production shares: USGS MCS (ore, annual), benchmark workbooks (intermediate/refined/battery-grade — CI/Benchmark for cobalt, equivalents per material), audited via the `benchmark_shares` loader gates (audited=Y, basis+source required, per-node sum ≤ 1.05) |
 | **Explicitly out** | Events (→ geopolitical), facility statuses (→ operational), criticality/volatility blends (the old `score_material_exposure` fallback — retired) |
 | **Expected output (cobalt)** | CD 83 (ore 75%, intermediate 76%), CN 89 (refined 79%, battery-grade 85%), ID 36, FI 26, RU 15, tail < 12, non-producers 0. Stage HHIs: ore .59, intermediate .59, refined .63, battery-grade .72 — all cliff to ≥ .95 ("extreme" tier) |
 | **Seed sources to manage** | USGS MCS (annual, ore stage, all materials — already loaded); benchmark PDF per material, read in full (cobalt ✓; nickel, lithium, graphite, REE pending) |
-| **Later evidence** | Comtrade export-share concentration as a *proxy* for stages with no production data (flagged as proxy, never mixed silently); USGS reserves HHI (future concentration); supplier-company HHI (CMOC alone = 41% of cobalt — company-level concentration is a real second axis); secondary-supply share as a concentration reducer. WGI weighting deliberately NOT here — governance lives in the geopolitical pillar only (see §10 Q2) |
+| **Later evidence** | Comtrade export-share concentration as a *proxy* for stages with no production data (flagged as proxy, never mixed silently); USGS reserves HHI (future concentration); supplier-company HHI (CMOC alone = 41% of cobalt — company-level concentration is a real second axis); secondary-supply share as a concentration reducer. ~~WGI weighting deliberately NOT here~~ **superseded 4.1: WGI governance amplifier now lives HERE (see formula above) and was removed from geopolitical** |
 | **Live sources** | None needed — structural signal moves annually. Re-read benchmark reports on publication (≈ 5-month lag is acceptable) |
 | **Data-quality note** | This pillar is only as good as stage coverage. Cobalt has 4 stages; most materials have ore only until their benchmark workbook is done. A material scored on ore alone is *correct but incomplete* — display which stages are covered. |
 
@@ -61,7 +63,7 @@ curated operational events──►  Operational pillar   ─┘         (4 pill
 | **Explicitly out** | Operational disruptions (shutdowns, strikes → operational); regulations with compliance character (→ regulatory) |
 | **Expected output (cobalt)** | CD elevated (2025 export ban + quota regime — the single most significant cobalt trade event); CN elevated (export-control expansion); clear daylight between geographies with real measures and the tail |
 | **Seed sources** | GTA (loaded), IEA policy tracker (loaded), manual workbook (CI-report extraction pending your direction/subtype audit) |
-| **Later evidence** | World Bank WGI / political-stability weighting on the concentration side (the EU CRMA weights HHI by WGI — principled, standard, and cheap to add); state-ownership share of production; trade-agreement/alignment context |
+| **Later evidence** | ~~World Bank WGI weighting~~ (ADOPTED in 4.1 — moved to the concentration pillar; the WGI α=0.5 discount overlay on this pillar's country_concentration was REMOVED so instability isn't double-counted; this pillar is now events + tariff/export/subsidy on raw concentration); state-ownership share of production; trade-agreement/alignment context |
 | **Live sources** | GTA updates (periodic re-ingest), IEA tracker updates; later: curated news monitoring with the same "fewer, confident, significant" bar |
 
 ## 5. Pillar: Regulatory & Compliance
@@ -151,7 +153,7 @@ Cobalt status: 1–3 done, 4 partially (CI extraction pending audit), 5 partial 
 ## 10. Open questions — ALL RESOLVED (Nicole, 2026-07-17)
 
 1. **UI labels the driving stage** — yes. Each geography's concentration score displays which stage drives it (CD ← intermediate, CN ← refined). Stage sub-scores stored in rationale_json for this.
-2. **WGI** — already implemented: `apply_wgi_governance_overlay` (geopolitical_risk.py:132, applied market_aggregator.py:1000), JRC-aligned α=0.5 discount on country_concentration in the *geopolitical* pillar, fed by ingest_worldbank_wgi. Kept as-is under V1. Decision: WGI lives in geopolitical only — do NOT also weight the concentration pillar's HHI by WGI (would double-count governance). Removed from concentration's later-evidence list.
+2. **WGI** — already implemented: `apply_wgi_governance_overlay` (geopolitical_risk.py:132, applied market_aggregator.py:1000), JRC-aligned α=0.5 discount on country_concentration in the *geopolitical* pillar, fed by ingest_worldbank_wgi. Kept as-is under V1. Original decision: WGI in geopolitical only. **REVISED 2026-07-20 (4.1, Nicole):** governance moved INTO concentration as a production-share-anchored instability amplifier (§3) and the geopolitical overlay was removed — the additive pillar model capped instability's effect at geopolitical's .267 weight, which couldn't express "majority share in an unstable country should raise the overall." One home for governance either way — never both.
 3. **Battery-grade CN share (85%, 2022)** — resolved by §7b freshness gate: stale-excluded from scoring, display-only. CN scores from refined stage (79%, 2024) → concentration ≈ 85.
 4. **Mining data feed** — tabled until the facility-watchlist phase.
 5. **Scoring version = `4.0`** — 3.x rows deleted after post-rescore verification.

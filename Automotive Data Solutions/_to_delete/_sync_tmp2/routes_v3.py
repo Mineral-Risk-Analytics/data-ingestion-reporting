@@ -37,7 +37,7 @@ from app.models.company import (
     CompanyMaterialExposure,
     CompanyScore,
 )
-from app.models.facility import CompanyFacility, Facility, FacilityMaterialLink
+from app.models.facility import CompanyFacility, Facility
 from app.models.intelligence import InsightPost
 from app.models.regulatory import (
     Regulation,
@@ -48,15 +48,14 @@ from app.models.regulatory import (
     RiskEventRegulation,
 )
 from app.models.documents import SourceDocument
-from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
+from app.models.scoring import MaterialGlobalRiskScore
 from app.models.supply import Material
 from app.schemas.common import PaginatedResponse
 from app.schemas.intelligence_entities import (
     CompanyFactOut,
     ComplianceWeightOut,
     ExposureOut,
-    GeoFootprintMaterialOut,
-    GeoFootprintOut,
+    FacilityOut,
     GeographyScopeOut,
     LinkedEventOut,
     LinkedPostOut,
@@ -343,23 +342,16 @@ def get_public_company(slug: str, db: Session = Depends(get_db)) -> PublicCompan
     )
     band = _band_out(overall)
 
-    # ══ "market + map" display architecture (2026-07-21 v4, Nicole) ═══
-    # After three same-day iterations on the exposure list's score basis
-    # (v1 at-source, v2 global-only, v3 at-source+captions), the page now
-    # has ONE score basis per section, no fallback mixing anywhere:
-    #   header band (Phase 4)  -> this company overall
-    #   material exposure      -> GLOBAL material rollup (market view,
-    #                             sidebar-consistent; one deduped row per
-    #                             material, stages combined)
-    #   geographic footprint   -> material×geography L1 AT each country
-    #                             the company operates or sources in
-    # The v3 mixed-basis column failed concretely: Glencore's cobalt bar
-    # meant "risk at CD" while its nickel bar meant "global fallback" —
-    # while the page itself displayed the CA nickel mine the fallback
-    # claimed not to know about.
-
-    # ── exposures: one row per material, GLOBAL score ─────────────────
-    expo_raw = db.execute(
+    # ── exposures: material GLOBAL score (same number as the sidebar) ──
+    # 2026-07-21 v2: rows originally displayed the L1 material×source-
+    # geography score. Reverted same day (Nicole): the same material then
+    # showed different bands on the sidebar (global rollup) vs a company
+    # profile (per-geo) — reads as a data bug to public readers. Every
+    # public surface now shows ONE number per material: the latest L2
+    # global rollup, insufficient-data-gated exactly like /risk-summary
+    # (concentration NULL/0 = "no scored stage" -> no score, no band).
+    # source_geography remains a descriptive sourcing tag only.
+    expo_rows = db.execute(
         select(
             CompanyMaterialExposure.material_id,
             Material.canonical_name,
@@ -369,12 +361,11 @@ def get_public_company(slug: str, db: Session = Depends(get_db)) -> PublicCompan
         )
         .join(Material, Material.id == CompanyMaterialExposure.material_id)
         .where(CompanyMaterialExposure.company_id == company.id)
-        .order_by(CompanyMaterialExposure.id)
     ).all()
 
-    _mat_ids = {r.material_id for r in expo_raw}
+    _mids = {r.material_id for r in expo_rows}
     _global_scores: dict[int, float] = {}
-    if _mat_ids:
+    if _mids:
         _ranked_g = (
             select(
                 MaterialGlobalRiskScore.material_id,
@@ -387,7 +378,7 @@ def get_public_company(slug: str, db: Session = Depends(get_db)) -> PublicCompan
                 )
                 .label("rn"),
             )
-            .where(MaterialGlobalRiskScore.material_id.in_(_mat_ids))
+            .where(MaterialGlobalRiskScore.material_id.in_(_mids))
             .subquery()
         )
         for _mid, _g_overall, _g_conc in db.execute(
@@ -397,150 +388,53 @@ def get_public_company(slug: str, db: Session = Depends(get_db)) -> PublicCompan
                 _ranked_g.c.material_concentration_score,
             ).where(_ranked_g.c.rn == 1)
         ):
-            # Insufficient-data gate, same as /risk-summary.
             if _g_overall is not None and _g_conc is not None and _g_conc > 0:
                 _global_scores[_mid] = float(_g_overall)
 
-    _by_mat: dict[int, dict] = {}
-    # (material_id, geo) sourcing pairs feed the footprint section below.
-    _sourcing_pairs: set[tuple[int, str]] = set()
-    _mat_names: dict[int, str] = {}
-    for mid, name, stg, geo, _exp in expo_raw:
-        _mat_names[mid] = name
-        if geo:
-            _sourcing_pairs.add((mid, geo.upper()))
-        d = _by_mat.setdefault(mid, {"material": name, "stages": []})
-        _lbl = _stage_label(stg)
-        if _lbl and _lbl not in d["stages"]:
-            d["stages"].append(_lbl)
-
     exposures = []
-    for mid, d in _by_mat.items():
+    for mid, mat, stg, geo, exp in expo_rows:
         rs = _global_scores.get(mid)
         exposures.append(
             ExposureOut(
-                material=d["material"],
-                stage_label=" · ".join(d["stages"]) or None,
+                material=mat,
+                stage_label=_stage_label(stg),
+                geography=geo,
+                exposure_score=exp,
                 risk_score=round(rs, 1) if rs is not None else None,
                 band=_band_out(rs),
             )
         )
-    exposures.sort(key=lambda e: (e.risk_score is None, -(e.risk_score or 0.0)))
+    # Highest risk first; unscored rows sink to the bottom.
+    exposures.sort(
+        key=lambda e: (e.risk_score is None, -(e.risk_score or 0.0))
+    )
 
-    # ── geographic footprint: one row per country ─────────────────────
-    # Country universe = facility countries ∪ CME source geographies.
-    # Chips = L1 score at that country for every material the company
-    # either processes there (facility material links) or sources there.
+    # ── facilities ────────────────────────────────────────────────────
+    fac_total = db.scalar(
+        select(func.count(CompanyFacility.id))
+        .where(CompanyFacility.company_id == company.id)
+    ) or 0
     fac_rows = db.execute(
-        select(Facility.id, Facility.country, Facility.facility_type)
+        select(Facility)
         .join(CompanyFacility, CompanyFacility.facility_id == Facility.id)
         .where(CompanyFacility.company_id == company.id)
-    ).all()
-    fac_total = len(fac_rows)
-
-    _fac_by_country: dict[str, dict] = {}
-    _fac_ids = []
-    _fac_country: dict = {}
-    for fid, country, ftype in fac_rows:
-        c = (country or "").upper()
-        if not c:
-            continue
-        _fac_ids.append(fid)
-        _fac_country[fid] = c
-        d = _fac_by_country.setdefault(c, {"count": 0, "activities": []})
-        d["count"] += 1
-        _ft = ftype.replace("_", " ")
-        if _ft not in d["activities"]:
-            d["activities"].append(_ft)
-
-    # material ids per country via facility links
-    _country_mids: dict[str, set[int]] = {c: set() for c in _fac_by_country}
-    if _fac_ids:
-        for _fid, _mid, _mname in db.execute(
-            select(
-                FacilityMaterialLink.facility_id,
-                FacilityMaterialLink.material_id,
-                Material.canonical_name,
-            )
-            .join(Material, Material.id == FacilityMaterialLink.material_id)
-            .where(FacilityMaterialLink.facility_id.in_(_fac_ids))
-        ):
-            _mat_names[_mid] = _mname
-            _country_mids.setdefault(_fac_country[_fid], set()).add(_mid)
-
-    _sourcing_by_country: dict[str, set[int]] = {}
-    for _mid, _geo in _sourcing_pairs:
-        _sourcing_by_country.setdefault(_geo, set()).add(_mid)
-        _country_mids.setdefault(_geo, set()).add(_mid)
-
-    _all_footprint_mids = set().union(*_country_mids.values()) if _country_mids else set()
-    _l1_by_pair: dict[tuple[int, str], float] = {}
-    if _all_footprint_mids:
-        _ranked_l1 = (
-            select(
-                MaterialGeographyRiskScore.material_id,
-                MaterialGeographyRiskScore.geography_code,
-                MaterialGeographyRiskScore.overall_risk_score,
-                func.row_number()
-                .over(
-                    partition_by=(
-                        MaterialGeographyRiskScore.material_id,
-                        MaterialGeographyRiskScore.geography_code,
-                    ),
-                    order_by=MaterialGeographyRiskScore.as_of_date.desc(),
-                )
-                .label("rn"),
-            )
-            .where(MaterialGeographyRiskScore.material_id.in_(_all_footprint_mids))
-            .subquery()
+        .order_by(Facility.status, Facility.country)
+        .limit(8)
+    ).scalars().all()
+    facilities = [
+        FacilityOut(
+            name=f.name,
+            facility_type=f.facility_type.replace("_", " "),
+            country=f.country,
+            # 2026-07-15 (Nicole): city when present, region as fallback —
+            # city coverage is ~4% so the joined "City, Region" form was
+            # almost always region-only anyway.
+            place=f.city or f.region,
+            status=f.status.replace("_", " ").title(),
+            status_level=_FACILITY_STATUS_LEVELS.get(f.status.lower(), "op"),
         )
-        for _mid, _geo, _rs in db.execute(
-            select(
-                _ranked_l1.c.material_id,
-                _ranked_l1.c.geography_code,
-                _ranked_l1.c.overall_risk_score,
-            ).where(_ranked_l1.c.rn == 1)
-        ):
-            if _rs is not None:
-                _l1_by_pair[(_mid, _geo)] = float(_rs)
-
-    geographies = []
-    for _c, _mids_here in _country_mids.items():
-        _scored = sorted(
-            (
-                (_mat_names[_m], _l1_by_pair[(_m, _c)])
-                for _m in _mids_here
-                if (_m, _c) in _l1_by_pair
-            ),
-            key=lambda t: (-t[1], t[0]),
-        )
-        _facinfo = _fac_by_country.get(_c, {"count": 0, "activities": []})
-        geographies.append(
-            GeoFootprintOut(
-                country=_c,
-                facility_count=_facinfo["count"],
-                activities=sorted(_facinfo["activities"]),
-                sourcing_materials=sorted(
-                    _mat_names[_m] for _m in _sourcing_by_country.get(_c, set())
-                ),
-                location_risk=_band_out(_scored[0][1]) if _scored else None,
-                materials=[
-                    GeoFootprintMaterialOut(
-                        material=_n,
-                        score=round(_v, 1),
-                        level=(_band_out(_v) or RiskBandOut(label="", level="low")).level,
-                    )
-                    for _n, _v in _scored
-                ],
-            )
-        )
-    geographies.sort(
-        key=lambda g: (
-            g.location_risk is None,
-            -(g.location_risk.score if g.location_risk and g.location_risk.score else 0.0),
-            g.country,
-        )
-    )
+        for f in fac_rows
+    ]
 
     # ── linked intelligence (tag contract) + events (Phase-5 flag) ────
     linked_posts = _tagged_posts(db, company.canonical_name)
@@ -592,7 +486,7 @@ def get_public_company(slug: str, db: Session = Depends(get_db)) -> PublicCompan
         facts=facts,
         intro=company.public_intro,  # 057: partner-authored public copy; None until written
         exposures=exposures,
-        geographies=geographies,
+        facilities=facilities,
         facilities_total=int(fac_total),
         linked_posts=linked_posts,
         linked_events=linked_events,

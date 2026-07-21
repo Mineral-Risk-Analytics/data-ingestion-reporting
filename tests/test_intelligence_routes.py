@@ -33,7 +33,7 @@ from app.api.deps import get_db
 from app.db.base import Base
 from app.main import app
 from app.models.intelligence import InsightPost
-from app.models.scoring import MaterialGeographyRiskScore
+from app.models.scoring import MaterialGlobalRiskScore
 from app.models.supply import Material
 
 
@@ -240,8 +240,11 @@ class TestPublicListAndDetail:
 
 
 class TestRiskSummary:
-    def test_picks_highest_geography_per_material(self, client, db):
-        # Two materials, two geographies each. Highest score per material wins.
+    """2026-07-21: endpoint rewritten onto the L2 global rollup
+    (``material_global_risk_scores``) with the insufficient-data gate and
+    bands.py banding — tests seed MaterialGlobalRiskScore accordingly."""
+
+    def test_orders_by_score_and_bands(self, client, db):
         lithium = Material(canonical_name="Lithium")
         cobalt = Material(canonical_name="Cobalt")
         db.add_all([lithium, cobalt])
@@ -250,29 +253,17 @@ class TestRiskSummary:
         as_of = date(2026, 4, 1)
         db.add_all(
             [
-                MaterialGeographyRiskScore(
+                MaterialGlobalRiskScore(
                     material_id=lithium.id,
-                    geography_code="CL",
                     as_of_date=as_of,
-                    overall_risk_score=42.0,
+                    overall_risk_score=54.3,
+                    material_concentration_score=83.9,
                 ),
-                MaterialGeographyRiskScore(
-                    material_id=lithium.id,
-                    geography_code="CN",
-                    as_of_date=as_of,
-                    overall_risk_score=78.0,
-                ),
-                MaterialGeographyRiskScore(
+                MaterialGlobalRiskScore(
                     material_id=cobalt.id,
-                    geography_code="CD",
                     as_of_date=as_of,
-                    overall_risk_score=88.0,
-                ),
-                MaterialGeographyRiskScore(
-                    material_id=cobalt.id,
-                    geography_code="ID",
-                    as_of_date=as_of,
-                    overall_risk_score=55.0,
+                    overall_risk_score=64.8,
+                    material_concentration_score=90.2,
                 ),
             ]
         )
@@ -283,37 +274,37 @@ class TestRiskSummary:
         body = r.json()
 
         assert body["as_of_date"] == "2026-04-01"
-        # Order is by overall_risk_score DESC
+        # Ordered by score DESC
         assert [m["material_name"] for m in body["materials"]] == ["Cobalt", "Lithium"]
 
         cobalt_bar = body["materials"][0]
-        assert cobalt_bar["top_geography"] == "CD"
-        assert cobalt_bar["top_geography_score"] == 88.0
-
+        assert cobalt_bar["band"] == {
+            "label": "Critical", "level": "crit", "score": 64.8,
+        }
         lithium_bar = body["materials"][1]
-        assert lithium_bar["top_geography"] == "CN"
-        assert lithium_bar["top_geography_score"] == 78.0
+        assert lithium_bar["band"]["level"] == "high"  # 45 <= 54.3 < 60
+        assert lithium_bar["band"]["score"] == 54.3
 
-    def test_uses_only_latest_as_of_date_per_pair(self, client, db):
+    def test_uses_only_latest_as_of_date_per_material(self, client, db):
         nickel = Material(canonical_name="Nickel")
         db.add(nickel)
         db.flush()
 
-        # Two rows for the same (material, geography). Only the newer one
-        # should drive the bar.
+        # Two rollup rows for the same material. Only the newer one should
+        # drive the bar (append-only history table).
         db.add_all(
             [
-                MaterialGeographyRiskScore(
+                MaterialGlobalRiskScore(
                     material_id=nickel.id,
-                    geography_code="ID",
                     as_of_date=date(2025, 10, 1),
                     overall_risk_score=20.0,
+                    material_concentration_score=40.0,
                 ),
-                MaterialGeographyRiskScore(
+                MaterialGlobalRiskScore(
                     material_id=nickel.id,
-                    geography_code="ID",
                     as_of_date=date(2026, 4, 1),
-                    overall_risk_score=66.0,
+                    overall_risk_score=59.9,
+                    material_concentration_score=85.0,
                 ),
             ]
         )
@@ -321,9 +312,51 @@ class TestRiskSummary:
 
         r = client.get("/api/v1/intelligence/risk-summary")
         assert r.status_code == 200
-        bar = r.json()["materials"][0]
+        body = r.json()
+        assert len(body["materials"]) == 1
+        bar = body["materials"][0]
         assert bar["material_name"] == "Nickel"
-        assert bar["top_geography_score"] == 66.0
+        assert bar["band"]["score"] == 59.9
+        assert body["as_of_date"] == "2026-04-01"
+
+    def test_insufficient_data_gate_excludes_unscored_concentration(self, client, db):
+        # Germanium-shape row: overall exists but the concentration pillar is
+        # 0 (no scored stage) -> must NOT appear in the public sidebar.
+        germanium = Material(canonical_name="Germanium")
+        sodium = Material(canonical_name="Sodium")
+        tin = Material(canonical_name="Tin")
+        db.add_all([germanium, sodium, tin])
+        db.flush()
+
+        as_of = date(2026, 4, 1)
+        db.add_all(
+            [
+                MaterialGlobalRiskScore(
+                    material_id=germanium.id,
+                    as_of_date=as_of,
+                    overall_risk_score=18.2,
+                    material_concentration_score=0.0,
+                ),
+                MaterialGlobalRiskScore(
+                    material_id=sodium.id,
+                    as_of_date=as_of,
+                    overall_risk_score=12.7,
+                    material_concentration_score=None,
+                ),
+                MaterialGlobalRiskScore(
+                    material_id=tin.id,
+                    as_of_date=as_of,
+                    overall_risk_score=27.9,
+                    material_concentration_score=20.4,
+                ),
+            ]
+        )
+        db.commit()
+
+        r = client.get("/api/v1/intelligence/risk-summary")
+        assert r.status_code == 200
+        names = [m["material_name"] for m in r.json()["materials"]]
+        assert names == ["Tin"]
 
     def test_returns_empty_when_no_scores(self, client):
         r = client.get("/api/v1/intelligence/risk-summary")

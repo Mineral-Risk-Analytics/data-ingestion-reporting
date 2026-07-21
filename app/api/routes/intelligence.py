@@ -39,7 +39,8 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db, require_admin
 from app.models.intelligence import InsightPost
 from app.services.content.docx_convert import convert_docx_stream
-from app.models.scoring import MaterialGeographyRiskScore
+from app.api.routes.intelligence_entities import _band_out
+from app.models.scoring import MaterialGlobalRiskScore
 from app.models.supply import Material
 from app.schemas.common import PaginatedResponse
 from app.schemas.intelligence import (
@@ -178,100 +179,70 @@ def list_draft_posts(
 
 @router.get("/risk-summary", response_model=RiskSummary)
 def get_risk_summary(db: Session = Depends(get_db)) -> RiskSummary:
-    """Public sidebar feed.
+    """Public sidebar feed — latest L2 global rollup per material.
 
-    Picks the highest-scoring geography per material from the most recent
-    ``MaterialGeographyRiskScore`` row per ``(material, geography)`` pair.
-    Materials with zero score rows are omitted entirely.
+    2026-07-21 rewrite (was: highest-scoring single GEOGRAPHY per material
+    from L1 rows — predated the global rollup and publicly disagreed with
+    the platform materials page). Now reads ``material_global_risk_scores``
+    (latest row per material) so the public hub and the authenticated
+    platform report the same number, banded by the shared ``bands.py``
+    cuts via ``_band_out``.
 
-    Aggregation uses two cheap queries plus an in-Python max-per-material
-    pass; this scales fine for the public hub (≲30 materials × ≲20 geographies).
+    Insufficient-data gate: rows whose ``material_concentration_score`` is
+    NULL or 0 are EXCLUDED. Global concentration is a MAX over scored
+    stages, so 0 means "no scored stage", not "perfectly diversified" —
+    banding those would read false-low in public (e.g. Germanium).
+    Mirrors ``MaterialListItem.concentration_scored`` on the platform side.
     """
-    # Step 1: latest as_of_date per (material_id, geography_code)
-    latest_dates_subq = (
+    ranked = (
         select(
-            MaterialGeographyRiskScore.material_id.label("material_id"),
-            MaterialGeographyRiskScore.geography_code.label("geography_code"),
-            func.max(MaterialGeographyRiskScore.as_of_date).label("max_date"),
-        )
-        .group_by(
-            MaterialGeographyRiskScore.material_id,
-            MaterialGeographyRiskScore.geography_code,
+            MaterialGlobalRiskScore.material_id,
+            MaterialGlobalRiskScore.overall_risk_score,
+            MaterialGlobalRiskScore.material_concentration_score,
+            MaterialGlobalRiskScore.as_of_date,
+            func.row_number()
+            .over(
+                partition_by=MaterialGlobalRiskScore.material_id,
+                order_by=MaterialGlobalRiskScore.as_of_date.desc(),
+            )
+            .label("rn"),
         )
         .subquery()
     )
-
-    # Step 2: pull the actual rows that match those (material, geography, max_date)
-    # tuples, joined with the material name for display.
     rows = db.execute(
         select(
-            MaterialGeographyRiskScore.material_id,
-            MaterialGeographyRiskScore.geography_code,
-            MaterialGeographyRiskScore.overall_risk_score,
-            MaterialGeographyRiskScore.as_of_date,
+            ranked.c.material_id,
+            ranked.c.overall_risk_score,
+            ranked.c.material_concentration_score,
+            ranked.c.as_of_date,
             Material.canonical_name,
         )
-        .join(
-            latest_dates_subq,
-            (
-                MaterialGeographyRiskScore.material_id
-                == latest_dates_subq.c.material_id
-            )
-            & (
-                MaterialGeographyRiskScore.geography_code
-                == latest_dates_subq.c.geography_code
-            )
-            & (
-                MaterialGeographyRiskScore.as_of_date
-                == latest_dates_subq.c.max_date
-            ),
-        )
-        .join(Material, Material.id == MaterialGeographyRiskScore.material_id)
+        .join(Material, Material.id == ranked.c.material_id)
+        .where(ranked.c.rn == 1)
     ).all()
 
-    # Step 3: group by material, keep the geography with the highest score.
-    # Ties broken by alphabetical ISO2 to keep output deterministic.
-    best_by_material: dict[int, dict] = {}
-    overall_max_date = None
-    for material_id, geography_code, score, as_of_date, name in rows:
-        if overall_max_date is None or (as_of_date and as_of_date > overall_max_date):
-            overall_max_date = as_of_date
-
-        current = best_by_material.get(material_id)
-        candidate_score = score if score is not None else float("-inf")
-        if current is None:
-            best_by_material[material_id] = {
-                "material_id": material_id,
-                "material_name": name,
-                "overall_risk_score": score,
-                "top_geography": geography_code,
-                "top_geography_score": score,
-            }
+    bars: list[MaterialRiskBar] = []
+    as_of = None
+    for material_id, overall, concentration, row_date, name in rows:
+        if overall is None:
             continue
-
-        current_score = (
-            current["overall_risk_score"]
-            if current["overall_risk_score"] is not None
-            else float("-inf")
-        )
-        if candidate_score > current_score or (
-            candidate_score == current_score
-            and geography_code < (current["top_geography"] or "")
-        ):
-            current.update(
-                overall_risk_score=score,
-                top_geography=geography_code,
-                top_geography_score=score,
+        if concentration is None or concentration <= 0:
+            continue  # insufficient-data gate
+        band = _band_out(overall)
+        if band is None:
+            continue
+        bars.append(
+            MaterialRiskBar(
+                material_id=material_id,
+                material_name=name,
+                band=band,
             )
+        )
+        if as_of is None or (row_date is not None and row_date > as_of):
+            as_of = row_date
 
-    bars = sorted(
-        (MaterialRiskBar(**v) for v in best_by_material.values()),
-        key=lambda b: (
-            -(b.overall_risk_score if b.overall_risk_score is not None else float("-inf")),
-            b.material_name,
-        ),
-    )
-    return RiskSummary(as_of_date=overall_max_date, materials=bars)
+    bars.sort(key=lambda b: (-(b.band.score or 0.0), b.material_name))
+    return RiskSummary(as_of_date=as_of, materials=bars)
 
 
 # ---------------------------------------------------------------------------

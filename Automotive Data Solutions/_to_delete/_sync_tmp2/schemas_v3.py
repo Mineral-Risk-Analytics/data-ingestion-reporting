@@ -92,40 +92,27 @@ class CompanyFactOut(BaseModel):
 
 
 class ExposureOut(BaseModel):
-    """One material the company depends on — "market + map" v4
-    (2026-07-21): deduped to ONE row per material, stages combined into
-    ``stage_label`` ("Refining · Cell"). ``risk_score`` is the material's
-    GLOBAL rollup (sidebar-consistent, insufficient-data gated) — the
-    where-question lives entirely in ``GeoFootprintOut`` now, which is
-    why the v1-v3 ``geography``/``score_basis`` fields are gone."""
-
     material: str
-    stage_label: Optional[str] = None       # combined, e.g. "Refining · Cell"
-    risk_score: Optional[float] = None      # 0-100 global rollup, gated
+    stage_label: Optional[str] = None
+    geography: Optional[str] = None         # ISO2 source geography
+    exposure_score: Optional[float] = None  # 0-1 dependence judgment (CME)
+    # 0-100, the material's latest L2 GLOBAL rollup — deliberately the
+    # same number as /risk-summary (sidebar) so a material never shows
+    # two different bands across public surfaces. Insufficient-data
+    # gated (None + band None when concentration is unscored). The
+    # per-geography L1 variant lasted a few hours on 2026-07-21 before
+    # this was reverted; source_geography is display-only.
+    risk_score: Optional[float] = None
     band: Optional[RiskBandOut] = None
 
 
-class GeoFootprintMaterialOut(BaseModel):
-    """One material's L1 score at this country (chip)."""
-
-    material: str
-    score: float                            # 0-100, 1dp
-    level: str                              # low | med | high | crit (CSS token)
-
-
-class GeoFootprintOut(BaseModel):
-    """One country the company operates or sources in — "market + map" v4
-    (2026-07-21), replacing the per-facility list. Groups every facility
-    in the country plus CME sourcing; chips carry the L1 material×
-    geography scores AT this place (the only section with per-geo
-    scores — exposure rows are global-only)."""
-
-    country: str                            # ISO2
-    facility_count: int                     # 0 = sourcing-only country
-    activities: list[str] = []              # distinct facility types, sorted
-    sourcing_materials: list[str] = []      # CME source_geography materials
-    location_risk: Optional[RiskBandOut] = None      # max across chips
-    materials: list[GeoFootprintMaterialOut] = []    # chips, score desc
+class FacilityOut(BaseModel):
+    name: Optional[str] = None
+    facility_type: str
+    country: str
+    place: Optional[str] = None             # "City, Region"
+    status: str
+    status_level: str                       # op | ramp | build | idle | closed
 
 
 class PublicCompanyProfile(BaseModel):
@@ -136,8 +123,8 @@ class PublicCompanyProfile(BaseModel):
     facts: list[CompanyFactOut] = []
     intro: Optional[str] = None             # public copy — None until admin flow
     exposures: list[ExposureOut] = []
-    geographies: list[GeoFootprintOut] = []
-    facilities_total: int = 0               # total facilities across all countries
+    facilities: list[FacilityOut] = []
+    facilities_total: int = 0
     linked_posts: list[LinkedPostOut] = []
     linked_events: list[LinkedEventOut] = []
 
