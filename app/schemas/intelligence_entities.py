@@ -128,6 +128,34 @@ class GeoFootprintOut(BaseModel):
     materials: list[GeoFootprintMaterialOut] = []    # chips, score desc
 
 
+
+class FacilityMaterialTag(BaseModel):
+    """A material a facility handles + its risk band AT the facility's
+    country. Level only (no number), matching the footprint chips."""
+
+    material: str
+    level: str  # low | med | high | crit
+
+
+class FacilityDetailOut(BaseModel):
+    """One facility, for the geographic-footprint drawer (2026-07-22)."""
+
+    name: Optional[str] = None
+    facility_type: str
+    status: str
+    status_level: str           # op | ramp | build | idle | closed
+    place: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    data_source: Optional[str] = None
+    materials: list[FacilityMaterialTag] = []
+
+
+class CompanyCountryFacilitiesOut(BaseModel):
+    country: str                # ISO2
+    country_name: str           # full display name (falls back to ISO2)
+    facilities: list[FacilityDetailOut]
+
 class PublicCompanyProfile(BaseModel):
     slug: str
     name: str

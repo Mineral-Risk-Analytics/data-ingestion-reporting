@@ -81,6 +81,15 @@ class Settings(BaseSettings):
     gta_rate_limit_delay: float = 0.5    # seconds between calls; UNRESTRICTED tier still benefits from pacing
     gta_page_size: int = 1000            # API max
 
+    # Cloudflare R2 (report PDF uploads — admin content v1, 2026-07-22).
+    # All empty = R2 disabled; the presign endpoint returns 503 with a
+    # clear message instead of generating broken URLs.
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket: str = ""
+    r2_public_base_url: str = ""  # no trailing slash; custom domain or r2.dev
+
     # Clerk auth (JWT via JWKS)
     # When clerk_jwks_url is empty AND app_env == "development", auth is bypassed
     # and a stub admin user is injected. Any non-empty value enforces verification.

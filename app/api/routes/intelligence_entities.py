@@ -32,6 +32,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
+from app.models.country import Country
 from app.models.company import (
     Company,
     CompanyMaterialExposure,
@@ -52,6 +53,9 @@ from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskSco
 from app.models.supply import Material
 from app.schemas.common import PaginatedResponse
 from app.schemas.intelligence_entities import (
+    CompanyCountryFacilitiesOut,
+    FacilityDetailOut,
+    FacilityMaterialTag,
     CompanyFactOut,
     ComplianceWeightOut,
     ExposureOut,
@@ -150,11 +154,14 @@ _FACILITY_STATUS_LEVELS: dict[str, str] = {
     "ramp_up": "ramp",
     "ramp-up": "ramp",
     "construction": "build",
+    "under_construction": "build",
     "planned": "build",
     "announced": "build",
     "idled": "idle",
     "suspended": "idle",
     "care_and_maintenance": "idle",
+    "care_maintenance": "idle",
+    "mothballed": "idle",
     "closed": "closed",
     "divested": "closed",
 }
@@ -596,6 +603,106 @@ def get_public_company(slug: str, db: Session = Depends(get_db)) -> PublicCompan
         facilities_total=int(fac_total),
         linked_posts=linked_posts,
         linked_events=linked_events,
+    )
+
+
+@router.get(
+    "/companies/{slug}/facilities",
+    response_model=CompanyCountryFacilitiesOut,
+    summary="Facilities for a company in one country (footprint drawer)",
+)
+def get_company_country_facilities(
+    slug: str,
+    country: str = Query(min_length=2, max_length=2),
+    db: Session = Depends(get_db),
+) -> CompanyCountryFacilitiesOut:
+    """Detail for the geographic-footprint drawer: every facility this
+    company operates in `country`, with the material(s) each handles and
+    that material's L1 risk band AT this country. Public — gated on the
+    company being published, same as the profile."""
+    company = db.scalar(
+        select(Company).where(Company.slug == slug, Company.is_published.is_(True))
+    )
+    if company is None:
+        raise HTTPException(status_code=404, detail="Company not found")
+    cc = country.upper()
+
+    fac_rows = db.execute(
+        select(Facility)
+        .join(CompanyFacility, CompanyFacility.facility_id == Facility.id)
+        .where(CompanyFacility.company_id == company.id, Facility.country == cc)
+        .order_by(Facility.status, Facility.name)
+    ).scalars().all()
+
+    links_by_fac: dict = {}
+    mids: set[int] = set()
+    if fac_rows:
+        for _fid, _mid, _mname in db.execute(
+            select(
+                FacilityMaterialLink.facility_id,
+                FacilityMaterialLink.material_id,
+                Material.canonical_name,
+            )
+            .join(Material, Material.id == FacilityMaterialLink.material_id)
+            .where(FacilityMaterialLink.facility_id.in_([f.id for f in fac_rows]))
+        ):
+            links_by_fac.setdefault(_fid, []).append((_mid, _mname))
+            mids.add(_mid)
+
+    l1: dict[int, float] = {}
+    if mids:
+        ranked = (
+            select(
+                MaterialGeographyRiskScore.material_id,
+                MaterialGeographyRiskScore.overall_risk_score,
+                func.row_number()
+                .over(
+                    partition_by=MaterialGeographyRiskScore.material_id,
+                    order_by=MaterialGeographyRiskScore.as_of_date.desc(),
+                )
+                .label("rn"),
+            )
+            .where(
+                MaterialGeographyRiskScore.material_id.in_(mids),
+                MaterialGeographyRiskScore.geography_code == cc,
+            )
+            .subquery()
+        )
+        for _mid, _rs in db.execute(
+            select(ranked.c.material_id, ranked.c.overall_risk_score).where(
+                ranked.c.rn == 1
+            )
+        ):
+            if _rs is not None:
+                l1[_mid] = float(_rs)
+
+    facilities = []
+    for f in fac_rows:
+        place = (
+            f"{f.city}, {f.region}" if f.city and f.region else (f.city or f.region)
+        )
+        mats = []
+        for _mid, _mname in links_by_fac.get(f.id, []):
+            band = _band_out(l1.get(_mid))
+            if band is not None:
+                mats.append(FacilityMaterialTag(material=_mname, level=band.level))
+        mats.sort(key=lambda t: t.material)
+        facilities.append(
+            FacilityDetailOut(
+                name=f.name,
+                facility_type=f.facility_type.replace("_", " "),
+                status=f.status.replace("_", " ").title(),
+                status_level=_FACILITY_STATUS_LEVELS.get(f.status.lower(), "op"),
+                place=place,
+                latitude=f.latitude,
+                longitude=f.longitude,
+                data_source=f.data_source,
+                materials=mats,
+            )
+        )
+    country_name = db.scalar(select(Country.name).where(Country.iso2 == cc)) or cc
+    return CompanyCountryFacilitiesOut(
+        country=cc, country_name=country_name, facilities=facilities
     )
 
 

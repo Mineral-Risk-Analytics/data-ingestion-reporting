@@ -87,6 +87,14 @@ class InsightPost(Base):
         nullable=True,
         comment="Free-form searchable topic tags, e.g. ['IRA', 'FEOC'] (052)",
     )
+    risk_band: Mapped[Optional[str]] = mapped_column(
+        String(8), nullable=True,
+        comment=(
+            "Editorial risk tag: low | med | high | crit (061). Author "
+            "judgment about the situation the post covers — NOT derived "
+            "from the scoring engine's computed bands."
+        ),
+    )
 
     # ---- content ----
     summary: Mapped[Optional[str]] = mapped_column(

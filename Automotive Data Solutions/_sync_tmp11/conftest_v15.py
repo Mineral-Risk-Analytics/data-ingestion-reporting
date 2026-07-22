@@ -41,14 +41,8 @@ class _PgTypeAsSqliteJson(SQLITE_JSON):
         super().__init__()
 
 
-# NB: patch the DRIVER dialect too — SQLiteDialect_pysqlite snapshots its
-# own ``colspecs`` dict at class-definition time (util.update_copy of the
-# base), so patching only the base class silently does nothing.
-from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
-
-for _dialect_cls in (SQLiteDialect, SQLiteDialect_pysqlite):
-    _dialect_cls.colspecs = {
-        **_dialect_cls.colspecs,
-        PG_ARRAY: _PgTypeAsSqliteJson,
-        PG_JSONB: _PgTypeAsSqliteJson,
-    }
+SQLiteDialect.colspecs = {
+    **SQLiteDialect.colspecs,
+    PG_ARRAY: _PgTypeAsSqliteJson,
+    PG_JSONB: _PgTypeAsSqliteJson,
+}

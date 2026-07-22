@@ -33,7 +33,6 @@ from app.api.deps import get_db
 from app.db.base import Base
 from app.main import app
 from app.models.company import Company
-from app.models.country import Country
 from app.models.intelligence import InsightPost
 from app.models.regulatory import Regulation
 from app.models.scoring import MaterialGlobalRiskScore
@@ -107,7 +106,6 @@ def _make_post(
     pillar: str | None = "geopolitical_trade",
     materials: list[str] | None = None,
     geographies: list[str] | None = None,
-    tags: list[str] | None = None,
     summary: str = "Short summary.",
     body: str = "Full markdown body.",
     published_at: datetime | None = None,
@@ -121,7 +119,6 @@ def _make_post(
         pillar=pillar,
         materials=materials,
         geographies=geographies,
-        tags=tags,
         summary=summary,
         body=body,
         status=status,
@@ -813,82 +810,3 @@ class TestPatchTags:
         )
         assert r.status_code == 200
         assert r.json()["tags"] is None
-
-
-class TestMetadataPickers:
-    """2026-07-22: materials + geographies autocomplete (editor pickers).
-    value must be the EXACT stored column string (canonical_name / ISO2)."""
-
-    def test_material_suggest_by_name_and_symbol(self, client, db):
-        db.add_all([
-            Material(canonical_name="Cobalt", symbol_or_code="Co"),
-            Material(canonical_name="Natural Graphite", symbol_or_code="C"),
-            Material(canonical_name="Lithium", symbol_or_code="Li"),
-        ])
-        db.commit()
-
-        r = client.get("/api/v1/intelligence/metadata/materials", params={"q": "cob"})
-        assert r.status_code == 200, r.text
-        sugg = r.json()["suggestions"]
-        assert [(s["value"], s["hint"]) for s in sugg] == [("Cobalt", "Co")]
-
-        # symbol match
-        r = client.get("/api/v1/intelligence/metadata/materials", params={"q": "Li"})
-        assert r.status_code == 200
-        vals = [s["value"] for s in r.json()["suggestions"]]
-        assert "Lithium" in vals
-
-    def test_geo_suggest_value_is_iso2(self, client, db):
-        db.add_all([
-            Country(iso2="CN", name="China"),
-            Country(iso2="CD", name="Democratic Republic of the Congo"),
-        ])
-        db.commit()
-
-        r = client.get("/api/v1/intelligence/metadata/geographies", params={"q": "china"})
-        assert r.status_code == 200, r.text
-        sugg = r.json()["suggestions"]
-        assert len(sugg) == 1
-        assert sugg[0]["value"] == "CN"  # stored value = ISO2
-        assert "China" in sugg[0]["label"]
-
-        # ISO2 match
-        r = client.get("/api/v1/intelligence/metadata/geographies", params={"q": "CD"})
-        assert [s["value"] for s in r.json()["suggestions"]] == ["CD"]
-
-
-class TestArticleEntityLinks:
-    """2026-07-22: article→entity outbound links on the public post detail.
-    Only publicly-visible entities (company.is_published / regulation.
-    verified) are linked, and companies resolve canonical_name → slug."""
-
-    def test_resolves_published_company_and_verified_regulation(self, client, db):
-        db.add_all([
-            Company(canonical_name="CATL", slug="catl", is_published=True),
-            Company(canonical_name="Hidden Co", slug="hidden", is_published=False),
-            Regulation(regulation_key="IRA_30D_FEOC", title="IRA 30D", verified=True),
-            Regulation(regulation_key="DRAFT_REG", title="Draft", verified=False),
-        ])
-        post = _make_post(
-            slug="linked-article", title="Linked", status="published",
-            tags=["CATL", "IRA_30D_FEOC", "Hidden Co", "DRAFT_REG", "cobalt"],
-        )
-        db.add(post)
-        db.commit()
-
-        r = client.get("/api/v1/intelligence/posts/linked-article")
-        assert r.status_code == 200, r.text
-        links = r.json()["entity_links"]
-        # Only visible entities; order preserved; topic tag + hidden omitted.
-        assert links == [
-            {"kind": "company", "label": "CATL", "url": "/intelligence/companies/catl"},
-            {"kind": "regulation", "label": "IRA_30D_FEOC", "url": "/intelligence/regulations/IRA_30D_FEOC"},
-        ]
-
-    def test_no_tags_no_links(self, client, db):
-        post = _make_post(slug="plain", title="Plain", status="published", tags=None)
-        db.add(post)
-        db.commit()
-        r = client.get("/api/v1/intelligence/posts/plain")
-        assert r.status_code == 200
-        assert r.json()["entity_links"] == []

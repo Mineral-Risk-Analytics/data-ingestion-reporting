@@ -36,20 +36,35 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+import re as _re
+
 from app.api.deps import get_current_user, get_db, require_admin
+from app.core.config import get_settings
 from app.models.intelligence import InsightPost
 from app.services.content.docx_convert import convert_docx_stream
 from app.api.routes.intelligence_entities import _band_out
 from app.models.scoring import MaterialGlobalRiskScore
 from app.models.supply import Material
 from app.schemas.common import PaginatedResponse
+from app.models.company import Company
+from app.models.country import Country
+from app.models.regulatory import Regulation
 from app.schemas.intelligence import (
     InsightPostCreate,
     InsightPostDetail,
     InsightPostListItem,
     InsightPostUpdate,
     MaterialRiskBar,
+    EntityLinkOut,
+    PdfUploadUrlIn,
+    PdfUploadUrlOut,
     RiskSummary,
+    FacetSuggestResponse,
+    FacetSuggestion,
+    TagClassifyIn,
+    TagClassifyOut,
+    TagSuggestResponse,
+    TagSuggestion,
 )
 
 router = APIRouter(prefix="/intelligence", tags=["intelligence"])
@@ -250,6 +265,51 @@ def get_risk_summary(db: Session = Depends(get_db)) -> RiskSummary:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_entity_links(db: Session, tags: list[str]) -> list[EntityLinkOut]:
+    """Map a post's tags to outbound links for publicly-visible entities.
+
+    Company tag = canonical_name but the URL needs the SLUG, so we resolve;
+    regulation tag IS the regulation_key (== URL param). Only published /
+    verified entities are linked (mirrors the public entity routes' gates)
+    so an article never links to a page that would 404. Preserves tag
+    order; a tag matching neither is just a plain topic tag (omitted).
+    """
+    if not tags:
+        return []
+    companies = {
+        name: slug
+        for name, slug in db.execute(
+            select(Company.canonical_name, Company.slug).where(
+                Company.canonical_name.in_(tags),
+                Company.is_published.is_(True),
+            )
+        )
+    }
+    regulations = {
+        key
+        for (key,) in db.execute(
+            select(Regulation.regulation_key).where(
+                Regulation.regulation_key.in_(tags),
+                Regulation.verified.is_(True),
+            )
+        )
+    }
+    out: list[EntityLinkOut] = []
+    for t in tags:
+        if t in companies:
+            _slug = companies[t] or ""
+            out.append(EntityLinkOut(
+                kind="company", label=t,
+                url=f"/intelligence/companies/{_slug}",
+            ))
+        elif t in regulations:
+            out.append(EntityLinkOut(
+                kind="regulation", label=t,
+                url=f"/intelligence/regulations/{t}",
+            ))
+    return out
+
+
 @router.get("/posts/{slug}", response_model=InsightPostDetail)
 def get_published_post(slug: str, db: Session = Depends(get_db)) -> InsightPostDetail:
     """Single post by slug, restricted to published state."""
@@ -261,7 +321,9 @@ def get_published_post(slug: str, db: Session = Depends(get_db)) -> InsightPostD
     )
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found")
-    return InsightPostDetail.model_validate(post)
+    detail = InsightPostDetail.model_validate(post)
+    detail.entity_links = _resolve_entity_links(db, post.tags or [])
+    return detail
 
 
 # ===========================================================================
@@ -298,6 +360,7 @@ def create_post(
         read_time_minutes=body.read_time_minutes,
         author=body.author,
         metadata_json=body.metadata_json,
+        published_at=body.published_at,
         status="draft",
     )
     db.add(post)
@@ -332,7 +395,15 @@ def update_post(
     for field, value in updates.items():
         setattr(post, field, value)
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # slug is unique — surfaces when a PATCH renames onto a taken slug.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"slug '{body.slug}' is already in use",
+        ) from exc
     db.refresh(post)
     return InsightPostDetail.model_validate(post)
 
@@ -418,6 +489,9 @@ def upload_docx(
     content_type: str = Form(...),
     title: Optional[str] = Form(None),
     author: Optional[str] = Form(None),
+    published_at: Optional[str] = Form(
+        None, description="Article (written) date, ISO format, e.g. 2026-07-15"
+    ),
     _user: dict = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> InsightPostDetail:
@@ -462,11 +536,211 @@ def upload_docx(
     )
     if author:
         post.author = author
+    if published_at:
+        # Article (written) date — parsed leniently: date-only strings
+        # become midnight UTC. Invalid input -> 422, not a silent skip.
+        try:
+            _parsed = datetime.fromisoformat(published_at)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"published_at is not an ISO date: '{published_at}'",
+            ) from exc
+        if _parsed.tzinfo is None:
+            _parsed = _parsed.replace(tzinfo=timezone.utc)
+        post.published_at = _parsed
     post.status = "draft"
     db.add(post)
     db.commit()
     db.refresh(post)
     return InsightPostDetail.model_validate(post)
+
+
+@router.get("/metadata/materials", response_model=FacetSuggestResponse)
+def suggest_materials(
+    q: str = Query(min_length=1, max_length=128),
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FacetSuggestResponse:
+    """Materials autocomplete for the editor (canonical name or symbol).
+    value = canonical_name — exactly what materials[] stores."""
+    like = f"%{q}%"
+    rows = db.execute(
+        select(Material.canonical_name, Material.symbol_or_code)
+        .where(
+            Material.canonical_name.ilike(like)
+            | Material.symbol_or_code.ilike(like)
+        )
+        .order_by(func.length(Material.canonical_name))
+        .limit(10)
+    ).all()
+    return FacetSuggestResponse(
+        suggestions=[
+            FacetSuggestion(value=name, label=name, hint=sym)
+            for name, sym in rows
+        ]
+    )
+
+
+@router.get("/metadata/geographies", response_model=FacetSuggestResponse)
+def suggest_geographies(
+    q: str = Query(min_length=1, max_length=128),
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FacetSuggestResponse:
+    """Country autocomplete for the editor (name or ISO2).
+    value = ISO2 — exactly what geographies[] stores."""
+    like = f"%{q}%"
+    rows = db.execute(
+        select(Country.iso2, Country.name)
+        .where(Country.name.ilike(like) | Country.iso2.ilike(like))
+        .order_by(func.length(Country.name))
+        .limit(10)
+    ).all()
+    return FacetSuggestResponse(
+        suggestions=[
+            FacetSuggestion(value=iso2, label=f"{iso2} \u2014 {name}", hint=None)
+            for iso2, name in rows
+        ]
+    )
+
+
+@router.get("/tags/suggest", response_model=TagSuggestResponse)
+def suggest_tags(
+    q: str = Query(min_length=2, max_length=128),
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TagSuggestResponse:
+    """Entity-tag autocomplete (admin editor). Merges companies (by
+    canonical/legal name) and regulations (by key/title), 8 each. Includes
+    unpublished companies deliberately — tagging is harmless pre-publish
+    and the link lights up when the entity page goes live."""
+    like = f"%{q}%"
+    companies = db.execute(
+        select(Company.canonical_name, Company.legal_name)
+        .where(
+            Company.canonical_name.ilike(like) | Company.legal_name.ilike(like)
+        )
+        .order_by(func.length(Company.canonical_name))
+        .limit(8)
+    ).all()
+    regulations = db.execute(
+        select(Regulation.regulation_key, Regulation.title)
+        .where(
+            Regulation.regulation_key.ilike(like) | Regulation.title.ilike(like)
+        )
+        .order_by(func.length(Regulation.regulation_key))
+        .limit(8)
+    ).all()
+    return TagSuggestResponse(
+        suggestions=[
+            TagSuggestion(label=name, kind="company", hint=legal)
+            for name, legal in companies
+        ]
+        + [
+            TagSuggestion(label=key, kind="regulation", hint=title)
+            for key, title in regulations
+        ]
+    )
+
+
+@router.post("/tags/classify", response_model=TagClassifyOut)
+def classify_tags(
+    body: TagClassifyIn,
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TagClassifyOut:
+    """Which of these tags are entity tags (exact-match linked_posts
+    contract)? Editor calls this once per post load so pre-existing tags
+    render with the right chip style."""
+    tags = [t for t in body.tags if t]
+    out: dict[str, Optional[str]] = {t: None for t in tags}
+    if tags:
+        for (name,) in db.execute(
+            select(Company.canonical_name).where(Company.canonical_name.in_(tags))
+        ):
+            out[name] = "company"
+        for (key,) in db.execute(
+            select(Regulation.regulation_key).where(Regulation.regulation_key.in_(tags))
+        ):
+            out[key] = "regulation"
+    return TagClassifyOut(classifications=out)
+
+
+@router.post(
+    "/posts/{post_id}/pdf-upload-url",
+    response_model=PdfUploadUrlOut,
+)
+def create_pdf_upload_url(
+    post_id: int,
+    body: PdfUploadUrlIn,
+    _user: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> PdfUploadUrlOut:
+    """Presigned R2 PUT for a report's PDF (admin content v1, 2026-07-22).
+
+    Browser flow: call this → PUT the file to ``upload_url`` (Content-Type
+    application/pdf; the R2 bucket needs a CORS rule allowing PUT from the
+    app origin) → save ``public_url`` into the post's ``pdf_url``.
+
+    503 when the R2_* env vars are unset — deliberate, so a misconfigured
+    deploy fails loudly instead of minting URLs that can never resolve.
+    """
+    post = _get_post_or_404(db, post_id)
+    if post.content_type != "report":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="PDF uploads are for report-type posts",
+        )
+
+    settings = get_settings()
+    if not all(
+        (
+            settings.r2_account_id,
+            settings.r2_access_key_id,
+            settings.r2_secret_access_key,
+            settings.r2_bucket,
+            settings.r2_public_base_url,
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="R2 storage is not configured (set the R2_* env vars)",
+        )
+
+    # Sanitize: basename only, safe charset, force .pdf.
+    name = _re.sub(r"[^A-Za-z0-9._-]+", "-", body.filename.rsplit("/", 1)[-1]).strip("-.")
+    if not name:
+        name = "report"
+    if not name.lower().endswith(".pdf"):
+        name += ".pdf"
+    key = f"insights/pdf/{post.slug}/{name}"
+
+    import boto3  # lazy: only needed when R2 is actually used
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=f"https://{settings.r2_account_id}.r2.cloudflarestorage.com",
+        aws_access_key_id=settings.r2_access_key_id,
+        aws_secret_access_key=settings.r2_secret_access_key,
+        region_name="auto",
+    )
+    expires = 900
+    upload_url = client.generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": settings.r2_bucket,
+            "Key": key,
+            "ContentType": "application/pdf",
+        },
+        ExpiresIn=expires,
+    )
+    return PdfUploadUrlOut(
+        upload_url=upload_url,
+        public_url=f"{settings.r2_public_base_url.rstrip('/')}/{key}",
+        key=key,
+        expires_in=expires,
+    )
 
 
 @router.get("/posts/by-id/{post_id}", response_model=InsightPostDetail)

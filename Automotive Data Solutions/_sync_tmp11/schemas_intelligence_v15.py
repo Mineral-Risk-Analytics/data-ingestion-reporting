@@ -70,18 +70,6 @@ class InsightPostListItem(BaseModel):
     risk_band: Optional[str] = None
 
 
-class EntityLinkOut(BaseModel):
-    """A resolved outbound link from an article to a public entity page —
-    the article→entity direction of linking (2026-07-22). Computed from
-    the post's tags: only entities that are publicly VISIBLE are included
-    (company.is_published / regulation.verified), so the link never 404s.
-    """
-
-    kind: Literal["company", "regulation"]
-    label: str          # tag string (canonical_name / regulation_key)
-    url: str            # public hub path
-
-
 class InsightPostDetail(InsightPostListItem):
     """Single-post view — full Markdown body + free-form metadata."""
 
@@ -90,9 +78,6 @@ class InsightPostDetail(InsightPostListItem):
     # status inherited from InsightPostListItem (2026-07-21)
     created_at: datetime
     updated_at: datetime
-    # Resolved outbound entity links (public slug route populates this;
-    # empty on admin fetches — the editor doesn't need it).
-    entity_links: list[EntityLinkOut] = []
 
 
 # ---------------------------------------------------------------------------
@@ -162,24 +147,6 @@ class InsightPostUpdate(BaseModel):
     # null clears it (a subsequent /publish re-stamps "now"). Also the
     # public feed's sort key, so backdating slots the post into history.
     published_at: Optional[datetime] = None
-
-
-class FacetSuggestion(BaseModel):
-    """One suggestion for a metadata picker (materials / geographies).
-
-    ``value`` is the EXACT string stored in the column — canonical_name
-    for materials, ISO2 for geographies — so the ?material=/?geography=
-    filters and any future profile page match verbatim.
-    """
-
-    value: str
-    label: str
-    hint: Optional[str] = None
-
-
-class FacetSuggestResponse(BaseModel):
-    suggestions: list[FacetSuggestion]
-    # (schema block; endpoints live in routes/intelligence.py)
 
 
 class TagSuggestion(BaseModel):

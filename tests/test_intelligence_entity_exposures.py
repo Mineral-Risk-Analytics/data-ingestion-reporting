@@ -34,6 +34,7 @@ from app.api.deps import get_db
 from app.db.base import Base
 from app.main import app
 from app.models.company import Company, CompanyMaterialExposure
+from app.models.country import Country
 from app.models.facility import CompanyFacility, Facility, FacilityMaterialLink
 from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
 from app.models.supply import Material
@@ -259,3 +260,75 @@ class TestGeographicFootprint:
         assert cl["materials"] == [
             {"material": "Lithium", "score": 42.0, "level": "med"},
         ]
+
+
+class TestCountryFacilitiesDrawer:
+    """2026-07-22: /companies/{slug}/facilities?country= — the footprint
+    drawer. Facilities in that country + each facility's materials banded
+    at the country's L1 score."""
+
+    def test_lists_facilities_with_material_bands(self, client, db):
+        company = Company(canonical_name="Glenco", slug="glenco", is_published=True)
+        cobalt = Material(canonical_name="Cobalt")
+        copper = Material(canonical_name="Copper")
+        db.add_all([company, cobalt, copper,
+                    Country(iso2="CD", name="Democratic Republic of the Congo")])
+        db.flush()
+        db.add_all([
+            MaterialGeographyRiskScore(material_id=cobalt.id, geography_code="CD",
+                                       as_of_date=AS_OF, overall_risk_score=70.0),
+            MaterialGeographyRiskScore(material_id=copper.id, geography_code="CD",
+                                       as_of_date=AS_OF, overall_risk_score=48.0),
+        ])
+        mine = Facility(facility_type="mine", country="CD", city="Kolwezi",
+                        region="Lualaba", status="operating", data_source="USGS")
+        plant = Facility(facility_type="processing", country="CD",
+                         region="Haut-Katanga", status="under_construction")
+        other = Facility(facility_type="mine", country="AU", status="operating")
+        db.add_all([mine, plant, other])
+        db.flush()
+        db.add_all([
+            CompanyFacility(company_id=company.id, facility_id=mine.id),
+            CompanyFacility(company_id=company.id, facility_id=plant.id),
+            CompanyFacility(company_id=company.id, facility_id=other.id),
+            FacilityMaterialLink(facility_id=mine.id, material_id=cobalt.id),
+            FacilityMaterialLink(facility_id=mine.id, material_id=copper.id),
+            FacilityMaterialLink(facility_id=plant.id, material_id=cobalt.id),
+        ])
+        db.commit()
+
+        r = client.get("/api/v1/intelligence/companies/glenco/facilities",
+                       params={"country": "cd"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["country"] == "CD"
+        assert body["country_name"] == "Democratic Republic of the Congo"
+        facs = body["facilities"]
+        # only CD facilities (AU excluded); ordered by status then name
+        assert len(facs) == 2
+        types = {f["facility_type"] for f in facs}
+        assert types == {"mine", "processing"}
+
+        mine_row = next(f for f in facs if f["facility_type"] == "mine")
+        assert mine_row["place"] == "Kolwezi, Lualaba"
+        assert mine_row["status"] == "Operating"
+        assert mine_row["status_level"] == "op"
+        assert mine_row["data_source"] == "USGS"
+        # materials sorted by name, each with its CD band
+        assert mine_row["materials"] == [
+            {"material": "Cobalt", "level": "crit"},
+            {"material": "Copper", "level": "high"},
+        ]
+
+        plant_row = next(f for f in facs if f["facility_type"] == "processing")
+        assert plant_row["status"] == "Under Construction"
+        assert plant_row["status_level"] == "build"  # dict fix
+        assert plant_row["place"] == "Haut-Katanga"  # region only
+
+    def test_unpublished_company_404(self, client, db):
+        c = Company(canonical_name="Hidden", slug="hidden", is_published=False)
+        db.add(c)
+        db.commit()
+        r = client.get("/api/v1/intelligence/companies/hidden/facilities",
+                       params={"country": "CD"})
+        assert r.status_code == 404
