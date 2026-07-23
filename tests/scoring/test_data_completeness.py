@@ -117,17 +117,17 @@ class TestMaterialPillar:
 
 
 class TestGeopoliticalPillar:
-    """3 slots: country_concentration above facility floor, exp_rest, tariff."""
+    """3 slots: country_concentration (> 0), exp_rest, tariff."""
 
-    def test_facility_floor_only_is_zero(self):
-        # country_concentration == _FACILITY_PRESENCE_FLOOR (0.02) means no
-        # real MCS share — facility presence only.
-        r = _call(geo_country_concentration=0.02)
+    def test_zero_concentration_is_empty_slot(self):
+        # 4.1: facility-presence floor removed — no MCS share is 0.0 (not the
+        # old 0.02 floor), which is an empty slot.
+        r = _call(geo_country_concentration=0.0)
         assert r["geopolitical"] == 0.0
 
-    def test_just_above_floor_counts_as_real(self):
-        # The slot threshold is "> 0.02" so 0.021 just barely qualifies.
-        r = _call(geo_country_concentration=0.021)
+    def test_any_real_concentration_counts(self):
+        # Threshold is now "> 0.0": any real MCS share fills the slot.
+        r = _call(geo_country_concentration=0.01)
         assert r["geopolitical"] == pytest.approx(1/3, abs=0.005)
 
     def test_all_three_slots_real(self):

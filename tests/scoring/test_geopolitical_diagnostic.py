@@ -125,11 +125,11 @@ class TestCountryConcentrationDiagnostic:
         assert diag["country_concentration"]["data_backed"] is False
         assert diag["country_concentration"]["source"] == "no_data"
 
-    def test_facility_floor_not_marked_data_backed(self, sqlite_session):
-        """Facility presence is a structural marker, not a quantitative
-        share — diagnostic should NOT call it data_backed even though it
-        produces a non-zero value (0.02)."""
-        # Seed a Facility + FacilityMaterialLink to trigger the floor branch.
+    def test_facility_link_does_not_fabricate_concentration(self, sqlite_session):
+        """4.1 (spec §8): a facility link is NOT a production share. With the
+        facility-presence floor removed, a geo known only through a facility
+        returns 0.0 / no_data — same as an empty DB. Regression guard against
+        the fabricated-0.02-concentration behavior."""
         from app.models.facility import Facility, FacilityMaterialLink
         from app.models.supply import Material
 
@@ -150,9 +150,9 @@ class TestCountryConcentrationDiagnostic:
             geo_trade_events=[], as_of_date=AS_OF, eligible_nodes=None,
         )
         ctry_conc, *_, diag = result
-        assert ctry_conc == pytest.approx(0.02)  # _FACILITY_PRESENCE_FLOOR
+        assert ctry_conc == 0.0
         assert diag["country_concentration"]["data_backed"] is False
-        assert diag["country_concentration"]["source"] == "facility_floor"
+        assert diag["country_concentration"]["source"] == "no_data"
 
     def test_mcs_share_marked_data_backed(self, sqlite_session):
         from app.models.supply import Material, MaterialProductionShare

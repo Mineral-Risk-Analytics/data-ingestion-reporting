@@ -140,11 +140,8 @@ _STAGE_ROLLUP_MIN_NODES = 1
 # ── Facility-presence floor for country_concentration fallback ──────────
 # Set when no MaterialProductionShare row exists for the (material, country)
 # pair but MRDS has at least one FacilityMaterialLink row for that material
-# in that country.  See _derive_market_geopolitical_inputs for full
-# rationale.  0.02 sits below the smallest USGS-tracked producer share
-# (Cobalt AU = 0.01) so it's clearly a presence marker, not a real share.
-# Contribution to pillar: 0.40 × 0.02 = 0.8 score points out of 100.
-_FACILITY_PRESENCE_FLOOR = 0.02
+# _FACILITY_PRESENCE_FLOOR removed in 4.1 (spec §8): a facility link is not
+# a production share; missing MCS data reads as no signal (0.0), not a floor.
 
 # ── Pink Sheet (commodity_prices) thresholds — short-window ─────────────
 # CV (coefficient of variation = std/mean) over the look-back window
@@ -639,28 +636,11 @@ def _derive_market_material_inputs(
         producer_signal = float(_producer_share_row.production_share)
         producer_source = "mcs_share"
     else:
-        # No MCS row — check facility-presence floor.
-        from app.models.facility import Facility, FacilityMaterialLink
-
-        _has_facility = db.scalar(
-            select(FacilityMaterialLink.id)
-            .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
-            .where(
-                FacilityMaterialLink.material_id == material_id,
-                Facility.country == geography_code,
-                # 2026-07-17: floor requires a LIVE production asset —
-                # closed/planned facilities no longer fabricate presence
-                # (MRDS status triage made closures meaningful).
-                Facility.status.in_(_PRODUCTION_ASSET_STATUSES),
-            )
-            .limit(1)
-        )
-        if _has_facility is not None:
-            producer_signal = _FACILITY_PRESENCE_FLOOR
-            producer_source = "facility_floor"
-        else:
-            producer_signal = 0.0
-            producer_source = "no_data"
+        # No MCS production share → no signal. (4.1: the facility-presence
+        # floor was removed per spec §8 data-honesty — a facility link is
+        # not a production share and must not fabricate 0.02 concentration.)
+        producer_signal = 0.0
+        producer_source = "no_data"
 
     # 11.4.B (2026-06): defaults for prod_hhi / reserve_hhi changed 0.5 → 0.0
     # (no data = no signal) to remove the silent score-inflation for
@@ -878,39 +858,14 @@ def _derive_market_geopolitical_inputs(
         # and RU on Lithium / Manganese.  The HCG fallback inflated 85-94%
         # of scored (material, country) pairs across the launch list.
         #
-        # New behavior: if MRDS knows about at least one facility for this
-        # material in this country, return a small floor value (0.02) to
-        # acknowledge "we know there's some production here, just below
-        # USGS's reporting threshold."  Otherwise 0.0 (no signal).
-        #
-        # Floor calibration: 0.02 sits below the smallest USGS-tracked
-        # share (Cobalt AU = 0.01) so it's identifiable as a presence
-        # marker rather than a real share.  Combined with the pillar's
-        # 0.40 weight on country_concentration that's worth 0.8 score
-        # points out of 100 — appreciable but not dominating.
-        from app.models.facility import Facility, FacilityMaterialLink
-
-        _has_facility = db.scalar(
-            select(FacilityMaterialLink.id)
-            .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
-            .where(
-                FacilityMaterialLink.material_id == material_id,
-                Facility.country == geography_code,
-                # 2026-07-17: floor requires a LIVE production asset —
-                # closed/planned facilities no longer fabricate presence
-                # (MRDS status triage made closures meaningful).
-                Facility.status.in_(_PRODUCTION_ASSET_STATUSES),
-            )
-            .limit(1)
-        )
-        if _has_facility is not None:
-            country_concentration = _FACILITY_PRESENCE_FLOOR
-            fallback_label = "facility_presence_floor"
-            country_concentration_source = "facility_floor"
-        else:
-            country_concentration = 0.0
-            fallback_label = "no_signal"
-            country_concentration_source = "no_data"
+        # 4.1: no MCS production share → no signal. The facility-presence
+        # floor (a hardcoded 0.02 when MRDS knew of a facility here) was
+        # removed per spec §8 data-honesty — a facility link is not a
+        # production share and must not fabricate concentration. (The old
+        # HIGH_CONCENTRATION_GEOS phantom set was already gone before this.)
+        country_concentration = 0.0
+        fallback_label = "no_signal"
+        country_concentration_source = "no_data"
         log.debug(
             "market_aggregator.geo.production_share_fallback",
             material_id=material_id,
@@ -2420,13 +2375,12 @@ def _compute_pillar_data_completeness(
 
     # ── Geopolitical / Trade ──
     # Three sub-inputs: country_concentration, export_restriction_exposure,
-    # tariff_exposure.  country_concentration is "real" when it exceeds the
-    # facility-presence floor (the engine returns _FACILITY_PRESENCE_FLOOR
-    # = 0.02 when no MCS production share exists but a facility is known;
-    # anything above that came from a real MCS share).  exp_rest / tariff
-    # are real when non-zero (zero means no qualifying events).
+    # tariff_exposure.  country_concentration is "real" when non-zero — it
+    # now comes only from a real MCS production share (4.1 removed the
+    # facility-presence floor).  exp_rest / tariff are real when non-zero
+    # (zero means no qualifying events).
     geo_slots = [
-        geo_country_concentration > _FACILITY_PRESENCE_FLOOR,
+        geo_country_concentration > 0.0,
         geo_export_restriction > 0.0,
         geo_tariff > 0.0,
     ]
