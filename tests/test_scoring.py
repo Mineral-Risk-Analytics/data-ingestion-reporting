@@ -6,7 +6,7 @@ from app.services.scoring.event_impact import compute_effective_confidence, comp
 from app.services.scoring.financial_pressure import score_financial_pressure
 from app.services.scoring.geopolitical_risk import score_geopolitical_trade
 from app.services.scoring.material_risk import score_material_exposure
-from app.services.scoring.regulatory_risk import COMPLIANCE_OBLIGATIONS, score_regulatory_profile
+from app.services.scoring.regulatory_risk import score_regulatory_profile
 from app.services.scoring.supplier_risk import SCORING_VERSION, aggregate_supplier_risk
 
 
@@ -42,26 +42,33 @@ def test_regulatory_risk_event_driven_only() -> None:
 
 
 def test_regulatory_obligation_uplift() -> None:
-    # UFLPA (25) + EU_BATTERY_REG_2023 (20) = 45 → capped at 40
-    uplift = min(40.0, COMPLIANCE_OBLIGATIONS["UFLPA"] + COMPLIANCE_OBLIGATIONS["EU_BATTERY_REG_2023"])
-    assert uplift == 40.0
-
+    # UFLPA (25) + EU_BATTERY_REG_2023 (20) = raw 45.
+    # 4.3 soft cap: 40 × (1 − e^(−45/35)) ≈ 28.94 (was hard-capped to 40).
+    import math
     score = score_regulatory_profile(
         top_event_impacts=[],
         active_obligations=[("UFLPA", 1.0), ("EU_BATTERY_REG_2023", 1.0)],
+        obligation_points={"UFLPA": 25, "EU_BATTERY_REG_2023": 20},
     )
-    assert score == 40.0
+    assert abs(score - 40.0 * (1 - math.exp(-45.0 / 35.0))) < 1e-9
 
 
 def test_regulatory_uflpa_only_uplift() -> None:
+    import math
     score = score_regulatory_profile(
-        top_event_impacts=[], active_obligations=[("UFLPA", 1.0)]
+        top_event_impacts=[],
+        active_obligations=[("UFLPA", 1.0)],
+        obligation_points={"UFLPA": 25},
     )
-    assert score == 25.0
+    # 4.3 soft cap: 40 × (1 − e^(−25/35)) ≈ 20.42
+    assert abs(score - 40.0 * (1 - math.exp(-25.0 / 35.0))) < 1e-9
 
 
-def test_regulatory_combined_capped_at_100() -> None:
-    # Max event score 60 + max obligation 40 = 100
+def test_regulatory_combined_approaches_100() -> None:
+    # Max event score 60 + soft-capped uplift (raw 60 → ≈32.8) ≈ 92.8.
+    # 4.3: 100 is now an asymptote, not a reachable value — the uplift
+    # curve never quite hits 40.
+    import math
     score = score_regulatory_profile(
         top_event_impacts=[1.0, 1.0, 1.0],
         active_obligations=[
@@ -69,8 +76,24 @@ def test_regulatory_combined_capped_at_100() -> None:
             ("EU_BATTERY_REG_2023", 1.0),
             ("IRA_DOMESTIC", 1.0),
         ],
+        obligation_points={"UFLPA": 25, "EU_BATTERY_REG_2023": 20, "IRA_DOMESTIC": 15},
     )
-    assert score == 100.0
+    expected = 60.0 + 40.0 * (1 - math.exp(-60.0 / 35.0))
+    assert abs(score - expected) < 1e-9
+    assert score < 100.0
+
+
+def test_regulatory_softcap_preserves_ordering() -> None:
+    """The REE×CN regression: raw 68 and raw 102 must NOT score the same
+    (the pre-4.3 hard cap pinned both to 40)."""
+    def uplift(raw_points: int) -> float:
+        return score_regulatory_profile(
+            top_event_impacts=[],
+            active_obligations=[("R", 1.0)],
+            obligation_points={"R": raw_points},
+        )
+    lo, mid, hi = uplift(26), uplift(68), uplift(102)
+    assert lo < mid < hi < 40.0
 
 
 # ---------------------------------------------------------------------------

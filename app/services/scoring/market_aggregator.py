@@ -470,6 +470,29 @@ def _avg_impact_normalised(
     return min(1.0, sum(impacts) / len(impacts) / _MAX_EVENT_IMPACT)
 
 
+def _max_impact_normalised(
+    events: list[EventWithRelevance],
+    category: RiskCategory,
+    as_of_date: date,
+) -> float:
+    """Strongest single event impact, normalised to 0-1.
+
+    4.2 (2026-07-23): the export / tariff / subsidy Geopolitical
+    sub-inputs switched from avg to max.  The strongest ACTIVE
+    restriction defines a trade lane's exposure; weaker corroborating
+    events must never dilute it, which is what an average structurally
+    does (cobalt/CD: a severity-0.07 sanctions-count stat next to the
+    severity-0.9 DRC export ban dragged the avg to 0.33 when the ban
+    alone decays to 0.64).  ``trade_volatility`` (Material pillar)
+    deliberately keeps the avg — breadth of disruption is the signal
+    there, not the single worst event.
+    """
+    if not events:
+        return 0.0
+    impacts = [_event_impact(ew, category, as_of_date) for ew in events]
+    return min(1.0, max(impacts) / _MAX_EVENT_IMPACT)
+
+
 def _classify_geo_events(
     events: list[EventWithRelevance],
 ) -> tuple[list[EventWithRelevance], list[EventWithRelevance], list[EventWithRelevance]]:
@@ -878,10 +901,10 @@ def _derive_market_geopolitical_inputs(
     export_events, tariff_events, subsidy_events = _classify_geo_events(
         geo_trade_events
     )
-    event_export = _avg_impact_normalised(
+    event_export = _max_impact_normalised(
         export_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
     )
-    event_tariff = _avg_impact_normalised(
+    event_tariff = _max_impact_normalised(
         tariff_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
     )
 
@@ -894,7 +917,7 @@ def _derive_market_geopolitical_inputs(
     # 4-component profile fires.  See docs/coverage-gap-plan-2026-05.md
     # § G-Cov-3.
     if subsidy_events:
-        subsidy_distortion: Optional[float] = _avg_impact_normalised(
+        subsidy_distortion: Optional[float] = _max_impact_normalised(
             subsidy_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
         )
     else:
@@ -1053,29 +1076,33 @@ def _resolve_compliance_weight(
 
     Lookup order:
       1. Exact ISO2 match in ``geo_weights``
-      2. "DEFAULT" fallback within ``geo_weights``
-      3. Universal 0.50 default when the column is NULL or empty
+      2. Region alias containing the country (e.g. "EU" — see
+         constants.REGION_MEMBERS; added 2026-07-23)
+      3. "DEFAULT" fallback within ``geo_weights``
+      4. Universal 0.50 default when the column is NULL or empty
 
     Returns a value in [0.0, 1.0].
 
-    11.4-Reg-A REVERT (2026-06-06): briefly flipped to 0.0 then reverted
-    after discovering ALL 8 partner-tier regulations (UFLPA, EU Battery
-    Reg, CRMA, IRA Domestic, EU CSDDD, EU REACH Cobalt, EU CBAM, EU
-    Conflict Minerals) have NULL ``geography_compliance_weights`` today.
-    Flipping the implicit fallback to 0.0 would have zeroed the
-    obligation_score component everywhere — exactly counter to the
-    "fill data gaps over re-math" policy.
-
-    The diagnostic added in 11.4-Reg-B (see
-    ``_derive_market_regulatory_inputs``) surfaces the gap via
-    ``obligations.default_weight_count``.  Partner-side workflow:
-    populate the JSONB tables (per-regulation per-country weights),
-    then revisit the math change once the default fallback is
-    actually rarely-fired rather than the dominant path.
+    STALE-COMMENT FIX (2026-07-24, Build 2): the 11.4-Reg-A note that
+    "all 8 partner-tier regulations have NULL geography_compliance_weights"
+    no longer holds — all 8 obligation regs have curated JSONB weights in
+    the live DB. The 0.50 fallback remains for genuinely uncurated rows
+    (rare now); ``obligations.default_weight_count`` in the diagnostic
+    still surfaces how often it fires.
     """
     if not geo_weights:
         return 0.50
-    return float(geo_weights.get(geography_code, geo_weights.get("DEFAULT", 0.50)))
+    if geography_code in geo_weights:
+        return float(geo_weights[geography_code])
+    # Region alias (2026-07-23): a weights key like "EU" applies to every
+    # member country that has no exact row of its own — lets curation write
+    # {"EU": 0.0, "DEFAULT": 0.3} (CBAM exempting intra-EU sourcing) in one
+    # row. Exact country match above always wins over the region row.
+    from app.constants import REGION_MEMBERS
+    for region, members in REGION_MEMBERS.items():
+        if region in geo_weights and geography_code in members:
+            return float(geo_weights[region])
+    return float(geo_weights.get("DEFAULT", 0.50))
 
 
 def _derive_market_regulatory_inputs(
@@ -1083,10 +1110,15 @@ def _derive_market_regulatory_inputs(
     material_id: int,
     geography_code: str,
     as_of_date: date,
-) -> tuple[list[float], list[tuple[str, float]], float, dict]:
+) -> tuple[list[float], list[tuple[str, float]], float, dict, dict]:
     """
     Returns (top_event_impacts, scope_obligations, policy_proximity_adjustment,
-             sub_input_diagnostic).
+             obligation_points, sub_input_diagnostic).
+
+    Build 2 (2026-07-24): ``obligation_points`` maps regulation_key → base
+    points read from ``regulations.obligation_points`` (coalesced to 0) —
+    passed to score_regulatory_profile in place of the retired hardcoded
+    COMPLIANCE_OBLIGATIONS dict.
 
     11.4-Reg (2026-06-06): added the 4th return value, ``sub_input_diagnostic``,
     mirroring the Material/Geopolitical/Operational 11.4 pattern.  Surfaces
@@ -1095,9 +1127,12 @@ def _derive_market_regulatory_inputs(
     40-point obligation cap.
 
     scope_obligations:
-        Regulations linked via RegulationMaterialScope to this material OR via
-        RegulationGeographyScope to this geography, each paired with its resolved
-        compliance risk weight for ``geography_code``.
+        Regulations linked via RegulationMaterialScope to this material OR
+        flagged ``applies_all_materials`` (all-goods rules — UFLPA, FLR,
+        CSDDD; migration 064 replaced the old RegulationGeographyScope
+        OR-gate, which leaked material-scoped regs into unlisted
+        materials). Each is paired with its resolved compliance risk
+        weight for ``geography_code``.
 
         Weights come from ``Regulation.geography_compliance_weights`` (JSONB):
           - Exact ISO2 match → that weight
@@ -1148,7 +1183,6 @@ def _derive_market_regulatory_inputs(
         RegulationMaterialScope,
         RiskEventRegulation,
     )
-    from app.services.scoring.regulatory_risk import COMPLIANCE_OBLIGATIONS
     from datetime import datetime as _dt
 
     # Scope-derived regulations (material + geography).
@@ -1157,6 +1191,9 @@ def _derive_market_regulatory_inputs(
     # or "default" (the 0.0 fallback that fires when JSONB is NULL/empty).
     weights: dict[str, float] = {}
     weight_sources: dict[str, str] = {}
+    # Build 2: obligation base points per regulation_key, straight from the
+    # row (coalesce(NULL,0) == the old COMPLIANCE_OBLIGATIONS.get(key, 0)).
+    obligation_points: dict[str, float] = {}
 
     def _record_weight(key: str, geo_weights: Optional[dict]) -> None:
         """Resolve + record the weight along with its source label."""
@@ -1172,20 +1209,35 @@ def _derive_market_regulatory_inputs(
             weight_sources[key] = "curated" if geo_weights else "default"
 
     mat_stmt = (
-        select(Regulation.regulation_key, Regulation.geography_compliance_weights)
+        select(
+            Regulation.regulation_key,
+            Regulation.geography_compliance_weights,
+            Regulation.obligation_points,
+        )
         .join(RegulationMaterialScope, RegulationMaterialScope.regulation_id == Regulation.id)
         .where(RegulationMaterialScope.material_id == material_id)
     )
-    for key, geo_weights in db.execute(mat_stmt).all():
+    for key, geo_weights, ob_points in db.execute(mat_stmt).all():
         _record_weight(key, geo_weights)
+        obligation_points[key] = float(ob_points or 0)
 
-    geo_stmt = (
-        select(Regulation.regulation_key, Regulation.geography_compliance_weights)
-        .join(RegulationGeographyScope, RegulationGeographyScope.regulation_id == Regulation.id)
-        .where(RegulationGeographyScope.country_code == geography_code)
+    # Gate change (2026-07-23, migration 064): all-goods regulations enter
+    # via the explicit applies_all_materials flag. The old
+    # RegulationGeographyScope OR-gate is gone from the market path — it
+    # leaked material-scoped regs (CRMA) into unlisted materials at their
+    # targeted countries. Geography scope rows are descriptive only now;
+    # geographic intensity lives entirely in geography_compliance_weights.
+    flag_stmt = (
+        select(
+            Regulation.regulation_key,
+            Regulation.geography_compliance_weights,
+            Regulation.obligation_points,
+        )
+        .where(Regulation.applies_all_materials.is_(True))
     )
-    for key, geo_weights in db.execute(geo_stmt).all():
+    for key, geo_weights, ob_points in db.execute(flag_stmt).all():
         _record_weight(key, geo_weights)
+        obligation_points[key] = float(ob_points or 0)
 
     scope_obligations = sorted(weights.items())
 
@@ -1197,12 +1249,15 @@ def _derive_market_regulatory_inputs(
     )
 
     # Mirror the obligation-score math in score_regulatory_profile so we can
-    # surface raw vs capped values.  The scorer applies COMPLIANCE_OBLIGATIONS
-    # × weight, sums, then caps at 40.
+    # surface raw vs capped values.  The scorer applies obligation_points
+    # (DB, Build 2) × weight, sums, then caps at 40.
     raw_obligation_score = sum(
-        COMPLIANCE_OBLIGATIONS.get(ob_key, 0) * weight
+        obligation_points.get(ob_key, 0.0) * weight
         for ob_key, weight in scope_obligations
     )
+    # 4.3: the hard cap is gone (scorer applies a 40-asymptote saturating
+    # curve). ``capped_at_40`` now flags "deep in the compressed zone" —
+    # raw > 40 — kept under its old name for diagnostic shape stability.
     capped_at_40 = raw_obligation_score > 40.0
 
     # Events for scoped regulations
@@ -1259,7 +1314,7 @@ def _derive_market_regulatory_inputs(
 
     return (
         top_event_impacts, scope_obligations, policy_proximity_adjustment,
-        sub_input_diagnostic,
+        obligation_points, sub_input_diagnostic,
     )
 
 
@@ -2529,7 +2584,8 @@ def score_material_geography(
     # geography_compliance_weights now resolves to 0.0 instead of 0.50;
     # uncurated regulations contribute 0 to obligation_score.
     (
-        top_reg_impacts, scope_obligations, prox_adj, reg_sub_input_diag,
+        top_reg_impacts, scope_obligations, prox_adj, reg_obligation_points,
+        reg_sub_input_diag,
     ) = _derive_market_regulatory_inputs(
         db, material_id, geography_code, as_of_date
     )
@@ -2747,7 +2803,8 @@ def score_material_geography(
         production_subsidy_distortion=subsidy_distortion,
     )
     reg_score = regulatory_risk.score_regulatory_profile(
-        top_reg_impacts, scope_obligations, prox_adj
+        top_reg_impacts, scope_obligations, prox_adj,
+        obligation_points=reg_obligation_points,
     )
     op_score = _score_operational_market(struct_dep, op_impacts)
     fin_score = fp_module.score_financial_pressure(base_sig, lev_bon, liq_bon, fin_count)

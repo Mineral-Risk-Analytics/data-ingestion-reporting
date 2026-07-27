@@ -123,7 +123,38 @@ _REG_STATUS_DISPLAY: dict[str, tuple[str, str]] = {
     "proposed": ("Proposed", "proposed"),
     "pending": ("Pending", "pending"),
     "superseded": ("Superseded", "ended"),
+    # 2026-07-26: complete the workbook status vocabulary. "stayed" =
+    # adopted but court-blocked, never in force (SEC_CLIMATE_2024);
+    # "archived" = removed from the curated set by the workbook sync.
+    "stayed": ("Stayed", "ended"),
+    "archived": ("Archived", "ended"),
 }
+
+
+def _editorial_out(metadata_json):
+    """Build EditorialOut from metadata_json["editorial"] (workbook-curated).
+    Returns None when absent so the frontend can fall back to summary."""
+    from app.schemas.intelligence_entities import EditorialOut, FurtherReadingOut
+    ed = (metadata_json or {}).get("editorial")
+    if not isinstance(ed, dict):
+        return None
+    fr = [
+        FurtherReadingOut(
+            title=x.get("title", ""), publisher=x.get("publisher", ""),
+            url=x.get("url", ""),
+        )
+        for x in ed.get("further_reading", [])
+        if isinstance(x, dict) and x.get("title") and x.get("url")
+    ]
+    sections = {
+        k: v for k, v in (ed.get("sections") or {}).items()
+        if isinstance(v, str) and v.strip()
+    }
+    if not (ed.get("standfirst") or sections or fr):
+        return None
+    return EditorialOut(
+        standfirst=ed.get("standfirst"), sections=sections, further_reading=fr,
+    )
 
 # regulations.policy_theme → public display label (2026-07-15, Nicole).
 # snake_case normalized server-side; 'pending_review' is an INTERNAL
@@ -798,29 +829,53 @@ def get_public_regulation(
     # future states on a fixed strip rather than a variable-length list.
     # Revision/amendment nodes were considered and cut (no tracking data).
     today = date.today()
-    _stage_rank = {"proposed": 0, "enacted": 1, "effective": 2}
-    _current = _stage_rank.get((reg.status or "").strip().lower(), 0)
-    _eff_future = reg.effective_date is not None and reg.effective_date > today
-    timeline = [
-        TimelineNodeOut(
-            label="Proposed",
-            date=reg.publication_date,
-            active=_current == 0,
-            future=False,
-        ),
-        TimelineNodeOut(
-            label="Enacted",
-            date=None,
-            active=_current == 1,
-            future=_current < 1,
-        ),
-        TimelineNodeOut(
-            label="Effective",
-            date=reg.effective_date,
-            active=_current == 2 and not _eff_future,
-            future=_current < 2 or _eff_future,
-        ),
-    ]
+    _status_norm = (reg.status or "").strip().lower()
+    if _status_norm == "stayed":
+        # 2026-07-26 (Nicole): court-stayed rules got past Proposed (they
+        # were adopted) but never took effect — render Adopted as reached
+        # and a terminal Stayed node instead of a dangling Effective date
+        # that never arrived.
+        timeline = [
+            TimelineNodeOut(
+                label="Proposed", date=reg.publication_date,
+                active=False, future=False,
+            ),
+            TimelineNodeOut(
+                label="Adopted", date=None, active=False, future=False,
+            ),
+            TimelineNodeOut(
+                label="Stayed", date=None, active=True, future=False,
+                note="Blocked by court order — never took effect.",
+            ),
+        ]
+    else:
+        _stage_rank = {"proposed": 0, "enacted": 1, "effective": 2}
+        _current = _stage_rank.get(_status_norm, 0)
+        _eff_future = reg.effective_date is not None and reg.effective_date > today
+        _eff_reached = _current >= 2 and not _eff_future
+        timeline = [
+            TimelineNodeOut(
+                label="Proposed",
+                date=reg.publication_date,
+                active=_current == 0,
+                future=False,
+            ),
+            TimelineNodeOut(
+                label="Enacted",
+                date=None,
+                active=_current == 1,
+                future=_current < 1,
+            ),
+            TimelineNodeOut(
+                label="Effective",
+                # 2026-07-26: only show the date when the stage is reached
+                # or genuinely scheduled ahead — a PAST effective_date on a
+                # not-yet-effective status is stale data, not a milestone.
+                date=reg.effective_date if (_eff_reached or _eff_future) else None,
+                active=_eff_reached,
+                future=_current < 2 or _eff_future,
+            ),
+        ]
 
     # ── scope chips + severity multipliers ────────────────────────────
     mat_rows = db.execute(
@@ -905,6 +960,7 @@ def get_public_regulation(
         status=disp,
         status_level=level,
         summary=reg.summary,
+        editorial=_editorial_out(reg.metadata_json),
         timeline=timeline,
         materials_scope=materials_scope,
         geographies_scope=geographies_scope,

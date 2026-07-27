@@ -55,6 +55,13 @@ def list_risk_events(
         )
     if event_type:
         q = q.where(RiskEvent.event_type == event_type)
+    else:
+        # Quarantine (2026-07-24, Build 1): orphan SEC filing signals are
+        # excluded from the default event view — they carry no company/
+        # material/geography links and score nowhere (stream paused).
+        # Explicitly filtering ?event_type=sec_filing_signal still shows
+        # them, so nothing is hidden from a deliberate search.
+        q = q.where(RiskEvent.event_type != "sec_filing_signal")
     if severity_min is not None:
         q = q.where(RiskEvent.severity_score >= severity_min)
     if date_from:

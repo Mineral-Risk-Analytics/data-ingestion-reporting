@@ -32,6 +32,13 @@ SUPPLY-CHAIN ROLLUP:
   fetches the most recent persisted ``CompanyScore`` per company so the
   propagation pillar consumes already-computed scores rather than recursing
   into rescore.
+
+Build 1 (2026-07-24): every event-selection query filters on
+``RiskEvent.primary_category`` (exactly one pillar per event) instead of
+``risk_categories_json.contains`` — the containment form let multi-tagged
+events score in several pillars at once (spec Principle 3 violation).
+``risk_categories_json`` is display/filter-only now. NULL primary_category
+(display-only streams) is never selected here by construction.
 """
 
 from __future__ import annotations
@@ -234,7 +241,7 @@ def get_events_for_company(
             RiskEventCompany.company_id == company_id,
             RiskEventCompany.review_status != "excluded",
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
-            RiskEvent.risk_categories_json.contains([category.value]),
+            RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
         )
         # 2026-07-15 EGRESS: defer Text columns that scoring never reads —
         # traced callers (orchestrator → evidence_aggregator) touch title,
@@ -406,9 +413,7 @@ def get_active_compliance_obligations(
         .where(
             RiskEventCompany.company_id == company_id,
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
-            RiskEvent.risk_categories_json.contains(
-                [RiskCategory.REGULATORY_COMPLIANCE.value]
-            ),
+            RiskEvent.primary_category == RiskCategory.REGULATORY_COMPLIANCE.value,  # Build 1
         )
         # 2026-07-15 EGRESS: this loop only reads ev.title — defer Text cols.
         .options(defer(RiskEvent.summary))
@@ -448,9 +453,7 @@ def get_filing_signals(
             RiskEventCompany.company_id == company_id,
             RiskEventCompany.review_status != "excluded",
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
-            RiskEvent.risk_categories_json.contains(
-                [RiskCategory.FINANCIAL_PRESSURE.value]
-            ),
+            RiskEvent.primary_category == RiskCategory.FINANCIAL_PRESSURE.value,  # Build 1
         )
         # 2026-07-15 EGRESS: defer Text cols (title/metadata_json used, summary/review_note not).
         .options(defer(RiskEvent.summary))
@@ -567,7 +570,7 @@ def get_events_for_material(
         .where(
             RiskEventMaterial.material_id == material_id,
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
-            RiskEvent.risk_categories_json.contains([category.value]),
+            RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
         )
         .order_by(RiskEvent.event_date.desc())
     )
@@ -654,7 +657,7 @@ def get_events_for_geographies(
         .where(
             RiskEventGeography.country_code.in_(country_codes),
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
-            RiskEvent.risk_categories_json.contains([category.value]),
+            RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
         )
         # 2026-07-15 EGRESS: defer Text cols summary + review_note.
         .options(defer(RiskEvent.summary))
@@ -760,7 +763,7 @@ def get_events_for_materials(
         .where(
             RiskEventMaterial.material_id.in_(material_ids),
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
-            RiskEvent.risk_categories_json.contains([category.value]),
+            RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
         )
         .order_by(RiskEvent.event_date.desc())
     )
@@ -832,7 +835,7 @@ def get_events_for_hs_mapping(
         .where(
             RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
-            RiskEvent.risk_categories_json.contains([category.value]),
+            RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
         )
         .order_by(RiskEvent.event_date.desc())
     )
@@ -973,9 +976,7 @@ def get_events_for_regulations(
             Regulation.regulation_key.in_(regulation_keys),
             Regulation.verified.is_(True),
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
-            RiskEvent.risk_categories_json.contains(
-                [RiskCategory.REGULATORY_COMPLIANCE.value]
-            ),
+            RiskEvent.primary_category == RiskCategory.REGULATORY_COMPLIANCE.value,  # Build 1
         )
         # 2026-07-15 EGRESS: defer Text cols summary + review_note.
         .options(defer(RiskEvent.summary))

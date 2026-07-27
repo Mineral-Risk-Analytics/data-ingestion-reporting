@@ -25,7 +25,7 @@ hard-coded uplift points in ``regulatory_risk.py``:
 
 Other seeded regulations (CRMA_2024, EU_CBAM, EU_CSDDD, EU_CONFLICT_MINERALS,
 EU_REACH_COBALT, SEC_CLIMATE_2024) are tracked for evidence and reporting but
-generate no uplift until ``COMPLIANCE_OBLIGATIONS`` is extended.
+generate no uplift until ``obligation_points`` is set on the row (Build 2).
 
 Trust model — verified flag
 ---------------------------
@@ -120,13 +120,16 @@ _SEED_VERSION = "2026-06-11"
 # ---------------------------------------------------------------------------
 # 1. Regulation definitions
 # ---------------------------------------------------------------------------
-# regulation_key MUST match the keys in regulatory_risk.COMPLIANCE_OBLIGATIONS
+# regulation_key is the stable lookup key; obligation_points/is_obligation on the
 # for the three scored regulations. Additional regulations can be seeded for
-# report context but won't affect scores until COMPLIANCE_OBLIGATIONS is extended.
+# row drive the uplift (Build 2, migration 063) — no code edit needed to extend.
 
 _REGULATIONS: list[dict] = [
     {
         "regulation_key": "UFLPA",
+        "applies_all_materials": True,
+        "is_obligation": True,
+        "obligation_points": 25,
         "title": "Uyghur Forced Labor Prevention Act",
         "issuing_body": "US Department of Homeland Security",
         "geography": "US",
@@ -158,6 +161,8 @@ _REGULATIONS: list[dict] = [
     },
     {
         "regulation_key": "IRA_DOMESTIC",
+        "is_obligation": True,
+        "obligation_points": 15,
         "title": "IRA FEOC & Domestic Content Framework",
         "issuing_body": "US Department of the Treasury / IRS",
         "geography": "US",
@@ -222,6 +227,8 @@ _REGULATIONS: list[dict] = [
     },
     {
         "regulation_key": "CRMA_2024",
+        "is_obligation": True,
+        "obligation_points": 15,
         "title": "EU Critical Raw Materials Act",
         "issuing_body": "European Council",
         "geography": "EU",
@@ -256,6 +263,8 @@ _REGULATIONS: list[dict] = [
     },
     {
         "regulation_key": "EU_CBAM",
+        "is_obligation": True,
+        "obligation_points": 5,
         "title": "EU Carbon Border Adjustment Mechanism",
         "issuing_body": "European Commission",
         "geography": "EU",
@@ -315,6 +324,8 @@ _REGULATIONS: list[dict] = [
 
     {
         "regulation_key": "EU_BATTERY_REG_2023",
+        "is_obligation": True,
+        "obligation_points": 20,
         "title": "EU Battery Regulation (EU) 2023/1542 — batteries and waste batteries",
         "issuing_body": "European Parliament and Council",
         "geography": "EU",
@@ -353,6 +364,9 @@ _REGULATIONS: list[dict] = [
     },
     {
         "regulation_key": "EU_CSDDD",
+        "applies_all_materials": True,
+        "is_obligation": True,
+        "obligation_points": 10,
         "title": "Corporate Sustainability Due Diligence Directive (EU) 2024/1760",
         "issuing_body": "European Parliament and Council",
         "geography": "EU",
@@ -387,6 +401,8 @@ _REGULATIONS: list[dict] = [
     },
     {
         "regulation_key": "EU_CONFLICT_MINERALS",
+        "is_obligation": True,
+        "obligation_points": 3,
         "title": "EU Conflict Minerals Regulation (EU) 2017/821",
         "issuing_body": "European Parliament and Council",
         "geography": "EU",
@@ -419,6 +435,8 @@ _REGULATIONS: list[dict] = [
     },
     {
         "regulation_key": "EU_REACH_COBALT",
+        "is_obligation": True,
+        "obligation_points": 8,
         "title": "REACH Regulation (EC) 1907/2006 — Cobalt SVHC restrictions",
         "issuing_body": "European Parliament and Council",
         "geography": "EU",

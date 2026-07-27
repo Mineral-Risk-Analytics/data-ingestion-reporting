@@ -39,6 +39,10 @@ class RegulationRead(BaseModel):
     summary: Optional[str] = None
     metadata_json: Optional[Dict[str, Any]] = None
     verified: bool = False
+    # Build 2 (migration 063): DB-driven obligation fields.
+    is_obligation: bool = False
+    applies_all_materials: bool = False
+    obligation_points: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 
@@ -46,13 +50,25 @@ class RegulationRead(BaseModel):
     # Surfaced so the regulation detail page can display the exact scoring
     # contribution this regulation produces, without the frontend having
     # to mirror Python constants.  Source-of-truth lookups:
-    #   compliance_uplift_points → app.services.scoring.regulatory_risk
-    #                              .COMPLIANCE_OBLIGATIONS
+    #   compliance_uplift_points → regulations.obligation_points (Build 2,
+    #                              migration 063 — DB-driven)
     #   status_severity_weight   → app.services.ingestion.eurlex
     #                              .SEVERITY_BY_STATUS
     #   proximity_window_active  → date math against effective_date
     #                              (decay.compute_recency_multiplier
     #                              applies a 1.10–1.20 step-up when True)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def editorial(self) -> Optional[Dict[str, Any]]:
+        """Content-site editorial block: {standfirst, sections{what_it_requires,
+        who_must_comply, materials_and_origins, key_dates, why_it_matters},
+        further_reading[{title, publisher, url}]}. Curated via the regulation
+        workbook's Editorial / FurtherReading sheets (2026-07-23); stored
+        under metadata_json["editorial"]."""
+        meta = self.metadata_json or {}
+        ed = meta.get("editorial")
+        return ed if isinstance(ed, dict) else None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -63,9 +79,9 @@ class RegulationRead(BaseModel):
         unknown=0.50, partial=0.40, compliant=0.0) before being summed
         with other obligations and capped at 40.
         """
-        # Late import to avoid circular: services.scoring imports schemas.
-        from app.services.scoring.regulatory_risk import COMPLIANCE_OBLIGATIONS
-        return COMPLIANCE_OBLIGATIONS.get(self.regulation_key, 0)
+        # Build 2 (2026-07-24): read from the row (migration 063) — the
+        # hardcoded COMPLIANCE_OBLIGATIONS dict is retired.
+        return int(self.obligation_points or 0)
 
     @computed_field  # type: ignore[prop-decorator]
     @property

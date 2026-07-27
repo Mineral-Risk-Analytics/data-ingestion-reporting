@@ -214,6 +214,22 @@ class ComplianceWeightOut(BaseModel):
     weight: float                           # 0-1; 1 = highest compliance risk
 
 
+class FurtherReadingOut(BaseModel):
+    title: str
+    publisher: str = ""
+    url: str
+
+
+class EditorialOut(BaseModel):
+    """Content-site editorial block, curated via the regulation workbook's
+    Editorial / FurtherReading sheets (2026-07-23). ``sections`` keys:
+    what_it_requires, who_must_comply, materials_and_origins, key_dates,
+    why_it_matters — the frontend renders them in that order."""
+    standfirst: Optional[str] = None
+    sections: dict[str, str] = {}
+    further_reading: list[FurtherReadingOut] = []
+
+
 class PublicRegulationDetail(BaseModel):
     regulation_key: str
     title: Optional[str] = None
@@ -223,6 +239,7 @@ class PublicRegulationDetail(BaseModel):
     status: Optional[str] = None
     status_level: Optional[str] = None
     summary: Optional[str] = None
+    editorial: Optional[EditorialOut] = None
     timeline: list[TimelineNodeOut] = []
     materials_scope: list[MaterialScopeOut] = []
     geographies_scope: list[GeographyScopeOut] = []

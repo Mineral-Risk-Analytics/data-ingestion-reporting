@@ -668,6 +668,12 @@ def _upsert_event(
         db.flush()
         return existing.id, False
 
+    # Build 1 (2026-07-24, Nicole): derived trade statistics are DISPLAY-
+    # ONLY — they are computed metrics, not government/operator actions
+    # (spec §4), so they carry no primary_category and never enter pillar
+    # scoring. The metadata flag tells the RiskEvent autofill listener to
+    # leave primary_category NULL.
+    metadata["scoring"] = "display_only"
     event = RiskEvent(
         event_type="GEOPOLITICAL_TRADE",
         event_subtype=event_subtype,  # typed col (migration 040)

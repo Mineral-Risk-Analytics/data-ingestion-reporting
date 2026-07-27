@@ -66,6 +66,8 @@ curated operational events──►  Operational pillar   ─┘         (4 pill
 | **Later evidence** | ~~World Bank WGI weighting~~ (ADOPTED in 4.1 — moved to the concentration pillar; the WGI α=0.5 discount overlay on this pillar's country_concentration was REMOVED so instability isn't double-counted; this pillar is now events + tariff/export/subsidy on raw concentration); state-ownership share of production; trade-agreement/alignment context |
 | **Live sources** | GTA updates (periodic re-ingest), IEA tracker updates; later: curated news monitoring with the same "fewer, confident, significant" bar |
 
+**4.2 sub-input aggregation (2026-07-23, Nicole):** the `export_restriction_exposure`, `tariff_exposure`, and `production_subsidy_distortion` sub-inputs use **max** event impact, not avg. Rationale: the strongest active restriction defines a trade lane's exposure; weaker corroborating events must never dilute it — under avg(), cobalt/CD's severity-0.07 sanctions-count stat dragged the export sub-input to 0.33 while the DRC export ban alone decays to 0.64 (CD geo 46→~57, global 39→~47). `trade_volatility` (Material pillar) deliberately keeps avg — breadth of disruption is its signal. The company-path mirror (`evidence_aggregator._avg_impact`) stays avg until the company-scoring V1 migration. Global-rollup weighting was audited in the same pass and confirmed correct: geopolitical is production-share-weighted (ore-stage ladder, CD=0.753) per the 7/18 decision — the "trade-flow-weighted" rationale note was a mislabel, fixed to name per-pillar operators.
+
 ## 5. Pillar: Regulatory & Compliance
 
 **One-sentence explanation:** "What rule changes affect the cost or right to produce/trade this material here?"

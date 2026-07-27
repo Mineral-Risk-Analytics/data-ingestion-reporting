@@ -13,6 +13,7 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
 from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import event as sa_event
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
@@ -64,6 +65,27 @@ class Regulation(Base):
         ),
     )
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # Build 2 (migration 063, 2026-07-24): DB-driven obligation uplift —
+    # replaces the hardcoded regulatory_risk.COMPLIANCE_OBLIGATIONS dict so
+    # curation can add obligations without code edits. Scoring math uses
+    # coalesce(obligation_points, 0); is_obligation is the curation-facing
+    # flag (admin UI / seed semantics).
+    is_obligation: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false",
+        comment="Hard legal obligation feeding the regulatory pillar's 0-40 uplift.",
+    )
+    obligation_points: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Obligation uplift base points (NULL/0 = no uplift; cap 40 total).",
+    )
+    # Migration 064 (2026-07-23): explicit all-goods gate. TRUE = the rule
+    # covers every material (UFLPA, EU FLR, CSDDD, S-211) and enters scoring
+    # for all of them; FALSE = only materials in regulation_material_scope.
+    # Geography scope rows are descriptive metadata, not a scoring gate.
+    applies_all_materials: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false",
+        comment="All-goods rule: gates into scoring for every material.",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -294,6 +316,33 @@ class RiskEvent(Base):
         # hide an event from a scoring pillar.  See constants.normalise_risk_categories.
         from app.constants import normalise_risk_categories
         return normalise_risk_categories(value) if value is not None else value
+
+    # Build 1 (migration 062, 2026-07-24): the ONE pillar this event scores
+    # in — pillar queries filter on THIS, not risk_categories_json, so a
+    # multi-tagged event can never double-count (spec Principle 3).
+    # NULL = display-only (SEC orphan stream, trade-signal derived stats,
+    # or no valid category). Autofilled on insert from risk_categories_json
+    # by precedence when not explicitly set — see _autofill_primary_category.
+    primary_category: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, index=True,
+        comment=(
+            "The ONE pillar this event scores in (RiskCategory value). "
+            "NULL = display-only. risk_categories_json remains the "
+            "multi-value display/filter tagging."
+        ),
+    )
+
+    @validates("primary_category")
+    def _validate_primary_category(self, key, value):
+        if value is None:
+            return value
+        from app.constants import RiskCategory
+        valid = {c.value for c in RiskCategory}
+        if value not in valid:
+            raise ValueError(
+                f"primary_category must be one of {sorted(valid)} or None, got {value!r}"
+            )
+        return value
     geography_json: Mapped[Optional[Any]] = mapped_column(JSONB)
     # {"primary": "CN", "secondary": ["RU", "CD"]}
     content_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)
@@ -586,3 +635,27 @@ class RiskEventHsMapping(Base):
 
     risk_event: Mapped["RiskEvent"] = relationship(back_populates="hs_mapping_links")
     hs_mapping: Mapped["HsCodeMaterialMapping"] = relationship()
+
+# ── Build 1 autofill (2026-07-24) ──────────────────────────────────────────
+# Every RiskEvent gets its primary scoring category derived from its display
+# categories at insert time unless (a) the caller set one explicitly, or
+# (b) the event is a display-only stream: SEC filing signals (paused, orphan)
+# or anything whose metadata carries {"scoring": "display_only"} (the
+# trade-signal derived statistics). Keeps ingesters and tests working without
+# per-call changes while making "each fact scores once" structurally true.
+
+_DISPLAY_ONLY_EVENT_TYPES = frozenset({"sec_filing_signal"})
+
+
+@sa_event.listens_for(RiskEvent, "before_insert")
+def _autofill_primary_category_on_insert(mapper, connection, target):  # noqa: ARG001
+    if target.primary_category is not None:
+        return
+    if target.event_type in _DISPLAY_ONLY_EVENT_TYPES:
+        return
+    meta = target.metadata_json
+    if isinstance(meta, dict) and meta.get("scoring") == "display_only":
+        return
+    from app.constants import derive_primary_category
+    target.primary_category = derive_primary_category(target.risk_categories_json)
+

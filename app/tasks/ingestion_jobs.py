@@ -418,10 +418,18 @@ INGESTION_FUNCTIONS = [
     ingest_federal_register_job,
     ingest_worldbank_job,
     # Quarterly auto-download
-    ingest_eurlex_job,
-    ingest_sec_edgar_job,
-    # Semi-annual auto-download
-    ingest_mrds_job,
+    # PARKED 2026-07-24 (regulatory_pillar_and_event_model_scope.md §0/§2):
+    #   - ingest_eurlex_job: dormant (6 events ever); EU landmark regs are
+    #     hand-curated under manual-primary. Re-register when the FR
+    #     discovery net proves itself and EUR-Lex gets the same filter.
+    #   - ingest_sec_edgar_job: paused — its events are orphans (no
+    #     company/material/geo links, nothing consumes sec_filing_signal).
+    #     Re-register only WITH CIK→risk_event_companies linkage built.
+    # Functions remain defined below for manual CLI use; they are simply
+    # not scheduled/served.
+    # ingest_eurlex_job,
+    # ingest_sec_edgar_job,
+
     # Reminder-only (manual upload)
     gta_refresh_reminder_job,
     iea_policy_tracker_reminder_job,

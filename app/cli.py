@@ -2625,6 +2625,37 @@ def ingest_vpic_cmd(
         s.close()
 
 
+@app.command("ingest-regulation-workbook")
+def ingest_regulation_workbook_cmd(
+    xlsx_path: str = typer.Argument(
+        ..., help="Path to the regulation curation workbook (regulations_workbook_v1.xlsx)."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Build the full diff report (created/updated/archived/rejected) and roll back.",
+    ),
+) -> None:
+    """Sync curated regulations to the partner workbook (SOURCE OF TRUTH).
+
+    Upserts regulations/weights/scopes from the workbook; curated regulations
+    missing from it are archived (never deleted). SUGGESTED_* discovery rows
+    are ignored. New regulations require source_url. Run with --dry-run first
+    to review the diff.
+
+    Example:
+    \b
+      bdi-ingest ingest-regulation-workbook "Automotive Data Solutions/regulations_workbook_v1.xlsx" --dry-run
+    """
+    from app.services.ingestion.regulation_workbook import load_regulation_workbook
+
+    s = _session()
+    try:
+        report = load_regulation_workbook(s, xlsx_path, dry_run=dry_run)
+        typer.echo(json.dumps(report.to_dict(), indent=2, default=str))
+    finally:
+        s.close()
+
+
 @app.command("seed-regulations")
 def seed_regulations_cmd(
     force: bool = typer.Option(

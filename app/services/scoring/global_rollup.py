@@ -1016,8 +1016,9 @@ def score_material_global_rollup(
         },
         "geographies": geo_detail,
         "notes": (
-            f"Trade-flow-weighted rollup across {len(geo_scores)} geographies "
-            f"(weight_source={weight_source}). "
+            f"Rollup across {len(geo_scores)} geographies "
+            f"(concentration=max, geopolitical=production-weighted, "
+            f"others trade-weighted; weight_source={weight_source}). "
             f"Overall {overall:.1f}." if overall is not None else
             f"Rollup across {len(geo_scores)} geographies produced no overall "
             f"score — no pillars had data."
