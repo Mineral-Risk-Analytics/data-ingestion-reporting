@@ -46,7 +46,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.constants import RiskCategory
+from app.constants import EXPORT_RESTRICTION_SUBTYPES, RiskCategory
 from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.scoring import HsCodeGeographyRiskScore, MaterialGeographyRiskScore
 from app.models.supply import Material, MaterialProductionShare
@@ -514,7 +514,7 @@ def _classify_geo_events(
         text = (ew.event.title or "").lower()
         if subtype == "EXPORT_SUBSIDY":
             subsidy_events.append(ew)
-        elif subtype == "EXPORT_RESTRICTION" or (
+        elif subtype in EXPORT_RESTRICTION_SUBTYPES or (
             "export" in text and ("restrict" in text or "ban" in text or "control" in text)
         ):
             export_events.append(ew)
@@ -1105,6 +1105,23 @@ def _resolve_compliance_weight(
     return float(geo_weights.get("DEFAULT", 0.50))
 
 
+def _resolve_enforcement_weight(
+    enforcement_weights: Optional[dict],
+    material_name: Optional[str],
+) -> float:
+    """Per-material enforcement weight for the obligation uplift (065).
+
+    Lookup: exact canonical-name match → "DEFAULT" → 1.0. The 1.0
+    fallback means uncurated regulations keep full points — the column
+    ships inert and only curation changes scores.
+    """
+    if not enforcement_weights or not material_name:
+        return 1.0
+    if material_name in enforcement_weights:
+        return float(enforcement_weights[material_name])
+    return float(enforcement_weights.get("DEFAULT", 1.0))
+
+
 def _derive_market_regulatory_inputs(
     db: Session,
     material_id: int,
@@ -1208,18 +1225,27 @@ def _derive_market_regulatory_inputs(
             # the "no JSONB at all" 0.0 fallback.
             weight_sources[key] = "curated" if geo_weights else "default"
 
+    # 065: enforcement weight scales the reg's points for THIS material.
+    # Resolve the scored material's canonical name once for the lookups.
+    _mat_name = db.scalar(
+        select(Material.canonical_name).where(Material.id == material_id)
+    )
+
     mat_stmt = (
         select(
             Regulation.regulation_key,
             Regulation.geography_compliance_weights,
             Regulation.obligation_points,
+            Regulation.material_enforcement_weights,
         )
         .join(RegulationMaterialScope, RegulationMaterialScope.regulation_id == Regulation.id)
         .where(RegulationMaterialScope.material_id == material_id)
     )
-    for key, geo_weights, ob_points in db.execute(mat_stmt).all():
+    for key, geo_weights, ob_points, enf_weights in db.execute(mat_stmt).all():
         _record_weight(key, geo_weights)
-        obligation_points[key] = float(ob_points or 0)
+        obligation_points[key] = float(ob_points or 0) * _resolve_enforcement_weight(
+            enf_weights, _mat_name
+        )
 
     # Gate change (2026-07-23, migration 064): all-goods regulations enter
     # via the explicit applies_all_materials flag. The old
@@ -1232,12 +1258,15 @@ def _derive_market_regulatory_inputs(
             Regulation.regulation_key,
             Regulation.geography_compliance_weights,
             Regulation.obligation_points,
+            Regulation.material_enforcement_weights,
         )
         .where(Regulation.applies_all_materials.is_(True))
     )
-    for key, geo_weights, ob_points in db.execute(flag_stmt).all():
+    for key, geo_weights, ob_points, enf_weights in db.execute(flag_stmt).all():
         _record_weight(key, geo_weights)
-        obligation_points[key] = float(ob_points or 0)
+        obligation_points[key] = float(ob_points or 0) * _resolve_enforcement_weight(
+            enf_weights, _mat_name
+        )
 
     scope_obligations = sorted(weights.items())
 
@@ -1682,13 +1711,26 @@ def _export_restriction_operational_impacts(
         RiskEventMaterial,
     )
 
+    # 2026-07-27 audit hardening: this fold deliberately borrows
+    # geopolitical-primary events at half weight — but it must still
+    # respect the platform-wide gates every other scoring query has:
+    #   * primary_category IS NOT NULL — display-only events (demoted
+    #     OpenSanctions matches, derived trade stats) were leaking into
+    #     the operational pillar through this side door (4 reachable in
+    #     the live DB at audit time; cobalt×CD's fold included the
+    #     severity-0.072 sanctions stat, diluting the event average).
+    #   * duplicate_of_id IS NULL — confirmed dupes must not double-fold.
+    #   * shared EXPORT_RESTRICTION_SUBTYPES — the manual quota/ban
+    #     subtypes fold too, consistent with the HS-node/market gates.
     rows = db.execute(
         select(RiskEvent)
         .join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
         .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
         .where(
             RiskEventMaterial.material_id == material_id,
-            RiskEvent.event_subtype == "EXPORT_RESTRICTION",
+            RiskEvent.event_subtype.in_(EXPORT_RESTRICTION_SUBTYPES),
+            RiskEvent.primary_category.isnot(None),
+            RiskEvent.duplicate_of_id.is_(None),
             RiskEventGeography.country_code == geography_code,
             RiskEventGeography.geography_context == "primary",
         )
@@ -1726,7 +1768,16 @@ def _score_operational_market(
 
     Result capped at 100.
     """
-    event_component = sum(op_impacts) / len(op_impacts) if op_impacts else 0.0
+    # 4.4 (2026-07-27, Nicole): top-3 mean instead of all-event mean —
+    # parity with the regulatory event component. A weak tail event
+    # (e.g. a half-weighted export-restriction fold) can no longer
+    # dilute a real disruption once three stronger impacts exist.
+    # Honest nuance: within the top 3 a weaker second event still
+    # lowers the mean vs a lone strong one — accepted for consistency
+    # with the regulatory component; pure max was rejected because
+    # simultaneous disruptions should register more than one.
+    top_3 = sorted(op_impacts, reverse=True)[:3]
+    event_component = sum(top_3) / len(top_3) if top_3 else 0.0
     if struct_dep is None:
         # No facility signal: pillar is 100% event-driven.
         raw = event_component * 100

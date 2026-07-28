@@ -108,11 +108,11 @@ def _seed_glencore_shape(db):
             # Global rollups (exposure bars).
             MaterialGlobalRiskScore(
                 material_id=cobalt.id, as_of_date=AS_OF,
-                overall_risk_score=64.8, material_concentration_score=90.2,
+                overall_risk_score=66.2, material_concentration_score=90.2,
             ),
             MaterialGlobalRiskScore(
                 material_id=nickel.id, as_of_date=AS_OF,
-                overall_risk_score=59.9, material_concentration_score=85.0,
+                overall_risk_score=63.9, material_concentration_score=85.0,
             ),
             MaterialGlobalRiskScore(
                 material_id=germanium.id, as_of_date=AS_OF,
@@ -182,12 +182,12 @@ class TestExposuresGlobalOnly:
 
         cobalt = expo[0]
         assert cobalt["stage_label"] == "Extraction · Refining"  # deduped + combined
-        assert cobalt["risk_score"] == 64.8  # GLOBAL, never the CD 70.0
+        assert cobalt["risk_score"] == 66.2  # GLOBAL, never the CD 70.0
         assert cobalt["band"]["level"] == "crit"
         assert "geography" not in cobalt and "score_basis" not in cobalt
 
         nickel = expo[1]
-        assert nickel["risk_score"] == 59.9  # global — no fallback concept anymore
+        assert nickel["risk_score"] == 63.9  # global — no fallback concept anymore
         assert nickel["band"]["level"] == "high"
 
         germanium = expo[2]
@@ -278,7 +278,7 @@ class TestCountryFacilitiesDrawer:
             MaterialGeographyRiskScore(material_id=cobalt.id, geography_code="CD",
                                        as_of_date=AS_OF, overall_risk_score=70.0),
             MaterialGeographyRiskScore(material_id=copper.id, geography_code="CD",
-                                       as_of_date=AS_OF, overall_risk_score=48.0),
+                                       as_of_date=AS_OF, overall_risk_score=53.0),
         ])
         mine = Facility(facility_type="mine", country="CD", city="Kolwezi",
                         region="Lualaba", status="operating", data_source="USGS")

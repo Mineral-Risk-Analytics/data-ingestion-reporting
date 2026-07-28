@@ -69,51 +69,50 @@ class TestStructuralDependencyDiagnostic:
     """3-way source: mrds_geography_stage_weighted / event_derived / no_signal."""
 
     def test_no_signal_when_empty_db(self, sqlite_session):
+        # V1 (4.0): struct_dep is ALWAYS None and the source label is the
+        # fixed "v1_event_only" — the MRDS tiers are retired (spec §6).
+        # Rewritten 2026-07-27 (test predated the V1 change).
         result = _derive_market_operational_inputs(
             sqlite_session, material_id=1, geography_code="CD",
             operational_events=[], as_of_date=AS_OF,
         )
         struct_dep, _, dep_source, _, diag = result
         assert struct_dep is None
-        assert dep_source == "no_signal"
+        assert dep_source == "v1_event_only"
+        assert diag["scoring_profile"] == "events_only"
         assert diag["structural_dependency"]["data_backed"] is False
-        assert diag["structural_dependency"]["source"] == "no_signal"
+        assert diag["structural_dependency"]["source"] == "v1_event_only"
 
     def test_event_derived_not_marked_data_backed(self, sqlite_session):
-        """When SINGLE_SOURCE / CAPACITY_CONSTRAINT events fire Tier 3,
-        struct_dep gets a numeric value but data_backed should remain
-        False — events aren't structural data."""
+        """V1: events never produce struct_dep — it stays None even when
+        capacity-constraint-flavored events exist; the pillar runs
+        events-only. Rewritten 2026-07-27 (predated V1)."""
         events = [_event(subtype="SINGLE_SOURCE", severity=0.8)]
         result = _derive_market_operational_inputs(
             sqlite_session, material_id=1, geography_code="CN",
             operational_events=events, as_of_date=AS_OF,
         )
-        struct_dep, _, dep_source, _, diag = result
-        assert struct_dep == pytest.approx(0.8)
-        assert dep_source == "event_derived"
+        struct_dep, impacts, dep_source, _, diag = result
+        assert struct_dep is None
+        assert dep_source == "v1_event_only"
         assert diag["structural_dependency"]["data_backed"] is False
-        assert diag["structural_dependency"]["source"] == "event_derived"
+        assert len(impacts) == 1        # the event scores as an EVENT, not structure
 
-    def test_mrds_geography_marked_data_backed(self, sqlite_session):
-        """When MRDS facilities exist for the (material, geography) pair,
-        Tier 1 fires and data_backed should be True."""
+    def test_mrds_data_never_scores(self, sqlite_session):
+        """V1: MRDS facilities are discovery-layer only — even with MRDS
+        rows present, struct_dep stays None (spec §6 demotion).
+        Rewritten 2026-07-27 from test_mrds_geography_marked_data_backed,
+        which asserted the retired pre-V1 MRDS tier."""
         from app.models.facility import Facility, FacilityMaterialLink
         from app.models.supply import Material
-
-        m = Material(canonical_name="TestMat")
+        m = Material(canonical_name="OpMat")
         sqlite_session.add(m)
         sqlite_session.flush()
-
-        f = Facility(
-            name="X", country="CN", facility_type="mine", status="operating",
-        )
-        sqlite_session.add(f)
+        fac = Facility(facility_type="mine", country="CN", status="mothballed",
+                       data_source="mrds")
+        sqlite_session.add(fac)
         sqlite_session.flush()
-
-        link = FacilityMaterialLink(
-            facility_id=f.id, material_id=m.id,
-            supply_chain_stage="ore",
-        )
+        link = FacilityMaterialLink(facility_id=fac.id, material_id=m.id)
         sqlite_session.add(link)
         sqlite_session.commit()
 
@@ -121,11 +120,10 @@ class TestStructuralDependencyDiagnostic:
             sqlite_session, material_id=m.id, geography_code="CN",
             operational_events=[], as_of_date=AS_OF,
         )
-        _, _, dep_source, _, diag = result
-        assert dep_source == "mrds_geography_stage_weighted"
-        assert diag["structural_dependency"]["data_backed"] is True
-        assert diag["structural_dependency"]["source"] == "mrds_geography_stage_weighted"
-
+        struct_dep, _, dep_source, _, diag = result
+        assert struct_dep is None
+        assert dep_source == "v1_event_only"
+        assert diag["structural_dependency"]["data_backed"] is False
 
 # ---------------------------------------------------------------------------
 # event_impacts diagnostic
@@ -192,16 +190,18 @@ class TestScoringProfileDiagnostic:
         assert struct_dep is None
         assert diag["scoring_profile"] == "events_only"
 
-    def test_event_derived_struct_dep_is_structural_plus_events(self, sqlite_session):
+    def test_scoring_profile_is_always_events_only(self, sqlite_session):
+        """V1: the 40/60 structural blend is gone — profile is events_only
+        regardless of event mix. Rewritten 2026-07-27 from
+        test_event_derived_struct_dep_is_structural_plus_events."""
         events = [_event(subtype="SINGLE_SOURCE", severity=0.6)]
         result = _derive_market_operational_inputs(
             sqlite_session, material_id=1, geography_code="CN",
             operational_events=events, as_of_date=AS_OF,
         )
         struct_dep, _, _, _, diag = result
-        assert struct_dep is not None
-        assert diag["scoring_profile"] == "structural_plus_events"
-
+        assert struct_dep is None
+        assert diag["scoring_profile"] == "events_only"
 
 # ---------------------------------------------------------------------------
 # Diagnostic shape stability
@@ -240,3 +240,28 @@ class TestDiagnosticShape:
             "export_restriction_event_count",
             "null_severity_event_count",
         }
+
+
+# ---------------------------------------------------------------------------
+# 4.4: top-3 mean event component (2026-07-27)
+# ---------------------------------------------------------------------------
+
+class TestOperationalTop3Mean:
+    def test_weak_tail_cannot_dilute(self):
+        from app.services.scoring.market_aggregator import _score_operational_market
+        strong = [0.8, 0.7, 0.6]
+        with_tail = strong + [0.05, 0.03]     # weak folds beyond the top 3
+        assert _score_operational_market(None, with_tail) == \
+               _score_operational_market(None, strong)
+
+    def test_empty_scores_zero(self):
+        from app.services.scoring.market_aggregator import _score_operational_market
+        assert _score_operational_market(None, []) == 0.0
+
+    def test_single_event_full_impact(self):
+        from app.services.scoring.market_aggregator import _score_operational_market
+        assert _score_operational_market(None, [0.8]) == 80.0
+
+    def test_capped_at_100(self):
+        from app.services.scoring.market_aggregator import _score_operational_market
+        assert _score_operational_market(None, [1.5, 1.4, 1.3]) == 100.0

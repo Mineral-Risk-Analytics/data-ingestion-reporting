@@ -2,6 +2,7 @@
 
 Weekly jobs (Sunday night UTC, feeds Monday scoring):
 
+- ``ingest-operational-news-weekly``— Sundays 20:00 UTC (display-only candidates)
 - ``ingest-opensanctions-weekly``   — Sundays 22:00 UTC
 - ``ingest-federal-register-weekly``— Sundays 22:30 UTC
 - ``ingest-worldbank-weekly``       — Sundays 23:00 UTC
@@ -290,6 +291,85 @@ async def ingest_mrds_job(ctx: inngest.Context) -> dict:
 # manually export and run the corresponding ``bdi-ingest`` command.
 # ---------------------------------------------------------------------------
 
+def _run_ingest_gta_api() -> dict:
+    """Weekly incremental GTA pull via the REST API (2026-07-27).
+
+    Replaces manual-CSV-only GTA refresh with an automated incremental
+    ingest: pulls interventions announced in the last 30 days (overlap on
+    a weekly cadence is deliberate — content-hash dedupe in ingest_gta
+    makes re-seen rows no-ops). Requires settings.gta_api_key
+    (env GTA_API_KEY); returns a skipped marker instead of erroring when
+    the key is absent so the schedule is safe to register ahead of the
+    key being provisioned. The quarterly CSV reminder stays registered as
+    the manual fallback path.
+    """
+    from datetime import date, timedelta
+
+    from app.core.config import get_settings
+    from app.services.ingestion.gta import ingest_gta
+
+    settings = get_settings()
+    if not settings.gta_api_key:
+        import structlog
+        structlog.get_logger(__name__).warning(
+            "ingestion_jobs.gta_api.skipped",
+            reason="GTA_API_KEY not configured — weekly GTA ingest is a no-op",
+        )
+        return {"source": "gta_api", "skipped": "no_api_key"}
+
+    session = get_session_factory()()
+    try:
+        result = ingest_gta(
+            session,
+            use_api=True,
+            api_since_date=date.today() - timedelta(days=30),
+        )
+        return {"source": "gta_api", **result}
+    finally:
+        session.close()
+
+
+@inngest_client.create_function(
+    fn_id="ingest-gta-api-weekly",
+    trigger=inngest.TriggerCron(cron="0 21 * * SUN"),
+)
+async def ingest_gta_api_job(ctx: inngest.Context) -> dict:
+    """Weekly GTA API incremental ingest (no-op until GTA_API_KEY is set)."""
+    return await asyncio.to_thread(_run_ingest_gta_api)
+
+
+def _run_ingest_operational_news() -> dict:
+    """Weekly operational news poll against the curated facility watchlist
+    (2026-07-27). Lands DISPLAY-ONLY candidate events for partner triage —
+    nothing scores until a human promotes it (primary_category + severity +
+    subtype). Feeds: SEC 8-K/6-K (official), unofficial ASX announcements
+    JSON (fail-soft), Google News RSS per watchlist facility. All three
+    adapters swallow their own errors, so one dead feed never fails the run.
+    """
+    from app.services.ingestion.ingest_operational_news import (
+        ingest_operational_news,
+    )
+
+    session = get_session_factory()()
+    try:
+        result = ingest_operational_news(session)
+        session.commit()
+        return {"source": "operational_news", **result}
+    finally:
+        session.close()
+
+
+@inngest_client.create_function(
+    fn_id="ingest-operational-news-weekly",
+    trigger=inngest.TriggerCron(cron="0 20 * * SUN"),
+)
+async def ingest_operational_news_job(ctx: inngest.Context) -> dict:
+    """Weekly operational news candidates — Sundays 20:00 UTC (before the
+    GTA 21:00 / FR 22:30 / WorldBank 23:00 block; candidates only score
+    after triage promotion, so ordering is for dashboard tidiness)."""
+    return await asyncio.to_thread(_run_ingest_operational_news)
+
+
 @inngest_client.create_function(
     fn_id="gta-refresh-reminder-quarterly",
     trigger=inngest.TriggerCron(cron="0 9 1 1,4,7,10 *"),
@@ -365,7 +445,9 @@ async def iea_policy_tracker_reminder_job(ctx: inngest.Context) -> dict:
 
 @inngest_client.create_function(
     fn_id="usgs-mcs-refresh-reminder-annual",
-    trigger=inngest.TriggerCron(cron="0 9 15 4 *"),
+    # 2026-07-27: moved Apr 15 → Feb 1. USGS publishes the MCS in late
+    # January/February; the old date reminded ~2.5 months after release.
+    trigger=inngest.TriggerCron(cron="0 9 1 2 *"),
 )
 async def usgs_mcs_refresh_reminder_job(ctx: inngest.Context) -> dict:
     """Annual USGS MCS refresh reminder — 15 April at 09:00 UTC.
@@ -414,9 +496,23 @@ async def usgs_mcs_refresh_reminder_job(ctx: inngest.Context) -> dict:
 
 INGESTION_FUNCTIONS = [
     # Weekly auto-download
-    ingest_opensanctions_job,
+    # PARKED 2026-07-27 (Nicole, scheduled-jobs review): the OpenSanctions
+    # ingester still creates severity-1.0 company-match events that the
+    # primary_category autofill would classify straight into scoring —
+    # the same unaudited class demoted to display-only on 2026-07-23.
+    # Re-register WITH the ingester rework (list-type severity,
+    # match-method confidence, born-display-only). Function remains
+    # defined for manual CLI use.
+    # ingest_opensanctions_job,
     ingest_federal_register_job,
     ingest_worldbank_job,
+    # 2026-07-27: automated GTA via REST API — incremental 30-day window,
+    # graceful no-op until GTA_API_KEY is provisioned. Quarterly CSV
+    # reminder below stays as the manual fallback.
+    ingest_gta_api_job,
+    # 2026-07-27: weekly operational news candidates (display-only, partner
+    # triage promotes). Sundays 20:00 UTC.
+    ingest_operational_news_job,
     # Quarterly auto-download
     # PARKED 2026-07-24 (regulatory_pillar_and_event_model_scope.md §0/§2):
     #   - ingest_eurlex_job: dormant (6 events ever); EU landmark regs are
@@ -446,7 +542,11 @@ __all__ = [
     "ingest_eurlex_job",
     "ingest_sec_edgar_job",
     "ingest_mrds_job",
+    "ingest_gta_api_job",
+    "ingest_operational_news_job",
     "gta_refresh_reminder_job",
+    "_run_ingest_gta_api",
+    "_run_ingest_operational_news",
     "iea_policy_tracker_reminder_job",
     "usgs_mcs_refresh_reminder_job",
     "_run_ingest_opensanctions",

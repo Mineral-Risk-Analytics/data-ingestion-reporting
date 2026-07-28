@@ -283,3 +283,26 @@ class TestEditorialSheets:
         report = load_regulation_workbook(session, _save(tmp_path, wb))
         assert report.created == ["PLAIN"]
         assert report.rejected == []
+
+
+class TestEnforcementWeightsSheet:
+    def test_enforcement_sheet_round_trips(self, session, tmp_path):
+        wb = _workbook([_reg_row("ENF_REG", all_mats=True)])
+        ws = wb.create_sheet("EnforcementWeights")
+        ws.append(["regulation_key", "material", "weight"])
+        ws.append(["ENF_REG", "Cobalt", 0.6])
+        ws.append(["ENF_REG", "DEFAULT", 0.3])
+        ws.append(["ENF_REG", "Unobtainium", 0.5])   # unknown -> rejected
+        ws.append(["ENF_REG", "Gallium", 1.5])        # out of range -> rejected
+        report = load_regulation_workbook(session, _save(tmp_path, wb))
+        reg = session.scalars(select(Regulation)).one()
+        assert reg.material_enforcement_weights == {"Cobalt": 0.6, "DEFAULT": 0.3}
+        reasons = [r["reason"] for r in report.rejected]
+        assert any("unknown material" in r for r in reasons)
+        assert any("outside [0, 1]" in r for r in reasons)
+
+    def test_absent_sheet_leaves_null(self, session, tmp_path):
+        wb = _workbook([_reg_row("NOENF_REG")])
+        load_regulation_workbook(session, _save(tmp_path, wb))
+        reg = session.scalars(select(Regulation)).one()
+        assert reg.material_enforcement_weights is None

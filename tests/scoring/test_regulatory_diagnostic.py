@@ -412,3 +412,73 @@ class TestAllMaterialsGate:
             )
         assert obligations == []   # pre-064 this leaked in via the geo row
         assert diag["obligations"]["total_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Material enforcement weights (migration 065, 2026-07-27)
+# ---------------------------------------------------------------------------
+
+class TestEnforcementWeights:
+    def test_resolver_ladder(self):
+        from app.services.scoring.market_aggregator import _resolve_enforcement_weight
+        w = {"Silicon (Anode Grade)": 1.0, "Cobalt": 0.6, "DEFAULT": 0.3}
+        assert _resolve_enforcement_weight(w, "Silicon (Anode Grade)") == 1.0
+        assert _resolve_enforcement_weight(w, "Cobalt") == 0.6
+        assert _resolve_enforcement_weight(w, "Rhenium") == 0.3     # DEFAULT
+        assert _resolve_enforcement_weight({}, "Rhenium") == 1.0    # uncurated
+        assert _resolve_enforcement_weight(None, "Rhenium") == 1.0
+        assert _resolve_enforcement_weight({"DEFAULT": 0.3}, None) == 1.0
+
+    def test_all_goods_reg_scaled_per_material(self, sqlite_session):
+        """UFLPA-shaped rule: full points for the enforced material, DEFAULT
+        fraction for the tail — the ~35 floor-cluster fix."""
+        from app.models.regulatory import Regulation
+        from app.models.supply import Material
+        si = Material(canonical_name="Silicon (Anode Grade)")
+        re_ = Material(canonical_name="Rhenium")
+        sqlite_session.add_all([si, re_])
+        sqlite_session.flush()
+        sqlite_session.add(Regulation(
+            regulation_key="ALL_GOODS_ENF", title="All goods, uneven enforcement",
+            is_obligation=True, obligation_points=25,
+            applies_all_materials=True,
+            geography_compliance_weights={"CN": 1.0, "DEFAULT": 0.0},
+            material_enforcement_weights={
+                "Silicon (Anode Grade)": 1.0, "DEFAULT": 0.2,
+            },
+        ))
+        sqlite_session.commit()
+        with _patch_events():
+            _, _, _, pts_si, diag_si = _derive_market_regulatory_inputs(
+                sqlite_session, material_id=si.id, geography_code="CN",
+                as_of_date=AS_OF,
+            )
+            _, _, _, pts_re, diag_re = _derive_market_regulatory_inputs(
+                sqlite_session, material_id=re_.id, geography_code="CN",
+                as_of_date=AS_OF,
+            )
+        assert pts_si["ALL_GOODS_ENF"] == 25.0            # full enforcement
+        assert pts_re["ALL_GOODS_ENF"] == 5.0             # 25 × DEFAULT 0.2
+        assert diag_si["obligations"]["raw_obligation_score"] == 25.0
+        assert diag_re["obligations"]["raw_obligation_score"] == 5.0
+
+    def test_uncurated_reg_unchanged(self, sqlite_session):
+        """No enforcement JSONB → exact pre-065 behavior (weight 1.0)."""
+        from app.models.regulatory import Regulation
+        from app.models.supply import Material
+        m = Material(canonical_name="AnyMat")
+        sqlite_session.add(m)
+        sqlite_session.flush()
+        sqlite_session.add(Regulation(
+            regulation_key="PLAIN_REG", title="plain",
+            is_obligation=True, obligation_points=10,
+            applies_all_materials=True,
+            geography_compliance_weights={"CN": 1.0},
+        ))
+        sqlite_session.commit()
+        with _patch_events():
+            _, _, _, pts, _diag = _derive_market_regulatory_inputs(
+                sqlite_session, material_id=m.id, geography_code="CN",
+                as_of_date=AS_OF,
+            )
+        assert pts["PLAIN_REG"] == 10.0

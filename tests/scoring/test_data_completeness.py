@@ -32,12 +32,12 @@ def _sig(**kwargs):
 def _call(sig=None, **kwargs):
     """Wrap _compute_pillar_data_completeness with neutral defaults."""
     defaults = dict(
-        geo_country_concentration=0.02,  # facility-presence floor
+        geo_country_concentration=0.0,  # 4.1 removed the facility-presence floor
         geo_export_restriction=0.0,
         geo_tariff=0.0,
         reg_top_event_count=0,
         reg_scope_obligation_count=0,
-        op_structural_dependency=0.3,  # neutral floor
+        op_structural_dependency=None,  # V1: struct_dep retired (event-only)
         op_event_count=0,
         fin_evidence_count=0,
         fin_company_coverage=0.0,
@@ -258,11 +258,15 @@ class TestCobaltLikeProfile:
             op_structural_dependency=0.3, op_event_count=0,
             fin_evidence_count=0, fin_company_coverage=0.0,
         )
-        # Material 5/6 = 0.833, Geo 2/3 = 0.667, Reg 1.0, Op 0, Fin 0
-        # Overall = 0.294*0.833 + 0.235*0.667 + 0.235 + 0 + 0 ≈ 0.637
+        # Material 5/6 = 0.833, Geo 2/3 = 0.667, Reg 1.0, Op 0, Fin 0.
+        # Overall recomputed from the LIVE weights (stale literals broke
+        # when the pillar weights changed under V1 — 2026-07-27 triage).
+        from app.services.scoring.market_aggregator import MARKET_PILLAR_WEIGHTS as W
         assert r["material"] == pytest.approx(0.833, abs=0.005)
         assert r["geopolitical"] == pytest.approx(0.667, abs=0.005)
         assert r["regulatory"] == 1.0
         assert r["operational"] == 0.0
         assert r["financial"] == 0.0
-        assert r["overall"] == pytest.approx(0.637, abs=0.005)
+        expected = (W["material"] * r["material"] + W["geopolitical"] * r["geopolitical"]
+                    + W["regulatory"] * 1.0)
+        assert r["overall"] == pytest.approx(expected, abs=0.005)

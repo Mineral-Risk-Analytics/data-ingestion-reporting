@@ -2176,8 +2176,25 @@ def ingest_federal_register(
                     # Per-run resolver instance was created at startup so the alias
                     # cache stays warm across all events in this ingest run.
                     doc_type_lc = (parsed.doc_type or "").strip().lower()
+                    # Build 3 (2026-07-27): relevance gate on the SUGGESTION
+                    # path. A high-authority doc only stages a suggested
+                    # regulation when the event carries at least one
+                    # DIRECT material attribution (relevance >= 0.90 —
+                    # canonical-name/keyword or title-basket match; the
+                    # 0.40 category-inference layer does not qualify).
+                    # Events are still created and linked regardless —
+                    # this only keeps partner-review queue noise out
+                    # (drone export rules, IC licensing, etc. staged 10
+                    # junk suggestions pre-filter). Agency allowlisting
+                    # already happens upstream via the structured queries.
+                    _direct_material_hit = any(
+                        rel >= 0.90 for _mid, rel, _rsn, _hs in detected_materials
+                    )
                     if doc_number:
-                        if doc_type_lc in _STAGE_REGULATION_DOC_TYPES:
+                        if (
+                            doc_type_lc in _STAGE_REGULATION_DOC_TYPES
+                            and _direct_material_hit
+                        ):
                             reg_result = reg_alias_resolver.resolve_or_stage(
                                 source_system="federal_register",
                                 source_key=doc_number,

@@ -812,8 +812,12 @@ async def _step_count_comtrade_writes_since(since_iso: str) -> dict:
 # ---------------------------------------------------------------------------
 
 @inngest_client.create_function(
-    fn_id="ingest-comtrade-daily",
-    trigger=inngest.TriggerCron(cron="0 4 * * *"),
+    fn_id="ingest-comtrade-weekly",
+    # 2026-07-27 (Nicole, scheduled-jobs review): daily → weekly Wednesday.
+    # Comtrade reporters update monthly at best; daily polling was 7x the
+    # API traffic for no freshness gain. Wednesday keeps data fresh ahead
+    # of the Sunday-ingest → Monday-rescore cycle.
+    trigger=inngest.TriggerCron(cron="0 4 * * WED"),
 )
 async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
     """Daily UN Comtrade trade flow ingestion — runs every day at 04:00 UTC
@@ -1056,11 +1060,15 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
 
 
 SCHEDULED_FUNCTIONS = [
-    ingest_comtrade_job,            # Daily  — 04:00 UTC (midnight EDT)
+    ingest_comtrade_job,            # Weekly — Wed 04:00 UTC (2026-07-27: was daily)
     rescore_hs_nodes_job,           # Level 0 — Mon 01:00 UTC
     rescore_market_scores_job,      # Level 1 — Mon 02:00 UTC
     rescore_global_rollups_job,     # Level 2 — Mon 03:00 UTC
-    rescore_chemistries_job,        # Level 3 — Mon 04:00 UTC
+    # PARKED 2026-07-27 (Nicole): chemistry scores (L3) are unused and
+    # off the launch roadmap — the weekly pass wrote rows nothing reads.
+    # Function remains for manual CLI / future L3; backfillable from
+    # global rollups at any time.
+    # rescore_chemistries_job,      # Level 3 — Mon 04:00 UTC
 ]
 
 __all__ = [

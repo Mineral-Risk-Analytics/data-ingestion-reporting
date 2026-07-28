@@ -267,7 +267,7 @@ class TestRiskSummary:
                 MaterialGlobalRiskScore(
                     material_id=cobalt.id,
                     as_of_date=as_of,
-                    overall_risk_score=64.8,
+                    overall_risk_score=66.2,
                     material_concentration_score=90.2,
                 ),
             ]
@@ -284,7 +284,7 @@ class TestRiskSummary:
 
         cobalt_bar = body["materials"][0]
         assert cobalt_bar["band"] == {
-            "label": "Critical", "level": "crit", "score": 64.8,
+            "label": "Critical", "level": "crit", "score": 66.2,
         }
         lithium_bar = body["materials"][1]
         assert lithium_bar["band"]["level"] == "high"  # 45 <= 54.3 < 60

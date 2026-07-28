@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.api.deps import get_current_user, get_db
 from app.models.battery_chemistry import BatteryChemistry
 from app.models.criticality_signal import MaterialCriticalitySignal
-from app.models.facility import FacilityMaterialLink
+from app.models.facility import Facility, FacilityMaterialLink
 from app.models.documents import SourceDocument
 from app.models.regulatory import (
     RiskEvent,
@@ -572,6 +572,26 @@ def list_materials(
             pct = round(float(share) * 100) if share is not None else 0
             lst.append(CountryShareItem(code=code, share_pct=pct))
 
+        # 2026-07-27 fallback: materials with no legacy
+        # material_production_shares rows (REE children / germanium, seeded
+        # via the benchmark workbook into the stage-aware
+        # hs_code_production_shares) get their chips from the most upstream
+        # global stage — the SAME ladder the concentration pillar and the
+        # geopolitical production-weights use, so the list display and the
+        # scores always cite one data source.
+        _missing = [m for m in material_ids if m not in top_producer_shares]
+        if _missing:
+            from app.services.scoring.global_rollup import _supply_origin_weights
+            for mid in _missing:
+                shares, _stage = _supply_origin_weights(db, mid)
+                if not shares:
+                    continue
+                top3 = sorted(shares.items(), key=lambda kv: -kv[1])[:3]
+                top_producer_shares[mid] = [
+                    CountryShareItem(code=cc, share_pct=round(sh * 100))
+                    for cc, sh in top3
+                ]
+
     # ── Risk-event count per material in the last 90 days ─────────────
     # Matches the coverage matrix window so the Materials page and the
     # dashboard tell the same story.
@@ -793,11 +813,18 @@ def get_material(
     # Facility coverage — any link, any stage, any capacity.  Matches
     # the (loosened) gap-detection check; 0 = launch-blocker for the
     # operational pillar's structural input.
+    # 2026-07-27 (Nicole): count only vetted facilities. MRDS rows are the
+    # unvetted discovery/reference layer (spec demotion — they never score)
+    # and were inflating this headline 7x (Aluminum: 349 shown, 48 curated).
     facility_n = int(
         db.scalar(
             select(func.count())
             .select_from(FacilityMaterialLink)
-            .where(FacilityMaterialLink.material_id == material_id)
+            .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
+            .where(
+                FacilityMaterialLink.material_id == material_id,
+                Facility.data_source != "mrds",
+            )
         )
         or 0
     )

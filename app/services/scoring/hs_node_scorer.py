@@ -103,7 +103,10 @@ _AT_RISK_STATUSES = frozenset({"mothballed", "closed", "care_maintenance"})
 # the previous ``{"TARIFF"}`` constant matched zero events in production,
 # leaving ``tariff_exposure`` permanently 0.  See gta._INTERVENTION_SUBTYPE_MAP.
 _TARIFF_SUBTYPES = frozenset({"TARIFF", "IMPORT_DISRUPTION"})
-_EXPORT_SUBTYPES = frozenset({"EXPORT_RESTRICTION"})
+# 2026-07-27: widened to the shared constant — manual-walkthrough subtypes
+# (national_export_quota etc.) were invisible here (exact-match gate, no
+# title fallback), so e.g. the DRC quota event never fed HS-node exports.
+from app.constants import EXPORT_RESTRICTION_SUBTYPES as _EXPORT_SUBTYPES
 
 # ── Geography contexts consumed by Tariff / Export sub-scores ─────────────
 # Primary    = the implementing country.  For export-side interventions

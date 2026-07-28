@@ -2655,7 +2655,6 @@ def ingest_regulation_workbook_cmd(
     finally:
         s.close()
 
-
 @app.command("seed-regulations")
 def seed_regulations_cmd(
     force: bool = typer.Option(
@@ -5419,6 +5418,182 @@ def wmd_crosscheck_cmd(
     finally:
         s.close()
 
+
+
+@app.command("ingest-operational-news")
+def ingest_operational_news_cmd(
+    lookback_days: int = typer.Option(
+        14,
+        "--lookback-days",
+        help="Only keep items published within this many days. Weekly cadence "
+             "+ 14-day lookback deliberately overlaps; dedupe makes re-seen "
+             "items no-ops.",
+    ),
+    feeds: str = typer.Option(
+        "edgar,asx,google_news",
+        "--feeds",
+        help="Comma-separated subset of: edgar, asx, google_news.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Fetch + classify + count, but write nothing.",
+    ),
+) -> None:
+    """Poll operational news feeds against the curated facility watchlist.
+
+    Lands DISPLAY-ONLY candidate events (event_type=operational_news_candidate,
+    primary_category NULL, severity NULL) for partner triage. Nothing this
+    command creates can affect scores until a human promotes the event
+    (sets primary_category='operational' + severity + subtype).
+
+    \b
+    Feeds:
+      edgar        — SEC 8-K/6-K for watchlist operators with a CIK (official)
+      asx          — UNOFFICIAL asx.com.au announcements JSON (fail-soft)
+      google_news  — Google News RSS query per watchlist facility
+
+    \b
+      bdi-ingest ingest-operational-news --dry-run
+      bdi-ingest ingest-operational-news --feeds edgar --lookback-days 30
+    """
+    from app.services.ingestion.ingest_operational_news import (
+        ingest_operational_news,
+    )
+
+    feed_list = [f.strip() for f in feeds.split(",") if f.strip()]
+    s = _session()
+    try:
+        result = ingest_operational_news(
+            s, lookback_days=lookback_days, feeds=feed_list, dry_run=dry_run,
+        )
+        if not dry_run:
+            s.commit()
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except Exception as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("list-operational-candidates")
+def list_operational_candidates_cmd(
+    limit: int = typer.Option(50, "--limit", help="Max candidates to show."),
+) -> None:
+    """Show the operational news triage queue (pending candidates only).
+
+    Promoted and rejected events are excluded. Each row shows the keyword
+    subtype SUGGESTION (metadata only — nothing scores off it) and any
+    facility links or candidates for attachment.
+    """
+    from app.services.ingestion.operational_triage import list_pending_candidates
+
+    s = _session()
+    try:
+        rows = list_pending_candidates(s, limit=limit)
+        if not rows:
+            typer.echo("Triage queue is empty.")
+            return
+        for r in rows:
+            typer.echo(f"#{r['id']}  [{r['date'] or '?'}]  ({r['feed']})  {r['title']}")
+            if r["suggested_subtype"]:
+                typer.echo(f"      suggested: {r['suggested_subtype']}")
+            if r["linked_facilities"]:
+                typer.echo(f"      facilities: {', '.join(r['linked_facilities'])}")
+            elif r["candidate_facilities"]:
+                typer.echo(
+                    f"      attach candidates: {', '.join(r['candidate_facilities'])}"
+                )
+            if r["url"]:
+                typer.echo(f"      {r['url']}")
+        typer.echo(f"\n{len(rows)} pending. Promote with:")
+        typer.echo(
+            "  bdi-ingest promote-operational-event --event-id N --subtype "
+            "facility_shutdown [--severity 0.8] [--facility 'Name']"
+        )
+    finally:
+        s.close()
+
+
+@app.command("promote-operational-event")
+def promote_operational_event_cmd(
+    event_id: int = typer.Option(..., "--event-id", help="risk_events.id of the candidate."),
+    subtype: str = typer.Option(
+        ...,
+        "--subtype",
+        help=(
+            "Operational subtype. Taxonomy subtypes get a default severity "
+            "(see constants.OPERATIONAL_SUBTYPE_DEFAULT_SEVERITY); free-form "
+            "subtypes require --severity."
+        ),
+    ),
+    severity: Optional[float] = typer.Option(
+        None, "--severity",
+        help="Override the taxonomy default (0-1). Required for free-form subtypes.",
+    ),
+    facility: Optional[str] = typer.Option(
+        None, "--facility",
+        help="Curated facility name to attach (adds facility/geo/material/operator links).",
+    ),
+    note: Optional[str] = typer.Option(None, "--note", help="Audit note."),
+) -> None:
+    """Promote an operational news candidate into scoring.
+
+    Sets event_subtype + severity (taxonomy default unless overridden),
+    primary_category='operational', verified=True, and records the triage
+    audit trail in metadata. The event participates in the operational
+    pillar at the NEXT rescore of the affected material×geo pairs.
+    """
+    from app.services.ingestion.operational_triage import (
+        TriageError,
+        promote_candidate,
+    )
+
+    s = _session()
+    try:
+        result = promote_candidate(
+            s, event_id, subtype=subtype, severity=severity,
+            facility_name=facility, note=note,
+        )
+        s.commit()
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except TriageError as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
+
+
+@app.command("reject-operational-event")
+def reject_operational_event_cmd(
+    event_id: int = typer.Option(..., "--event-id", help="risk_events.id of the candidate."),
+    reason: str = typer.Option(..., "--reason", help="Why it's rejected (audit trail)."),
+) -> None:
+    """Reject an operational news candidate (removes it from the queue).
+
+    The row is kept (audit trail + dedupe anchor so re-ingestion can't
+    resurrect it) but it never scores and stops appearing in
+    list-operational-candidates.
+    """
+    from app.services.ingestion.operational_triage import (
+        TriageError,
+        reject_candidate,
+    )
+
+    s = _session()
+    try:
+        result = reject_candidate(s, event_id, reason=reason)
+        s.commit()
+        typer.echo(json.dumps({"ok": True, **result}, indent=2))
+    except TriageError as exc:
+        s.rollback()
+        typer.echo(json.dumps({"ok": False, "error": str(exc)}), err=True)
+        raise typer.Exit(code=1)
+    finally:
+        s.close()
 
 
 def main() -> None:

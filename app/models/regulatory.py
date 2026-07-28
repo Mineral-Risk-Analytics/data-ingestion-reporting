@@ -86,6 +86,15 @@ class Regulation(Base):
         Boolean, nullable=False, server_default="false",
         comment="All-goods rule: gates into scoring for every material.",
     )
+    # Migration 065 (2026-07-27): per-material ENFORCEMENT weight for the
+    # obligation uplift — all-goods laws apply everywhere but enforce
+    # unevenly (UFLPA: polysilicon >> rhenium). Keys = material canonical
+    # names + optional "DEFAULT"; resolution exact → DEFAULT → 1.0, so
+    # NULL keeps today's behavior exactly.
+    material_enforcement_weights: Mapped[Optional[Any]] = mapped_column(
+        JSONB, nullable=True,
+        comment="Material canonical name → enforcement weight 0-1; 'DEFAULT' fallback; NULL = 1.0.",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -644,7 +653,13 @@ class RiskEventHsMapping(Base):
 # trade-signal derived statistics). Keeps ingesters and tests working without
 # per-call changes while making "each fact scores once" structurally true.
 
-_DISPLAY_ONLY_EVENT_TYPES = frozenset({"sec_filing_signal"})
+_DISPLAY_ONLY_EVENT_TYPES = frozenset({
+    "sec_filing_signal",
+    # Operational news candidates (ingest_operational_news.py, 2026-07-27):
+    # born display-only, promoted to primary_category='operational' only by
+    # partner triage. Belt-and-braces with metadata_json["scoring"].
+    "operational_news_candidate",
+})
 
 
 @sa_event.listens_for(RiskEvent, "before_insert")

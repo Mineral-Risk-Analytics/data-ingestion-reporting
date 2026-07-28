@@ -62,6 +62,10 @@ _GEO_SHEET = "GeographyScopes"
 # metadata_json["editorial"] = {standfirst, sections{...}, further_reading[...]}.
 _EDITORIAL_SHEET = "Editorial"
 _FR_SHEET = "FurtherReading"
+# Optional (2026-07-27): per-material enforcement weights for the obligation
+# uplift (regulation_key | material | weight) → material_enforcement_weights
+# JSONB keyed by canonical name (+ DEFAULT). Absent sheet/rows = NULL = 1.0.
+_ENF_SHEET = "EnforcementWeights"
 _EDITORIAL_SECTIONS = (
     "what_it_requires", "who_must_comply", "materials_and_origins",
     "key_dates", "why_it_matters",
@@ -246,6 +250,30 @@ def load_regulation_workbook(
             continue
         geo_scopes_by_key.setdefault(key, []).append((cc, st))
 
+    # ── Pass 1a½: optional enforcement-weights sheet ────────────────────
+    enf_by_key: dict[str, dict[str, float]] = {}
+    if _ENF_SHEET in wb.sheetnames:
+        hdrs, rows = _read_sheet(wb, _ENF_SHEET)
+        e_key = _col(hdrs, "regulation_key")
+        e_mat, e_wt = _col(hdrs, "material"), _col(hdrs, "weight")
+        for rn, vals in rows:
+            key, mat = _cell_str(vals[e_key]), _cell_str(vals[e_mat])
+            if not key or not mat:
+                _reject(report, _ENF_SHEET, rn, key, "missing regulation_key or material")
+                continue
+            if mat != "DEFAULT" and mat not in materials:
+                _reject(report, _ENF_SHEET, rn, key, f"unknown material '{mat}'")
+                continue
+            try:
+                wt = float(vals[e_wt])
+            except (TypeError, ValueError):
+                _reject(report, _ENF_SHEET, rn, key, "weight is not a number")
+                continue
+            if not 0.0 <= wt <= 1.0:
+                _reject(report, _ENF_SHEET, rn, key, f"weight {wt} outside [0, 1]")
+                continue
+            enf_by_key.setdefault(key, {})[mat] = wt
+
     # ── Pass 1b: optional editorial sheets ──────────────────────────────
     editorial_by_key: dict[str, dict[str, Any]] = {}
     if _EDITORIAL_SHEET in wb.sheetnames:
@@ -404,6 +432,12 @@ def load_regulation_workbook(
         new_w = weights_by_key.get(key) or None
         if reg.geography_compliance_weights != new_w:
             reg.geography_compliance_weights = new_w
+            changed = True
+
+        # Enforcement weights (065): rebuilt the same way; None = 1.0 for all.
+        new_enf = enf_by_key.get(key) or None
+        if reg.material_enforcement_weights != new_enf:
+            reg.material_enforcement_weights = new_enf
             changed = True
 
         # Scopes: replace wholesale (sheet is authoritative).
