@@ -65,7 +65,7 @@ except ImportError:  # pragma: no cover
 # repo imports (script is run from repo root)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.utils.storage import get_local_storage  # noqa: E402
+from app.utils.storage import get_insight_asset_storage  # noqa: E402
 
 WORDS_PER_MINUTE = 220
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -77,21 +77,23 @@ VALID_PILLARS = {
 
 
 def convert_docx(docx_path: Path, slug: str, storage) -> tuple[str, list[str]]:
-    """Return (markdown_body, image_storage_paths)."""
-    image_paths: list[str] = []
+    """Return (markdown_body, image_public_urls). ``storage`` is an
+    InsightAssetStorage (R2 or Local) — put_bytes returns the final ``src``
+    URL to embed, so the CLI and the API upload path stay identical."""
+    image_urls: list[str] = []
     counter = {"n": 0}
 
     def store_image(image) -> dict:
         counter["n"] += 1
-        ext = (image.content_type or "image/png").split("/")[-1]
+        content_type = image.content_type or "image/png"
+        ext = content_type.split("/")[-1]
         ext = {"jpeg": "jpg", "svg+xml": "svg"}.get(ext, ext)
         key = f"insights/{slug}/img_{counter['n']:02d}.{ext}"
         with image.open() as f:
-            stored = storage.write_bytes(key, f.read())
-        image_paths.append(stored)
-        # Rendered URL: the API serves storage paths under /content-assets/
-        # (swap prefix for the R2 public bucket URL at cutover).
-        return {"src": f"/content-assets/{stored}"}
+            data = f.read()
+        src_url = storage.put_bytes(key, data, content_type)
+        image_urls.append(src_url)
+        return {"src": src_url}
 
     with open(docx_path, "rb") as f:
         result = mammoth.convert_to_html(
@@ -116,7 +118,7 @@ def convert_docx(docx_path: Path, slug: str, storage) -> tuple[str, list[str]]:
             + "\n```\n"
         )
     md = re.sub(r"\\?\[\\?\[chart:\s*([^\]\\]+)\\?\]\\?\]", _placeholder, md)
-    return md, image_paths
+    return md, image_urls
 
 
 def estimate_read_minutes(markdown: str) -> int:
@@ -149,7 +151,7 @@ def main() -> None:
     if not args.docx.exists():
         sys.exit(f"file not found: {args.docx}")
 
-    storage = get_local_storage()
+    storage = get_insight_asset_storage()
     body_md, images = convert_docx(args.docx, args.slug, storage)
     title = args.title or first_heading(body_md) or args.docx.stem
     read_min = estimate_read_minutes(body_md) if args.content_type in ("analysis", "report") else None

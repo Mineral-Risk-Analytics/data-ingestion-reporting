@@ -14,6 +14,7 @@ Conversion pipeline (design decided 2026-07-08):
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass, field
@@ -22,7 +23,9 @@ from typing import BinaryIO
 import mammoth
 from markdownify import markdownify as html_to_md
 
-from app.utils.storage import get_local_storage
+from app.utils.storage import get_insight_asset_storage
+
+_log = logging.getLogger(__name__)
 
 WORDS_PER_MINUTE = 220
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -62,24 +65,46 @@ def convert_docx_stream(fileobj: BinaryIO, slug: str) -> ConversionResult:
     if not SLUG_RE.match(slug):
         raise ValueError(f"slug must be kebab-case: {slug!r}")
 
-    storage = get_local_storage()
-    image_paths: list[str] = []
+    storage = get_insight_asset_storage()
+    image_urls: list[str] = []
+    image_errors: list[str] = []
     counter = {"n": 0}
 
     def store_image(image) -> dict:
         counter["n"] += 1
-        ext = (image.content_type or "image/png").split("/")[-1]
-        ext = {"jpeg": "jpg", "svg+xml": "svg"}.get(ext, ext)
-        key = f"insights/{slug}/img_{counter['n']:02d}.{ext}"
-        with image.open() as f:
-            stored = storage.write_bytes(key, f.read())
-        image_paths.append(stored)
-        return {"src": f"/content-assets/{stored}"}
+        # Soft-fail every image individually — 2026-07-28: an image-heavy
+        # upload was 500-ing the whole request. Losing images is recoverable
+        # via the admin editor; losing the entire article isn't. Root cause
+        # still gets logged (see _log.exception) + surfaced as a mammoth-style
+        # message in the ConversionResult.
+        try:
+            content_type = image.content_type or "image/png"
+            ext = content_type.split("/")[-1]
+            ext = {"jpeg": "jpg", "svg+xml": "svg"}.get(ext, ext)
+            key = f"insights/{slug}/img_{counter['n']:02d}.{ext}"
+            with image.open() as f:
+                data = f.read()
+            src_url = storage.put_bytes(key, data, content_type)
+            image_urls.append(src_url)
+            return {"src": src_url}
+        except Exception as exc:  # noqa: BLE001 — deliberately swallow all
+            _log.exception(
+                "image #%d failed (%s) during docx upload slug=%s",
+                counter["n"], exc.__class__.__name__, slug,
+            )
+            image_errors.append(
+                f"image #{counter['n']} ({image.content_type or 'unknown'}): "
+                f"{exc.__class__.__name__}: {exc}"
+            )
+            # Placeholder src — renders as broken image in article; author
+            # replaces via the editor. Return value must be dict of HTML attrs.
+            return {"src": "", "alt": f"[image {counter['n']} unavailable]"}
 
     result = mammoth.convert_to_html(
         fileobj, convert_image=mammoth.images.img_element(store_image)
     )
     messages = [f"{m.type}: {m.message}" for m in result.messages]
+    messages.extend(f"image-error: {e}" for e in image_errors)
 
     md = html_to_md(result.value, heading_style="ATX", bullets="-")
     md = re.sub(r"\n{3,}", "\n\n", md).strip() + "\n"
@@ -87,7 +112,7 @@ def convert_docx_stream(fileobj: BinaryIO, slug: str) -> ConversionResult:
 
     return ConversionResult(
         markdown=md,
-        image_paths=image_paths,
+        image_paths=image_urls,
         messages=messages,
         title=first_heading(md),
         read_time_minutes=estimate_read_minutes(md),
