@@ -72,11 +72,27 @@ def _load_candidate(session: Session, event_id: int) -> RiskEvent:
     return event
 
 
-def list_pending_candidates(session: Session, *, limit: int = 100) -> list[dict]:
+def list_pending_candidates(
+    session: Session,
+    *,
+    limit: int = 100,
+    check_duplicates: bool = True,
+) -> list[dict]:
     """The triage queue: candidates still pending (not promoted, not rejected).
 
     Returns plain dicts (newest first) so the CLI can render without ORM
     coupling.
+
+    ``check_duplicates`` (default on) attaches a ``duplicate_hints`` block
+    per row from ``event_dedupe.find_similar_events`` — the partner curates
+    a story by hand in the walkthrough and the news feed then lands the same
+    story a day later, and nothing else in the pipeline catches that
+    (``content_hash`` only stops byte-identical re-ingestion). Promoting a
+    hinted duplicate double-counts it in the operational pillar. The check
+    is advisory: it never filters a row out, because a false positive that
+    silently hid a real event would be worse than a hint the reviewer
+    dismisses. Turn it off to keep the queue cheap — it loads every
+    canonical event's anchors once per call.
     """
     events = session.scalars(
         select(RiskEvent)
@@ -114,6 +130,18 @@ def list_pending_candidates(session: Session, *, limit: int = 100) -> list[dict]
         })
         if len(out) >= limit:
             break
+
+    if check_duplicates and out:
+        # Imported lazily: event_dedupe pulls in openpyxl at module scope
+        # for the xlsx report, which the queue has no use for.
+        from app.services.ingestion.event_dedupe import find_similar_events
+
+        hints = find_similar_events(session, [r["id"] for r in out])
+        for row in out:
+            row["duplicate_hints"] = hints.get(
+                row["id"],
+                {"checked": False, "reason": "not_checked", "hints": []},
+            )
     return out
 
 

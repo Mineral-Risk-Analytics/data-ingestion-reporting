@@ -5481,21 +5481,39 @@ def ingest_operational_news_cmd(
 @app.command("list-operational-candidates")
 def list_operational_candidates_cmd(
     limit: int = typer.Option(50, "--limit", help="Max candidates to show."),
+    check_duplicates: bool = typer.Option(
+        True,
+        "--check-duplicates/--no-check-duplicates",
+        help="Warn when a candidate resembles an event already in the DB.",
+    ),
 ) -> None:
     """Show the operational news triage queue (pending candidates only).
 
     Promoted and rejected events are excluded. Each row shows the keyword
     subtype SUGGESTION (metadata only — nothing scores off it) and any
     facility links or candidates for attachment.
+
+    By default each row is also checked against every canonical event
+    sharing a material/facility/company anchor, and near-matches print as
+    "POSSIBLE DUPLICATE". Read the status tag before acting: [SCORING]
+    means promoting this row would double-count the story in the
+    operational pillar; [rejected] means a human already called the same
+    story noise; [pending] means two feeds landed it and only one should
+    be promoted. The hints are advisory — nothing is filtered out — and
+    "no similar events found" prints distinctly from "SKIPPED", which
+    means the candidate has no entity links to compare on.
     """
     from app.services.ingestion.operational_triage import list_pending_candidates
 
     s = _session()
     try:
-        rows = list_pending_candidates(s, limit=limit)
+        rows = list_pending_candidates(
+            s, limit=limit, check_duplicates=check_duplicates
+        )
         if not rows:
             typer.echo("Triage queue is empty.")
             return
+        flagged = 0
         for r in rows:
             typer.echo(f"#{r['id']}  [{r['date'] or '?'}]  ({r['feed']})  {r['title']}")
             if r["suggested_subtype"]:
@@ -5508,6 +5526,27 @@ def list_operational_candidates_cmd(
                 )
             if r["url"]:
                 typer.echo(f"      {r['url']}")
+            dh = r.get("duplicate_hints")
+            if dh is not None:
+                if not dh["checked"]:
+                    typer.echo(f"      dup check: SKIPPED ({dh['reason']})")
+                elif not dh["hints"]:
+                    typer.echo("      dup check: no similar events found")
+                else:
+                    flagged += 1
+                    typer.echo("      POSSIBLE DUPLICATE:")
+                    for h in dh["hints"]:
+                        tag = "SCORING" if h["scores_already"] else h["status"]
+                        typer.echo(
+                            f"        #{h['event_id']} [{tag}] sim={h['similarity']} "
+                            f"({h['source']}, {h['date'] or '?'}) {h['title'][:90]}"
+                        )
+                        typer.echo(f"          shared: {', '.join(h['shared'])}")
+        if flagged:
+            typer.echo(
+                f"\n{flagged} candidate(s) resemble existing events — check those "
+                "before promoting, or reject with a reason."
+            )
         typer.echo(f"\n{len(rows)} pending. Promote with:")
         typer.echo(
             "  bdi-ingest promote-operational-event --event-id N --subtype "

@@ -290,6 +290,215 @@ def find_duplicate_candidates(
     return report
 
 
+@dataclass
+class _Anchored:
+    """A single event plus the entity keys it can be matched on."""
+
+    id: int
+    title: str
+    date: datetime | None
+    subtype: str | None
+    event_type: str | None
+    primary_category: str | None
+    source: str
+    status: str
+    anchors: set[tuple[str, int]] = field(default_factory=set)
+    tokens: set[str] = field(default_factory=set)
+
+
+def _event_status(primary_category, event_type, meta) -> str:
+    """Where an event sits relative to scoring, for reviewer-facing hints.
+
+    A hint is only actionable if the reviewer knows what the other row
+    already is: ``scoring`` means promoting this candidate double-counts;
+    ``rejected`` means a human already judged the same story to be noise;
+    ``pending_triage`` means two feeds landed the same story and only one
+    should be promoted; ``display_only`` is everything else (SEC signals,
+    NULL-category rows).
+    """
+    if primary_category is not None:
+        return "scoring"
+    reason = (meta or {}).get("display_only_reason")
+    if reason == "rejected":
+        return "rejected"
+    if event_type == "operational_news_candidate":
+        return "pending_triage"
+    return "display_only"
+
+
+def _load_anchored_events(
+    db: Session,
+) -> tuple[dict[int, _Anchored], dict[tuple[str, int], str]]:
+    """All canonical events with material/facility/company anchor keys.
+
+    Returns ``(events_by_id, anchor_key -> display name)``.
+
+    Deliberately LEFT-joins the source document: 126 events (manual
+    curation predating the source-document convention) have none, and
+    they are exactly the human-audited rows a new candidate is most
+    likely to duplicate.  ``find_duplicate_candidates`` inner-joins
+    because its xlsx report keys on source name; this loader does not.
+    """
+    from app.models.company import Company
+    from app.models.facility import Facility
+    from app.models.supply import Material
+    from app.models.regulatory import RiskEventCompany, RiskEventFacility
+
+    rows = db.execute(
+        select(
+            RiskEvent.id,
+            RiskEvent.title,
+            RiskEvent.event_date,
+            RiskEvent.event_subtype,
+            RiskEvent.event_type,
+            RiskEvent.primary_category,
+            RiskEvent.metadata_json,
+            Source.name.label("source_name"),
+        )
+        .outerjoin(SourceDocument, SourceDocument.id == RiskEvent.source_document_id)
+        .outerjoin(Source, Source.id == SourceDocument.source_id)
+        .where(RiskEvent.duplicate_of_id.is_(None))
+    ).all()
+    events = {
+        r.id: _Anchored(
+            id=r.id, title=r.title, date=r.event_date, subtype=r.event_subtype,
+            event_type=r.event_type, primary_category=r.primary_category,
+            source=r.source_name or "(uncredited)",
+            status=_event_status(r.primary_category, r.event_type, r.metadata_json),
+            tokens=_title_tokens(r.title),
+        )
+        for r in rows
+    }
+
+    junctions = (
+        ("material", RiskEventMaterial.risk_event_id,
+         RiskEventMaterial.material_id, Material),
+        ("facility", RiskEventFacility.risk_event_id,
+         RiskEventFacility.facility_id, Facility),
+        ("company", RiskEventCompany.risk_event_id,
+         RiskEventCompany.company_id, Company),
+    )
+    names: dict[tuple[str, int], str] = {}
+    for kind, ev_col, ent_col, model in junctions:
+        label = model.name if model is Facility else model.canonical_name
+        for ev_id, ent_id, ent_name in db.execute(
+            select(ev_col, ent_col, label).join(model, model.id == ent_col)
+        ):
+            if ev_id in events:
+                events[ev_id].anchors.add((kind, ent_id))
+                names[(kind, ent_id)] = ent_name
+    return events, names
+
+
+def find_similar_events(
+    db: Session,
+    event_ids: list[int],
+    *,
+    min_similarity: float = _MIN_SIMILARITY,
+    limit: int = 3,
+) -> dict[int, dict]:
+    """Per-event duplicate hints for a review queue (2026-07-28, Nicole).
+
+    Read-only counterpart to ``find_duplicate_candidates``: instead of
+    sweeping the whole corpus into an xlsx, it answers "does anything
+    already in the DB look like THIS event?" for a short list of ids, so
+    the operational triage queue can warn a reviewer before they promote
+    a story the partner already curated by hand.
+
+    Same gates as the xlsx report — shared entity anchor, compatible
+    subtype family, compatible dates, title-token Jaccard over a tiered
+    bar — with two deliberate differences:
+
+    * Anchors are material OR facility OR company, not (material AND
+      primary geography).  News candidates are anchored facility-first;
+      requiring a geography row would miss the company-only exchange-feed
+      items entirely.
+    * Same-source pairs are NOT skipped.  ``content_hash`` only catches
+      byte-identical re-ingestion, so two different articles about one
+      halt — an 8-K and a wire story, both on the news watchlist — are a
+      real duplicate pair this must surface.
+
+    Returns ``{event_id: {"checked": bool, "reason": str|None,
+    "hints": [...]}}``.  ``checked=False`` means the event carries no
+    entity anchors, so no reliable comparison was possible — reported
+    honestly rather than falling back to a title-only scan that would
+    pair unrelated materials.  An empty ``hints`` list under
+    ``checked=True`` is a real negative; the two are NOT interchangeable
+    and the CLI renders them differently.
+    """
+    if not event_ids:
+        return {}
+
+    events, names = _load_anchored_events(db)
+
+    by_anchor: dict[tuple[str, int], list[int]] = {}
+    for e in events.values():
+        for a in e.anchors:
+            by_anchor.setdefault(a, []).append(e.id)
+
+    out: dict[int, dict] = {}
+    for ev_id in event_ids:
+        target = events.get(ev_id)
+        if target is None:
+            out[ev_id] = {"checked": False, "reason": "event_not_found",
+                          "hints": []}
+            continue
+        if not target.anchors:
+            out[ev_id] = {
+                "checked": False,
+                "reason": "no_material_facility_or_company_links",
+                "hints": [],
+            }
+            continue
+
+        seen: set[int] = set()
+        scored: list[tuple[float, dict]] = []
+        for anchor in target.anchors:
+            for other_id in by_anchor.get(anchor, ()):
+                if other_id == ev_id or other_id in seen:
+                    continue
+                seen.add(other_id)
+                other = events[other_id]
+                fa, fb = _family(target.subtype), _family(other.subtype)
+                if fa is not None and fb is not None and fa != fb:
+                    continue
+                if not _dates_compatible(target.date, other.date):
+                    continue
+                sim = _pair_similarity(target, other)
+                # Both families known implies they MATCH (mismatches were
+                # skipped above), so this is the same tiered bar the xlsx
+                # report uses: family + shared anchor + date window is
+                # already strong structural agreement, and the title bar
+                # drops to 0.15 so an editorial headline can pair with a
+                # bureaucratic ingester title.
+                bar = 0.15 if (fa is not None and fb is not None) else min_similarity
+                if sim < bar:
+                    continue
+                shared = sorted(
+                    names.get(a, f"{a[0]}:{a[1]}")
+                    for a in target.anchors & other.anchors
+                )
+                scored.append((sim, {
+                    "event_id": other.id,
+                    "title": other.title,
+                    "source": other.source,
+                    "date": other.date.date().isoformat() if other.date else None,
+                    "subtype": other.subtype,
+                    "primary_category": other.primary_category,
+                    "status": other.status,
+                    "scores_already": other.primary_category is not None,
+                    "similarity": sim,
+                    "shared": shared,
+                }))
+        scored.sort(key=lambda t: (-t[0], t[1]["event_id"]))
+        out[ev_id] = {
+            "checked": True,
+            "reason": None,
+            "hints": [h for _, h in scored[:limit]],
+        }
+    return out
+
+
 def apply_duplicate_marks(
     db: Session,
     xlsx_path: str,

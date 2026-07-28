@@ -8,6 +8,8 @@ plus generalized per-entity analyst-note (flag-issue) endpoints.
 
 from __future__ import annotations
 
+import logging
+import traceback
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -68,29 +70,67 @@ app.add_middleware(
 
 
 @app.exception_handler(HTTPException)
-async def _http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    # Merge exc.headers with CORS fallback (see _cors_headers_for docstring
+    # below) so 403/404/etc responses are browser-readable, not just 500s.
+    headers = {**(getattr(exc, "headers", None) or {}), **_cors_headers_for(request)}
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": exc.__class__.__name__, "detail": exc.detail},
-        headers=getattr(exc, "headers", None),
+        headers=headers or None,
     )
 
 
 @app.exception_handler(RequestValidationError)
 async def _validation_exception_handler(
-    _request: Request, exc: RequestValidationError
+    request: Request, exc: RequestValidationError
 ) -> JSONResponse:
     return JSONResponse(
         status_code=422,
         content={"error": "ValidationError", "detail": exc.errors()},
+        headers=_cors_headers_for(request) or None,
     )
 
 
+_log = logging.getLogger(__name__)
+
+
+def _cors_headers_for(request: Request) -> dict[str, str]:
+    """Best-effort ACAO headers for error responses.
+
+    Starlette gotcha: responses returned from user-defined ``@app.exception_handler``
+    handlers bypass the user middleware stack, so ``CORSMiddleware`` never gets
+    to add the ACAO header. That means a browser sees "No Access-Control-Allow-
+    Origin" on every 500 and the response body is unreadable in DevTools —
+    exactly the failure mode we hit on the insight-post upload 500 (2026-07-28).
+    Adding the header here restores browser visibility without touching the
+    middleware. If the request Origin isn't in the allowlist we skip — never
+    open the API to a wider set than CORSMiddleware itself allows.
+    """
+    origin = request.headers.get("origin")
+    if not origin or origin not in _origins:
+        return {}
+    return {
+        "access-control-allow-origin": origin,
+        "access-control-allow-credentials": "true",
+        "vary": "Origin",
+    }
+
+
 @app.exception_handler(Exception)
-async def _unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
+async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    # Log the full traceback so Railway/Uvicorn logs actually show it. Our
+    # exception handler suppresses FastAPI's default unhandled-exception log,
+    # so without this we get a silent 500 with no clue what raised (2026-07-28).
+    _log.exception("Unhandled %s on %s %s", exc.__class__.__name__, request.method, request.url.path)
     return JSONResponse(
         status_code=500,
-        content={"error": exc.__class__.__name__, "detail": str(exc)},
+        content={
+            "error": exc.__class__.__name__,
+            "detail": str(exc),
+            "traceback": traceback.format_exc().splitlines()[-8:],
+        },
+        headers=_cors_headers_for(request),
     )
 
 
