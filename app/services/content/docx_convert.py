@@ -13,6 +13,7 @@ Conversion pipeline (design decided 2026-07-08):
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import math
@@ -100,8 +101,18 @@ def convert_docx_stream(fileobj: BinaryIO, slug: str) -> ConversionResult:
             # replaces via the editor. Return value must be dict of HTML attrs.
             return {"src": "", "alt": f"[image {counter['n']} unavailable]"}
 
+    # BytesIO wrap — 2026-07-28: FastAPI's UploadFile.file is a
+    # SpooledTemporaryFile whose ``.name`` is an int (file descriptor) while
+    # it's still in memory (small uploads under the spool threshold). mammoth
+    # calls ``os.path.dirname(fileobj.name)`` for external-image resolution
+    # and crashes on the int with ``TypeError: expected str, bytes or
+    # os.PathLike object, not int``. BytesIO has no ``.name``, so mammoth
+    # skips the path-derivation branch and reads the docx zip in-memory. The
+    # CLI path was unaffected because it opens a real file (str name).
+    data = fileobj.read()
     result = mammoth.convert_to_html(
-        fileobj, convert_image=mammoth.images.img_element(store_image)
+        io.BytesIO(data),
+        convert_image=mammoth.images.img_element(store_image),
     )
     messages = [f"{m.type}: {m.message}" for m in result.messages]
     messages.extend(f"image-error: {e}" for e in image_errors)
