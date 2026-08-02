@@ -39,6 +39,14 @@ Build 1 (2026-07-24): every event-selection query filters on
 events score in several pillars at once (spec Principle 3 violation).
 ``risk_categories_json`` is display/filter-only now. NULL primary_category
 (display-only streams) is never selected here by construction.
+
+2026-07-28: every event-selection query used for SCORING also carries
+``_scores_as_risk()``, which drops ``POSITIVE_EVENT_SUBTYPES``. Risk falls
+when structure improves, not when good news arrives; a supportive policy is
+not a negative disruption. Before this, only the geopolitical pillar
+filtered positives (via its subtype allowlist) and the other four scored
+them as risk. ``get_evidence_for_material_x_geography`` is a DISPLAY query
+and deliberately does NOT carry the gate — positives stay visible there.
 """
 
 from __future__ import annotations
@@ -50,10 +58,10 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import structlog
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, defer, selectinload
 
-from app.constants import RiskCategory
+from app.constants import POSITIVE_EVENT_SUBTYPES, RiskCategory
 from app.models.battery_chemistry import (
     BatteryChemistry,
     BatteryChemistryMaterial,
@@ -166,12 +174,74 @@ class SupplierEdge:
     path: list[uuid.UUID]                       # buyer-to-this, exclusive of root
 
 
+def _scores_as_risk():
+    """WHERE clause every pillar-scoring query must carry.
+
+    Positive-direction events are excluded from risk arithmetic — see
+    ``POSITIVE_EVENT_SUBTYPES`` in ``app.constants`` for the reasoning and
+    for the measured effect of not having done this. The gate lives here,
+    in one expression, because the bug it fixes was caused by exactly the
+    opposite arrangement: each pillar decided independently what to do with
+    the list it was handed, and four of the five decided nothing.
+
+    The ``is_(None)`` arm is load-bearing, not defensive. SQL three-valued
+    logic evaluates ``NULL NOT IN ('POSITIVE_POLICY', …)`` to NULL, which
+    fails the WHERE — so a bare ``not_in`` would silently drop every event
+    with no subtype, which is most of the corpus (GTA interventions,
+    POLICY_MILESTONE rows, all Federal Register notices).
+
+    Display queries deliberately do NOT use this. Positives stay in the
+    evidence drawer, tagged with what they are; only the arithmetic
+    ignores them.
+    """
+    return or_(
+        RiskEvent.event_subtype.is_(None),
+        RiskEvent.event_subtype.not_in(tuple(sorted(POSITIVE_EVENT_SUBTYPES))),
+    )
+
+
 def _category_window_cutoff(category: RiskCategory, as_of_date: date) -> Optional[datetime]:
     window_days = EVIDENCE_WINDOWS[category]
     if window_days is None:
         return None
     cutoff_date = as_of_date - timedelta(days=window_days)
     return datetime(cutoff_date.year, cutoff_date.month, cutoff_date.day, tzinfo=timezone.utc)
+
+
+def _event_window_clause(cutoff: Optional[datetime], as_of_date: date):
+    """Both bounds of an evidence window, as one SQL clause.
+
+    Every window in this module used to be a lower bound only::
+
+        (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
+
+    which is a silent correctness bug rather than a missing nicety.  An event
+    dated in the future satisfies *every* trailing window, forever — a
+    2029-dated trade measure counts as evidence for "the last 365 days" in
+    2026, in 2027, and in 2028, and no amount of recency decay removes it
+    because decay is computed from the same future date.  Twelve GTA events in
+    production carried dates up to 2029-01-01 and two of them were live in the
+    Lithium / geopolitical evidence pool.
+
+    The upper bound is ``as_of_date`` end-of-day, so a score computed "as of"
+    a date can never see past it.  This also makes historical rescores honest:
+    re-running a 2026-01-01 score no longer picks up events ingested later.
+
+    NULL ``event_date`` is still admitted — sanctions programs and standing
+    regulations often have no single anchor date, and excluding them would
+    quietly drop real evidence.  This preserves the prior behaviour on that
+    branch and is why the null check appears on both sides.
+    """
+    horizon = datetime(
+        as_of_date.year, as_of_date.month, as_of_date.day,
+        23, 59, 59, tzinfo=timezone.utc,
+    )
+    if cutoff is None:
+        return or_(RiskEvent.event_date <= horizon, RiskEvent.event_date.is_(None))
+    return or_(
+        RiskEvent.event_date.is_(None),
+        and_(RiskEvent.event_date >= cutoff, RiskEvent.event_date <= horizon),
+    )
 
 
 def _dedup_event_rows(rows) -> list[EventWithRelevance]:
@@ -242,6 +312,7 @@ def get_events_for_company(
             RiskEventCompany.review_status != "excluded",
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
         # 2026-07-15 EGRESS: defer Text columns that scoring never reads —
         # traced callers (orchestrator → evidence_aggregator) touch title,
@@ -251,10 +322,7 @@ def get_events_for_company(
         .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
 
     # Scope: country / material filters apply via secondary joins so we still
     # only return events tagged to this company AND matching the scope facets.
@@ -414,6 +482,7 @@ def get_active_compliance_obligations(
             RiskEventCompany.company_id == company_id,
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.primary_category == RiskCategory.REGULATORY_COMPLIANCE.value,  # Build 1
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
         # 2026-07-15 EGRESS: this loop only reads ev.title — defer Text cols.
         .options(defer(RiskEvent.summary))
@@ -454,6 +523,7 @@ def get_filing_signals(
             RiskEventCompany.review_status != "excluded",
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.primary_category == RiskCategory.FINANCIAL_PRESSURE.value,  # Build 1
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
         # 2026-07-15 EGRESS: defer Text cols (title/metadata_json used, summary/review_note not).
         .options(defer(RiskEvent.summary))
@@ -571,13 +641,11 @@ def get_events_for_material(
             RiskEventMaterial.material_id == material_id,
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
     if scope.country_codes is not None:
         stmt = stmt.join(
             RiskEventGeography,
@@ -658,15 +726,13 @@ def get_events_for_geographies(
             RiskEventGeography.country_code.in_(country_codes),
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
         # 2026-07-15 EGRESS: defer Text cols summary + review_note.
         .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
     rows = db.execute(stmt).all()
     return _dedup_event_rows(rows)
 
@@ -764,13 +830,11 @@ def get_events_for_materials(
             RiskEventMaterial.material_id.in_(material_ids),
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
     rows = db.execute(stmt).all()
     results = _dedup_material_event_rows(rows)
     results = _apply_hs_confidence_multiplier_batch(db, material_ids, results)
@@ -836,13 +900,11 @@ def get_events_for_hs_mapping(
             RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
     if scope.country_codes is not None:
         stmt = stmt.join(
             RiskEventGeography,
@@ -977,15 +1039,13 @@ def get_events_for_regulations(
             Regulation.verified.is_(True),
             RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEvent.primary_category == RiskCategory.REGULATORY_COMPLIANCE.value,  # Build 1
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
         # 2026-07-15 EGRESS: defer Text cols summary + review_note.
         .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
     rows = db.execute(stmt).all()
     return _dedup_event_rows(rows)
 
@@ -1638,7 +1698,7 @@ def get_evidence_for_material_x_geography(
         # Window filter: events with no event_date are kept (sanctions
         # programs often lack a single anchor date) but cutoff applies to
         # those that do.
-        .where(or_(RiskEvent.event_date >= cutoff, RiskEvent.event_date.is_(None)))
+        .where(_event_window_clause(cutoff, as_of_date))
         # Two-hop selectinload: SourceDocument → Source so we can name the
         # ingester (global_trade_alert / federal_register / eurlex / iea /
         # opensanctions / sec_edgar) without an N+1 follow-up.
@@ -1682,7 +1742,7 @@ def get_evidence_for_material_x_geography(
             RiskEventGeography.country_code == cc,
             RiskEvent.duplicate_of_id.is_(None),
             RiskEventMaterial.is_direct.is_(False),
-            or_(RiskEvent.event_date >= cutoff, RiskEvent.event_date.is_(None)),
+            _event_window_clause(cutoff, as_of_date),
         )
     ) or 0
 

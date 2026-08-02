@@ -432,3 +432,80 @@ class TestParseApiCapturesNewFields:
         # latest_action captured for downstream substitution
         assert parsed[0]["latest_action_date"] is not None
         assert parsed[0]["latest_action_date"].date() == date(2026, 3, 15)
+
+
+# ---------------------------------------------------------------------------
+# fetch_gta_interventions_api — timeout retry (2026-07-31)
+# ---------------------------------------------------------------------------
+
+class TestFetchTimeoutRetry:
+    def test_read_timeout_is_retried_then_succeeds(self, monkeypatch):
+        """A transient ReadTimeout must be retried, not kill the run.
+
+        Observed in production 2026-07-31: pages take ~30s, page 3 of a full
+        pull exceeded the old 60s client timeout and the exception escaped
+        the 429/5xx retry loop entirely — after two pages of metered records
+        had already been pulled and were then thrown away.
+        """
+        import httpx as _httpx
+
+        from app.services.ingestion import gta as gta_mod
+
+        calls = {"n": 0}
+
+        class _FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return []  # empty page → fetch loop terminates
+
+        class _FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, *a, **k):
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise _httpx.ReadTimeout("simulated read timeout")
+                return _FakeResponse()
+
+        monkeypatch.setattr(gta_mod.httpx, "Client", _FakeClient)
+        monkeypatch.setattr("time.sleep", lambda s: None)
+
+        rows = gta_mod.fetch_gta_interventions_api(api_key="k", max_pages=2)
+        assert rows == []
+        assert calls["n"] == 3  # two timeouts + one success
+
+    def test_timeout_exhaustion_raises(self, monkeypatch):
+        import httpx as _httpx
+
+        from app.services.ingestion import gta as gta_mod
+
+        class _AlwaysTimeout:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def post(self, *a, **k):
+                raise _httpx.ReadTimeout("simulated")
+
+        monkeypatch.setattr(gta_mod.httpx, "Client", _AlwaysTimeout)
+        monkeypatch.setattr("time.sleep", lambda s: None)
+
+        import pytest as _pytest
+        with _pytest.raises(_httpx.ReadTimeout):
+            gta_mod.fetch_gta_interventions_api(api_key="k", max_pages=1)

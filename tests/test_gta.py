@@ -341,7 +341,11 @@ class TestParseGtaCsv:
         assert graphite["in_force"] is True
         assert atlantis["in_force"] is True
 
-    def test_summary_truncated(self):
+    def test_long_summary_survives_parse(self):
+        # 2026-07-30: the old 500-char cap silently destroyed source content
+        # (2,497 of 2,575 production GTA events were sliced mid-word).  A
+        # realistic long description must now survive intact; only the 8000
+        # sanity bound truncates.
         long_desc = "x" * 1000
         csv_text = (
             "id,title,date_announced,date_implemented,date_removed,"
@@ -351,7 +355,49 @@ class TestParseGtaCsv:
         )
         results = parse_gta_csv(csv_text.encode(), since_year=2018)
         assert len(results) == 1
-        assert len(results[0]["summary"]) == 500
+        assert len(results[0]["summary"]) == 1000
+
+    def test_summary_sanity_bound_at_8000(self):
+        huge_desc = "y" * 9000
+        csv_text = (
+            "id,title,date_announced,date_implemented,date_removed,"
+            "implementing_jurisdiction,gta_evaluation,intervention_type,"
+            "affected_hs_codes,description,in_force\n"
+            f"2001,Huge desc,2023-01-01,2023-02-01,,China,Red,Export bans,260400,{huge_desc},true\n"
+        )
+        results = parse_gta_csv(csv_text.encode(), since_year=2018)
+        assert len(results) == 1
+        assert len(results[0]["summary"]) == 8000
+
+    def test_future_implementation_reanchored_to_announcement(self):
+        # 2026-07-30: a future implementation date must not become event_date
+        # (trailing evidence windows would admit it forever, at max decay
+        # weight).  With a past announcement, the event is dated to the
+        # announcement and the forward date is preserved.
+        csv_text = (
+            "id,title,date_announced,date_implemented,date_removed,"
+            "implementing_jurisdiction,gta_evaluation,intervention_type,"
+            "affected_hs_codes,description,in_force\n"
+            "2002,Announced future ban,2024-01-15,2099-01-01,,China,Red,Export bans,260400,Ban takes effect 2099.,false\n"
+        )
+        results = parse_gta_csv(csv_text.encode(), since_year=2018)
+        assert len(results) == 1
+        r = results[0]
+        assert r["event_date"].year == 2024
+        assert r["scheduled_implementation_date"] is not None
+        assert r["scheduled_implementation_date"].year == 2099
+
+    def test_entirely_future_row_skipped(self):
+        # Announced AND implemented in the future → nothing has happened yet;
+        # the row must not enter the database at all.
+        csv_text = (
+            "id,title,date_announced,date_implemented,date_removed,"
+            "implementing_jurisdiction,gta_evaluation,intervention_type,"
+            "affected_hs_codes,description,in_force\n"
+            "2003,Entirely future ban,2098-06-01,2099-01-01,,China,Red,Export bans,260400,Nothing yet.,false\n"
+        )
+        results = parse_gta_csv(csv_text.encode(), since_year=2018)
+        assert results == []
 
 
 # ---------------------------------------------------------------------------
@@ -441,9 +487,13 @@ class TestIngestGta:
             assert link.match_reason == "hs_code"
             assert link.relevance_score == 0.9
 
-    def test_creates_single_source_and_document(
+    def test_creates_source_and_per_intervention_documents(
         self, session, seeded_materials_and_hs
     ):
+        # 2026-07-30: one per-run bulk document PLUS one document per
+        # inserted intervention, each carrying its permalink.  Before this,
+        # every event pointed at the run document (url=NULL) and rendered
+        # with no source link.
         with patch(
             "app.services.ingestion.gta.download_gta_csv",
             return_value=_csv_bytes(),
@@ -456,9 +506,39 @@ class TestIngestGta:
         assert sources[0].source_type == "gta"
 
         docs = session.scalars(select(SourceDocument)).all()
-        assert len(docs) == 1
-        assert docs[0].external_id.startswith("gta_bulk_csv_")
-        assert docs[0].document_type == "trade_policy_database"
+        run_docs = [d for d in docs if d.external_id.startswith("gta_bulk_csv_")]
+        intervention_docs = [
+            d for d in docs if d.external_id.startswith("gta_intervention_")
+        ]
+        assert len(run_docs) == 1
+        assert run_docs[0].document_type == "trade_policy_database"
+        # 2 inserted events → 2 intervention documents.
+        assert len(intervention_docs) == 2
+        for d in intervention_docs:
+            assert d.url is not None
+            assert d.url.startswith("https://globaltradealert.org/intervention/")
+            assert d.document_type == "trade_intervention"
+
+    def test_events_point_at_permalink_documents(
+        self, session, seeded_materials_and_hs
+    ):
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=_csv_bytes(),
+        ):
+            ingest_gta(session, since_year=2018)
+
+        events = session.scalars(select(RiskEvent)).all()
+        assert len(events) == 2
+        for e in events:
+            doc = session.get(SourceDocument, e.source_document_id)
+            gta_id = (e.metadata_json or {}).get("gta_id")
+            assert doc.url == f"https://globaltradealert.org/intervention/{gta_id}"
+            assert (e.metadata_json or {}).get("permalink") == doc.url
+            # source_url now records the event's own permalink, with the bulk
+            # download URL preserved separately.
+            assert (e.metadata_json or {}).get("source_url") == doc.url
+            assert "bulk_source_url" in (e.metadata_json or {})
 
     def test_idempotent_second_run_skips_all(
         self, session, seeded_materials_and_hs
@@ -471,7 +551,7 @@ class TestIngestGta:
             result2 = ingest_gta(session, since_year=2018)
 
         assert result2["inserted"] == 0
-        assert result2["skipped_existing"] == 2
+        assert result2["skipped_existing"] + result2["refreshed_existing"] == 2
         assert result2["material_links"] == 0
         assert result2["geography_links"] == 0
 
@@ -479,6 +559,129 @@ class TestIngestGta:
         assert len(session.scalars(select(RiskEvent)).all()) == 2
         assert len(session.scalars(select(RiskEventMaterial)).all()) == 2
         assert len(session.scalars(select(RiskEventGeography)).all()) == 2
+
+    def test_reingest_repairs_truncated_summary_without_duplicating(
+        self, session, seeded_materials_and_hs
+    ):
+        # 2026-07-30: the repair path.  First ingest stores a short (e.g.
+        # previously truncated) summary; a later ingest carrying the full
+        # text must UPDATE the same row, not insert a duplicate — identity
+        # is the GTA intervention id, not a hash of the text.
+        short_desc = "Short version."
+        long_desc = "Short version. " + "Much longer restored text. " * 30
+        header = (
+            "id,title,date_announced,date_implemented,date_removed,"
+            "implementing_jurisdiction,gta_evaluation,intervention_type,"
+            "affected_hs_codes,description,in_force\n"
+        )
+        row = "3000,Repairable event,2023-01-01,2023-02-01,,China,Red,Export bans,260400,{desc},true\n"
+        csv_short = (header + row.format(desc=short_desc)).encode()
+        csv_long = (header + row.format(desc=long_desc)).encode()
+
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=csv_short,
+        ):
+            r1 = ingest_gta(session, since_year=2018)
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=csv_long,
+        ):
+            r2 = ingest_gta(session, since_year=2018)
+
+        assert r1["inserted"] == 1
+        assert r2["inserted"] == 0
+        assert r2["refreshed_existing"] == 1
+        assert r2["refresh_field_counts"].get("summary") == 1
+
+        events = session.scalars(select(RiskEvent)).all()
+        assert len(events) == 1
+        assert events[0].summary == long_desc.strip()
+
+        # And a regressed (shorter) feed must NOT destroy the longer text.
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=csv_short,
+        ):
+            r3 = ingest_gta(session, since_year=2018)
+        assert r3["inserted"] == 0
+        events = session.scalars(select(RiskEvent)).all()
+        assert len(events) == 1
+        assert events[0].summary == long_desc.strip()
+
+    def test_refresh_never_touches_curated_fields(
+        self, session, seeded_materials_and_hs
+    ):
+        # A human-set verified flag / category / severity must survive a
+        # repair re-ingest untouched.
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=_csv_bytes(),
+        ):
+            ingest_gta(session, since_year=2018)
+
+        ev = session.scalars(select(RiskEvent)).first()
+        ev.verified = True
+        ev.severity_score = 0.123
+        ev.confidence_score = 0.456
+        session.commit()
+        ev_id = ev.id
+
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=_csv_bytes(),
+        ):
+            ingest_gta(session, since_year=2018)
+
+        ev = session.get(RiskEvent, ev_id)
+        assert ev.verified is True
+        assert ev.severity_score == 0.123
+        assert ev.confidence_score == 0.456
+
+    def test_dry_run_writes_nothing(self, session, seeded_materials_and_hs):
+        # 2026-07-30: --dry-run reports the blast radius and rolls back.
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=_csv_bytes(),
+        ):
+            result = ingest_gta(session, since_year=2018, dry_run=True)
+
+        assert result["dry_run"] == 1
+        assert result["inserted"] == 2  # would-be inserts, still counted
+        assert session.scalars(select(RiskEvent)).all() == []
+        assert session.scalars(select(RiskEventMaterial)).all() == []
+        assert session.scalars(select(SourceDocument)).all() == []
+
+    def test_dry_run_reports_refreshes_without_writing(
+        self, session, seeded_materials_and_hs
+    ):
+        short_desc = "Short version."
+        long_desc = "Short version. " + "Restored. " * 40
+        header = (
+            "id,title,date_announced,date_implemented,date_removed,"
+            "implementing_jurisdiction,gta_evaluation,intervention_type,"
+            "affected_hs_codes,description,in_force\n"
+        )
+        row = "3001,Dry-run repair probe,2023-01-01,2023-02-01,,China,Red,Export bans,260400,{desc},true\n"
+
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=(header + row.format(desc=short_desc)).encode(),
+        ):
+            ingest_gta(session, since_year=2018)
+        stored = session.scalars(select(RiskEvent)).first().summary
+
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=(header + row.format(desc=long_desc)).encode(),
+        ):
+            result = ingest_gta(session, since_year=2018, dry_run=True)
+
+        assert result["dry_run"] == 1
+        assert result["refreshed_existing"] == 1
+        assert result["refresh_field_counts"].get("summary") == 1
+        # Nothing actually changed.
+        assert session.scalars(select(RiskEvent)).first().summary == stored
 
     def test_since_year_filter_applied(self, session, seeded_materials_and_hs):
         # since_year=2024 excludes everything in the fixture.
@@ -490,3 +693,173 @@ class TestIngestGta:
 
         assert result["inserted"] == 0
         assert result["downloaded_rows"] == 0
+
+
+# ---------------------------------------------------------------------------
+# --api-raw-cache (2026-07-31)
+# ---------------------------------------------------------------------------
+
+class TestApiRawCache:
+    def _api_row(self):
+        return {
+            "intervention_id":         77001,
+            "state_act_id":            88001,
+            "state_act_title":         "China: cached export ban on graphite",
+            "intervention_description": [{"text": "<p>Cached description</p>"}],
+            "gta_evaluation":           "Red",
+            "implementing_jurisdictions": [{"id": 156, "name": "China", "iso": "CHN"}],
+            "affected_jurisdictions":   [],
+            "intervention_type":        "Export ban",
+            "mast_chapter":             "P1",
+            "affected_sectors":         [],
+            "affected_products":        [{"product_id": 250410, "name": "Graphite"}],
+            "date_announced":           "2023-06-01",
+            "date_implemented":         "2023-07-01",
+            "is_in_force":              True,
+            "is_official_source":       True,
+        }
+
+    def test_cache_hit_skips_api_and_needs_no_key(
+        self, session, seeded_materials_and_hs, tmp_path, monkeypatch
+    ):
+        """A pre-existing cache file must be used INSTEAD of calling the API.
+
+        GTA meters by records pulled per month; the cache exists so a
+        dry-run + real-run sequence pulls once, and so a failed parse does
+        not throw away a completed pull.  On a cache hit no API key is
+        required at all.
+        """
+        import json as _json
+
+        from app.services.ingestion import gta as gta_mod
+
+        cache = tmp_path / "gta_raw.json"
+        cache.write_text(_json.dumps([self._api_row()]))
+
+        def _must_not_fetch(*a, **k):
+            raise AssertionError("API was called despite a cache hit")
+
+        monkeypatch.setattr(gta_mod, "fetch_gta_interventions_api", _must_not_fetch)
+
+        result = ingest_gta(
+            session, since_year=2018, use_api=True, api_raw_cache=str(cache)
+        )
+        assert result["inserted"] == 1
+
+    def test_cache_written_after_successful_fetch(
+        self, session, seeded_materials_and_hs, tmp_path, monkeypatch
+    ):
+        import json as _json
+
+        from app.services.ingestion import gta as gta_mod
+
+        cache = tmp_path / "gta_raw.json"
+        assert not cache.exists()
+
+        monkeypatch.setattr(
+            gta_mod, "fetch_gta_interventions_api", lambda **k: [self._api_row()]
+        )
+
+        class _FakeSettings:
+            gta_api_key = "test-key"
+
+        monkeypatch.setattr(
+            "app.core.config.get_settings", lambda: _FakeSettings()
+        )
+
+        result = ingest_gta(
+            session, since_year=2018, use_api=True, api_raw_cache=str(cache)
+        )
+        assert result["inserted"] == 1
+        assert cache.exists()
+        assert _json.loads(cache.read_text())[0]["intervention_id"] == 77001
+
+
+# ---------------------------------------------------------------------------
+# Suggestion inversion (2026-07-31, triage plan Phase 1)
+# ---------------------------------------------------------------------------
+
+class TestSuggestionInversion:
+    def test_events_land_pending_with_suggestions_not_assignments(
+        self, session, seeded_materials_and_hs
+    ):
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=_csv_bytes(),
+        ):
+            ingest_gta(session, since_year=2018)
+
+        events = session.scalars(select(RiskEvent)).all()
+        assert len(events) == 2
+        for e in events:
+            # The machine proposes...
+            assert e.suggested_category == "geopolitical_trade"
+            assert e.direction == "restrictive"
+            # ...and does NOT dispose: nothing scores until a human confirms.
+            assert e.primary_category is None
+            assert e.triage_status == "pending_triage"
+            assert e.metadata_json.get("category_mapping") == "explicit"
+            assert e.metadata_json.get("n_materials") == 1
+
+    def test_supportive_subsidy_lands_display_only(
+        self, session, seeded_materials_and_hs
+    ):
+        # Audit F1 (decided 2026-07-31): the production-subsidy family is
+        # supply-SUPPORTIVE from a buyer's perspective and must not queue as
+        # risk — it lands display_only (visible, reviewable, promotable).
+        csv_text = (
+            "id,title,date_announced,date_implemented,date_removed,"
+            "implementing_jurisdiction,gta_evaluation,intervention_type,"
+            "affected_hs_codes,description,in_force\n"
+            "4000,US grant to graphite anode plant,2024-01-01,2024-02-01,,"
+            "United States of America,Red,Financial grant,250410,"
+            "Grant supporting domestic anode capacity.,true\n"
+        )
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=csv_text.encode(),
+        ):
+            ingest_gta(session, since_year=2018)
+
+        ev = session.scalars(select(RiskEvent)).one()
+        assert ev.direction == "supportive"
+        assert ev.suggested_category == "financial_pressure"
+        assert ev.triage_status == "display_only"
+        assert ev.primary_category is None
+        assert ev.metadata_json.get("triage_route") == "auto_display_only_supportive"
+
+    def test_material_links_are_suggested(self, session, seeded_materials_and_hs):
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=_csv_bytes(),
+        ):
+            ingest_gta(session, since_year=2018)
+
+        links = session.scalars(select(RiskEventMaterial)).all()
+        assert links
+        for link in links:
+            assert link.status == "suggested"
+
+    def test_unknown_intervention_type_marked_fallback(
+        self, session, seeded_materials_and_hs
+    ):
+        csv_text = (
+            "id,title,date_announced,date_implemented,date_removed,"
+            "implementing_jurisdiction,gta_evaluation,intervention_type,"
+            "affected_hs_codes,description,in_force\n"
+            "4001,Novel measure,2024-01-01,2024-02-01,,China,Red,"
+            "Some brand new measure type,260400,Unmapped type.,true\n"
+        )
+        with patch(
+            "app.services.ingestion.gta.download_gta_csv",
+            return_value=csv_text.encode(),
+        ):
+            ingest_gta(session, since_year=2018)
+
+        ev = session.scalars(select(RiskEvent)).one()
+        # Falls back to the default category — but says so.
+        assert ev.suggested_category == "geopolitical_trade"
+        assert ev.metadata_json.get("category_mapping") == "fallback"
+        # Unknown type → no subtype family → neutral direction, stays pending.
+        assert ev.direction == "neutral"
+        assert ev.triage_status == "pending_triage"

@@ -21,7 +21,10 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.constants import OPERATIONAL_SUBTYPE_DEFAULT_SEVERITY
+from app.constants import (
+    OPERATIONAL_SUBTYPE_DEFAULT_SEVERITY,
+    POSITIVE_EVENT_SUBTYPES,
+)
 from app.db.base import Base
 from app.models import (
     Company,
@@ -62,6 +65,9 @@ def _make_candidate(session: Session, title: str = "Mine halted") -> RiskEvent:
         event_type=EVENT_TYPE_CANDIDATE,
         title=title,
         risk_categories_json=["operational"],
+        # 2026-07-31 harmonisation: mirror the ingester's triage fields.
+        suggested_category="operational",
+        triage_status="pending_triage",
         metadata_json={
             "scoring": "display_only",
             "display_only_reason": "pending_triage",
@@ -129,6 +135,27 @@ class TestPromotion:
             session, ev.id, subtype="bespoke_walkthrough_thing", severity=0.42,
         )
         assert result["severity_source"] == "explicit"
+
+    @pytest.mark.parametrize("subtype", sorted(POSITIVE_EVENT_SUBTYPES))
+    def test_positive_subtype_refused(self, session, subtype):
+        """Promotion means "this scores"; a positive subtype never does.
+
+        Reachable without this guard: POSITIVE_* is outside the controlled
+        taxonomy, so a reviewer supplying an explicit severity would clear
+        both existing checks and land a row that reads as promoted —
+        primary_category='operational', verified, out of the queue — while
+        the read-time filter in ``evidence_query`` silently contributes
+        nothing from it. Refusal is the only outcome that tells the
+        reviewer the truth.
+        """
+        ev = _make_candidate(session)
+        with pytest.raises(TriageError, match="positive-direction"):
+            promote_candidate(session, ev.id, subtype=subtype, severity=0.6)
+        # Nothing was written — the row is still a pending candidate.
+        assert ev.primary_category is None
+        assert ev.event_subtype is None
+        assert ev.verified is not True
+        assert [r["id"] for r in list_pending_candidates(session, check_duplicates=False)] == [ev.id]
 
     def test_severity_range_checked(self, session):
         ev = _make_candidate(session)
@@ -218,3 +245,29 @@ class TestQueue:
         assert [r["title"] for r in rows] == ["Pending one"]
         assert rows[0]["suggested_subtype"] == "operations_halt"
         assert rows[0]["feed"] == "google_news"
+
+
+# ---------------------------------------------------------------------------
+# Triage-status harmonisation (2026-07-31, migration 066)
+# ---------------------------------------------------------------------------
+
+class TestTriageStatusHarmonisation:
+    def test_candidate_lands_pending_with_suggested_category(self, session):
+        ev = _make_candidate(session)
+        assert ev.triage_status == "pending_triage"
+        assert ev.suggested_category == "operational"
+        assert ev.primary_category is None
+
+    def test_promote_sets_scoring_status(self, session):
+        ev = _make_candidate(session)
+        promote_candidate(session, ev.id, subtype="labor_strike", severity=0.5)
+        assert ev.triage_status == "scoring"
+        assert ev.primary_category == "operational"
+
+    def test_reject_sets_rejected_status_and_leaves_queue(self, session):
+        ev = _make_candidate(session)
+        reject_candidate(session, ev.id, reason="not operational")
+        assert ev.triage_status == "rejected"
+        assert ev.primary_category is None
+        pending = list_pending_candidates(session, check_duplicates=False)
+        assert ev.id not in [r["id"] for r in pending]

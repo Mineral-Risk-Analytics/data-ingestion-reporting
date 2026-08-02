@@ -799,6 +799,9 @@ def _persist_material_links(
                 material_id=material_id,
                 relevance_score=relevance,
                 match_reason=f"keyword_match:{matched_keyword[:48]}",
+                # 2026-07-31 (triage plan Phase 1): machine-written links
+                # are suggestions until confirmed in triage.
+                status="suggested",
             ))
             written += 1
 
@@ -1306,6 +1309,49 @@ def _severity(doc_type: str | None, abstract: str | None, title: str | None,
 
 
 # ---------------------------------------------------------------------------
+# Procedural-step detection (2026-07-31, triage plan Phase 1)
+# ---------------------------------------------------------------------------
+# The trade-remedy stream captures every Federal Register document in an
+# AD/CVD case's life, and most of them are administrative steps of an
+# already-known measure: the Türkiye aluminum-sheet case alone produced
+# four events in one week ("Preliminary Results", "Postponement", "Notice
+# of Court Decision", ...), each at ~0.54 severity.  One underlying trade
+# measure was being multiplied into a stream of procedural exhaust.
+#
+# Decision (Nicole, 2026-07-31): case initiations and FINAL determinations
+# remain real pending-triage events; intermediate procedural steps land
+# display_only at capped severity.  Detection is by title pattern —
+# deliberately conservative: an unmatched title stays a full event, so a
+# false negative costs a redundant triage row, never a lost measure.
+_PROCEDURAL_TITLE_PATTERNS: tuple[str, ...] = (
+    "postponement",
+    "preliminary results",
+    "preliminary determination",
+    "amended final results",
+    "supplemental schedule",
+    "schedule for the final",
+    "notice of court decision",
+    "extension of time",
+    "rescission",
+    "correction",
+    "initiation of administrative review",   # annual review of an EXISTING order
+    "opportunity to request administrative review",
+)
+
+# Severity cap for procedural steps — a postponement notice is not a
+# 0.5-severity risk event.  Chosen below every scoring-relevant band the
+# aggregator uses.
+_PROCEDURAL_SEVERITY_CAP = 0.25
+
+
+def _is_procedural_step(title: str) -> bool:
+    """True when the document is an administrative step in an ongoing
+    AD/CVD case rather than a new measure — see pattern list above."""
+    t = (title or "").lower()
+    return any(p in t for p in _PROCEDURAL_TITLE_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -1387,6 +1433,25 @@ def _insert_risk_event(
     agencies: list[str],
     content_hash: str,
 ) -> RiskEvent:
+    # ── Suggestion fields (2026-07-31, triage plan Phase 1) ────────────────
+    # Same inversion as GTA/IEA: category and direction are SUGGESTIONS —
+    # primary_category stays NULL until a human confirms in triage, so the
+    # event cannot enter a scoring pool (pillar queries filter on
+    # primary_category, migration 062).
+    #
+    # Direction: every FR query stream captures restriction-side measures
+    # (tariffs, export controls, sanctions, regulatory obligations) — there
+    # is no subsidy stream here, so direction is uniformly "restrictive".
+    # Category provenance is the query config itself (hardcoded per stream,
+    # never a keyword fallback) — recorded as "query_config" so the triage
+    # UI can distinguish it from keyword-derived suggestions.
+    procedural = _is_procedural_step(title)
+    if procedural:
+        severity = min(severity, _PROCEDURAL_SEVERITY_CAP)
+        triage_status = "display_only"
+    else:
+        triage_status = "pending_triage"
+
     ev = RiskEvent(
         source_document_id=doc.id,
         event_type="federal_register_notice",
@@ -1397,6 +1462,11 @@ def _insert_risk_event(
         severity_score=severity,
         confidence_score=0.70,
         risk_categories_json=risk_categories,
+        # Inverted 2026-07-31 (triage plan Phase 1): the machine suggests,
+        # a human assigns.  primary_category deliberately NOT set.
+        suggested_category=risk_categories[0] if risk_categories else None,
+        direction="restrictive",
+        triage_status=triage_status,
         geography_json={"primary": geo_primary, "scope": "federal"},
         content_hash=content_hash,
         metadata_json={
@@ -1410,6 +1480,12 @@ def _insert_risk_event(
             # from event_date (which may be effective_on for final rules).
             "publication_date": doc.published_at.date().isoformat()
             if doc.published_at else None,
+            # 2026-07-31 triage-plan Phase 1 markers:
+            "category_mapping": "query_config",
+            "is_procedural_step": procedural,
+            "triage_route": (
+                "auto_display_only_procedural" if procedural else None
+            ),
         },
     )
     session.add(ev)

@@ -701,6 +701,14 @@ def ingest_operational_news(
                 {"primary": matched_facs[0].country} if matched_facs else None
             ),
             content_hash=ch,
+            # 2026-07-31 harmonisation with the triage status model
+            # (migration 066): this module's metadata-based state predates
+            # the general model and now maps onto it — candidates awaiting
+            # review are pending_triage (the archetypal case), promotion
+            # sets scoring, rejection sets rejected.  The metadata flags
+            # stay for one release as the documented back-compat guards.
+            suggested_category="operational",
+            triage_status="pending_triage",
             metadata_json={
                 # BOTH display-only guards: the metadata flag is the
                 # documented autofill escape hatch; the event_type is also in

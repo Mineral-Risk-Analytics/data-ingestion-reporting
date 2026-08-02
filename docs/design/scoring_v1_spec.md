@@ -70,6 +70,10 @@ curated operational events──►  Operational pillar   ─┘         (4 pill
 
 ## 5. Pillar: Regulatory & Compliance
 
+**Enforcement weights (migration 065, 2026-07-27, Nicole):** `regulations.material_enforcement_weights` JSONB (material canonical name → 0-1, `DEFAULT` fallback, NULL = 1.0) scales a regulation's obligation points per scored material. Motivation: the 4.3 rescore surfaced a ~35-point regulatory floor cluster — all-goods laws (UFLPA/FLR/CSDDD) apply to every material in law but enforce unevenly (polysilicon detentions dwarf rhenium's). Ships inert (1.0 fallback); curated via the workbook's EnforcementWeights sheet (amber starter judgments for UFLPA/FLR/CSDDD; S-211 deliberately uniform). Same pass: export-restriction subtype gate unified in `constants.EXPORT_RESTRICTION_SUBTYPES` (HS-node exact-match gate was blind to manual subtypes like `national_export_quota`), and the Federal Register suggestion path now requires a direct material attribution (relevance ≥ 0.90) before staging a SUGGESTED_ regulation (Build 3 relevance filter; the 10 archived noise rows would all have been blocked). Future-dated decay clamp verified already implemented (2026-06-14, all five pillar formulas).
+
+**4.3 obligation soft cap (2026-07-26, Nicole):** the uplift's hard `min(40, raw)` is replaced by a saturating curve `40 × (1 − e^(−raw/35))`. Evidence from the 25-regulation workbook rescore: REE×CN raw uplift 101.9 and raw 68 both pinned to exactly 40, so the +30 points of new CN REE regimes were invisible at CN, and cobalt×CD absorbed the DRC quota's 10 points the same way — the cap was re-creating the clustering the workbook was built to break. The curve preserves ordering at any raw value (26→21, 45→29, 68→34, 102→38), never reaches 40, and keeps differentiating as regulations accumulate. 100 for the pillar is now an asymptote. Diagnostic `capped_at_40` is kept under its old name but now flags raw > 40 ("deep in the compressed zone").
+
 **One-sentence explanation:** "What rule changes affect the cost or right to produce/trade this material here?"
 
 | | |
@@ -94,6 +98,13 @@ curated operational events──►  Operational pillar   ─┘         (4 pill
 | **Expected output (cobalt)** | AU/ZM/CD carry real operational signal from curated events; most geographies 0 |
 | **Facility data path (your plan, endorsed)** | Curate a vetted facility registry (partner seed) → subscribe to a mining data feed queried *against the watchlist* (monitored facilities only) rather than bulk-seeding unvetted rows. Candidates to evaluate: S&P Capital IQ Pro (Mine Economics), Wood Mackenzie, Benchmark, GlobalData, Mining Data Online. When statuses are trustworthy per material, capacity-weighted structural dependency returns as a versioned upgrade |
 | **Live sources** | Company production reports (quarterly — the Glencore/CMOC cadence), the mining feed once selected, curated news |
+
+**4.4 update (2026-07-27, Nicole):** two changes from the operational audit.
+
+1. **Aggregation is now top-3 mean, not plain mean.** `_score_operational_market` averages the three highest event impacts instead of all of them, so a tail of low-severity events can no longer dilute a serious disruption (previously 1 shutdown + 5 minor notices scored *lower* than the shutdown alone). One event = its own value; zero events = 0, unchanged.
+2. **The export-restriction fold is hardened.** `_export_restriction_operational_impacts` (the G-Cov-2 half-weight fold of export-restriction events into operational) now requires `primary_category IS NOT NULL` and `duplicate_of_id IS NULL`, and uses the shared `EXPORT_RESTRICTION_SUBTYPES` constant — display-only/duplicate events had been leaking into the fold.
+
+`SCORING_VERSION` 4.3 → 4.4. Tests: `TestOperationalTop3Mean` in `tests/scoring/test_operational_diagnostic.py`.
 
 ## 7. Weights, L2, and bands
 

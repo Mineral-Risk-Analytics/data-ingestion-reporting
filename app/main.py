@@ -33,6 +33,7 @@ from app.api.routes.market_scores import router as market_scores_router
 from app.api.routes.materials import router as materials_router
 from app.api.routes.regulations import router as regulations_router
 from app.api.routes.risk_events import router as risk_events_router
+from app.api.routes.triage import router as triage_router
 from app.api.routes.sources import router as sources_router
 from app.api.routes.trade_flows import router as trade_flows_router
 from app.core.config import get_settings
@@ -145,6 +146,7 @@ app.include_router(trade_flows_router, prefix="/api/v1")
 # Phase 2 — reference data browsers + generalized flag-issue notes
 app.include_router(regulations_router, prefix="/api/v1")
 app.include_router(risk_events_router, prefix="/api/v1")
+app.include_router(triage_router, prefix="/api/v1")
 app.include_router(materials_router, prefix="/api/v1")
 app.include_router(facilities_router, prefix="/api/v1")
 app.include_router(chemistries_router, prefix="/api/v1")

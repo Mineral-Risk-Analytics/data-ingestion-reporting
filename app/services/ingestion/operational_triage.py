@@ -16,6 +16,9 @@ pillar):
   overrides (scale matters — a strike at Escondida isn't a strike at a 5kt
   mine). A subtype outside the taxonomy is allowed (the walkthrough
   vocabulary is free-form) but then an explicit severity is REQUIRED.
+* A ``POSITIVE_EVENT_SUBTYPES`` subtype is REFUSED (2026-07-28): positives
+  never enter risk arithmetic, so promoting one would mark the row promoted
+  and verified while contributing nothing.
 * Promotion sets ``primary_category='operational'``, writes the subtype and
   severity, marks the event verified, and rewrites the display-only
   metadata into an audit trail (``triage`` block). After the next rescore
@@ -39,7 +42,10 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.constants import OPERATIONAL_SUBTYPE_DEFAULT_SEVERITY
+from app.constants import (
+    OPERATIONAL_SUBTYPE_DEFAULT_SEVERITY,
+    POSITIVE_EVENT_SUBTYPES,
+)
 from app.models import (
     CompanyFacility,
     Facility,
@@ -94,11 +100,17 @@ def list_pending_candidates(
     dismisses. Turn it off to keep the queue cheap — it loads every
     canonical event's anchors once per call.
     """
+    # 2026-07-31 harmonisation (migration 066): the queue is defined by the
+    # triage_status column — one state machine across every source.  The
+    # metadata filter below stays for one release as a belt-and-braces
+    # guard on rows written before the column existed (there are none in
+    # production, but tests and dev DBs may carry them).
     events = session.scalars(
         select(RiskEvent)
         .where(
             RiskEvent.event_type == EVENT_TYPE_CANDIDATE,
             RiskEvent.primary_category.is_(None),
+            RiskEvent.triage_status == "pending_triage",
         )
         .order_by(RiskEvent.event_date.desc().nullslast(), RiskEvent.id.desc())
         .limit(limit * 2)  # over-fetch; rejected rows are filtered in Python
@@ -159,6 +171,9 @@ def promote_candidate(
     Severity resolution: explicit ``severity`` wins; else the taxonomy
     default for ``subtype``; else error (free-form subtypes need an explicit
     number). Range-checked to [0, 1].
+
+    Raises ``TriageError`` for a positive-direction ``subtype`` — see the
+    guard below.
     """
     event = _load_candidate(session, event_id)
     if event.primary_category is not None:
@@ -167,6 +182,27 @@ def promote_candidate(
     subtype = subtype.strip()
     if not subtype:
         raise TriageError("subtype is required")
+
+    # 2026-07-28: promotion means "this event scores". A POSITIVE_* subtype
+    # is excluded from every pillar's arithmetic at read time
+    # (constants.POSITIVE_EVENT_SUBTYPES), so promoting one would produce a
+    # row that LOOKS promoted — primary_category='operational', verified,
+    # out of the queue — and contributes nothing, with no signal to the
+    # reviewer that it didn't take. Refuse rather than silently no-op.
+    #
+    # Refusal, not a warning, because the free-form-subtype escape hatch
+    # below makes this reachable: POSITIVE_* is not in the controlled
+    # taxonomy, so a reviewer passing an explicit severity would otherwise
+    # sail through both existing checks.
+    if subtype in POSITIVE_EVENT_SUBTYPES:
+        raise TriageError(
+            f"Subtype {subtype!r} is positive-direction and is excluded from "
+            "risk scoring, so promoting it would have no effect. If the story "
+            "IS a supply disruption, promote it under the disruption subtype "
+            "that describes it; if it is good news, reject it with a reason — "
+            "the row stays as the audit trail and stays visible in the "
+            "evidence drawer."
+        )
 
     default = OPERATIONAL_SUBTYPE_DEFAULT_SEVERITY.get(subtype)
     if severity is None:
@@ -190,6 +226,7 @@ def promote_candidate(
     event.event_subtype = subtype
     event.severity_score = severity
     event.primary_category = "operational"
+    event.triage_status = "scoring"   # 2026-07-31: one state machine
     event.verified = True
 
     meta = dict(event.metadata_json or {})
@@ -233,6 +270,7 @@ def reject_candidate(
     if not reason.strip():
         raise TriageError("A rejection reason is required (audit trail)")
 
+    event.triage_status = "rejected"   # 2026-07-31: one state machine
     meta = dict(event.metadata_json or {})
     meta["display_only_reason"] = "rejected"
     meta["triage"] = {

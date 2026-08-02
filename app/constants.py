@@ -104,6 +104,44 @@ REGION_MEMBERS: dict[str, frozenset[str]] = {
 }
 
 
+# ── Positive-direction events are excluded from risk arithmetic ────────────
+# (2026-07-28, Nicole's call.)
+#
+# A supportive policy does not make sourcing from a risky geography less
+# risky. DRC cobalt is risky because of governance, concentration, and
+# restriction exposure; a financing announcement changes none of those on
+# the day it lands. Risk falls when the STRUCTURE improves — WGI moves,
+# production share disperses, a material comes off a restriction list —
+# and every one of those is measured by a different sub-input that already
+# exists. Netting a policy event against a structural measurement mixes two
+# axes, so positives contribute nothing to a risk score.
+#
+# This was not a no-op when it was written. Events reach a pillar via
+# ``RiskEvent.primary_category`` alone; only the geopolitical pillar then
+# applied a subtype allowlist (``_classify_geo_events``). The operational,
+# financial, regulatory, and material pillars consumed whatever they were
+# handed, so a positive event RAISED risk — measured 2026-07-28 across the
+# 50 material x country cells with operational events: 29 of 90 top-3
+# slots held by a positive, and 12 cells whose entire operational score
+# came from good news (up to 37 points). See
+# docs/design/positive_event_sign_vs_mitigation.md.
+#
+# Enforced as a read-time filter in ``evidence_query`` rather than by
+# nulling ``primary_category``: the column keeps meaning "which pillar this
+# event is ABOUT", so positives stay visible in the evidence drawer and
+# stay queryable as the input to a future mitigation signal
+# (docs/design/positive_policy_scoring.md Layer 2). Nulling the column
+# would have made them invisible to both.
+#
+# An explicit set, not a ``POSITIVE_%`` prefix match: the manual walkthrough
+# vocabulary is free-form, so a prefix rule could silently swallow a subtype
+# a partner invents. A new positive subtype must be added here deliberately.
+POSITIVE_EVENT_SUBTYPES: frozenset[str] = frozenset({
+    "POSITIVE_POLICY",       # government action supportive of supply (IEA + manual)
+    "POSITIVE_DEVELOPMENT",  # favorable company outcome (manual walkthrough)
+})
+
+
 PRIMARY_CATEGORY_PRECEDENCE: tuple[str, ...] = (
     RiskCategory.OPERATIONAL.value,
     RiskCategory.GEOPOLITICAL_TRADE.value,

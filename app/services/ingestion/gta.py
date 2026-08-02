@@ -356,6 +356,35 @@ GTA_INTERVENTION_CATEGORY_MAP: dict[str, str] = {
 }
 DEFAULT_GTA_CATEGORY = "geopolitical_trade"
 
+# ── Supply-risk direction (2026-07-31, GTA audit F1) ──────────────────────
+# GTA's "Red" evaluation means "harmful to foreign commercial interests" —
+# which is not the same thing as "supply risk for a battery-materials
+# buyer".  55% of the stored corpus is subsidies: state aid that mostly
+# ADDS or diversifies supply (802 plain financial grants; a third of the
+# subsidy events come from the US, Japan, Australia, Canada and Germany —
+# IRA-era industrial policy).  Deriving a direction from the subtype family
+# lets the triage layer default supportive events to display_only instead
+# of narrating them as financial-pressure risk.
+#
+# Whether supportive events should eventually LOWER risk is a scoring
+# design question, deliberately deferred (see the triage plan).
+_SUBTYPE_DIRECTION: dict[str, str] = {
+    "EXPORT_RESTRICTION": "restrictive",
+    "IMPORT_DISRUPTION":  "restrictive",
+    "TRADE_DEFENSE":      "restrictive",
+    "FDI_RESTRICTION":    "restrictive",
+    "PROCUREMENT_POLICY": "restrictive",   # localisation constrains sourcing
+    "EXPORT_SUBSIDY":     "supportive",    # production-subsidy family
+}
+_DEFAULT_DIRECTION = "neutral"             # subtype NULL (rare: 4 of 2,629)
+
+
+def _direction_for(event_subtype: Optional[str]) -> str:
+    """Supply-risk direction for a subtype family — see _SUBTYPE_DIRECTION."""
+    if event_subtype is None:
+        return _DEFAULT_DIRECTION
+    return _SUBTYPE_DIRECTION.get(event_subtype, _DEFAULT_DIRECTION)
+
 # Map GTA intervention_type → event_subtype stored in metadata_json["event_subtype"].
 #
 # The scoring engine in market_aggregator.py and evidence_aggregator.py reads
@@ -546,8 +575,19 @@ _INTERVENTION_ID_TO_SUBTYPE: dict[int, str] = {
 
 # RiskEvent.event_type is String(128); truncate to fit.
 _EVENT_TYPE_MAX = 128
-# Summary kept short so the row stays printable in admin tables.
-_SUMMARY_MAX = 500
+# Summary bound.  Raised from 500 → 8000 on 2026-07-30.
+#
+# The old 500-char cap was a display convenience ("keep the row printable in
+# admin tables") that silently destroyed source content: 2,497 of 2,575 stored
+# GTA events were sliced mid-word at exactly 500 characters with no ellipsis,
+# and the full text is not recoverable from the database because
+# SourceDocument.raw_text is never populated on this path.  Truncation for
+# display belongs in the presentation layer, not the ingester.
+#
+# 8000 is a sanity bound, not a design target — GTA intervention descriptions
+# run to a few thousand characters at the high end.  ``risk_events.summary`` is
+# TEXT, so there is no storage-level constraint being respected here.
+_SUMMARY_MAX = 8000
 # Flush every N inserts to keep the SQLAlchemy unit-of-work compact.
 _FLUSH_EVERY = 100
 
@@ -623,7 +663,7 @@ def fetch_gta_interventions_api(
     base_url: Optional[str] = None,
     page_size: Optional[int] = None,
     rate_limit_delay: Optional[float] = None,
-    timeout: int = 60,
+    timeout: int = 180,
     max_pages: Optional[int] = None,
 ) -> list[dict]:
     """Fetch Red interventions from the GTA API, paginated.
@@ -646,6 +686,10 @@ def fetch_gta_interventions_api(
                                  returns all types.
         base_url, page_size,
         rate_limit_delay:        Override settings if given (testing).
+        timeout:                 Per-request read timeout in seconds.  Raised
+                                 60 → 180 on 2026-07-31: production pages
+                                 routinely take ~30s and deeper offsets are
+                                 slower; 60s killed a full pull on page 3.
         max_pages:               Safety cap — None means iterate until
                                  fewer-than-page-size rows return.  Tests
                                  should pass max_pages=1.
@@ -727,10 +771,37 @@ def fetch_gta_interventions_api(
             # exponential backoff 30s → 60s → 120s → 240s → 480s.  Other
             # 4xx (auth, bad request) still raise immediately — retrying
             # those wastes quota.
+            #
+            # 2026-07-31: read timeouts are retryable too.  Observed in
+            # production: pages routinely take ~30s and deeper offsets are
+            # slower; page 3 of a full pull exceeded the old 60s client
+            # timeout, and because a timeout raises an exception rather
+            # than returning a status, it escaped this loop entirely and
+            # killed the run — after two pages of metered records had
+            # already been pulled and were then thrown away.  Timeouts get
+            # a shorter backoff than 429s (10s → 20s → 40s → 80s → 160s):
+            # they signal a slow server, not a rate limit.
             _RETRYABLE = {429, 500, 502, 503, 504}
             attempt = 0
+            timeout_attempt = 0
             while True:
-                response = client.post(url, headers=headers, json=body)
+                try:
+                    response = client.post(url, headers=headers, json=body)
+                except httpx.TimeoutException as exc:
+                    timeout_attempt += 1
+                    if timeout_attempt > 5:
+                        raise
+                    wait_s = min(10.0 * (2 ** (timeout_attempt - 1)), 300.0)
+                    log.warning(
+                        "gta.api.fetch.timeout_retry",
+                        attempt=timeout_attempt,
+                        wait_seconds=wait_s,
+                        offset=offset,
+                        error=str(exc) or type(exc).__name__,
+                    )
+                    import time as _t
+                    _t.sleep(wait_s)
+                    continue
                 if response.status_code not in _RETRYABLE:
                     response.raise_for_status()
                     break
@@ -846,12 +917,26 @@ def parse_gta_api_response(
         # ── 3. Date filter ──────────────────────────────────────────────────
         date_implemented = _parse_date(row.get("date_implemented") or "")
         date_announced   = _parse_date(row.get("date_announced") or "")
-        event_date = date_implemented or date_announced
+        # 2026-07-30: future implementation dates are re-anchored to the
+        # announcement rather than stored forward — see _resolve_event_date.
+        event_date, scheduled_implementation = _resolve_event_date(
+            date_implemented, date_announced
+        )
         if event_date is None:
-            log.warning(
-                "gta.api.parse.bad_date",
-                intervention_id=row.get("intervention_id"),
-            )
+            if scheduled_implementation is not None:
+                # Announced *and* implemented in the future — nothing has
+                # happened yet.  Skipped rather than stored so it cannot enter
+                # an evidence pool before it is real.
+                log.info(
+                    "gta.api.parse.future_only",
+                    intervention_id=row.get("intervention_id"),
+                    scheduled=scheduled_implementation.isoformat(),
+                )
+            else:
+                log.warning(
+                    "gta.api.parse.bad_date",
+                    intervention_id=row.get("intervention_id"),
+                )
             continue
         if since_year is not None and event_date.year < since_year:
             continue
@@ -966,6 +1051,7 @@ def parse_gta_api_response(
             "implementation_level":  implementation_level,
             "is_horizontal":         False,    # API doesn't expose; default False
             "date_announced":        date_announced,
+            "scheduled_implementation_date": scheduled_implementation,
             "mast_chapter":          mast_chapter,
             "eligible_firm":         eligible_firm,
             "affected_sectors_raw":  affected_sectors_raw,
@@ -1262,6 +1348,48 @@ def _parse_date(raw: str) -> Optional[datetime]:
     return None
 
 
+def _resolve_event_date(
+    date_implemented: Optional[datetime],
+    date_announced: Optional[datetime],
+    *,
+    now: Optional[datetime] = None,
+) -> tuple[Optional[datetime], Optional[datetime]]:
+    """Return ``(event_date, scheduled_implementation_date)``.
+
+    GTA publishes interventions with an implementation date that may be in the
+    future — an announced measure taking effect next year.  Storing that
+    forward date as ``RiskEvent.event_date`` is wrong in a specific and costly
+    way: every evidence window in the scoring engine is a *trailing* window
+    (``event_date >= cutoff``, no upper bound), so a future-dated event
+    satisfies every window forever, and ``decay.py`` clamps negative ages to
+    the 1.20 multiplier ceiling — so it is weighted *more* heavily than an
+    event happening today, permanently.
+
+    The rule here is deliberately narrow:
+
+    - implementation date in the past → use it, nothing scheduled
+    - implementation date in the future, announcement in the past → date the
+      event to the announcement (the announcement *is* the thing that
+      happened) and preserve the forward date as metadata
+    - both in the future → return ``(None, scheduled)`` so the caller skips
+      the row; nothing has happened yet
+    - no implementation date → fall through to the announcement date
+
+    Preserving the forward date rather than discarding it matters: an
+    announced-but-not-yet-in-force export ban is real information, and the
+    triage surface should be able to show "takes effect 2029-01-01".
+    """
+    now = now or datetime.now(timezone.utc)
+    event_date = date_implemented or date_announced
+    if event_date is None:
+        return None, None
+    if event_date <= now:
+        return event_date, None
+    if date_announced is not None and date_announced <= now:
+        return date_announced, event_date
+    return None, event_date
+
+
 def _split_hs_codes(raw: str) -> list[str]:
     """Split a GTA HS codes cell into normalised 6-digit strings.
 
@@ -1527,14 +1655,26 @@ def parse_gta_csv(
             row.get(col["date_announced"]) if "date_announced" in col else ""
         ) or ""
 
-        event_date = _parse_date(date_implemented_str) or _parse_date(date_announced_str)
+        # 2026-07-30: future implementation dates are re-anchored to the
+        # announcement rather than stored forward — see _resolve_event_date.
+        event_date, scheduled_implementation = _resolve_event_date(
+            _parse_date(date_implemented_str),
+            _parse_date(date_announced_str),
+        )
         if event_date is None:
-            log.warning(
-                "gta.parse.bad_date",
-                gta_id=row.get(col["id"]),
-                date_implemented=date_implemented_str,
-                date_announced=date_announced_str,
-            )
+            if scheduled_implementation is not None:
+                log.info(
+                    "gta.parse.future_only",
+                    gta_id=row.get(col["id"]),
+                    scheduled=scheduled_implementation.isoformat(),
+                )
+            else:
+                log.warning(
+                    "gta.parse.bad_date",
+                    gta_id=row.get(col["id"]),
+                    date_implemented=date_implemented_str,
+                    date_announced=date_announced_str,
+                )
             continue
 
         if since_year is not None and event_date.year < since_year:
@@ -1628,6 +1768,7 @@ def parse_gta_csv(
                 "implementation_level":  implementation_level,
                 "is_horizontal":         is_horizontal,
                 "date_announced":        date_announced,
+                "scheduled_implementation_date": scheduled_implementation,
                 # 2026-05-12 attribution-classifier additions:
                 "mast_chapter":          mast_chapter,
                 "eligible_firm":         eligible_firm,
@@ -1705,17 +1846,147 @@ def _create_gta_source_document(
 
 
 # ---------------------------------------------------------------------------
+# Permalinks
+# ---------------------------------------------------------------------------
+#
+# Verified 2026-07-30: both patterns return HTTP 200 on the canonical host.
+# ``www.globaltradealert.org`` 301-redirects to the no-www host, so the no-www
+# form is stored to avoid a redirect hop on every click-through.
+
+_GTA_INTERVENTION_URL = "https://globaltradealert.org/intervention/{id}"
+_GTA_STATE_ACT_URL = "https://globaltradealert.org/state-act/{id}"
+
+
+def gta_permalink(
+    gta_id: Optional[int],
+    state_act_id: Optional[int] = None,
+) -> Optional[str]:
+    """Public GTA URL for an intervention, or ``None`` if neither id is usable.
+
+    The intervention page is preferred: it is the narrower record and matches
+    the granularity of a single ``RiskEvent``.  The state-act page is the
+    fallback for rows that carry only the parent act id.
+    """
+    if gta_id:
+        return _GTA_INTERVENTION_URL.format(id=int(gta_id))
+    if state_act_id:
+        return _GTA_STATE_ACT_URL.format(id=int(state_act_id))
+    return None
+
+
+def _get_or_create_intervention_document(
+    session: Session,
+    *,
+    source_id: int,
+    gta_id: int,
+    state_act_id: Optional[int],
+    title: str,
+    event_date: Optional[datetime],
+    run_document_id: int,
+    dry_run: bool = False,
+) -> Optional[int]:
+    """One ``SourceDocument`` per GTA intervention, carrying its permalink.
+
+    Before 2026-07-30 every GTA event pointed at a single per-run bulk-CSV
+    document whose ``url`` was NULL.  ``GET /materials/{id}/risk-events`` reads
+    ``SourceDocument.url`` and nothing else, so all 2,575 GTA events rendered
+    with no source link — the provenance existed in the database but was
+    invisible to anyone using the product.
+
+    Storing the permalink in ``metadata_json`` alone would not have fixed that
+    without an API change; a per-intervention document fixes it at the data
+    layer *and* gives each event a stable provenance row of its own.
+
+    Falls back to the per-run document when no permalink is derivable, so the
+    provenance chain is never broken — a missing link is preferable to a
+    dangling ``source_document_id``.
+
+    With ``dry_run=True`` this never writes: an existing document's id is
+    still returned (lookups are reads), but a document that *would* be created
+    returns ``None`` so the caller can count it without creating it.
+    """
+    permalink = gta_permalink(gta_id, state_act_id)
+    if permalink is None:
+        return run_document_id
+
+    external_id = (
+        f"gta_intervention_{int(gta_id)}" if gta_id
+        else f"gta_state_act_{int(state_act_id)}"
+    )
+    existing = session.scalar(
+        select(SourceDocument).where(
+            SourceDocument.source_id == source_id,
+            SourceDocument.external_id == external_id,
+        )
+    )
+    if existing is not None:
+        # Repair rows written before the permalink existed.
+        if not existing.url and not dry_run:
+            existing.url = permalink
+        return existing.id
+
+    if dry_run:
+        return None
+
+    doc = SourceDocument(
+        source_id=source_id,
+        external_id=external_id,
+        url=permalink,
+        title=title[:1024] if title else external_id,
+        document_type="trade_intervention",
+        published_at=event_date,
+        metadata_json={
+            "gta_id": gta_id or None,
+            "state_act_id": state_act_id,
+            "permalink": permalink,
+        },
+    )
+    session.add(doc)
+    session.flush()
+    return doc.id
+
+
+# ---------------------------------------------------------------------------
 # Idempotency
 # ---------------------------------------------------------------------------
 
 def _content_hash(title: str, summary: str, event_date: datetime) -> str:
-    """SHA-256 of ``f'{title}{summary}{event_date.isoformat()}'``.
+    """LEGACY SHA-256 of ``f'{title}{summary}{event_date.isoformat()}'``.
 
-    Per the prompt spec — no separator characters. The hash is the primary
-    deduplication key for ``risk_events``; GTA occasionally re-publishes the
-    same intervention with a new ``id`` so the row id alone is not enough.
+    Retained only so ``scripts/backfill_gta_quality.py`` can recognise rows
+    written before 2026-07-30 and re-key them.  Do not use for new inserts —
+    see ``_gta_identity_hash`` for why.
     """
     payload = f"{title}{summary}{event_date.isoformat()}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _gta_identity_hash(gta_id: int, title: str, event_date: datetime) -> str:
+    """Stable dedupe key for a GTA intervention.
+
+    The legacy key hashed the summary text, which made *summary length* part
+    of row identity.  Two consequences, both observed in production:
+
+    1.  Raising ``_SUMMARY_MAX`` changes the hash of every event, so a
+        re-ingest would have inserted 2,575 duplicates.  Only the unindexed
+        JSONB ``gta_id`` fallback in ``_existing_event_id`` prevented that,
+        and that fallback degrades to an O(N) Python scan on SQLite.
+    2.  GTA revises intervention descriptions in place.  Under the legacy key
+        a revised description reads as a brand-new event, so the same
+        intervention accumulates rows over time.
+
+    Keying on the GTA intervention id instead makes identity mean what it
+    should: one row per intervention, whose content can be updated in place.
+    ``risk_events.content_hash`` is ``String(64)`` and indexed but *not*
+    unique, so re-keying existing rows is safe.
+
+    Interventions with no usable id fall back to the old title+date shape
+    (minus the summary), which is at least stable under a cap change.
+    """
+    payload = (
+        f"gta:{gta_id}" if gta_id
+        else f"gta:noid:{title}{event_date.isoformat()}"
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -1758,6 +2029,81 @@ def _existing_event_id(
                 if meta.get("gta_id") == gta_id:
                     return ev.id
     return None
+
+
+def _refresh_existing_event(
+    session: Session,
+    *,
+    event_id: int,
+    summary: Optional[str],
+    content_hash: str,
+    source_document_id: Optional[int],
+    metadata_additions: Optional[dict] = None,
+    dry_run: bool = False,
+) -> list[str]:
+    """Repair source-derived fields on an already-stored GTA event.
+
+    Added 2026-07-30.  Until now the ingest loop *skipped* any event it
+    recognised, which meant a fix to the ingester could only ever improve
+    future rows — the 2,497 events already truncated at 500 characters would
+    have stayed truncated forever, because the full text is not recoverable
+    from the database (``SourceDocument.raw_text`` is never populated on this
+    path).  Re-ingesting is the only repair route, so the loop has to be able
+    to update.
+
+    **This function deliberately touches only fields derived from the source
+    feed.**  It never writes:
+
+      ``verified``, ``primary_category``, ``severity_score``,
+      ``confidence_score``, ``risk_categories_json``
+
+    nor any material / HS-code / geography link.  Those are either curated by
+    hand or produced by scoring logic, and an ingest pass must not silently
+    revert a human decision.  Summary is only replaced when the incoming text
+    is *longer* than what is stored, so a feed that regresses to a shorter
+    description cannot destroy content either.
+
+    Returns the list of field names actually changed (empty when the row was
+    already correct), so the caller can distinguish "refreshed" from
+    "skipped" and so ``--dry-run`` can report a precise blast radius.
+    """
+    ev = session.get(RiskEvent, event_id)
+    if ev is None:
+        return []
+
+    changed: list[str] = []
+
+    if summary and (ev.summary is None or len(summary) > len(ev.summary)):
+        if not dry_run:
+            ev.summary = summary
+        changed.append("summary")
+
+    if content_hash and ev.content_hash != content_hash:
+        if not dry_run:
+            ev.content_hash = content_hash
+        changed.append("content_hash")
+
+    if source_document_id is not None and ev.source_document_id != source_document_id:
+        if not dry_run:
+            ev.source_document_id = source_document_id
+        changed.append("source_document_id")
+
+    if metadata_additions:
+        current = dict(ev.metadata_json or {})
+        merged = {**current}
+        for key, value in metadata_additions.items():
+            if value is None:
+                continue
+            if current.get(key) != value:
+                merged[key] = value
+        if merged != current:
+            if not dry_run:
+                # Reassign rather than mutate — SQLAlchemy does not track
+                # in-place mutation of a plain JSONB dict.
+                ev.metadata_json = merged
+            changed.append("metadata_json")
+
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -1967,6 +2313,8 @@ def ingest_gta(
     use_api: bool = False,
     api_since_date: Optional[date] = None,
     api_until_date: Optional[date] = None,
+    dry_run: bool = False,
+    api_raw_cache: Optional[str] = None,
 ) -> dict[str, int]:
     """Download (or read locally), parse, and ingest GTA harmful interventions.
 
@@ -1988,17 +2336,33 @@ def ingest_gta(
             "Harmful Trade Policy Interventions: Batteries") where GTA has
             already applied product-level filtering. The full bulk State Acts
             export should always use the default ``False``.
+        dry_run: When ``True``, parse and classify normally but write nothing:
+            the run reports what *would* be inserted and which existing rows
+            *would* be refreshed (with per-field counts), then rolls back.
+            Added 2026-07-30 so the blast radius of a repair re-ingest can be
+            inspected before it touches the database.
+        api_raw_cache: Optional path for caching the raw API payload (API mode
+            only).  If the file exists, it is read INSTEAD of calling the API
+            — no key needed, no metered records consumed.  If it does not
+            exist, the API is fetched normally and the payload is written
+            there on success.  Added 2026-07-31 because GTA meters by records
+            pulled per month: without this, a dry-run + real-run sequence
+            pulls everything twice, and a run that dies mid-parse throws away
+            everything it pulled.  Delete the file to force a fresh pull.
 
     Returns:
         dict with these keys::
 
             downloaded_rows         rows kept after Red + HS filters
-            inserted                new RiskEvent rows created
-            skipped_existing        rows skipped due to content_hash / gta_id match
+            inserted                new RiskEvent rows created (or would-be, in dry-run)
+            refreshed_existing      existing rows repaired in place (2026-07-30)
+            refresh_field_counts    dict of field name → rows changed (2026-07-30)
+            skipped_existing        recognised rows needing no repair
             material_links          RiskEventMaterial rows created
             hs_mapping_links        RiskEventHsMapping rows created (stage attribution)
             geography_links         RiskEventGeography rows created
             skipped_unknown_country events inserted but with no resolvable country
+            dry_run                 1 when the run was a dry run, else 0
     """
     # Derive HS prefix filter from the DB (or fall back to hardcoded list).
     effective_prefixes = list(hs_prefixes) if hs_prefixes else _derive_hs_prefixes_from_db(session)
@@ -2014,38 +2378,63 @@ def ingest_gta(
     # CSV path is retained for the --local-file flow (offline testing) and
     # for environments without an API key.
     if use_api:
-        from app.core.config import get_settings
-        api_key = get_settings().gta_api_key
-        if not api_key:
-            raise ValueError(
-                "ingest_gta(use_api=True) but settings.gta_api_key is empty. "
-                "Set GTA_API_KEY in the env or .env file."
+        import json as _json
+        import pathlib as _pathlib
+
+        raw_rows: Optional[list] = None
+        cache_path = _pathlib.Path(api_raw_cache) if api_raw_cache else None
+        if cache_path is not None and cache_path.exists():
+            # Cache hit — no API call, no key needed, no metered records.
+            raw_rows = _json.loads(cache_path.read_text())
+            log.info(
+                "gta.ingest.api_raw_cache_hit",
+                path=str(cache_path),
+                rows=len(raw_rows),
             )
-        # Convert since_year to a date floor for the API call when no
-        # explicit api_since_date is given.
-        effective_since = api_since_date or (
-            date(since_year, 1, 1) if since_year is not None else None
-        )
-        # F-GTA-API-1 (2026-06-11): the API matches affected_products against
-        # full 6-digit HS codes, not 4-digit prefixes.  effective_prefixes
-        # is 4-digit (correct for client-side prefix matching downstream),
-        # so derive a separate 6-digit list for the server-side filter.
-        api_hs_codes = (
-            [] if skip_hs_filter else _derive_hs_codes_for_api_from_db(session)
-        )
-        log.info(
-            "gta.ingest.mode_api",
-            since=effective_since.isoformat() if effective_since else None,
-            until=api_until_date.isoformat() if api_until_date else None,
-            client_side_prefix_count=len(effective_prefixes),
-            server_side_hs_code_count=len(api_hs_codes),
-        )
-        raw_rows = fetch_gta_interventions_api(
-            api_key=api_key,
-            hs_prefixes=api_hs_codes,
-            since_date=effective_since,
-            until_date=api_until_date,
-        )
+
+        if raw_rows is None:
+            from app.core.config import get_settings
+            api_key = get_settings().gta_api_key
+            if not api_key:
+                raise ValueError(
+                    "ingest_gta(use_api=True) but settings.gta_api_key is empty. "
+                    "Set GTA_API_KEY in the env or .env file."
+                )
+            # Convert since_year to a date floor for the API call when no
+            # explicit api_since_date is given.
+            effective_since = api_since_date or (
+                date(since_year, 1, 1) if since_year is not None else None
+            )
+            # F-GTA-API-1 (2026-06-11): the API matches affected_products against
+            # full 6-digit HS codes, not 4-digit prefixes.  effective_prefixes
+            # is 4-digit (correct for client-side prefix matching downstream),
+            # so derive a separate 6-digit list for the server-side filter.
+            api_hs_codes = (
+                [] if skip_hs_filter else _derive_hs_codes_for_api_from_db(session)
+            )
+            log.info(
+                "gta.ingest.mode_api",
+                since=effective_since.isoformat() if effective_since else None,
+                until=api_until_date.isoformat() if api_until_date else None,
+                client_side_prefix_count=len(effective_prefixes),
+                server_side_hs_code_count=len(api_hs_codes),
+            )
+            raw_rows = fetch_gta_interventions_api(
+                api_key=api_key,
+                hs_prefixes=api_hs_codes,
+                since_date=effective_since,
+                until_date=api_until_date,
+            )
+            if cache_path is not None:
+                # Written only after a fully successful fetch, so a partial
+                # pull can never masquerade as a complete cache.
+                cache_path.write_text(_json.dumps(raw_rows))
+                log.info(
+                    "gta.ingest.api_raw_cache_written",
+                    path=str(cache_path),
+                    rows=len(raw_rows),
+                )
+
         interventions = parse_gta_api_response(
             raw_rows,
             hs_prefixes=effective_prefixes,
@@ -2079,13 +2468,19 @@ def ingest_gta(
 
     source_id = _get_or_create_gta_source(session)
     today = date.today()
-    source_document_id = _create_gta_source_document(
+    # Renamed from ``source_document_id`` 2026-07-30: this is the *per-run*
+    # bulk document.  Events now point at per-intervention documents carrying
+    # their permalink (see _get_or_create_intervention_document); the run
+    # document remains as the fallback for rows with no derivable permalink.
+    run_document_id = _create_gta_source_document(
         session, source_id, len(interventions), today
     )
 
     hs_material_map = _build_hs_material_map(session)
 
     inserted = 0
+    refreshed_existing = 0                    # added 2026-07-30
+    refresh_field_counts: dict[str, int] = {}  # added 2026-07-30
     skipped_existing = 0
     skipped_unknown_country = 0
     skipped_no_resolved_material = 0   # added 2026-05-06 (Scope 2)
@@ -2138,16 +2533,85 @@ def ingest_gta(
         )
         confidence_override = intervention.get("confidence_override")
         latest_action_date = intervention.get("latest_action_date")
+        scheduled_implementation = intervention.get("scheduled_implementation_date")
         # If the API recorded a more-recent action date, prefer it for
         # recency-decay purposes — captures status changes (revocation,
         # scope expansion) that occurred after the original implementation.
+        #
+        # 2026-07-30: bounded above by "now".  latest_action_date can itself be
+        # forward-dated, and pushing event_date into the future re-introduces
+        # exactly the defect _resolve_event_date exists to prevent.
         if latest_action_date and isinstance(event_date, datetime):
-            if latest_action_date > event_date:
+            if event_date < latest_action_date <= datetime.now(timezone.utc):
                 event_date = latest_action_date
 
-        ch = _content_hash(title, summary, event_date)
-        if _existing_event_id(session, content_hash=ch, gta_id=gta_id) is not None:
-            skipped_existing += 1
+        # GTA's parent "state act" id, when the row carries one.  Used only as
+        # a permalink fallback for rows with no intervention id.
+        state_act_id: Optional[int] = None
+        _raw_row = intervention.get("raw_row") or {}
+        for _key in ("state_act_id", "state_act", "act_id"):
+            _val = _raw_row.get(_key)
+            if _val:
+                try:
+                    state_act_id = int(str(_val).strip())
+                    break
+                except (TypeError, ValueError):
+                    continue
+
+        # 2026-07-30: identity is the GTA intervention id, not a hash of the
+        # summary text — see _gta_identity_hash.
+        ch = _gta_identity_hash(gta_id, title, event_date)
+        existing_id = _existing_event_id(session, content_hash=ch, gta_id=gta_id)
+        if existing_id is not None:
+            # Previously this was a blind ``continue``.  Now the row is
+            # repaired in place: truncated summaries are replaced with the
+            # full text, the legacy content_hash is re-keyed, and the event is
+            # re-pointed at its own permalink document.  Curated and scored
+            # fields are never touched — see _refresh_existing_event.
+            permalink = gta_permalink(gta_id, state_act_id)
+            permalink_doc_id = _get_or_create_intervention_document(
+                session,
+                source_id=source_id,
+                gta_id=gta_id,
+                state_act_id=state_act_id,
+                title=title,
+                event_date=event_date,
+                run_document_id=run_document_id,
+                dry_run=dry_run,
+            )
+            changed = _refresh_existing_event(
+                session,
+                event_id=existing_id,
+                summary=summary,
+                content_hash=ch,
+                source_document_id=permalink_doc_id,
+                metadata_additions={
+                    "permalink": permalink,
+                    "source_url": permalink,
+                    "state_act_id": state_act_id,
+                    "scheduled_implementation_date": (
+                        scheduled_implementation.isoformat()
+                        if isinstance(scheduled_implementation, datetime)
+                        else None
+                    ),
+                },
+                dry_run=dry_run,
+            )
+            if dry_run and permalink_doc_id is None and permalink:
+                # The intervention document does not exist yet, so a real run
+                # would create it and repoint the event at it.  Counted here
+                # because _refresh_existing_event cannot see a doc id that was
+                # deliberately not created.
+                if "source_document_id" not in changed:
+                    changed = [*changed, "source_document_id"]
+            if changed:
+                refreshed_existing += 1
+                for _field in changed:
+                    refresh_field_counts[_field] = (
+                        refresh_field_counts.get(_field, 0) + 1
+                    )
+            else:
+                skipped_existing += 1
             continue
 
         # ── Strict attribution gates (Scope 2 audit, 2026-05-06) ───────────
@@ -2214,7 +2678,15 @@ def ingest_gta(
             "gta_hs_codes": matched_hs_codes,
             "raw_intervention_type": intervention["intervention_type"],
             "in_force": in_force,
-            "source_url": url,
+            # 2026-07-30: source_url used to record the bulk download URL —
+            # the same value on every event of a run, and one that has since
+            # gone 404 in production metadata.  It now records the event's own
+            # permalink when one is derivable, with the bulk URL preserved
+            # separately.  Metadata should not claim a source it cannot show.
+            "source_url": gta_permalink(gta_id, state_act_id) or url,
+            "permalink": gta_permalink(gta_id, state_act_id),
+            "bulk_source_url": url,
+            "state_act_id": state_act_id,
             "implementation_level": implementation_level,
             "is_horizontal": is_horizontal,
             # 2026-05-12 structural fields — captured even when None so
@@ -2236,6 +2708,15 @@ def ingest_gta(
             # Used by market_aggregator's policy_proximity_adjustment when
             # date_announced is within 90 days of as_of_date.
             metadata["effective_date"] = date_announced.date().isoformat()
+        if isinstance(scheduled_implementation, datetime):
+            # 2026-07-30: the forward-looking implementation date preserved by
+            # _resolve_event_date.  The event itself is dated to its
+            # announcement; this records when the measure actually takes
+            # effect, so the triage/content surfaces can show it.
+            metadata["scheduled_implementation_date"] = (
+                scheduled_implementation.isoformat()
+            )
+            metadata["in_force_status"] = "announced_not_yet_in_force"
         if affected_iso2_list:
             metadata["affected_iso2_list"] = affected_iso2_list
 
@@ -2304,8 +2785,51 @@ def ingest_gta(
         if write_affected_rows:
             geography_json["affected"] = affected_iso2_list
 
+        # ── Suggestion fields (2026-07-31, triage plan Phase 1) ────────────
+        # The category/direction the machine derived are SUGGESTIONS —
+        # primary_category stays NULL until a human confirms in triage, so
+        # this event cannot enter a scoring pool (pillar queries filter on
+        # primary_category, migration 062).
+        direction = _direction_for(event_subtype)
+        # Audit F6: unknown intervention types fall back to
+        # DEFAULT_GTA_CATEGORY silently — mark them so the triage UI can
+        # sort uncertain rows first.
+        metadata["category_mapping"] = (
+            "explicit" if intervention_type in GTA_INTERVENTION_CATEGORY_MAP
+            else "fallback"
+        )
+        metadata["n_materials"] = len({m for m, _, _ in resolved_codes})
+        # Audit F1 (decided 2026-07-31, Nicole): supportive events —
+        # subsidies that mostly ADD supply — land as display_only rather
+        # than queueing for scoring triage.  Still visible, still reviewable,
+        # promotable to scoring in the UI; just not narrated as risk by
+        # default.  Recorded in metadata so the routing is auditable.
+        if direction == "supportive":
+            triage_status = "display_only"
+            metadata["triage_route"] = "auto_display_only_supportive"
+        else:
+            triage_status = "pending_triage"
+
+        if dry_run:
+            # All gates passed — this row would insert.  Counted and skipped
+            # before any write so the dry run leaves no trace.
+            inserted += 1
+            continue
+
+        # 2026-07-30: events point at their own per-intervention document
+        # (carrying the permalink), not the per-run bulk document.
+        intervention_doc_id = _get_or_create_intervention_document(
+            session,
+            source_id=source_id,
+            gta_id=gta_id,
+            state_act_id=state_act_id,
+            title=title,
+            event_date=event_date,
+            run_document_id=run_document_id,
+        )
+
         event = RiskEvent(
-            source_document_id=source_document_id,
+            source_document_id=intervention_doc_id,
             event_type=intervention_type or "trade_intervention",
             event_subtype=event_subtype,  # typed col (migration 040); None when no subtype maps
             event_date=event_date,
@@ -2318,6 +2842,12 @@ def ingest_gta(
             # default preserved.
             confidence_score=(confidence_override if confidence_override is not None else 0.9),
             risk_categories_json=[risk_category],
+            # Inverted 2026-07-31 (triage plan Phase 1): the machine
+            # suggests, a human assigns.  primary_category deliberately
+            # NOT set — see the suggestion block above.
+            suggested_category=risk_category,
+            direction=direction,
+            triage_status=triage_status,
             geography_json=geography_json,
             content_hash=ch,
             metadata_json=metadata,
@@ -2411,6 +2941,9 @@ def ingest_gta(
                     relevance_score=relevance * _breadth,
                     is_direct=_is_direct,
                     match_reason="hs_code",
+                    # 2026-07-31 (triage plan Phase 1): machine-written
+                    # links are suggestions until confirmed in triage.
+                    status="suggested",
                 )
             )
             material_links_created += 1
@@ -2433,15 +2966,27 @@ def ingest_gta(
             log.info(
                 "gta.ingest.batch_progress",
                 inserted_so_far=inserted,
+                refreshed_so_far=refreshed_existing,
                 skipped_so_far=skipped_existing,
             )
             pending_in_batch = 0
 
-    session.commit()
+    if dry_run:
+        # The parse/classify pass may still have created the Source and the
+        # per-run document via flush — roll everything back so a dry run
+        # leaves the database exactly as it found it.
+        session.rollback()
+        log.info("gta.ingest.dry_run_rolled_back")
+    else:
+        session.commit()
 
     result = {
         "downloaded_rows": len(interventions),
         "inserted": inserted,
+        # Added 2026-07-30 (repair re-ingest):
+        "refreshed_existing": refreshed_existing,
+        "refresh_field_counts": refresh_field_counts,
+        "dry_run": 1 if dry_run else 0,
         "skipped_existing": skipped_existing,
         "material_links": material_links_created,
         "hs_mapping_links": hs_mapping_links_created,

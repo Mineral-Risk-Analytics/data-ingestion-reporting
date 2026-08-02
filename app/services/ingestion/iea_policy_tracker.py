@@ -89,6 +89,9 @@ log = structlog.get_logger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
+# Sanity bound on stored summaries.  Not a display bound — see the call site.
+_SUMMARY_MAX = 8000
+
 _SOURCE_NAME = "IEA Critical Minerals Policy Tracker"
 _SOURCE_TYPE = "iea_policy_tracker"
 _SOURCE_PHASE = "1"
@@ -193,16 +196,62 @@ def _has_battery_relevance(rec: dict[str, Any]) -> bool:
             return True
     return False
 
-# Policy family/name keywords → risk category
+# Policy family/name keywords → risk category.
+#
+# Rewritten 2026-07-31 (cross-source harmonisation sweep, decided with
+# Nicole — see docs/design/iea_categorization_audit.md §3 F2/F3 and the
+# triage plan).  Three decisions:
+#
+#   1. Subsidy/financing family → financial_pressure, matching GTA's
+#      convention (was geopolitical_trade here — the same Canadian tax
+#      credit got different pillars depending on which source captured it).
+#   2. Neutral machinery (strategic plans/lists, stockpiling, surveys) →
+#      regulatory_compliance.  The old bare-"strategic" keyword dragged
+#      every "…; Strategic plans" combo into geopolitical_trade.
+#   3. International arrangements → geopolitical_trade (was silent
+#      fallback; 82 events — the second-largest block in the corpus).
+#
+# Also fixed outright: export/import controls and tariffs had NO keyword at
+# all, so the most risk-relevant events in the corpus (DRC cobalt
+# suspension, China antimony/REE controls, Tanzania lithium ban) fell
+# through to the default and suggested regulatory_compliance while GTA maps
+# the identical measures to geopolitical_trade.
+#
+# ORDER MATTERS: first match wins, and dicts preserve insertion order.
+# Trade measures are checked first so "Export controls; Financing" reads as
+# a trade measure, not a subsidy.  "foreign direct investment" precedes
+# "investment" so FDI policy keeps GTA's geopolitical convention.
 _CATEGORY_MAP: dict[str, str] = {
-    "investment":            "geopolitical_trade",
-    "financing":             "geopolitical_trade",
-    "innovation funds":      "geopolitical_trade",
-    "subsid":                "geopolitical_trade",
-    "tax credit":            "geopolitical_trade",
+    # ── Trade measures → geopolitical_trade (harmonised with GTA) ────────
+    "export control":        "geopolitical_trade",
+    "export restriction":    "geopolitical_trade",
+    "export ban":            "geopolitical_trade",
+    "export and import ban": "geopolitical_trade",
+    "import control":        "geopolitical_trade",
+    "import restriction":    "geopolitical_trade",
+    "import ban":            "geopolitical_trade",
+    "tariff":                "geopolitical_trade",   # catches "non-tariff" too
     "trade":                 "geopolitical_trade",
-    "procurement":           "geopolitical_trade",
-    "strategic":             "geopolitical_trade",
+    "international arrangement": "geopolitical_trade",
+    "foreign direct investment": "geopolitical_trade",  # FDI family, GTA convention
+    # ── Subsidy / state-aid family → financial_pressure (GTA convention) ─
+    "investment":            "financial_pressure",
+    "financing":             "financial_pressure",
+    "innovation fund":       "financial_pressure",
+    "subsid":                "financial_pressure",
+    "tax credit":            "financial_pressure",
+    "tax incentive":         "financial_pressure",
+    "grant":                 "financial_pressure",
+    "loan":                  "financial_pressure",
+    # ── Policy machinery & compliance → regulatory_compliance ────────────
+    "procurement":           "regulatory_compliance",  # GTA convention (localisation family)
+    "strategic":             "regulatory_compliance",  # plans + mineral lists
+    "stockpiling":           "regulatory_compliance",
+    "geological survey":     "regulatory_compliance",
+    "permitting":            "regulatory_compliance",
+    "due diligence":         "regulatory_compliance",
+    "traceability":          "regulatory_compliance",
+    "transparency":          "regulatory_compliance",
     "recycling":             "regulatory_compliance",
     "standard":              "regulatory_compliance",
     "reporting":             "regulatory_compliance",
@@ -649,6 +698,12 @@ def parse_policy_tracker_file(
 _RESTRICTIVE_POLICY_KEYWORDS: tuple[str, ...] = (
     "export control", "export restriction", "export ban", "export tax",
     "export licens", "export quota", "import ban", "import restriction",
+    # 2026-07-31 (harmonisation sweep): import-side controls and tariffs
+    # were not caught — "Import controls and restrictions; Minerals
+    # Recycling" derived SUPPORTIVE (via the recycling keyword) and
+    # "Tariffs and duties" derived neutral.  "tariff" also catches
+    # "non-tariff" measures, which lean restrictive.
+    "import control", "import licens", "import quota", "tariff",
 )
 _SUPPORTIVE_POLICY_KEYWORDS: tuple[str, ...] = (
     "invest", "financ", "fund", "grant", "subsid", "tax credit",
@@ -713,6 +768,17 @@ def _derive_category(policy_type_names: list[str]) -> str:
         if kw in combined:
             return cat
     return _DEFAULT_CATEGORY
+
+
+def _category_is_fallback(policy_type_names: list[str]) -> bool:
+    """True when _derive_category matched NO keyword and fell back to the
+    default.  Cannot be inferred from the returned value — several keywords
+    map to the same category as the default — so it is derived here and
+    recorded as ``metadata_json["category_mapping"]`` (triage plan Phase 1,
+    GTA audit F6: silent defaults become low-confidence suggestions the UI
+    can sort first)."""
+    combined = " ".join(policy_type_names).lower()
+    return not any(kw in combined for kw in _CATEGORY_MAP)
 
 
 def _derive_severity(status: str) -> float:
@@ -1007,7 +1073,25 @@ def ingest_policy_tracker(
             # Title: first country ISO2 + policy title, truncated
             country_label = rec["iso2_codes"][0] if rec["iso2_codes"] else rec["jurisdiction"] or "INTL"
             title = f"{country_label} — {rec['title']}"[:1024]
-            summary = rec["description"][:500] if rec["description"] else None
+            # 2026-07-30: cap raised 500 → 8000.  407 of 434 stored IEA events
+            # were sliced mid-sentence by the old bound; ``risk_events.summary``
+            # is TEXT, so nothing at the storage layer required it.  Truncation
+            # for display belongs in the presentation layer.  8000 is a sanity
+            # bound, not a design target.
+            summary = rec["description"][:_SUMMARY_MAX] if rec["description"] else None
+
+            # ── Suggestion fields (2026-07-31, triage plan Phase 1) ────────
+            # Same inversion as the GTA ingester: category and direction are
+            # SUGGESTIONS — primary_category stays NULL until a human
+            # confirms in triage, so this event cannot enter a scoring pool.
+            # Direction was already derived here (2026-07-13 taxonomy); it
+            # now also routes: supportive policies land display_only per the
+            # F1 decision (Nicole, 2026-07-31) instead of queueing as risk.
+            _n_materials_pre = len({c[0] for c in refined_candidates})
+            if direction == "supportive":
+                triage_status = "display_only"
+            else:
+                triage_status = "pending_triage"
 
             event = RiskEvent(
                 source_document_id=source_document_id,
@@ -1026,6 +1110,12 @@ def ingest_policy_tracker(
                 severity_score=severity,
                 confidence_score=0.65,
                 risk_categories_json=[category],
+                # Inverted 2026-07-31 (triage plan Phase 1): the machine
+                # suggests, a human assigns.  primary_category deliberately
+                # NOT set — see the suggestion block above.
+                suggested_category=category,
+                direction=direction,
+                triage_status=triage_status,
                 geography_json={
                     "primary": rec["iso2_codes"][0] if rec["iso2_codes"] else None,
                     "all_countries": rec["iso2_codes"],
@@ -1044,6 +1134,18 @@ def ingest_policy_tracker(
                     # every event, mislabelling export controls as positive.
                     "positive_policy": direction == "supportive",
                     "policy_direction": direction,
+                    # 2026-07-31 triage-plan Phase 1 markers (GTA audit
+                    # F3/F6 equivalents): mapping provenance + fan-out size
+                    # for the triage UI.
+                    "category_mapping": (
+                        "fallback" if _category_is_fallback(policy_type_names)
+                        else "explicit"
+                    ),
+                    "n_materials": _n_materials_pre,
+                    "triage_route": (
+                        "auto_display_only_supportive"
+                        if direction == "supportive" else None
+                    ),
                     # 2026-05-12: events with no confident material
                     # attribution are preserved with these flags so an
                     # analyst can triage them later in a dedicated review
@@ -1107,6 +1209,9 @@ def ingest_policy_tracker(
                     relevance_score=relevance * _breadth,
                     is_direct=_is_direct,
                     match_reason=matched_kw[:64],
+                    # 2026-07-31 (triage plan Phase 1): machine-written
+                    # links are suggestions until confirmed in triage.
+                    status="suggested",
                 ))
                 material_links += 1
 

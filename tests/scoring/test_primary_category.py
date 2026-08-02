@@ -64,7 +64,13 @@ class TestDerivePrimaryCategory:
 
 
 # ---------------------------------------------------------------------------
-# 2. before_insert autofill listener
+# 2. before_insert listener — INVERTED 2026-07-31 (triage plan Phase 1)
+#
+# The listener no longer writes primary_category (an authoritative scoring
+# assignment); the derived category goes to suggested_category, and
+# primary_category stays NULL until a human confirms it in triage.  Because
+# pillar queries filter on primary_category (migration 062), an untriaged
+# event structurally cannot score.
 # ---------------------------------------------------------------------------
 
 def _make_event(**overrides) -> RiskEvent:
@@ -78,26 +84,29 @@ def _make_event(**overrides) -> RiskEvent:
     return RiskEvent(**kwargs)
 
 
-class TestAutofillListener:
-    def test_single_tag_autofill(self, sqlite_session):
+class TestSuggestionListener:
+    def test_single_tag_becomes_suggestion_not_assignment(self, sqlite_session):
         ev = _make_event(risk_categories_json=["operational"])
         sqlite_session.add(ev)
         sqlite_session.commit()
-        assert ev.primary_category == "operational"
+        assert ev.primary_category is None          # the human hasn't spoken
+        assert ev.suggested_category == "operational"
 
-    def test_multi_tag_uses_precedence(self, sqlite_session):
+    def test_multi_tag_suggestion_uses_precedence(self, sqlite_session):
         ev = _make_event(
             risk_categories_json=["regulatory_compliance", "geopolitical_trade"],
         )
         sqlite_session.add(ev)
         sqlite_session.commit()
-        assert ev.primary_category == "geopolitical_trade"
+        assert ev.primary_category is None
+        assert ev.suggested_category == "geopolitical_trade"
 
-    def test_no_tags_stays_null(self, sqlite_session):
+    def test_no_tags_suggests_nothing(self, sqlite_session):
         ev = _make_event(risk_categories_json=[])
         sqlite_session.add(ev)
         sqlite_session.commit()
         assert ev.primary_category is None
+        assert ev.suggested_category is None
 
     def test_sec_filing_signal_skipped(self, sqlite_session):
         # SEC events are quarantined display-only pending link triage.
@@ -108,6 +117,7 @@ class TestAutofillListener:
         sqlite_session.add(ev)
         sqlite_session.commit()
         assert ev.primary_category is None
+        assert ev.suggested_category is None
 
     def test_metadata_display_only_skipped(self, sqlite_session):
         # Derived trade-signal stats set metadata scoring=display_only.
@@ -119,9 +129,13 @@ class TestAutofillListener:
         sqlite_session.add(ev)
         sqlite_session.commit()
         assert ev.primary_category is None
+        assert ev.suggested_category is None
 
-    def test_explicit_value_respected(self, sqlite_session):
-        # Curation may deliberately override precedence.
+    def test_explicit_primary_respected_and_not_second_guessed(
+        self, sqlite_session
+    ):
+        # Curated paths (manual loader, triage confirm) set primary_category
+        # deliberately — the listener must not overwrite or shadow it.
         ev = _make_event(
             risk_categories_json=["geopolitical_trade", "regulatory_compliance"],
             primary_category="regulatory_compliance",
@@ -129,6 +143,27 @@ class TestAutofillListener:
         sqlite_session.add(ev)
         sqlite_session.commit()
         assert ev.primary_category == "regulatory_compliance"
+        assert ev.suggested_category is None
+
+    def test_ingester_provided_suggestion_not_overwritten(self, sqlite_session):
+        # GTA writes suggested_category itself (with direction context);
+        # the listener must leave it alone.
+        ev = _make_event(
+            risk_categories_json=["geopolitical_trade"],
+            suggested_category="financial_pressure",
+        )
+        sqlite_session.add(ev)
+        sqlite_session.commit()
+        assert ev.primary_category is None
+        assert ev.suggested_category == "financial_pressure"
+
+    def test_default_triage_status_is_pending(self, sqlite_session):
+        ev = _make_event()
+        sqlite_session.add(ev)
+        sqlite_session.commit()
+        # server_default applies on insert when the attribute isn't set.
+        sqlite_session.refresh(ev)
+        assert ev.triage_status == "pending_triage"
 
 
 # ---------------------------------------------------------------------------
@@ -141,10 +176,14 @@ class TestEvidenceQueryDoubleCount:
         sqlite_session.add(m)
         sqlite_session.flush()
 
+        # Post-inversion (2026-07-31): a scoring event is one a human (or a
+        # curated path) confirmed — set primary_category explicitly, exactly
+        # as the triage flow will.
         ev = _make_event(
             title="Sanctions on refiner",
             risk_categories_json=["geopolitical_trade", "regulatory_compliance"],
             severity_score=0.8,
+            primary_category="geopolitical_trade",
         )
         sqlite_session.add(ev)
         sqlite_session.flush()

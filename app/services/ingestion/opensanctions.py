@@ -91,6 +91,8 @@ from app.models.regulatory import (
     RiskEventGeography,
     RiskEventMaterial,
 )
+from app.models.documents import SourceDocument
+from app.models.source import Source
 from app.models.supply import MaterialProductionShare
 from app.services.ingestion import feature_flags
 
@@ -519,9 +521,22 @@ def _attribute_company_event_to_materials(
         .group_by(CompanyMaterialExposure.material_id)
     ).all()
 
+    # 2026-07-31: links surviving the suggested-only refresh (human-confirmed
+    # or rejected in triage) must not be re-inserted — the unique
+    # (risk_event_id, material_id) constraint would fire, and curation wins.
+    _existing_material_ids = set(
+        session.scalars(
+            select(RiskEventMaterial.material_id).where(
+                RiskEventMaterial.risk_event_id == risk_event_id
+            )
+        )
+    )
+
     inserted = 0
     for material_id, score in rows:
         if score is None or float(score) <= 0:
+            continue
+        if material_id in _existing_material_ids:
             continue
         session.add(
             RiskEventMaterial(
@@ -529,6 +544,9 @@ def _attribute_company_event_to_materials(
                 material_id=material_id,
                 relevance_score=float(score),
                 match_reason="company_material_exposure",
+                # 2026-07-31 (triage plan Phase 1): machine-written links
+                # are suggestions until confirmed in triage.
+                status="suggested",
             )
         )
         inserted += 1
@@ -587,8 +605,19 @@ def _attribute_geo_event_to_materials(
     ).all()
 
     inserted = 0
+    # 2026-07-31: same curation guard as the company helper — do not
+    # re-insert materials whose links survived the suggested-only refresh.
+    _existing_material_ids = set(
+        session.scalars(
+            select(RiskEventMaterial.material_id).where(
+                RiskEventMaterial.risk_event_id == risk_event_id
+            )
+        )
+    )
     for material_id, prod_share in rows:
         if prod_share is None:
+            continue
+        if material_id in _existing_material_ids:
             continue
         session.add(
             RiskEventMaterial(
@@ -596,6 +625,8 @@ def _attribute_geo_event_to_materials(
                 material_id=material_id,
                 relevance_score=float(prod_share),
                 match_reason="country_production_concentration",
+                # 2026-07-31 (triage plan Phase 1): suggestion until confirmed.
+                status="suggested",
             )
         )
         inserted += 1
@@ -622,6 +653,72 @@ def _attribute_geo_event_to_materials(
 # in place (title / severity / summary / metadata refreshed, material +
 # geography junctions deleted and re-inserted; company junctions left
 # alone per the partial-rewrite audit decision).
+
+# ---------------------------------------------------------------------------
+# Provenance (2026-07-31, triage plan Phase 1)
+# ---------------------------------------------------------------------------
+# Until now this ingester created NO Source and NO SourceDocument — its
+# events were the only ones in the corpus with source_document_id NULL and
+# therefore no provenance chain at all: no source label, no URL, nothing
+# for the events API to render.  One document per dataset snapshot date
+# fixes that; the upsert path also repairs existing NULL rows on the next
+# run, so the historical 18 events regain provenance without a backfill.
+
+_SOURCE_NAME = "OpenSanctions"
+_OPENSANCTIONS_SITE_URL = "https://www.opensanctions.org/datasets/sanctions/"
+
+
+def _get_or_create_opensanctions_source(session: Session) -> int:
+    existing = session.scalar(select(Source).where(Source.name == _SOURCE_NAME))
+    if existing is not None:
+        return existing.id
+    source = Source(
+        name=_SOURCE_NAME,
+        source_type="opensanctions",
+        phase="1",
+        is_active=True,
+        config_json={"csv_url": OPENSANCTIONS_CSV_URL},
+    )
+    session.add(source)
+    session.flush()
+    log.info("opensanctions.source_created", source_id=source.id)
+    return source.id
+
+
+def _get_or_create_snapshot_document(
+    session: Session,
+    source_id: int,
+    snapshot_date,
+    entity_count: int,
+) -> int:
+    """One ``SourceDocument`` per snapshot date.  ``url`` points at the
+    human-readable dataset page (the raw CSV URL is in metadata) so the
+    events API renders a link a person can actually use."""
+    external_id = f"opensanctions_snapshot_{snapshot_date.isoformat()}"
+    existing = session.scalar(
+        select(SourceDocument).where(
+            SourceDocument.source_id == source_id,
+            SourceDocument.external_id == external_id,
+        )
+    )
+    if existing is not None:
+        return existing.id
+    doc = SourceDocument(
+        source_id=source_id,
+        external_id=external_id,
+        title=f"OpenSanctions consolidated sanctions snapshot {snapshot_date.isoformat()}",
+        url=_OPENSANCTIONS_SITE_URL,
+        document_type="sanctions_dataset",
+        metadata_json={
+            "snapshot_date": snapshot_date.isoformat(),
+            "csv_url": OPENSANCTIONS_CSV_URL,
+            "entity_count": entity_count,
+        },
+    )
+    session.add(doc)
+    session.flush()
+    return doc.id
+
 
 def _company_event_stable_key(company_id: str) -> str:
     """Stable identifier for an OpenSanctions company-match event."""
@@ -740,6 +837,17 @@ def ingest_opensanctions(
     buf = download_sanctions_csv(url)
     entities = parse_sanctions_csv(buf)
 
+    # Provenance (2026-07-31): one Source + one SourceDocument per snapshot.
+    # The "latest" CSV carries no version stamp, so the run date is the
+    # snapshot date.  snapshot_dt also anchors event dates — see below.
+    snapshot_dt = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    source_id = _get_or_create_opensanctions_source(session)
+    snapshot_doc_id = _get_or_create_snapshot_document(
+        session, source_id, snapshot_dt.date(), len(entities)
+    )
+
     company_events_inserted = 0
     company_events_updated = 0
     geography_events_inserted = 0
@@ -753,7 +861,14 @@ def ingest_opensanctions(
 
     for company, matched_entities in matches:
         datasets = sorted({ds for e in matched_entities for ds in e["datasets"]})
-        event_date = datetime.now(timezone.utc)
+        # 2026-07-31: was datetime.now() refreshed on every run — the events
+        # never aged, so recency decay treated a years-old listing as
+        # brand-new forever (the future-dated-events defect in another
+        # costume).  Anchor to the most recent first_seen of the matched
+        # entities (when the entity actually entered a list); snapshot date
+        # only as a last resort.
+        _seen_dates = [e["first_seen"] for e in matched_entities if e.get("first_seen")]
+        event_date = max(_seen_dates) if _seen_dates else snapshot_dt
         title = f"{company.canonical_name} — Active Sanctions Match"
         summary = (
             f"Matched against {len(matched_entities)} sanctioned entity record(s) "
@@ -779,7 +894,12 @@ def ingest_opensanctions(
             # In-place UPDATE.  Rewrite fields that depend on the latest
             # snapshot of OpenSanctions data; refresh geography +
             # material junctions; leave the named-company link alone.
+            # 2026-07-31: event_date now anchored to entity first_seen —
+            # stable across runs unless a new listing moves it.  Repair
+            # provenance on rows written before the snapshot document existed.
             existing.event_date = event_date
+            if existing.source_document_id is None:
+                existing.source_document_id = snapshot_doc_id
             existing.title = title
             existing.summary = summary
             existing.severity_score = 1.0
@@ -795,8 +915,12 @@ def ingest_opensanctions(
                 )
             )
             session.execute(
+                # 2026-07-31: only machine-suggested links are refreshed.
+                # A link a human confirmed (or rejected) in triage survives
+                # the upsert — an ingest pass must not revert curation.
                 _sql_delete(RiskEventMaterial).where(
                     RiskEventMaterial.risk_event_id == existing.id,
+                    RiskEventMaterial.status == "suggested",
                 )
             )
 
@@ -832,6 +956,7 @@ def ingest_opensanctions(
             continue
 
         event = RiskEvent(
+            source_document_id=snapshot_doc_id,   # provenance (2026-07-31)
             event_type="sanctions_listing",
             # 2026-05-19: event_subtype="EXPORT_RESTRICTION" added so
             # these events feed the Geopolitical pillar's specific
@@ -854,9 +979,16 @@ def ingest_opensanctions(
             # without duplicating the underlying RiskEvent row.  See
             # docs/coverage-gap-plan-2026-05.md.
             risk_categories_json=["geopolitical_trade", "regulatory_compliance"],
+            # Inverted 2026-07-31 (triage plan Phase 1): the machine
+            # suggests, a human assigns.  primary_category deliberately
+            # NOT set — a real severity-1.0 sanctions match queues for
+            # review rather than scoring unreviewed.
+            suggested_category="geopolitical_trade",
+            direction="restrictive",
+            triage_status="pending_triage",
             geography_json={"primary": primary_country},
             content_hash=ch,
-            metadata_json=metadata,
+            metadata_json={**metadata, "category_mapping": "hardcoded_source_rule"},
         )
         session.add(event)
         session.flush()
@@ -945,7 +1077,10 @@ def ingest_opensanctions(
         )
         dataset_sample = sorted(ds for ds, _ in dataset_counter.most_common(5))
 
-        event_date = datetime.now(timezone.utc)
+        # 2026-07-31: snapshot-anchored, and NOT refreshed on upsert — an
+        # aggregate statistic's row keeps its first-seen date; the latest
+        # snapshot date lives in metadata instead.
+        event_date = snapshot_dt
         title = f"{country} — {count} Sanctioned Entities (OpenSanctions)"
         summary = (
             f"OpenSanctions bulk data contains {count} company/organisation records "
@@ -966,7 +1101,11 @@ def ingest_opensanctions(
             # so refresh every field.  Then rewrite geography + material
             # junctions (the sanctioned-entity set may have changed
             # composition, not just size).
-            existing.event_date = event_date
+            # 2026-07-31: event_date deliberately NOT refreshed — the row
+            # keeps its first-seen date; the latest snapshot is in metadata.
+            # Repair provenance on rows written before the snapshot document.
+            if existing.source_document_id is None:
+                existing.source_document_id = snapshot_doc_id
             existing.title = title
             existing.summary = summary
             existing.severity_score = severity
@@ -981,8 +1120,12 @@ def ingest_opensanctions(
                 )
             )
             session.execute(
+                # 2026-07-31: only machine-suggested links are refreshed.
+                # A link a human confirmed (or rejected) in triage survives
+                # the upsert — an ingest pass must not revert curation.
                 _sql_delete(RiskEventMaterial).where(
                     RiskEventMaterial.risk_event_id == existing.id,
+                    RiskEventMaterial.status == "suggested",
                 )
             )
             session.add(
@@ -1013,6 +1156,7 @@ def ingest_opensanctions(
             continue
 
         geo_event = RiskEvent(
+            source_document_id=snapshot_doc_id,   # provenance (2026-07-31)
             event_type="geography_sanctions_exposure",
             # 2026-05-19: event_subtype="EXPORT_RESTRICTION" added —
             # geography sanctions exposure is the aggregate "this
@@ -1035,9 +1179,20 @@ def ingest_opensanctions(
             # without duplicating the underlying RiskEvent row.  See
             # docs/coverage-gap-plan-2026-05.md.
             risk_categories_json=["geopolitical_trade", "regulatory_compliance"],
+            # Inverted 2026-07-31 + routed display_only (Nicole): these are
+            # aggregate statistics — standing counts of sanctioned entities
+            # per country — not events.  Visible context, not scoring
+            # evidence, matching the trade-signal statistics quarantine.
+            suggested_category="geopolitical_trade",
+            direction="restrictive",
+            triage_status="display_only",
             geography_json={"primary": country},
             content_hash=ch,
-            metadata_json=metadata,
+            metadata_json={
+                **metadata,
+                "category_mapping": "hardcoded_source_rule",
+                "triage_route": "auto_display_only_statistic",
+            },
         )
         session.add(geo_event)
         session.flush()

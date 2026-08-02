@@ -84,15 +84,6 @@ from app.models.source import Source
 from app.models.supply import Material
 from app.services.ingestion import feature_flags
 
-import structlog
-
-# 2026-07-13: the semicolon _split_csv patch (2026-07-10) added a
-# log.warning() legacy-comma hint but never defined `log` — every cell
-# containing a comma with no semicolon (single legal names like
-# "Sumitomo Metal Mining Co., Ltd.") raised NameError and hard-failed
-# its row (47 rows in the 07-13 dry-run).
-log = structlog.get_logger(__name__)
-
 
 # Canonical source row for all manually-entered events.
 _MANUAL_SOURCE_NAME = "manual_walkthrough"
@@ -159,27 +150,20 @@ CANONICAL_RISK_CATEGORIES = {
 
 
 def _split_csv(value: Any) -> list[str]:
-    """Split a SEMICOLON-separated cell value into trimmed strings.
+    """Split a delimited cell value into trimmed strings.
 
-    2026-07-10: separator changed from comma to semicolon. Company canonical
-    and legal names legitimately contain commas ("Sumitomo Metal Mining Co.,
-    Ltd."), so comma-splitting shattered them into unresolvable fragments.
-    The workbook's list columns (companies / materials / facilities /
-    secondary_countries / risk_categories) were normalized to "; " the same
-    day. A comma with no semicolon present now logs a hint rather than
-    silently mis-splitting.
+    Accepts commas AND semicolons (2026-08-02 fix): the workbook's own
+    column documentation gives "NL; ES" as the format, and 85 rows use
+    semicolon-separated risk_categories — but this splitter only handled
+    commas, so a cell like "operational; financial_pressure" parsed as ONE
+    invalid token and hard-errored 99 of 207 rows at the first re-ingest.
+    The July run predated the category validation, which is why the
+    mismatch never surfaced until now.
     """
     if value is None or str(value).strip() == "":
         return []
-    raw = str(value)
-    if ";" not in raw and "," in raw:
-        log.warning(
-            "load_events.legacy_comma_list",
-            value=raw[:80],
-            hint="list columns are semicolon-separated since 2026-07-10; "
-                 "treating whole cell as ONE name",
-        )
-    return [s.strip() for s in raw.split(";") if s.strip()]
+    import re as _re
+    return [s.strip() for s in _re.split(r"[,;]", str(value)) if s.strip()]
 
 
 def _coerce_date(value: Any) -> Optional[datetime]:
@@ -293,20 +277,10 @@ def _resolve_companies(
     """Return (resolved_companies, unresolved_names)."""
     resolved: list[Company] = []
     unresolved: list[str] = []
-    from app.models.company import CompanyAlias
     for name in names:
         company = session.scalar(
             select(Company).where(Company.canonical_name == name)
         )
-        if company is None:
-            # 2026-07-10: alias fallback — partner workbooks use full legal
-            # names ("Vale S.A.") while engine canon is short ("Vale");
-            # company_aliases carries alias_type='legal_name' rows for these.
-            company = session.scalar(
-                select(Company)
-                .join(CompanyAlias, CompanyAlias.company_id == Company.id)
-                .where(CompanyAlias.alias == name)
-            )
         if company is None:
             unresolved.append(name)
         else:
@@ -400,7 +374,12 @@ def _validate_row(row: dict) -> list[str]:
 
     cats = _split_csv(row.get("risk_categories"))
     for c in cats:
-        if c not in CANONICAL_RISK_CATEGORIES:
+        # 2026-08-02: normalise before validating — the models normalise on
+        # write anyway (constants.normalise_risk_categories), so a shorthand
+        # like "geopolitical" that normalises cleanly to "geopolitical_trade"
+        # must not hard-reject the row here.
+        from app.constants import normalise_risk_categories
+        if c not in CANONICAL_RISK_CATEGORIES and not normalise_risk_categories([c]):
             errors.append(f"invalid_risk_category:{c}")
 
     sev = _coerce_float(row.get("severity_score"))
@@ -566,7 +545,13 @@ def _process_row(
         geography_json=geography_json,
         content_hash=content_hash,
         metadata_json=metadata_json,
-        verified=True,  # manual entry = verified by definition
+        # 2026-07-31 (Nicole, triage plan): was True ("manual entry =
+        # verified by definition").  Manual events now enter the same triage
+        # flow as every other source — verification happens when a human
+        # confirms in the triage UI, not at load time.  Under the suggestion
+        # inversion the listener derives suggested_category from
+        # risk_categories; primary_category stays NULL until confirmed.
+        verified=False,
     )
     session.add(event)
     session.flush()  # get event.id

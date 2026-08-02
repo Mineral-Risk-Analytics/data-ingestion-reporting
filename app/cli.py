@@ -2995,6 +2995,28 @@ def ingest_gta_cmd(
             "Recommended for nightly runs; --local-file remains for offline testing."
         ),
     ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Parse and classify normally but write nothing.  Reports what would "
+            "be inserted and which existing rows would be refreshed (with "
+            "per-field counts), then rolls back.  Run this before a repair "
+            "re-ingest to see the blast radius.  Added 2026-07-30."
+        ),
+    ),
+    api_raw_cache: Optional[str] = typer.Option(
+        None,
+        "--api-raw-cache",
+        help=(
+            "Path to a JSON cache of the raw API payload (API mode only).  "
+            "If the file exists it is read instead of calling the API — no "
+            "metered records consumed.  Otherwise the API is fetched and the "
+            "payload saved there on success.  Use the same path for a "
+            "--dry-run and the real run so GTA is only pulled once.  "
+            "Delete the file to force a fresh pull.  Added 2026-07-31."
+        ),
+    ),
 ) -> None:
     """Ingest Global Trade Alert harmful trade interventions into risk_events.
 
@@ -3048,6 +3070,8 @@ def ingest_gta_cmd(
             local_file=local_file,
             skip_hs_filter=skip_hs_filter,
             use_api=use_api,
+            dry_run=dry_run,
+            api_raw_cache=api_raw_cache,
         )
         typer.echo(json.dumps({"ok": True, **result}, indent=2))
     except Exception as exc:
@@ -3104,6 +3128,13 @@ def ingest_sec_edgar_cmd(
     ),
 ) -> None:
     """Ingest SEC EDGAR filing metadata for public companies in the battery supply chain.
+
+    ⏸  PAUSED (2026-07-31, Nicole) — do not run on a schedule or by hand.
+    The stream produces orphan display-only rows nothing consumes (78%
+    FILING_INDEX noise; zero material/company links; stub summaries), and
+    the Phase 4 reset deletes its events without re-ingesting them.  See
+    docs/design/sec_edgar_stream_audit.md for the revival criteria
+    (admission filtering + company links + body text, shipped together).
 
     Fetches the `submissions` endpoint (no API key required) for each company CIK.
     Creates SourceDocument + RiskEvent rows categorised as FINANCIAL_PRESSURE, then
