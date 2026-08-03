@@ -31,21 +31,23 @@ Semantics encoded here (each traceable to a session decision):
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import Select, and_, func, or_, select
+from sqlalchemy import Select, and_, case, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_user, get_db
 from app.constants import POSITIVE_EVENT_SUBTYPES, RiskCategory
+from app.models.country import Country
 from app.models.documents import SourceDocument
 from app.models.regulatory import RiskEvent, RiskEventMaterial
 from app.models.source import Source
 from app.models.supply import Material
+from app.services.scoring.launch_list import is_launch_list_material
 
 log = structlog.get_logger(__name__)
 
@@ -53,6 +55,15 @@ router = APIRouter(prefix="/triage", tags=["triage"])
 
 _VALID_STATUSES = {"pending_triage", "scoring", "display_only", "rejected"}
 _VALID_CATEGORIES = {c.value for c in RiskCategory}
+
+# The coverage tracker's bar and window are the dashboard's thin-events
+# thresholds, imported (privates and all) rather than restated: the whole
+# point of the tracker is to explain the dashboard's "thin" verdict, and two
+# copies of the number would eventually disagree about what "thin" means.
+from app.api.routes.dashboard import (  # noqa: E402
+    _GAP_THIN_EVENTS_MIN as _COVERAGE_TARGET,
+    _GAP_THIN_EVENTS_WINDOW_DAYS as _COVERAGE_WINDOW_DAYS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +78,28 @@ class TriageLinkRead(BaseModel):
     match_reason: Optional[str] = None
     relevance_score: Optional[float] = None
     is_direct: bool = True
+    # Discriminator for the drawer's grouped link list.  Only ``material``
+    # links exist today: migration 066 added ``status`` to
+    # ``risk_event_materials`` alone, so company / facility / regulation
+    # links have nowhere to record a triage decision.  The field is emitted
+    # now so the UI groups correctly the day those tables gain a status
+    # column, rather than the UI having to guess.
+    kind: str = "material"
+
+
+class TriageFlagRead(BaseModel):
+    """A data-quality note filed against an event.
+
+    Stored in ``metadata_json["flags"]`` (see ``flag_event``).  These were
+    write-only until now — the drawer could file one and never read it back,
+    so notes vanished the moment they were submitted.
+    """
+
+    id: str
+    note_type: str
+    note_text: str
+    author: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class TriageEventRow(BaseModel):
@@ -92,6 +125,31 @@ class TriageEventRow(BaseModel):
     quality_defects: list[str] = Field(default_factory=list)
     flags_count: int = 0
     links: list[TriageLinkRead] = Field(default_factory=list)
+    # The full set of pillars the event touches (risk_categories_json), as
+    # distinct from ``primary_category`` — the single pillar it scores in.
+    # Shown read-only in the drawer: the set is derived at ingest, only the
+    # scoring pillar is a triage decision.
+    risk_categories: list[str] = Field(default_factory=list)
+    # ISO country codes from geography_json, primary first.
+    geography_codes: list[str] = Field(default_factory=list)
+    # code → display name, covering exactly the codes in ``geography_codes``.
+    #
+    # Resolved server-side against the ``countries`` table rather than left to
+    # the browser's Intl.DisplayNames, because these codes are whatever
+    # ``countries.iso2`` holds and that column explicitly admits non-ISO
+    # entries — the column comment names bloc identifiers like "EU", and any
+    # territory row that has been added behaves the same way.  Intl returns
+    # the code unchanged for anything it does not recognise, which produces a
+    # tooltip that repeats the text the user is already looking at.  A code
+    # with no matching row is simply absent here and the UI shows the bare
+    # code, which is the honest rendering of "nothing in the reference table
+    # explains this".
+    geography_names: dict[str, str] = Field(default_factory=dict)
+    # Served rather than inferred: the UI previously carried its own copy of
+    # POSITIVE_EVENT_SUBTYPES, which had already drifted from the backend's
+    # set.  One source of truth, evaluated where the constant lives.
+    is_positive: bool = False
+    flags: list[TriageFlagRead] = Field(default_factory=list)
 
 
 class TriageEventList(BaseModel):
@@ -107,6 +165,27 @@ class TriageSummary(BaseModel):
     display_only: int
     rejected: int
     total: int
+
+
+class MaterialCoverageItem(BaseModel):
+    material_id: int
+    name: str
+    is_launch_list: bool
+    # Direct, confirmed links on live events inside the window — the signal an
+    # analyst has actually stood behind.
+    confirmed: int
+    # Direct, still-suggested links on live events inside the window — present
+    # in the queue, contributing nothing until someone confirms them.
+    pending: int
+
+
+class MaterialCoverage(BaseModel):
+    window_days: int
+    # The "5-event bar": below this many confirmed events a material counts as
+    # thin.  Served rather than hardcoded client-side so the tracker and the
+    # dashboard's coverage-gaps KPI can never disagree about the bar.
+    target: int
+    items: list[MaterialCoverageItem]
 
 
 class StatusUpdate(BaseModel):
@@ -174,6 +253,24 @@ def _material_labels(db: Session, events: list[RiskEvent]) -> dict[int, str]:
     return {mid: name for mid, name in rows}
 
 
+def _country_names(db: Session, events: list[RiskEvent]) -> dict[str, str]:
+    """Geography codes → display names, in one batch query.
+
+    Same shape and reason as ``_material_labels``: geography_json stores bare
+    codes, there is no relationship to follow, and a page of 25 events would
+    otherwise be 25-plus lookups.  Unmatched codes are left out of the map
+    rather than defaulted, so the caller can tell "no row in ``countries``"
+    apart from "row exists, name happens to equal the code".
+    """
+    codes = {c for ev in events for c in _geography_codes(ev)}
+    if not codes:
+        return {}
+    rows = db.execute(
+        select(Country.iso2, Country.name).where(Country.iso2.in_(codes))
+    ).all()
+    return {iso2: name for iso2, name in rows}
+
+
 def _is_positive_direction(ev: RiskEvent) -> bool:
     return bool(ev.event_subtype) and ev.event_subtype in POSITIVE_EVENT_SUBTYPES
 
@@ -216,7 +313,72 @@ def _quality_defects(ev: RiskEvent, now: datetime) -> list[str]:
     return out
 
 
-def _row(ev: RiskEvent, now: datetime, labels: dict[int, str]) -> TriageEventRow:
+def _pillars(ev: RiskEvent) -> list[str]:
+    """risk_categories_json → list[str], tolerant of the shapes the ingesters
+    produce (list, dict keyed by slug, or None).  Mirrors
+    ``materials._coerce_pillars``; kept local so the triage surface does not
+    import another router."""
+    raw = ev.risk_categories_json
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x) for x in raw if x]
+    if isinstance(raw, dict):
+        return [str(k) for k in raw.keys() if k]
+    return []
+
+
+def _geography_codes(ev: RiskEvent) -> list[str]:
+    """geography_json → ISO codes, primary first, de-duplicated in order.
+    Shape is ``{"primary": "CN", "secondary": ["RU", "CD"]}``."""
+    geo = ev.geography_json
+    if not isinstance(geo, dict):
+        return []
+    out: list[str] = []
+    primary = geo.get("primary")
+    if isinstance(primary, str) and primary:
+        out.append(primary)
+    secondary = geo.get("secondary")
+    if isinstance(secondary, list):
+        for code in secondary:
+            if isinstance(code, str) and code and code not in out:
+                out.append(code)
+    return out
+
+
+def _flags(ev: RiskEvent) -> list[TriageFlagRead]:
+    """metadata_json["flags"] → typed notes.
+
+    Notes carry no database id (they live inside a JSONB blob), so the index
+    is used as a stable-within-a-response key for the UI's list rendering.
+    """
+    meta = ev.metadata_json or {}
+    raw = meta.get("flags") or []
+    out: list[TriageFlagRead] = []
+    for i, note in enumerate(raw):
+        if not isinstance(note, dict):
+            continue
+        text = note.get("note_text")
+        if not text:
+            continue
+        out.append(
+            TriageFlagRead(
+                id=f"{ev.id}-{i}",
+                note_type=str(note.get("note_type") or "issue"),
+                note_text=str(text),
+                author=note.get("author"),
+                created_at=note.get("created_at"),
+            )
+        )
+    return out
+
+
+def _row(
+    ev: RiskEvent,
+    now: datetime,
+    labels: dict[int, str],
+    country_names: dict[str, str],
+) -> TriageEventRow:
     meta = ev.metadata_json or {}
     doc = ev.source_document
     src = doc.source if doc is not None else None
@@ -253,9 +415,36 @@ def _row(ev: RiskEvent, now: datetime, labels: dict[int, str]) -> TriageEventRow
                 match_reason=l.match_reason,
                 relevance_score=l.relevance_score,
                 is_direct=bool(l.is_direct),
+                kind="material",
             )
             for l in ev.material_links
         ],
+        risk_categories=_pillars(ev),
+        geography_codes=_geography_codes(ev),
+        # Narrowed to this event's own codes so the payload does not carry the
+        # whole batch's names on every row.
+        geography_names={
+            c: country_names[c] for c in _geography_codes(ev) if c in country_names
+        },
+        is_positive=_is_positive_direction(ev),
+        flags=_flags(ev),
+    )
+
+
+def _one(db: Session, ev: RiskEvent) -> TriageEventRow:
+    """Single-event response body.
+
+    Every write endpoint returns the mutated event, and each was repeating the
+    same three-part construction.  Collapsing it means a new lookup map — this
+    one added ``_country_names`` — has one place to be wired in rather than
+    six, which is exactly how the geography names would otherwise have been
+    served on the list and missing from every write response.
+    """
+    return _row(
+        ev,
+        datetime.now(timezone.utc),
+        _material_labels(db, [ev]),
+        _country_names(db, [ev]),
     )
 
 
@@ -303,6 +492,88 @@ def triage_summary(
     )
 
 
+@router.get("/coverage", response_model=MaterialCoverage)
+def material_coverage(
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MaterialCoverage:
+    """Per-material event coverage, split into confirmed vs queue-pending.
+
+    The dashboard's coverage-gaps KPI already counts events per launch-list
+    material, but a plain count cannot distinguish the two states an analyst
+    actually cares about on the triage screen: a material below the bar with
+    suggestions waiting in the queue is *triage backlog* (clear the queue and
+    the gap may close), while a material below the bar with nothing pending is
+    a *sourcing problem* no amount of triage will fix.  This endpoint splits
+    them, per link status.
+
+    Counting rules, shared with ``_compute_coverage_gaps`` in dashboard.py:
+
+      * ``duplicate_of_id IS NULL`` — confirmed duplicates never count (055)
+      * ``is_direct IS TRUE``       — inherited links are not coverage (056)
+      * 90-day window, 5-event bar  — same thresholds, served in the payload
+
+    Two deliberate divergences from the dashboard count:
+
+      * The window is on ``event_date``, not ``created_at``.  The dashboard
+        measures ingest recency; this card measures *signal* recency — an
+        event ingested yesterday about something that happened last year is
+        not fresh coverage.  Future-dated events count (they are separately
+        flagged as a data defect, but they are signal); events with no date
+        at all do not, because "inside a window" is unanswerable for them.
+      * Rejected events are excluded, and links are split by their own
+        status.  The dashboard counts every direct link regardless; here a
+        rejected link contributes to neither bucket — an analyst has said it
+        is wrong, which is not "pending".
+
+    Every material row is returned, including all-zero ones: "no signal at
+    all" is the most important state the tracker renders, and it cannot be
+    distinguished from "not returned" client-side.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_COVERAGE_WINDOW_DAYS)
+
+    rows = db.execute(
+        select(
+            RiskEventMaterial.material_id,
+            func.sum(
+                case((RiskEventMaterial.status == "confirmed", 1), else_=0)
+            ).label("confirmed"),
+            func.sum(
+                case((RiskEventMaterial.status == "suggested", 1), else_=0)
+            ).label("pending"),
+        )
+        .join(RiskEvent, RiskEvent.id == RiskEventMaterial.risk_event_id)
+        .where(
+            RiskEvent.duplicate_of_id.is_(None),
+            RiskEvent.triage_status != "rejected",
+            RiskEvent.event_date.isnot(None),
+            RiskEvent.event_date >= cutoff,
+            RiskEventMaterial.is_direct.is_(True),
+        )
+        .group_by(RiskEventMaterial.material_id)
+    ).all()
+    counts = {r.material_id: (int(r.confirmed or 0), int(r.pending or 0)) for r in rows}
+
+    materials = db.execute(
+        select(Material.id, Material.canonical_name).order_by(Material.canonical_name)
+    ).all()
+
+    return MaterialCoverage(
+        window_days=_COVERAGE_WINDOW_DAYS,
+        target=_COVERAGE_TARGET,
+        items=[
+            MaterialCoverageItem(
+                material_id=m.id,
+                name=m.canonical_name,
+                is_launch_list=is_launch_list_material(m.canonical_name),
+                confirmed=counts.get(m.id, (0, 0))[0],
+                pending=counts.get(m.id, (0, 0))[1],
+            )
+            for m in materials
+        ],
+    )
+
+
 @router.get("/events", response_model=TriageEventList)
 def list_triage_events(
     _user: dict = Depends(get_current_user),
@@ -318,7 +589,10 @@ def list_triage_events(
     severity_min: Optional[float] = Query(None, ge=0, le=1),
     material: Optional[str] = Query(None, description="material canonical_name with a non-rejected link"),
     defect: Optional[str] = Query(None, description="quality-defect facet, e.g. needs_material_review"),
+    has_defects: bool = Query(False, description="only events carrying at least one quality defect"),
+    flagged: bool = Query(False, description="only events with an open data-quality note"),
     sort: str = Query("event_date", description="event_date|severity_score|triage_status"),
+    sort_dir: str = Query("desc", description="asc|desc"),
 ) -> TriageEventList:
     stmt: Select = (
         select(RiskEvent)
@@ -378,18 +652,42 @@ def list_triage_events(
 
     now = datetime.now(timezone.utc)
 
+    asc = sort_dir == "asc"
     if sort == "severity_score":
-        stmt = stmt.order_by(RiskEvent.severity_score.desc().nullslast(), RiskEvent.id.desc())
+        col = RiskEvent.severity_score
+        stmt = stmt.order_by(
+            (col.asc() if asc else col.desc()).nullslast(), RiskEvent.id.desc()
+        )
     elif sort == "triage_status":
-        stmt = stmt.order_by(RiskEvent.triage_status.asc(), RiskEvent.id.desc())
+        col = RiskEvent.triage_status
+        stmt = stmt.order_by(col.asc() if asc else col.desc(), RiskEvent.id.desc())
     else:
-        stmt = stmt.order_by(RiskEvent.event_date.desc().nullslast(), RiskEvent.id.desc())
+        col = RiskEvent.event_date
+        stmt = stmt.order_by(
+            (col.asc() if asc else col.desc()).nullslast(), RiskEvent.id.desc()
+        )
 
-    # Defect facets are derived per-row, so filter in Python.  The corpus is
-    # a few thousand rows; when it grows past that, materialise the flags.
-    if defect:
+    # Defect facets are derived per-row, so filter in Python.  ``flagged``
+    # joins them: notes live inside metadata_json, and the JSONB array-length
+    # predicate that would express it in SQL has no SQLite equivalent, so the
+    # test suite could not exercise it.  The corpus is a few thousand rows;
+    # when it grows past that, materialise both.
+    if defect or has_defects or flagged:
         events = list(db.scalars(stmt).all())
-        events = [e for e in events if defect in _quality_defects(e, now)]
+
+        def _keep(e: RiskEvent) -> bool:
+            if flagged and not ((e.metadata_json or {}).get("flags") or []):
+                return False
+            if not (defect or has_defects):
+                return True
+            found = _quality_defects(e, now)
+            if defect and defect not in found:
+                return False
+            if has_defects and not found:
+                return False
+            return True
+
+        events = [e for e in events if _keep(e)]
         total = len(events)
         events = events[(page - 1) * limit : (page - 1) * limit + limit]
     else:
@@ -400,8 +698,9 @@ def list_triage_events(
         events = list(db.scalars(stmt.offset((page - 1) * limit).limit(limit)).all())
 
     labels = _material_labels(db, events)
+    country_names = _country_names(db, events)
     return TriageEventList(
-        items=[_row(e, now, labels) for e in events],
+        items=[_row(e, now, labels, country_names) for e in events],
         total=total,
         page=page,
         limit=limit,
@@ -415,7 +714,7 @@ def get_triage_event(
     db: Session = Depends(get_db),
 ) -> TriageEventRow:
     ev = _get_event_or_404(db, event_id)
-    return _row(ev, datetime.now(timezone.utc), _material_labels(db, [ev]))
+    return _one(db, ev)
 
 
 @router.get("/events/{event_id}/duplicate-hints", response_model=DuplicateHints)
@@ -506,7 +805,7 @@ def set_triage_status(
     _apply_status(db, ev, body.status, _actor(user), body.primary_category)
     db.commit()
     ev2 = _get_event_or_404(db, event_id)
-    return _row(ev2, datetime.now(timezone.utc), _material_labels(db, [ev2]))
+    return _one(db, ev2)
 
 
 @router.patch("/events/{event_id}/category", response_model=TriageEventRow)
@@ -529,7 +828,7 @@ def set_primary_category(
     ev.triaged_at = datetime.now(timezone.utc)
     db.commit()
     ev2 = _get_event_or_404(db, event_id)
-    return _row(ev2, datetime.now(timezone.utc), _material_labels(db, [ev2]))
+    return _one(db, ev2)
 
 
 @router.post("/events/{event_id}/accept", response_model=TriageEventRow)
@@ -551,7 +850,7 @@ def accept_suggestions(
             link.status = "confirmed"
     db.commit()
     ev2 = _get_event_or_404(db, event_id)
-    return _row(ev2, datetime.now(timezone.utc), _material_labels(db, [ev2]))
+    return _one(db, ev2)
 
 
 @router.post("/events/{event_id}/promote-operational", response_model=TriageEventRow)
@@ -593,7 +892,7 @@ def promote_operational(
     ev.triaged_at = datetime.now(timezone.utc)
     db.commit()
     ev2 = _get_event_or_404(db, event_id)
-    return _row(ev2, datetime.now(timezone.utc), _material_labels(db, [ev2]))
+    return _one(db, ev2)
 
 
 @router.post("/events/{event_id}/flags", response_model=TriageEventRow)
@@ -620,7 +919,7 @@ def flag_event(
     ev.metadata_json = meta  # reassign — JSONB in-place mutation is untracked
     db.commit()
     ev2 = _get_event_or_404(db, event_id)
-    return _row(ev2, datetime.now(timezone.utc), _material_labels(db, [ev2]))
+    return _one(db, ev2)
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +952,7 @@ def set_link_status(
         match_reason=link.match_reason,
         relevance_score=link.relevance_score,
         is_direct=bool(link.is_direct),
+        kind="material",
     )
 
 
@@ -681,7 +981,10 @@ def add_material_link(
         material_id=mat.id,
         relevance_score=1.0,
         is_direct=True,
-        match_reason="analyst",
+        # Same provenance code the operational-triage service writes for a
+        # hand-attached link (operational_triage.py) — one value, so the UI
+        # hint and any downstream reason grouping do not split in two.
+        match_reason="triage_attach",
         status="confirmed",
     )
     db.add(link)
@@ -694,4 +997,5 @@ def add_material_link(
         match_reason=link.match_reason,
         relevance_score=link.relevance_score,
         is_direct=True,
+        kind="material",
     )
