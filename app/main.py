@@ -23,6 +23,7 @@ from app.api.routes.chart_data import router as chart_data_router
 from app.api.routes.content_assets import router as content_assets_router
 from app.api.routes.chemistries import router as chemistries_router
 from app.api.routes.companies import router as companies_router
+from app.api.routes.concentration import router as concentration_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.facilities import router as facilities_router
 from app.api.routes.health import router as health_router
@@ -153,6 +154,8 @@ app.include_router(chemistries_router, prefix="/api/v1")
 
 # Foundation Phase 2 — market intelligence scores (material × geography)
 app.include_router(market_scores_router, prefix="/api/v1")
+# Phase 3b — supply-concentration transparency (Workstream A instrument)
+app.include_router(concentration_router, prefix="/api/v1")
 
 # Foundation Phase 4 — Intelligence Hub (public content site backend)
 app.include_router(intelligence_router, prefix="/api/v1")

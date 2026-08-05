@@ -554,12 +554,21 @@ def _compute_recent_risk_events_30d(
     cutoff_30d = now - timedelta(days=30)
     cutoff_60d = now - timedelta(days=60)
 
-    # Total counts: current 30d and previous 30d
+    # Total counts: current 30d and previous 30d.
+    #
+    # 2026-08-03: these headline counts now apply the same visibility rules
+    # as the top-sources list right below them (055 duplicates, 066
+    # soft-dismissals) — they used to count every stored row, so the KPI
+    # could say "12 events" over a source list that visibly sums to fewer.
     count_30d = int(
         db.scalar(
             select(func.count())
             .select_from(RiskEvent)
-            .where(RiskEvent.created_at >= cutoff_30d)
+            .where(
+                RiskEvent.created_at >= cutoff_30d,
+                RiskEvent.duplicate_of_id.is_(None),  # 055
+                RiskEvent.triage_status != "rejected",  # 066
+            )
         )
         or 0
     )
@@ -570,6 +579,8 @@ def _compute_recent_risk_events_30d(
             .where(
                 RiskEvent.created_at >= cutoff_60d,
                 RiskEvent.created_at < cutoff_30d,
+                RiskEvent.duplicate_of_id.is_(None),  # 055
+                RiskEvent.triage_status != "rejected",  # 066
             )
         )
         or 0
@@ -586,6 +597,7 @@ def _compute_recent_risk_events_30d(
         .where(
             RiskEvent.created_at >= cutoff_30d,
             RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
         )
         .group_by(Source.name)
         .order_by(func.count(RiskEvent.id).desc())
@@ -686,6 +698,7 @@ def _compute_coverage_gaps(db: Session, *, now: datetime) -> CoverageGaps:
             RiskEventMaterial.material_id.in_(materials_by_name.values()),
             RiskEvent.created_at >= cutoff_events,
             RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
             RiskEventMaterial.is_direct.is_(True),  # 056
         )
         .group_by(RiskEventMaterial.material_id)
@@ -839,6 +852,7 @@ def coverage_matrix(
         .join(Source, Source.id == SourceDocument.source_id)
         .where(
             RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
             RiskEventMaterial.is_direct.is_(True),  # 056
             RiskEventMaterial.material_id.in_(all_mat_ids or [-1]),
             RiskEvent.created_at >= cutoff,

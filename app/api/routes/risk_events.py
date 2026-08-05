@@ -44,7 +44,19 @@ def list_risk_events(
 ) -> PaginatedResponse[RiskEventRead]:
     # 055: confirmed cross-source duplicates are hidden from the list —
     # the canonical row carries the event.
-    q = select(RiskEvent).where(RiskEvent.duplicate_of_id.is_(None))
+    #
+    # 066 follow-up (2026-08-03): soft-dismissed events are hidden too.  The
+    # triage plan's contract is that ``rejected`` rows are retained *only* so
+    # dedupe cannot resurrect the same story — "hidden from scoring, triage,
+    # and the content site".  This endpoint was written before the status
+    # column existed and was the one surface still serving them.  There is
+    # deliberately no ``?include_rejected`` escape hatch: reviewing dismissals
+    # is triage work and belongs on the triage surface, which has the actions
+    # to un-dismiss.
+    q = select(RiskEvent).where(
+        RiskEvent.duplicate_of_id.is_(None),
+        RiskEvent.triage_status != "rejected",
+    )
 
     if search:
         q = q.where(

@@ -4,6 +4,26 @@
 else is proposal until reviewed. Counts in §2 were measured against the live
 Neon database on 2026-07-30.*
 
+## 0. Status ledger (updated 2026-08-03)
+
+The plan below is kept as written; this section is what actually happened.
+
+| Phase | Status |
+| --- | --- |
+| 0 — GTA quality | **Done** (2026-07-30/31, incl. repair re-ingest + backfill) |
+| 1 — audit + inversion | **Done**, all active ingesters. Its open item (`needs_material_review` triage facet) shipped 2026-08-01. Never built: the "low-confidence marker on fallback categorizations" from the GTA audit — likely moot since the harmonisation sweep left zero fallbacks in the corpus, but noting it was dropped, not delivered. |
+| 2 — status model (066) | **Done, applied.** Soft-dismiss dedupe wiring done (`event_dedupe` consults rejected). |
+| 3 — triage web UI v1 | **Done, beyond spec.** All v1 actions (confirm-as-is, pillar change, link add/remove, all four statuses, fully bidirectional, `triaged_by`/`triaged_at` stamped), operational promote with the severity ladder, plus unplanned: duplicate hints, data-quality flags, defect facets, quality-defect chips, resolved geography names/pills, and a material-coverage tracker (confirmed vs queue-pending per material, dashboard thin-events thresholds served by the API). The country filter — the one v1 spec gap — closed 2026-08-03 via the `risk_event_geographies` junction. Still unsurfaced: per-link `n_materials` fan-out. |
+| 3b — Supply Concentration view | **Not started.** |
+| 4 — the reset | **Done** (Nicole, by 2026-08-03). Post-reset live counts: 2,282 events — 1,190 `pending_triage`, 1,089 `display_only` (machine-routed at ingest: supportive-direction F1 rule, AD/CVD procedural, geography aggregates), 3 `rejected`, 0 `scoring`. The September GTA-access deadline no longer gates the reset itself. |
+| 5 — triage the queue | **Active phase.** 1,190 pending. Note the queue-summary "reviewed" figure counts machine-routed `display_only` rows; human decisions so far are the dismissals only. |
+| 6 — scoring flip | **Not done** (by design — awaits a confirmed baseline). Nothing outside the triage API reads `triage_status`; frozen grandfather scores still displayed; scheduled scoring stays off until this flips. |
+| 7 — content feed | **Not built.** Related leak closed early (2026-08-03): every event-serving read surface (`risk_events` list, intelligence entity pages, company events, dashboard KPIs, monthly chart, materials counts, market-scores evidence counts) now excludes `rejected` rows — "hidden everywhere" was previously only true on the triage surface. |
+
+§7 open items still open: suggestion-engine quality measurement (needs a few
+hundred triage decisions), and verifying the IEA re-ingest recovered the 407
+truncated summaries — checkable now that the reset has run.
+
 ## 1. Why this plan exists
 
 The strategic premise, per partner direction: the data itself is the product.

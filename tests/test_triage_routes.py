@@ -23,7 +23,11 @@ from app.api.routes.triage import router as triage_router
 from app.db.base import Base
 from app.models.country import Country
 from app.models.documents import SourceDocument
-from app.models.regulatory import RiskEvent, RiskEventMaterial
+from app.models.regulatory import (
+    RiskEvent,
+    RiskEventGeography,
+    RiskEventMaterial,
+)
 from app.models.source import Source
 from app.models.supply import Material
 
@@ -426,11 +430,25 @@ class TestCoverage:
         from datetime import timedelta
 
         now = datetime.now(timezone.utc)
-        # Counted as confirmed.
-        e1 = _seed(db, event_date=self._recent(), content_hash="c1")
+        # Counted as confirmed: link confirmed AND event promoted to scoring —
+        # this is what the Phase 6 flip will actually read.
+        e1 = _seed(db, event_date=self._recent(), triage_status="scoring",
+                   primary_category="geopolitical_trade", content_hash="c1")
         self._link(db, e1, status="confirmed")
-        # Counted as pending (suggested is the _seed default).
+        # Counted as pending (suggested link on a pending event).
         _seed(db, event_date=self._recent(), content_hash="c2")
+        # Also pending: a hand-attached (already confirmed) link on an event
+        # still awaiting triage — the event is what's in the queue.
+        e2b = _seed(db, event_date=self._recent(), content_hash="c2b")
+        self._link(db, e2b, status="confirmed")
+        # Excluded from BOTH buckets: display_only event, even with a
+        # confirmed link.  Post-reset ~half the corpus is machine-routed
+        # display_only (supportive subsidies, AD/CVD procedural, statistics);
+        # counting their links as pending made gaps look closable from the
+        # queue when confirming those links would change nothing.
+        e_dsp = _seed(db, event_date=self._recent(),
+                      triage_status="display_only", content_hash="c_dsp")
+        self._link(db, e_dsp, status="confirmed")
         # Excluded: outside the 90-day window (the _seed default date is old,
         # but pin it explicitly so this test does not rot as time passes).
         _seed(db, event_date=now - timedelta(days=120), content_hash="c3")
@@ -443,8 +461,9 @@ class TestCoverage:
         e6 = _seed(db, event_date=self._recent(), content_hash="c6")
         e6.duplicate_of_id = e1.id
         db.commit()
-        # Excluded: inherited link (056), even though confirmed.
-        e7 = _seed(db, event_date=self._recent(), content_hash="c7")
+        # Excluded: inherited link (056), even though confirmed + scoring.
+        e7 = _seed(db, event_date=self._recent(), triage_status="scoring",
+                   primary_category="geopolitical_trade", content_hash="c7")
         self._link(db, e7, status="confirmed", is_direct=False)
         # Excluded from both buckets: rejected link on a live event.
         e8 = _seed(db, event_date=self._recent(), content_hash="c8")
@@ -455,7 +474,7 @@ class TestCoverage:
         assert body["target"] == 5
         nickel = next(i for i in body["items"] if i["name"] == "Nickel")
         assert nickel["confirmed"] == 1
-        assert nickel["pending"] == 1
+        assert nickel["pending"] == 2
         assert nickel["is_launch_list"] is True
 
     def test_future_dated_events_count(self, client, db):
@@ -466,6 +485,8 @@ class TestCoverage:
         ev = _seed(
             db,
             event_date=datetime.now(timezone.utc) + timedelta(days=30),
+            triage_status="scoring",
+            primary_category="geopolitical_trade",
             content_hash="f1",
         )
         self._link(db, ev, status="confirmed")
@@ -492,3 +513,30 @@ class TestCoverage:
             "confirmed": 0,
             "pending": 0,
         }
+
+
+class TestCountryFilter:
+    def test_country_matches_primary_and_secondary(self, client, db):
+        """Filter reads the geographies junction — primary and secondary rows
+        alike — because "the China events" means anything touching China."""
+        e1 = _seed(db, title="china primary", content_hash="g1")
+        db.add(RiskEventGeography(risk_event_id=e1.id, country_code="CN",
+                                  geography_context="primary"))
+        e2 = _seed(db, title="china secondary", content_hash="g2")
+        db.add(RiskEventGeography(risk_event_id=e2.id, country_code="US",
+                                  geography_context="primary"))
+        db.add(RiskEventGeography(risk_event_id=e2.id, country_code="CN",
+                                  geography_context="secondary"))
+        e3 = _seed(db, title="elsewhere", content_hash="g3")
+        db.add(RiskEventGeography(risk_event_id=e3.id, country_code="AU",
+                                  geography_context="primary"))
+        db.commit()
+
+        titles = [
+            i["title"]
+            for i in client.get(
+                "/api/v1/triage/events", params={"country": "cn"}
+            ).json()["items"]
+        ]
+        # Lowercase input matched too — codes are stored uppercase.
+        assert sorted(titles) == ["china primary", "china secondary"]

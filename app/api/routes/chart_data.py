@@ -153,6 +153,12 @@ def events_monthly(
     conditions = [
         RiskEvent.event_date.is_not(None),
         RiskEvent.event_date >= since,
+        # 2026-08-03: the chart used to count every stored row, which is not
+        # what any other surface calls "an event" — confirmed duplicates (055)
+        # and soft-dismissed rows (066) are invisible everywhere else, so a
+        # month bar that includes them disagrees with the lists it links to.
+        RiskEvent.duplicate_of_id.is_(None),
+        RiskEvent.triage_status != "rejected",
     ]
     if min_severity > 0:
         conditions.append(RiskEvent.severity_score >= min_severity)

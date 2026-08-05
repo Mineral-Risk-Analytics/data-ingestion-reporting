@@ -621,6 +621,7 @@ def list_materials(
                 RiskEventMaterial.material_id.in_(material_ids),
                 RiskEvent.event_date >= cutoff,
                 RiskEvent.duplicate_of_id.is_(None),  # 055
+                RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
                 RiskEventMaterial.is_direct.is_(True),  # 056
             )
             .group_by(RiskEventMaterial.material_id)
@@ -770,6 +771,7 @@ def get_material(
                 RiskEventMaterial.material_id == material_id,
                 RiskEvent.event_date >= cutoff_90d,
                 RiskEvent.duplicate_of_id.is_(None),  # 055
+                RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
                 RiskEventMaterial.is_direct.is_(True),  # 056
             )
         )
@@ -953,6 +955,7 @@ def list_material_risk_events(
             RiskEventMaterial.material_id == material_id,
             RiskEvent.event_date >= cutoff,
             RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
         )
     )
     if not include_broad:
@@ -1102,15 +1105,6 @@ def list_material_risk_events(
     rows: list[MaterialRiskEventRow] = []
     for e in page_events:
         sname, surl = source_meta_by_event.get(e.id, (None, None))
-        # 2026-07-30: fall back to the event's own permalink when its source
-        # document carries no URL.  Before the GTA per-intervention documents
-        # existed, all 2,575 GTA events pointed at a per-run bulk document
-        # with a NULL url and rendered with no source link; events backfilled
-        # with a metadata permalink but not yet repointed at a permalink
-        # document still render a working link through this fallback.
-        if not surl:
-            meta = e.metadata_json or {}
-            surl = meta.get("permalink") or None
         rows.append(
             MaterialRiskEventRow(
                 id=e.id,

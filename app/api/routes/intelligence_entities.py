@@ -588,6 +588,7 @@ def get_public_company(slug: str, db: Session = Depends(get_db)) -> PublicCompan
         .where(
             RiskEventCompany.company_id == company.id,
             RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
         )
         .order_by(RiskEvent.event_date.desc().nulls_last())
         .limit(6)
@@ -925,9 +926,18 @@ def get_public_regulation(
         )
 
     # ── linked events + posts ─────────────────────────────────────────
+    # The count joins through to the event so it applies the same visibility
+    # rules as the list below — it used to count raw junction rows, so a page
+    # could claim more events than it would ever show once duplicates (055)
+    # and soft-dismissals (066) were filtered from the list.
     event_count = db.scalar(
         select(func.count(RiskEventRegulation.id))
-        .where(RiskEventRegulation.regulation_id == reg.id)
+        .join(RiskEvent, RiskEvent.id == RiskEventRegulation.risk_event_id)
+        .where(
+            RiskEventRegulation.regulation_id == reg.id,
+            RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEvent.triage_status != "rejected",  # 066
+        )
     ) or 0
     event_rows = db.execute(
         select(RiskEvent)
@@ -935,6 +945,7 @@ def get_public_regulation(
         .where(
             RiskEventRegulation.regulation_id == reg.id,
             RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
         )
         .order_by(RiskEvent.event_date.desc().nulls_last())
         .limit(6)

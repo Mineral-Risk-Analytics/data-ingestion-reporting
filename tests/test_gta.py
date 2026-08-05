@@ -212,11 +212,66 @@ class TestSeverityFor:
     def test_export_ban_high(self):
         assert _severity_for("Export bans", in_force=True) == 0.9
 
+    def test_export_ban_not_in_force_takes_discount(self):
+        """A suspended/revoked ban is a latent threat, not a blocked supply
+        line.  The original early return handed 0.9 to any export ban
+        regardless of state — surfaced by the EU-US countermeasures package,
+        whose ban was suspended before its effective date (never in force)
+        yet carried corpus-maximum severity."""
+        assert _severity_for("Export ban", in_force=False) == 0.3
+        assert _severity_for("Export bans", in_force=False) == 0.3
+
     def test_active_non_ban(self):
         assert _severity_for("Export taxes", in_force=True) == 0.7
 
     def test_inactive(self):
         assert _severity_for("Export taxes", in_force=False) == 0.3
+
+
+class TestResolveJurisdictionEuCollapse:
+    """_resolve_iso3_jurisdiction used to return list[0] unconditionally, so
+    EU-wide measures (member states enumerated alphabetically) all landed as
+    Austria."""
+
+    NAME_MAP = {
+        "AUT": "AT", "DEU": "DE", "FRA": "FR", "USA": "US", "CAN": "CA",
+        "European Union": "EU",
+    }
+
+    @staticmethod
+    def _entry(iso3="", name=""):
+        return {"id": 0, "iso": iso3, "name": name}
+
+    def test_multi_member_list_collapses_to_eu(self):
+        from app.services.ingestion.gta import _resolve_iso3_jurisdiction
+
+        got = _resolve_iso3_jurisdiction(
+            [self._entry("AUT"), self._entry("DEU"), self._entry("FRA")],
+            self.NAME_MAP,
+        )
+        assert got == "EU"
+
+    def test_explicit_eu_entry_wins(self):
+        from app.services.ingestion.gta import _resolve_iso3_jurisdiction
+
+        got = _resolve_iso3_jurisdiction(
+            [self._entry("", "European Union"), self._entry("FRA")],
+            self.NAME_MAP,
+        )
+        assert got == "EU"
+
+    def test_single_country_unchanged(self):
+        from app.services.ingestion.gta import _resolve_iso3_jurisdiction
+
+        assert _resolve_iso3_jurisdiction([self._entry("AUT")], self.NAME_MAP) == "AT"
+
+    def test_mixed_non_eu_list_keeps_first(self):
+        from app.services.ingestion.gta import _resolve_iso3_jurisdiction
+
+        got = _resolve_iso3_jurisdiction(
+            [self._entry("USA"), self._entry("CAN")], self.NAME_MAP
+        )
+        assert got == "US"
 
 
 class TestContentHash:

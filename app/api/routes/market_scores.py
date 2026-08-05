@@ -232,6 +232,7 @@ def list_material_market_scores(
         .where(
             RiskEventMaterial.material_id == material_id,
             RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
             RiskEventMaterial.is_direct.is_(True),  # 056
             ((RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))),
         )

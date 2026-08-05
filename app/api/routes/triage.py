@@ -44,7 +44,7 @@ from app.api.deps import get_current_user, get_db
 from app.constants import POSITIVE_EVENT_SUBTYPES, RiskCategory
 from app.models.country import Country
 from app.models.documents import SourceDocument
-from app.models.regulatory import RiskEvent, RiskEventMaterial
+from app.models.regulatory import RiskEvent, RiskEventGeography, RiskEventMaterial
 from app.models.source import Source
 from app.models.supply import Material
 from app.services.scoring.launch_list import is_launch_list_material
@@ -521,10 +521,26 @@ def material_coverage(
         not fresh coverage.  Future-dated events count (they are separately
         flagged as a data defect, but they are signal); events with no date
         at all do not, because "inside a window" is unanswerable for them.
-      * Rejected events are excluded, and links are split by their own
-        status.  The dashboard counts every direct link regardless; here a
-        rejected link contributes to neither bucket — an analyst has said it
-        is wrong, which is not "pending".
+      * Both buckets are gated on EVENT status as well as link status.  The
+        dashboard counts every direct link regardless; here the buckets mean
+        exactly what their tooltips claim:
+
+          confirmed — link confirmed AND event ``scoring``.  What scoring
+                      will actually read after the Phase 6 flip.
+          pending   — link not rejected AND event ``pending_triage``.  What
+                      working the queue can still promote into the count.
+
+        A ``display_only`` event contributes to NEITHER bucket, and post-
+        reset that is the difference that matters: ~half the corpus is
+        machine-routed display_only (supportive-direction subsidies, AD/CVD
+        procedural steps, sanction statistics).  Counting their links as
+        "pending" made gaps look closable from the queue when the events
+        backing them had already been routed out of scoring — confirming
+        those links changes nothing.  Their exclusion is also why a
+        display_only-heavy material can honestly show "no signal at all"
+        while its event list looks busy.  Rejected links and rejected
+        events likewise count nowhere — an analyst said no, which is not
+        "pending".
 
     Every material row is returned, including all-zero ones: "no signal at
     all" is the most important state the tracker renders, and it cannot be
@@ -536,16 +552,34 @@ def material_coverage(
         select(
             RiskEventMaterial.material_id,
             func.sum(
-                case((RiskEventMaterial.status == "confirmed", 1), else_=0)
+                case(
+                    (
+                        and_(
+                            RiskEvent.triage_status == "scoring",
+                            RiskEventMaterial.status == "confirmed",
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )
             ).label("confirmed"),
             func.sum(
-                case((RiskEventMaterial.status == "suggested", 1), else_=0)
+                case(
+                    (
+                        and_(
+                            RiskEvent.triage_status == "pending_triage",
+                            RiskEventMaterial.status != "rejected",
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )
             ).label("pending"),
         )
         .join(RiskEvent, RiskEvent.id == RiskEventMaterial.risk_event_id)
         .where(
             RiskEvent.duplicate_of_id.is_(None),
-            RiskEvent.triage_status != "rejected",
+            RiskEvent.triage_status.in_(("scoring", "pending_triage")),
             RiskEvent.event_date.isnot(None),
             RiskEvent.event_date >= cutoff,
             RiskEventMaterial.is_direct.is_(True),
@@ -588,6 +622,7 @@ def list_triage_events(
     event_type: Optional[str] = Query(None),
     severity_min: Optional[float] = Query(None, ge=0, le=1),
     material: Optional[str] = Query(None, description="material canonical_name with a non-rejected link"),
+    country: Optional[str] = Query(None, description="geography code (countries.iso2), primary or secondary"),
     defect: Optional[str] = Query(None, description="quality-defect facet, e.g. needs_material_review"),
     has_defects: bool = Query(False, description="only events carrying at least one quality defect"),
     flagged: bool = Query(False, description="only events with an open data-quality note"),
@@ -646,6 +681,20 @@ def list_triage_events(
                 .where(
                     Material.canonical_name == material,
                     RiskEventMaterial.status != "rejected",
+                )
+            )
+        )
+    if country:
+        # Filtered through the risk_event_geographies junction rather than
+        # geography_json: every active ingester writes junction rows, the
+        # column is indexed, and JSON containment is not portable between
+        # Postgres and the SQLite the tests run on.  Matches primary and
+        # secondary geographies alike — "show me the China events" means any
+        # event that touches China, not only the ones where it leads.
+        stmt = stmt.where(
+            RiskEvent.id.in_(
+                select(RiskEventGeography.risk_event_id).where(
+                    RiskEventGeography.country_code == country.upper()
                 )
             )
         )

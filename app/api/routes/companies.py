@@ -465,6 +465,7 @@ def get_company_events(
         .where(
             RiskEventCompany.company_id == company_id,
             RiskEvent.duplicate_of_id.is_(None),  # 055
+            RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
         )
         .order_by(desc(RiskEvent.event_date))
         .limit(limit)

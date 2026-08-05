@@ -1116,14 +1116,59 @@ def _resolve_api_jurisdiction_entry(
     return _resolve_country(name, country_name_map) or None
 
 
+# EU membership as of 2020 (post-Brexit, 27 states).  Used only to collapse
+# a multi-member implementing list into the bloc — if enlargement ever adds a
+# member, the worst failure mode is that a list containing the new state
+# stops collapsing and falls back to first-entry, which is the old behaviour.
+_EU_MEMBER_ISO2: frozenset[str] = frozenset({
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR",
+    "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL",
+    "PL", "PT", "RO", "SK", "SI", "ES", "SE",
+})
+
+
 def _resolve_iso3_jurisdiction(
     jurisdiction_list: list[dict],
     country_name_map: Optional[dict[str, str]] = None,
 ) -> Optional[str]:
-    """Extract the first implementing-country ISO2 from an API jurisdiction list."""
+    """Resolve an API implementing-jurisdiction list to a single ISO2.
+
+    The original implementation took ``jurisdiction_list[0]`` unconditionally.
+    For EU-wide measures GTA enumerates the member states individually —
+    alphabetically — so every EU regulation in the corpus landed with
+    ``implementing_iso2 = "AT"``: Austria was "implementing" the EU–US
+    countermeasures package because Austria sorts first.  (The tell was
+    already in the data: those same rows carried the *supranational*
+    implementation-level multiplier.)
+
+    Rules, in order:
+
+      1. Resolve every entry, not just the first.
+      2. If any entry resolves to ``EU`` itself, the bloc is the implementer.
+      3. If more than one distinct member state resolves and ALL of them are
+         EU members, collapse to ``EU`` — that is what an enumerated list of
+         member states means.  ``countries.iso2`` explicitly admits ``EU``,
+         so downstream joins and the geography pill both handle it.
+      4. Otherwise (single country, or a mixed multilateral list like a G7
+         action) keep the first resolved entry — for genuinely mixed lists
+         there is no honest single answer, and first-entry at least matches
+         prior behaviour while the full list is preserved separately in the
+         affected/geography structures.
+    """
     if not jurisdiction_list:
         return None
-    return _resolve_api_jurisdiction_entry(jurisdiction_list[0], country_name_map)
+    resolved: list[str] = []
+    for entry in jurisdiction_list:
+        iso = _resolve_api_jurisdiction_entry(entry, country_name_map)
+        if iso and iso not in resolved:
+            resolved.append(iso)
+    if not resolved:
+        return None
+    if "EU" in resolved:
+        return "EU"
+    if len(resolved) > 1 and all(c in _EU_MEMBER_ISO2 for c in resolved):
+        return "EU"
+    return resolved[0]
 
 
 def _resolve_iso3_list(
@@ -2121,11 +2166,24 @@ def _severity_for(intervention_type: str, in_force: bool) -> float:
     recent interventions still dominate even when their severity score is
     moderate.
 
+    2026-08-04: export bans now take the not-in-force discount like every
+    other type.  The original early return handed 0.9 to any ban regardless
+    of state, which surfaced on the EU–US countermeasures package: an export
+    ban suspended before its effective date — never in force for a single
+    day — carried the corpus-maximum severity while the sibling tariff
+    intervention of the same state act correctly showed the 0.3 path.  A
+    suspended or revoked ban is a latent threat, not a blocked supply line;
+    0.3 is the honest reading.  Caveat that applies to ALL types, not just
+    bans: severity is computed at insert only — ``_refresh_existing_event``
+    deliberately never rewrites it — so an in-force flip in either
+    direction goes stale on stored rows.  The recalibrate-gta-severity
+    backfill recomputes untriaged rows from stored metadata when needed.
+
     See ``_apply_severity_modifiers`` for the implementation-level + horizontal
     multipliers added 2026-05-06 (Scope 2 audit refinements).
     """
     if "ban" in intervention_type.lower() and "export" in intervention_type.lower():
-        return 0.9
+        return 0.9 if in_force else 0.3
     return 0.7 if in_force else 0.3
 
 
