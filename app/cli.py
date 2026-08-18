@@ -331,6 +331,40 @@ def ingest_usgs_cmd(
         skipped_aliases: list[str] = []
         unknown_aliases: list[str] = []
 
+        # ── Old-convention cleanup (freshness fix, 2026-08-05) ──────────
+        # Rows written before this fix were stamped with the MCS EDITION
+        # year (reference_year = mcs_year) instead of the data year the
+        # CSV Year column actually carries (2024/2025 for the 2026
+        # edition).  The corrected writers below key on the data year, so
+        # a plain re-run would leave the mis-stamped rows in place as the
+        # "latest" vintage — every consumer takes max(reference_year), so
+        # the stale rows would keep winning.  Delete them up front.
+        # Scoped strictly to USGS-sourced GLOBAL rows at the edition year:
+        # benchmark-workbook rows, us-scope import shares, and correctly
+        # stamped rows from any source are untouched.  Idempotent — a
+        # second run finds nothing to delete.
+        stale_material_rows = s.execute(
+            delete(MaterialProductionShare).where(
+                MaterialProductionShare.data_source == "usgs_mcs",
+                MaterialProductionShare.reference_year == mcs_year,
+            )
+        ).rowcount
+        stale_hs_rows = s.execute(
+            delete(HsCodeProductionShare).where(
+                HsCodeProductionShare.source.in_(
+                    ["usgs_mcs", "usgs_mcs_propagated"]
+                ),
+                HsCodeProductionShare.market_scope == "global",
+                HsCodeProductionShare.reference_year == mcs_year,
+            )
+        ).rowcount
+        if stale_material_rows or stale_hs_rows:
+            typer.echo(
+                f"Old-convention cleanup: deleted {stale_material_rows} "
+                f"material share rows and {stale_hs_rows} HS share rows "
+                f"stamped with edition year {mcs_year}."
+            )
+
         for rec in records:
             source_system = rec.pop("source_system", None)
             source_name = rec.pop("source_name", None)
@@ -569,19 +603,26 @@ def ingest_usgs_cmd(
                         commodity_prices_skipped_existing += 1
 
                 # ── material_production_shares upsert ─────────────────────
+                # reference_year is the DATA year from the CSV Year column
+                # (freshness fix, 2026-08-05) — NOT the MCS edition year.
+                # Pre-fix rows said 2026 for data USGS collected in 2024/25,
+                # making every freshness gate one year optimistic.  Edition
+                # year remains the fallback for records without a parseable
+                # year (none in the 2026 file today).
                 for share in production_shares:
+                    share_ref_year = share.get("reference_year") or mcs_year
                     existing_share = s.scalar(
                         select(MaterialProductionShare).where(
                             MaterialProductionShare.material_id == material.id,
                             MaterialProductionShare.country_code == share["country_code"],
-                            MaterialProductionShare.reference_year == mcs_year,
+                            MaterialProductionShare.reference_year == share_ref_year,
                         )
                     )
                     if existing_share is None:
                         s.add(MaterialProductionShare(
                             material_id=material.id,
                             country_code=share["country_code"],
-                            reference_year=mcs_year,
+                            reference_year=share_ref_year,
                             production_volume=share["production_volume"],
                             production_share=share["production_share"],
                             unit_of_measure=share.get("unit_of_measure"),
@@ -688,11 +729,13 @@ def ingest_usgs_cmd(
                         err=True,
                     )
                     continue
+                # Data year, not edition year (freshness fix, 2026-08-05).
+                hs_ref_year = hs_share.get("reference_year") or mcs_year
                 existing_hs_share = s.scalar(
                     select(HsCodeProductionShare).where(
                         HsCodeProductionShare.hs_mapping_id == hs_mapping.id,
                         HsCodeProductionShare.country_code == hs_share["country_code"],
-                        HsCodeProductionShare.reference_year == mcs_year,
+                        HsCodeProductionShare.reference_year == hs_ref_year,
                         HsCodeProductionShare.market_scope == "global",
                         HsCodeProductionShare.source == "usgs_mcs",
                     )
@@ -701,9 +744,14 @@ def ingest_usgs_cmd(
                     s.add(HsCodeProductionShare(
                         hs_mapping_id=hs_mapping.id,
                         country_code=hs_share["country_code"],
-                        reference_year=mcs_year,
+                        reference_year=hs_ref_year,
                         production_share=hs_share["production_share"],
                         production_volume=hs_share["production_volume"],
+                        # 2026-08-05: parser has always emitted the unit;
+                        # the writer silently dropped it, leaving every HS
+                        # row's unit NULL — surfaced when the Producers
+                        # table moved onto these rows.
+                        unit_of_measure=hs_share.get("unit_of_measure"),
                         market_scope="global",
                         source="usgs_mcs",
                         notes=(
@@ -715,6 +763,7 @@ def ingest_usgs_cmd(
                 elif force:
                     existing_hs_share.production_share = hs_share["production_share"]
                     existing_hs_share.production_volume = hs_share["production_volume"]
+                    existing_hs_share.unit_of_measure = hs_share.get("unit_of_measure")
                     hs_shares_written += 1
 
                 # Step 2A — collect for same-stage propagation.  We propagate
@@ -727,6 +776,9 @@ def ingest_usgs_cmd(
                 bucket = stage_anchors.setdefault(anchor_stage, {
                     "anchor_mapping_id": hs_mapping.id,
                     "type_substring": hs_share.get("type_substring", ""),
+                    # Propagated rows must carry the anchor's DATA year —
+                    # stages can differ in vintage within one material.
+                    "reference_year": hs_ref_year,
                     "shares": [],
                 })
                 # If multiple sub-types resolve to the same stage via
@@ -766,11 +818,16 @@ def ingest_usgs_cmd(
             if force and stage_anchors:
                 # Clear stale propagated rows for this material before
                 # refanning.  Primary 'usgs_mcs' rows are NOT touched.
+                # Scoped to the anchor data years this run will rewrite
+                # (was mcs_year pre-2026-08-05).
+                anchor_years = {
+                    b["reference_year"] for b in stage_anchors.values()
+                }
                 s.execute(
                     delete(HsCodeProductionShare)
                     .where(
                         HsCodeProductionShare.source == "usgs_mcs_propagated",
-                        HsCodeProductionShare.reference_year == mcs_year,
+                        HsCodeProductionShare.reference_year.in_(anchor_years),
                         HsCodeProductionShare.market_scope == "global",
                         HsCodeProductionShare.hs_mapping_id.in_(
                             select(HsCodeMaterialMapping.id).where(
@@ -783,6 +840,7 @@ def ingest_usgs_cmd(
             for stage_name, bucket in stage_anchors.items():
                 anchor_id = bucket["anchor_mapping_id"]
                 anchor_shares = bucket["shares"]
+                anchor_ref_year = bucket["reference_year"]
                 if not anchor_shares:
                     continue
                 sibling_mappings = list(s.scalars(
@@ -799,7 +857,7 @@ def ingest_usgs_cmd(
                     has_existing = s.scalar(
                         select(HsCodeProductionShare.id).where(
                             HsCodeProductionShare.hs_mapping_id == sibling.id,
-                            HsCodeProductionShare.reference_year == mcs_year,
+                            HsCodeProductionShare.reference_year == anchor_ref_year,
                             HsCodeProductionShare.market_scope == "global",
                         ).limit(1)
                     )
@@ -810,7 +868,7 @@ def ingest_usgs_cmd(
                         s.add(HsCodeProductionShare(
                             hs_mapping_id=sibling.id,
                             country_code=country_code,
-                            reference_year=mcs_year,
+                            reference_year=anchor_ref_year,
                             production_share=share,
                             # production_volume intentionally NULL on
                             # propagated rows — the country MIX is what

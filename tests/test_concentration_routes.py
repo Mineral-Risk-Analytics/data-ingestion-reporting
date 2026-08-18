@@ -92,17 +92,28 @@ def _material(db, name, symbol=None) -> Material:
     return m
 
 
-def _stage_rows(db, material, stage, hs_prefix, shares, year, source="benchmark", digit_count=4):
-    mapping = HsCodeMaterialMapping(
-        hs_code_prefix=hs_prefix, material_id=material.id,
-        digit_count=digit_count, market_scope="global", supply_chain_stage=stage,
-    )
-    db.add(mapping)
-    db.flush()
+def _stage_rows(
+    db, material, stage, hs_prefix, shares, year, source="benchmark",
+    digit_count=4, volumes=None, unit=None, mapping=None,
+):
+    """``volumes``/``unit`` (added 2026-08-05): per-country tonnage for the
+    per-stage Producers surface — set for USGS-style rows, left None for
+    benchmark-style share-only rows.  ``mapping`` (added 2026-08-10): pass an
+    existing mapping to add a second vintage/source to the SAME node — the
+    shape a workbook source switch produces."""
+    if mapping is None:
+        mapping = HsCodeMaterialMapping(
+            hs_code_prefix=hs_prefix, material_id=material.id,
+            digit_count=digit_count, market_scope="global", supply_chain_stage=stage,
+        )
+        db.add(mapping)
+        db.flush()
     for cc, share in shares.items():
         db.add(HsCodeProductionShare(
             hs_mapping_id=mapping.id, country_code=cc, production_share=share,
             reference_year=year, market_scope="global", source=source,
+            production_volume=(volumes or {}).get(cc),
+            unit_of_measure=unit,
         ))
     db.flush()
     return mapping
@@ -225,6 +236,158 @@ class TestDetail:
 
     def test_404_for_unknown_material(self, client):
         assert client.get("/api/v1/concentration/materials/999").status_code == 404
+
+
+class TestStageProducers:
+    """2026-08-05: detail producers are per-stage snapshots derived from the
+    SAME rows the engine scores — the pre-fix material_production_shares
+    list summed mine + refinery and disagreed with the stage table."""
+
+    def _copper(self, db):
+        m = _material(db, "Copper", "Cu")
+        _stage_rows(
+            db, m, "ore", "2603", {"CL": 0.23, "CN": 0.078}, 2025,
+            source="usgs_mcs",
+            volumes={"CL": 5300.0, "CN": 1800.0}, unit="thousand metric tons",
+        )
+        _stage_rows(
+            db, m, "refined", "7403", {"CN": 0.483, "CL": 0.066}, 2025,
+            source="usgs_mcs",
+            volumes={"CN": 14000.0, "CL": 1900.0}, unit="thousand metric tons",
+        )
+        # Benchmark-sourced downstream stage: shares only, stale vintage —
+        # still enumerated (all sources, per 2026-08-05 decision).
+        _stage_rows(db, m, "battery_grade", "8544", {"CN": 0.61}, 2022)
+        return m
+
+    def test_producers_enumerate_every_stage_with_data(self, client, db):
+        m = self._copper(db)
+        db.commit()
+        body = client.get(
+            f"/api/v1/concentration/materials/{m.id}", params={"as_of": AS_OF}
+        ).json()
+
+        producers = body["producers"]
+        # Stage-ordered (ore → refined → battery_grade), share-desc within.
+        assert [(p["stage"], p["country_code"]) for p in producers] == [
+            ("ore", "CL"), ("ore", "CN"),
+            ("refined", "CN"), ("refined", "CL"),
+            ("battery_grade", "CN"),
+        ]
+
+    def test_producer_shares_match_stage_table_exactly(self, client, db):
+        """The incoherence guard: the Producers table can never again say
+        CN 33.7% while the stage table says refined CN 52.1%."""
+        m = self._copper(db)
+        db.commit()
+        body = client.get(
+            f"/api/v1/concentration/materials/{m.id}", params={"as_of": AS_OF}
+        ).json()
+
+        stage_shares = {
+            (s["stage"], cc): share
+            for s in body["stages"] for cc, share in s["shares"].items()
+        }
+        for p in body["producers"]:
+            assert p["production_share"] == pytest.approx(
+                stage_shares[(p["stage"], p["country_code"])]
+            )
+
+    def test_volumes_present_for_usgs_absent_for_benchmark(self, client, db):
+        m = self._copper(db)
+        db.commit()
+        body = client.get(
+            f"/api/v1/concentration/materials/{m.id}", params={"as_of": AS_OF}
+        ).json()
+
+        by_key = {(p["stage"], p["country_code"]): p for p in body["producers"]}
+        refined_cn = by_key[("refined", "CN")]
+        assert refined_cn["production_volume"] == 14000.0
+        assert refined_cn["unit_of_measure"] == "thousand metric tons"
+        assert refined_cn["source"] == "usgs_mcs"
+        assert refined_cn["reference_year"] == 2025
+        bg_cn = by_key[("battery_grade", "CN")]
+        assert bg_cn["production_volume"] is None
+        assert bg_cn["unit_of_measure"] is None
+        assert bg_cn["source"] == "benchmark"
+        assert bg_cn["reference_year"] == 2022
+        # Header unit = first non-null unit across stage producers.
+        assert body["unit"] == "thousand metric tons"
+
+    def test_propagated_sibling_does_not_mask_primary_volume(self, client, db):
+        """2026-08-05 (Nicole): Step-2A propagation fans the anchor's country
+        mix to more-specific sibling mappings with volumes intentionally
+        omitted.  The engine dedupe prefers the most specific mapping, so the
+        propagated row won the display slot and copper showed 'share-only
+        (propagated)' despite MCS publishing actual tonnages.  Volume/unit/
+        source attribution must fall back to the volume-bearing primary row."""
+        m = _material(db, "Copper", "Cu")
+        # Primary anchor: general 4-digit mapping, volumes published.
+        _stage_rows(
+            db, m, "ore", "2603", {"CL": 0.23, "CN": 0.078}, 2025,
+            source="usgs_mcs",
+            volumes={"CL": 5300.0, "CN": 1800.0}, unit="thousand metric tons",
+        )
+        # Propagated sibling: more specific 6-digit mapping, same shares,
+        # NO volumes — wins the engine dedupe on digit_count.
+        _stage_rows(
+            db, m, "ore", "260300", {"CL": 0.23, "CN": 0.078}, 2025,
+            source="usgs_mcs_propagated", digit_count=6,
+        )
+        db.commit()
+
+        body = client.get(
+            f"/api/v1/concentration/materials/{m.id}", params={"as_of": AS_OF}
+        ).json()
+        ore_cl = next(
+            p for p in body["producers"]
+            if p["stage"] == "ore" and p["country_code"] == "CL"
+        )
+        assert ore_cl["production_volume"] == 5300.0
+        assert ore_cl["unit_of_measure"] == "thousand metric tons"
+        assert ore_cl["source"] == "usgs_mcs"
+        # Share still comes from the engine-chosen row (identical anyway).
+        assert ore_cl["production_share"] == pytest.approx(0.23)
+        # Stage-table attribution must also prefer the primary source —
+        # the stage's distribution ORIGINATES at the primary anchor even
+        # when propagated siblings win the engine dedupe.
+        ore_stage = next(s for s in body["stages"] if s["stage"] == "ore")
+        assert ore_stage["source"] == "usgs_mcs"
+
+    def test_source_switch_on_one_mapping_attributes_latest_vintage(self, client, db):
+        """2026-08-10 (Nicole): after the cobalt refined CI→IEA source switch,
+        one mapping carried CI rows @2024 AND IEA rows @2025.  Sources were
+        keyed per mapping_id (last row wins), so the 2025 snapshot displayed
+        the CI 2024 label.  Sources are now keyed per (mapping, country,
+        year): the snapshot must report the source of ITS OWN vintage, and
+        the shadowed prior vintage's source must never leak into it."""
+        m = _material(db, "Cobalt", "Co")
+        # Old vintage: CI rows @2024 on the mapping.
+        mapping = _stage_rows(
+            db, m, "refined", "810520", {"CN": 0.786, "FI": 0.072}, 2024,
+            source="benchmark_cobalt_institute_bench",
+        )
+        # New vintage: IEA rows @2025 on the SAME mapping (source switch).
+        _stage_rows(
+            db, m, "refined", "810520", {"CN": 0.756, "FI": 0.084}, 2025,
+            source="benchmark_iea_global_critical_mi", mapping=mapping,
+        )
+        db.commit()
+
+        body = client.get(
+            f"/api/v1/concentration/materials/{m.id}", params={"as_of": AS_OF}
+        ).json()
+        refined = next(s for s in body["stages"] if s["stage"] == "refined")
+        # Snapshot is the 2025 vintage and must carry the 2025 source.
+        assert refined["reference_year"] == 2025
+        assert refined["shares"]["CN"] == pytest.approx(0.756)
+        assert refined["source"] == "benchmark_iea_global_critical_mi"
+        # Producers rows likewise attribute their own vintage's source.
+        ref_cn = next(
+            p for p in body["producers"]
+            if p["stage"] == "refined" and p["country_code"] == "CN"
+        )
+        assert ref_cn["source"] == "benchmark_iea_global_critical_mi"
 
 
 class TestOverview:

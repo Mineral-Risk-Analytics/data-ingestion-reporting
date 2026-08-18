@@ -71,8 +71,8 @@ keys the existing CLI write logic expects:
       "_reserve_life_index":  float | None,
       "_production_yoy_pct":  float | None,
       "_capacity_utilization": float | None,
-      "_production_shares":    list[dict],   # material-level (aggregated across sub-types)
-      "_hs_production_shares": list[dict],   # per-HS-node (sub-type split)
+      "_production_shares":    list[dict],   # material-level (SINGLE stream — earliest stage; carries reference_year data year)
+      "_hs_production_shares": list[dict],   # per-HS-node (sub-type split; carries reference_year data year)
       "_us_import_sources":    list[dict],   # per-HS-node, market_scope='us'
       "notes": str,
     }
@@ -103,6 +103,42 @@ log = structlog.get_logger(__name__)
 from app.services.ingestion.seeds.usgs_country_mapping import (
     _COUNTRY_ISO2,
     _EXCLUDE_COUNTRIES,
+)
+
+# ---------------------------------------------------------------------------
+# Unattributed-production rows (denominator fix, 2026-08-05)
+# ---------------------------------------------------------------------------
+# ``_EXCLUDE_COUNTRIES`` conflates two different kinds of aggregate row:
+#
+#   * World totals ("world total", "world total (rounded)") — a SUM of the
+#     other rows.  Adding these to any denominator double-counts.
+#
+#   * Unattributed remainders ("other countries") and multi-country
+#     aggregates ("united states and canada") — REAL production that simply
+#     can't be pinned to a single ISO code.  Excluding these from the world
+#     denominator (the pre-2026-08-05 behaviour) inflated every named
+#     country's share and every HHI: copper's CN refined share read 52.1%
+#     against a named-countries-only denominator vs 48.3% against the true
+#     world total.
+#
+# Rows named below contribute their tonnage to the share denominator but
+# get no share row of their own (no ISO code) and no HHI term (see
+# ``_hhi``'s world_total parameter).
+_UNATTRIBUTED_COUNTRIES: frozenset[str] = frozenset({
+    "other countries",
+    "united states and canada",
+})
+
+# Stage order used to choose THE single material-level stream (summing fix,
+# 2026-08-05).  material_production_shares is one-row-per-country and its 16
+# consumers treat it as a single coherent market — so it carries the
+# earliest available supply-chain stage (mine production for every chapter
+# that has one), never a sum across stages.  Chapters with no mine stream
+# (GALLIUM primary production, BISMUTH refinery) fall through to the
+# earliest stage they do publish.  Per-stage detail lives in
+# hs_code_production_shares.
+_MATERIAL_STAGE_ORDER: tuple[str, ...] = (
+    "ore", "concentrate", "intermediate", "refined", "battery_grade",
 )
 
 
@@ -367,7 +403,10 @@ def _parse_percent_with_bound(value: str) -> Optional[float]:
         return None
 
 
-def _hhi(country_productions: dict[str, float]) -> float:
+def _hhi(
+    country_productions: dict[str, float],
+    world_total: Optional[float] = None,
+) -> float:
     """Raw Herfindahl-Hirschman Index from ``{country: production_volume}``.
 
     Returns the standard HHI: sum of squared market shares.  Mathematical
@@ -379,11 +418,22 @@ def _hhi(country_productions: dict[str, float]) -> float:
     is more concentrated than one produced equally across 30 countries,
     because losing any one producer hits the 3-country case harder).
 
+    ``world_total`` (added 2026-08-05, denominator fix): when provided
+    and larger than the named-country sum, shares are computed against
+    it so MCS "Other countries" tonnage deflates every named share.  The
+    unattributed remainder contributes NOTHING to the sum of squares —
+    it is a bag of unnamed small producers, and treating it as atomistic
+    (each ≈0 share) is the conservative reading; treating it as one
+    producer would fabricate a phantom concentrated actor.  A
+    ``world_total`` at or below the named sum falls back to the named
+    sum (never inflate shares).
+
     Empty input returns ``0.0``; an all-zero-volume dict also returns
     ``0.0``.  Caller is expected to gate the call on ``country_prod``
     truthiness when it wants ``None`` for no-data chapters.
     """
-    total = sum(country_productions.values())
+    named_total = sum(country_productions.values())
+    total = max(named_total, world_total or 0.0)
     if total == 0:
         return 0.0
     return sum((v / total) ** 2 for v in country_productions.values())
@@ -423,7 +473,10 @@ def _resolve_country(name: str) -> Optional[str]:
 def _extract_world_production_per_country(
     chapter_rows: list[dict],
     detail_substring: Optional[str] = None,
-) -> tuple[dict[str, float], dict[str, float], dict[str, float], Optional[int], str]:
+) -> tuple[
+    dict[str, float], dict[str, float], dict[str, float], Optional[int], str,
+    float, float,
+]:
     """Extract per-country production tonnages from World Production sections.
 
     Walks all rows in the chapter whose ``Section`` starts with "World ".
@@ -437,11 +490,14 @@ def _extract_world_production_per_country(
     When ``detail_substring`` is None and a chapter has multiple production
     sub-types in the same year for the same country (e.g. Copper's
     "mine production" + "refinery production" rows under one chapter),
-    this function SUMS them into a single material-level country total.
-    Callers wanting per-stage breakdowns must call
-    ``_extract_per_stage_world_production`` instead — that wrapper buckets
-    rows by stage and calls this helper per-bucket so the cross-sum
-    happens within one stage.
+    this function SUMS them into a single country total.  Since 2026-08-05
+    the orchestrator no longer uses that sum as the material-level result
+    (mine + refinery is not a real quantity) — it calls this whole-chapter
+    variant only for reserves and as a fallback for chapters with no
+    stage-classifiable rows.  Callers wanting per-stage breakdowns use
+    ``_extract_per_stage_world_production`` — that wrapper buckets rows by
+    stage and calls this helper per-bucket so the cross-sum happens within
+    one stage.
 
     detail_substring scope
     ----------------------
@@ -467,12 +523,20 @@ def _extract_world_production_per_country(
         all_country_prod_by_year: {iso2: {year: vol}} for time-series use
         latest_year:      int (4-digit year used for the headline production shares)
         unit:             str (unit of measurement; see "Units" caveat above)
+        unattributed_prod:     float — latest-year tonnage from "Other
+                               countries" / multi-country aggregate rows
+                               (``_UNATTRIBUTED_COUNTRIES``).  Belongs in
+                               the share denominator; carries no ISO code
+                               (denominator fix, 2026-08-05).
+        unattributed_reserves: float — same, for the latest reserves year.
     """
     country_prod: dict[str, float] = {}
     country_reserves: dict[str, float] = {}
     by_year: dict[str, dict[int, float]] = defaultdict(dict)
     unit = ""
     units_seen: set[str] = set()
+    unattributed_prod = 0.0
+    unattributed_reserves = 0.0
 
     detail_low = detail_substring.lower() if detail_substring else None
     production_rows: list[dict] = []
@@ -508,7 +572,18 @@ def _extract_world_production_per_country(
     # "world total" rows the inline 'world' substring check handles.
     for r in production_rows:
         country_name_low = (r.get("Country") or "").strip().lower()
-        if not country_name_low or country_name_low in _EXCLUDE_COUNTRIES:
+        if not country_name_low:
+            continue
+        if country_name_low in _UNATTRIBUTED_COUNTRIES:
+            # Real but unattributable tonnage — counts toward the world
+            # denominator, gets no share row (denominator fix, 2026-08-05).
+            year_str = r.get("Year", "")
+            m = re.match(r"^\s*(\d{4})", year_str)
+            val = _parse_value(r.get("Value", ""))
+            if m and val is not None and int(m.group(1)) == latest_year:
+                unattributed_prod += val
+            continue
+        if country_name_low in _EXCLUDE_COUNTRIES:
             continue
         if "world" in country_name_low:
             continue
@@ -559,7 +634,14 @@ def _extract_world_production_per_country(
         if not m or int(m.group(1)) != latest_reserves_year:
             continue
         country_name_low = (r.get("Country") or "").strip().lower()
-        if not country_name_low or country_name_low in _EXCLUDE_COUNTRIES:
+        if not country_name_low:
+            continue
+        if country_name_low in _UNATTRIBUTED_COUNTRIES:
+            val = _parse_value(r.get("Value", ""))
+            if val is not None:
+                unattributed_reserves += val
+            continue
+        if country_name_low in _EXCLUDE_COUNTRIES:
             continue
         if "world" in country_name_low:
             continue
@@ -570,7 +652,10 @@ def _extract_world_production_per_country(
         if val is not None:
             country_reserves[iso2] = country_reserves.get(iso2, 0.0) + val
 
-    return country_prod, country_reserves, dict(by_year), latest_year, unit
+    return (
+        country_prod, country_reserves, dict(by_year), latest_year, unit,
+        unattributed_prod, unattributed_reserves,
+    )
 
 
 def _extract_world_capacity_per_country(
@@ -683,7 +768,9 @@ _DQ_DUPLICATE_SUSPECT = "duplicate_suspect"  # multiple details, >30% country ov
 
 def _extract_per_stage_world_production(
     chapter_rows: list[dict],
-) -> list[tuple[str, str, dict[str, float], Optional[int], str, Optional[str]]]:
+) -> list[
+    tuple[str, str, dict[str, float], Optional[int], str, Optional[str], float]
+]:
     """Group all "World *" production rows by detected supply_chain_stage.
 
     Replaces the per-substring loop in ``parse_mcs2026_csv`` with auto-
@@ -735,9 +822,12 @@ def _extract_per_stage_world_production(
     The chapter alias should be marked ``is_skipped=true`` if this fires.
 
     Returns:
-        list of 6-tuples (stage, detail_low, country_prod, latest_year,
-        unit, data_quality_flag).  Previous callers using 5-tuple
-        destructuring need updating.
+        list of 7-tuples (stage, detail_low, country_prod, latest_year,
+        unit, data_quality_flag, unattributed_prod).  unattributed_prod
+        (added 2026-08-05) is the stage's "Other countries" tonnage —
+        callers must include it in the share denominator but write no
+        share row for it.  Previous callers using 6-tuple destructuring
+        need updating.
     """
     # First pass — build (stage, detail) buckets and extract per-country
     # production per bucket.
@@ -760,10 +850,10 @@ def _extract_per_stage_world_production(
     # can distinguish "no data" from "parser bug" when chapter coverage
     # looks thin.
     bucket_extractions: list[
-        tuple[str, str, dict[str, float], Optional[int], str]
+        tuple[str, str, dict[str, float], Optional[int], str, float]
     ] = []
     for (stage, detail_low), bucket_rows in by_bucket.items():
-        country_prod, _r, _by_year, latest_year, unit = (
+        country_prod, _r, _by_year, latest_year, unit, unattributed, _ur = (
             _extract_world_production_per_country(bucket_rows, detail_substring=None)
         )
         if not country_prod:
@@ -775,14 +865,14 @@ def _extract_per_stage_world_production(
             )
             continue
         bucket_extractions.append(
-            (stage, detail_low, country_prod, latest_year, unit or "")
+            (stage, detail_low, country_prod, latest_year, unit or "", unattributed)
         )
 
     # Cross-bucket unit consistency check (Issue 5.1).  Sum-based
     # consolidation is only well-defined if the buckets share a unit.
     units_per_stage: dict[str, Counter] = defaultdict(Counter)
     countries_per_bucket: dict[tuple[str, str], set[str]] = {}
-    for stage, detail_low, country_prod, _yr, unit in bucket_extractions:
+    for stage, detail_low, country_prod, _yr, unit, _unattr in bucket_extractions:
         if unit:
             units_per_stage[stage][unit] += 1
         countries_per_bucket[(stage, detail_low)] = set(country_prod.keys())
@@ -848,9 +938,13 @@ def _extract_per_stage_world_production(
     )
     by_stage_meta: dict[str, dict] = {}
     by_stage_details: dict[str, list[str]] = defaultdict(list)
-    for stage, detail_low, country_prod, latest_year, unit in bucket_extractions:
+    # Unattributed tonnage sums across buckets exactly like named-country
+    # tonnage does — an "Other countries" row exists per detail bucket.
+    by_stage_unattributed: dict[str, float] = defaultdict(float)
+    for stage, detail_low, country_prod, latest_year, unit, unattr in bucket_extractions:
         for iso2, vol in country_prod.items():
             by_stage_country[stage][iso2] += vol
+        by_stage_unattributed[stage] += unattr
         prev = by_stage_meta.get(stage)
         if prev is None or len(country_prod) > prev["country_count"]:
             by_stage_meta[stage] = {
@@ -884,6 +978,7 @@ def _extract_per_stage_world_production(
             by_stage_meta[stage]["latest_year"],
             by_stage_meta[stage]["unit"],
             stage_dq_flag[stage],
+            by_stage_unattributed[stage],
         )
         for stage in by_stage_country
     ]
@@ -1574,20 +1669,65 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
         if not chapter or not chapter_rows:
             continue
 
-        # ── Material-level production shares (aggregated across sub-types) ──
-        country_prod, country_reserves, _by_year, latest_year, unit = (
-            _extract_world_production_per_country(chapter_rows, detail_substring=None)
+        # ── Material-level production shares (single-stream, 2026-08-05) ──
+        # Pre-fix this block summed EVERY production detail in the chapter
+        # into one per-country total — copper's CN row was mine 1,800 +
+        # refinery 14,000 = 15,800 kt, a quantity that exists at no single
+        # point in the supply chain.  material_production_shares is one-
+        # row-per-country, so it now carries exactly ONE stream: the
+        # earliest available stage per _MATERIAL_STAGE_ORDER (mine
+        # production wherever MCS publishes one).  Per-stage detail lives
+        # in hs_code_production_shares.
+        #
+        # The whole-chapter call is kept for reserves (stage-independent)
+        # and as a legacy fallback stream for chapters whose Statistics_
+        # detail strings defeat stage auto-detection.
+        (
+            fallback_prod, country_reserves, _by_year, fallback_year,
+            fallback_unit, fallback_unattr, unattributed_reserves,
+        ) = _extract_world_production_per_country(chapter_rows, detail_substring=None)
+
+        # Computed once; reused for hs_production_shares Path A below.
+        per_stage_extractions = _extract_per_stage_world_production(chapter_rows)
+        stage_by_name = {entry[0]: entry for entry in per_stage_extractions}
+        material_stage = next(
+            (s for s in _MATERIAL_STAGE_ORDER if s in stage_by_name), None
+        )
+        if material_stage is not None:
+            (
+                _ms, _ms_detail, country_prod, latest_year, unit,
+                _ms_dq, unattributed_prod,
+            ) = stage_by_name[material_stage]
+        else:
+            country_prod = fallback_prod
+            latest_year = fallback_year
+            unit = fallback_unit
+            unattributed_prod = fallback_unattr
+
+        # World totals include unattributed "Other countries" tonnage
+        # (denominator fix, 2026-08-05) — shares are fractions of the true
+        # world total, not of the named-countries sum.
+        world_prod = (
+            sum(country_prod.values()) + unattributed_prod
+            if country_prod else None
+        )
+        world_reserves = (
+            sum(country_reserves.values()) + unattributed_reserves
+            if country_reserves else None
         )
 
-        criticality = round(_hhi(country_prod), 4) if country_prod else None
-        reserve_hhi = round(_hhi(country_reserves), 4) if country_reserves else None
+        criticality = (
+            round(_hhi(country_prod, world_total=world_prod), 4)
+            if country_prod else None
+        )
+        reserve_hhi = (
+            round(_hhi(country_reserves, world_total=world_reserves), 4)
+            if country_reserves else None
+        )
 
         ranked_countries = [
             iso2 for iso2, _ in sorted(country_prod.items(), key=lambda x: -x[1])
         ]
-
-        world_prod = sum(country_prod.values()) if country_prod else None
-        world_reserves = sum(country_reserves.values()) if country_reserves else None
 
         production_shares: list[dict] = []
         if country_prod and world_prod and world_prod > 0:
@@ -1597,6 +1737,9 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
                     "production_volume": vol,
                     "production_share": round(vol / world_prod, 6),
                     "unit_of_measure": unit or None,
+                    # Data year from the CSV Year column — NOT the MCS
+                    # edition year (freshness fix, 2026-08-05).
+                    "reference_year": latest_year,
                 })
 
         # Reserve life index — guard against unit-scale mismatches that
@@ -1662,13 +1805,16 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
         # the orchestrator's ``world_unit`` output would report the
         # wrong value if a chapter ever had mixed-stage units.
         for (
-            stage, detail_low, stage_country_prod, _yr, stage_unit, dq_flag
-        ) in _extract_per_stage_world_production(chapter_rows):
+            stage, detail_low, stage_country_prod, stage_year, stage_unit,
+            dq_flag, stage_unattributed,
+        ) in per_stage_extractions:
             # Skip if this detail substring is handled by the explicit
             # sub-type override below (Silicon ferrosilicon/silicon metal).
             if any(ovr in detail_low for ovr in path_b_overrides):
                 continue
-            sub_world = sum(stage_country_prod.values())
+            # Denominator includes the stage's "Other countries" tonnage
+            # (denominator fix, 2026-08-05).
+            sub_world = sum(stage_country_prod.values()) + stage_unattributed
             if sub_world <= 0:
                 continue
             for iso2, vol in stage_country_prod.items():
@@ -1681,6 +1827,9 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
                     "production_share":  round(vol / sub_world, 6),
                     "unit_of_measure":   stage_unit or None,
                     "type_substring":    detail_low,
+                    # Data year from the CSV Year column, not the edition
+                    # year (freshness fix, 2026-08-05).
+                    "reference_year":    stage_year,
                     # Issue 5.2 (2026-05-31): surface the consolidation
                     # judgment so downstream review / future scoring can
                     # gate on TELLURIUM-style duplicate_suspect cases.
@@ -1702,12 +1851,16 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
         for (cfg_chapter, cfg_detail), hs_prefix in _DETAIL_TO_HS_PREFIX.items():
             if cfg_chapter != chapter:
                 continue
-            sub_country_prod, _sub_reserves, _sub_year, _sub_y, sub_unit = (
-                _extract_world_production_per_country(
-                    chapter_rows, detail_substring=cfg_detail,
-                )
+            (
+                sub_country_prod, _sub_reserves, _sub_by_year, sub_year,
+                sub_unit, sub_unattributed, _sub_unattr_res,
+            ) = _extract_world_production_per_country(
+                chapter_rows, detail_substring=cfg_detail,
             )
-            sub_world = sum(sub_country_prod.values()) if sub_country_prod else 0.0
+            sub_world = (
+                sum(sub_country_prod.values()) + sub_unattributed
+                if sub_country_prod else 0.0
+            )
             if sub_country_prod and sub_world > 0:
                 for iso2, vol in sub_country_prod.items():
                     hs_production_shares.append({
@@ -1718,6 +1871,7 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
                         "production_share": round(vol / sub_world, 6),
                         "unit_of_measure": sub_unit or None,
                         "type_substring": cfg_detail,
+                        "reference_year": sub_year,
                     })
 
         # ── US import sources ─────────────────────────────────────────────
@@ -1752,6 +1906,17 @@ def parse_mcs2026_csv(filepath: str | Path) -> list[dict]:
             "Source: USGS Mineral Commodity Summaries 2026 long-format CSV.",
             f"Latest production year used: {latest_year}.",
         ]
+        if material_stage is not None:
+            notes_parts.append(
+                f"Material-level shares carry the '{material_stage}' stream "
+                "only (single-stream fix 2026-08-05); per-stage detail in "
+                "hs_production_shares."
+            )
+        if unattributed_prod:
+            notes_parts.append(
+                f"World total includes {unattributed_prod:,.0f} {unit} "
+                "unattributed ('Other countries') tonnage."
+            )
         # Issue 8.4 fix (2026-05-31): explicit ``is not None`` so a
         # legitimate zero world_total still surfaces in notes.  The
         # other notes branches already use this pattern; this one was

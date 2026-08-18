@@ -107,6 +107,11 @@ class GeoResultOut(BaseModel):
 
 
 class ProducerOut(BaseModel):
+    # Stage the row belongs to (2026-08-05): detail-endpoint producers are
+    # per-stage snapshots — shares are within-stage fractions and must
+    # never be summed across stages.  None on overview top_production rows,
+    # which come from the single-stream material_production_shares table.
+    stage: Optional[str] = None
     country_code: str
     production_share: float
     production_volume: Optional[float] = None
@@ -215,18 +220,32 @@ class ConcentrationOverview(BaseModel):
 # Computation helpers
 # ---------------------------------------------------------------------------
 
+# Per-observation volume + unit, keyed (hs_mapping_id, country_code,
+# reference_year) — ShareRow is the engine's dataclass and must not grow
+# UI-only fields, so volumes travel beside the rows instead of on them.
+VolumeKey = tuple[int, str, int]
+VolumeMap = dict[VolumeKey, tuple[Optional[float], Optional[str]]]
+# Per-observation source, same key (2026-08-10).  Was keyed per mapping_id
+# with last-row-wins, which mislabelled snapshots the moment one mapping
+# carried rows from two sources — first hit when cobalt refined switched
+# CI→IEA and the 2025 IEA snapshot displayed the CI 2024 label (Nicole).
+SourceMap = dict[VolumeKey, Optional[str]]
+
+
 def _load_rows_with_source_bulk(
     db: Session, material_ids: list[int]
-) -> dict[int, tuple[list[ShareRow], dict[int, Optional[str]]]]:
+) -> dict[int, tuple[list[ShareRow], SourceMap, VolumeMap]]:
     """Superset of ``stage_concentration.load_share_rows``, batched.
 
     Same rows and filters as the engine's loader, plus each observation's
     ``source`` (so the UI can attribute a snapshot: USGS at ore, benchmark
-    downstream) — fetched for EVERY requested material in ONE query and
-    grouped in Python.  The overview used to call the single-material loader
-    in a loop, which multiplied into hundreds of round trips against a remote
-    Postgres (~11s page loads); the round trips, not the row volume, were the
-    cost.
+    downstream) and its ``production_volume``/``unit_of_measure`` (the
+    per-stage Producers table shows tonnages where USGS publishes them;
+    benchmark rows carry shares only) — fetched for EVERY requested
+    material in ONE query and grouped in Python.  The overview used to
+    call the single-material loader in a loop, which multiplied into
+    hundreds of round trips against a remote Postgres (~11s page loads);
+    the round trips, not the row volume, were the cost.
     """
     if not material_ids:
         return {}
@@ -240,6 +259,8 @@ def _load_rows_with_source_bulk(
             HsCodeMaterialMapping.digit_count,
             HsCodeProductionShare.hs_mapping_id,
             HsCodeProductionShare.source,
+            HsCodeProductionShare.production_volume,
+            HsCodeProductionShare.unit_of_measure,
         )
         .join(
             HsCodeMaterialMapping,
@@ -251,36 +272,43 @@ def _load_rows_with_source_bulk(
             HsCodeMaterialMapping.supply_chain_stage.is_not(None),
         )
     ).all()
-    out: dict[int, tuple[list[ShareRow], dict[int, Optional[str]]]] = {
-        mid: ([], {}) for mid in material_ids
+    out: dict[int, tuple[list[ShareRow], SourceMap, VolumeMap]] = {
+        mid: ([], {}, {}) for mid in material_ids
     }
     for r in result:
-        rows, sources = out[int(r[0])]
+        rows, sources, volumes = out[int(r[0])]
         rows.append(ShareRow(
             stage=r[1], country_code=r[2], production_share=float(r[3]),
             reference_year=int(r[4]), digit_count=int(r[5]), hs_mapping_id=int(r[6]),
         ))
-        sources[int(r[6])] = r[7]
+        key = (int(r[6]), r[2], int(r[4]))
+        sources[key] = r[7]
+        volumes[key] = (
+            float(r[8]) if r[8] is not None else None,
+            r[9],
+        )
     return out
 
 
 def _load_rows_with_source(
     db: Session, material_id: int
-) -> tuple[list[ShareRow], dict[int, Optional[str]]]:
+) -> tuple[list[ShareRow], SourceMap, VolumeMap]:
     """Single-material convenience over the bulk loader (detail endpoint)."""
     return _load_rows_with_source_bulk(db, [material_id])[material_id]
 
 
-def _snapshot_detail(
-    stage: str, stage_rows: list[ShareRow], as_of: date,
-    sources: dict[int, Optional[str]],
-) -> StageDetailOut:
-    """One stage's single-vintage snapshot, deduped the way the engine dedupes.
+def _stage_snapshot_best(
+    stage: str, stage_rows: list[ShareRow]
+) -> tuple[int, dict[str, ShareRow], list[str]]:
+    """Latest-vintage, deduped country→row snapshot for one stage.
 
     Mirrors ``compute_stage_concentration``'s latest-year selection and
-    prefer-most-specific-mapping rule so stale stages get EXACTLY the numbers
-    they would have had if fresh — anything else would make the understatement
-    comparison apples-to-oranges.
+    prefer-most-specific-mapping rule so every surface derived from it
+    (stage sub-score table, per-stage Producers table, stale-stage
+    understatement comparison) shows EXACTLY the numbers the engine
+    scores — anything else would make the surfaces disagree with the
+    score, which is the incoherence the 2026-08-05 Copper investigation
+    caught.
     """
     latest_year = max(r.reference_year for r in stage_rows)
     snapshot = [r for r in stage_rows if r.reference_year == latest_year]
@@ -301,16 +329,46 @@ def _snapshot_detail(
             )
             if r.production_share > cur.production_share:
                 best[r.country_code] = r
+    return latest_year, best, conflicts
+
+
+def _snapshot_detail(
+    stage: str, stage_rows: list[ShareRow], as_of: date,
+    sources: SourceMap,
+) -> StageDetailOut:
+    """One stage's single-vintage snapshot, deduped the way the engine dedupes."""
+    latest_year, best, conflicts = _stage_snapshot_best(stage, stage_rows)
 
     shares = {c: r.production_share for c, r in best.items()}
     hhi_raw = sum(s * s for s in shares.values())
     age = as_of.year - latest_year
-    src_values = {sources.get(r.hs_mapping_id) for r in best.values()}
+    # Source attribution looks at ALL same-vintage rows, preferring a
+    # primary source over '*_propagated' (2026-08-05, Nicole): the engine
+    # dedupe hands the winning slots to more-specific PROPAGATED siblings,
+    # but those rows are copies — the distribution originates at the
+    # primary anchor, and labelling the stage "propagated" misattributes
+    # it.  "Propagated" now only shows when a stage genuinely has no
+    # primary row at the snapshot vintage.  Sources are keyed per
+    # (mapping, country, year) — per-mapping keying mislabelled snapshots
+    # once a mapping carried two sources across vintages (2026-08-10).
+    src_values = {
+        sources.get((r.hs_mapping_id, r.country_code, r.reference_year))
+        for r in stage_rows
+        if r.reference_year == latest_year
+    }
     src_values.discard(None)
+    primary_sources = sorted(
+        s for s in src_values if not s.endswith("_propagated")
+    )
+    source = (
+        primary_sources[0]
+        if primary_sources
+        else (sorted(src_values)[0] if src_values else None)
+    )
     return StageDetailOut(
         stage=stage,
         reference_year=latest_year,
-        source=sorted(src_values)[0] if src_values else None,
+        source=source,
         hhi_raw=hhi_raw,
         hhi_cliff=hhi_concentration_risk(hhi_raw),
         fresh=age <= FRESHNESS_YEARS,
@@ -320,18 +378,88 @@ def _snapshot_detail(
     )
 
 
-def _material_concentration(
-    db: Session, material_id: int, as_of: date
-) -> tuple[list[StageDetailOut], dict[str, GeoResultOut], Optional[str], bool, Optional[PriorOreHhiOut]]:
-    """Full stage + per-geo picture for one material (detail endpoint)."""
-    rows, sources = _load_rows_with_source(db, material_id)
-    wgi = _load_wgi_by_geo(db, {r.country_code for r in rows})
-    return _material_concentration_from_rows(rows, sources, wgi, as_of)
+def _rows_by_stage(rows: list[ShareRow]) -> dict[str, list[ShareRow]]:
+    """Scoring-eligible rows grouped by stage (engine's stage vocabulary)."""
+    by_stage: dict[str, list[ShareRow]] = {}
+    for r in rows:
+        if r.stage in CONCENTRATION_STAGES and r.production_share > 0:
+            by_stage.setdefault(r.stage, []).append(r)
+    return by_stage
+
+
+def _stage_producers(
+    by_stage: dict[str, list[ShareRow]],
+    sources: SourceMap,
+    volumes: VolumeMap,
+) -> list[ProducerOut]:
+    """Per-stage producer rows from the SAME snapshots the engine scores.
+
+    One entry per (stage × country), stage-ordered then share-descending.
+    Replaces the material_production_shares-backed list (2026-08-05): that
+    table's rows summed mine + refinery volumes, so the Producers table
+    said CN 33.7% while the stage table said refined CN 52.1%.  Deriving
+    producers from the stage snapshots makes disagreement structurally
+    impossible.  Shares are within-stage fractions — stages must never be
+    summed against each other (different denominators).  Volumes/units are
+    present where USGS publishes tonnage; benchmark-sourced stages carry
+    shares only.
+    """
+    out: list[ProducerOut] = []
+    for stage in _STAGE_ORDER:
+        stage_rows = by_stage.get(stage)
+        if not stage_rows:
+            continue
+        latest_year, best, _conflicts = _stage_snapshot_best(stage, stage_rows)
+        stage_out: list[ProducerOut] = []
+        for country, r in best.items():
+            volume, unit = volumes.get(
+                (r.hs_mapping_id, country, r.reference_year), (None, None)
+            )
+            source = sources.get((r.hs_mapping_id, country, r.reference_year))
+            if volume is None:
+                # The engine's dedupe prefers the most SPECIFIC mapping,
+                # which after Step-2A fan-out is often a PROPAGATED sibling
+                # — same share by construction, but volumes are
+                # intentionally omitted on propagated rows.  For display
+                # attribution, fall back to any same-vintage row for this
+                # (stage, country) that carries published tonnage: that's
+                # the primary anchor the distribution came from.  Without
+                # this, copper showed "share-only (propagated)" while the
+                # MCS publishes actual tonnages (caught by Nicole,
+                # 2026-08-05).
+                for alt in stage_rows:
+                    if (
+                        alt.country_code != country
+                        or alt.reference_year != latest_year
+                    ):
+                        continue
+                    alt_volume, alt_unit = volumes.get(
+                        (alt.hs_mapping_id, country, alt.reference_year),
+                        (None, None),
+                    )
+                    if alt_volume is not None:
+                        volume, unit = alt_volume, alt_unit
+                        source = sources.get(
+                            (alt.hs_mapping_id, country, alt.reference_year)
+                        )
+                        break
+            stage_out.append(ProducerOut(
+                stage=stage,
+                country_code=country,
+                production_share=r.production_share,
+                production_volume=volume,
+                reference_year=latest_year,
+                unit_of_measure=unit,
+                source=source,
+            ))
+        stage_out.sort(key=lambda p: -p.production_share)
+        out.extend(stage_out)
+    return out
 
 
 def _material_concentration_from_rows(
     rows: list[ShareRow],
-    sources: dict[int, Optional[str]],
+    sources: SourceMap,
     wgi: dict[str, float],
     as_of: date,
 ) -> tuple[list[StageDetailOut], dict[str, GeoResultOut], Optional[str], bool, Optional[PriorOreHhiOut]]:
@@ -344,10 +472,7 @@ def _material_concentration_from_rows(
     # amplifier diagnostics.  Never recompute what it already decides.
     engine = compute_stage_concentration(rows, as_of, wgi_by_geo=wgi)
 
-    by_stage: dict[str, list[ShareRow]] = {}
-    for r in rows:
-        if r.stage in CONCENTRATION_STAGES and r.production_share > 0:
-            by_stage.setdefault(r.stage, []).append(r)
+    by_stage = _rows_by_stage(rows)
 
     details = [
         _snapshot_detail(stage, stage_rows, as_of, sources)
@@ -472,11 +597,6 @@ def _latest_producers_bulk(
     return out
 
 
-def _latest_producers(db: Session, material_id: int) -> list[ProducerOut]:
-    """Single-material convenience over the bulk loader (detail endpoint)."""
-    return _latest_producers_bulk(db, [material_id])[material_id]
-
-
 def _latest_criticality_bulk(
     db: Session, material_ids: list[int]
 ) -> dict[int, MaterialCriticalitySignal]:
@@ -529,7 +649,7 @@ def concentration_overview(
     crit_by_material = _latest_criticality_bulk(db, material_ids)
     wgi = _load_wgi_by_geo(
         db,
-        {r.country_code for rows, _ in rows_by_material.values() for r in rows},
+        {r.country_code for rows, *_ in rows_by_material.values() for r in rows},
     )
 
     items: list[OverviewRowOut] = []
@@ -539,7 +659,7 @@ def concentration_overview(
 
     for m in materials:
         producers = producers_by_material[m.id]
-        rows, sources = rows_by_material[m.id]
+        rows, sources, _volumes = rows_by_material[m.id]
         details, per_geo, driving_geo, headline_understated, prior = (
             _material_concentration_from_rows(rows, sources, wgi, as_of_date)
         )
@@ -636,10 +756,16 @@ def concentration_detail(
     if m is None:
         raise HTTPException(status_code=404, detail="Material not found")
 
-    details, per_geo, driving_geo, headline_understated, prior = _material_concentration(
-        db, material_id, as_of_date
+    rows, sources, volumes = _load_rows_with_source(db, material_id)
+    wgi = _load_wgi_by_geo(db, {r.country_code for r in rows})
+    details, per_geo, driving_geo, headline_understated, prior = (
+        _material_concentration_from_rows(rows, sources, wgi, as_of_date)
     )
-    producers = _latest_producers(db, material_id)
+    # Producers come from the SAME stage snapshots the score uses — not
+    # from material_production_shares (2026-08-05; that table is single-
+    # stream and its pre-fix rows summed mine + refinery).  All sources
+    # included: USGS stages carry volumes, benchmark stages shares only.
+    producers = _stage_producers(_rows_by_stage(rows), sources, volumes)
 
     cap_rows = db.scalars(
         select(MaterialCapacityShare)
@@ -683,7 +809,9 @@ def concentration_detail(
         name=m.canonical_name,
         symbol=m.symbol_or_code,
         is_launch_list=is_launch_list_material(m.canonical_name),
-        unit=producers[0].unit_of_measure if producers else None,
+        # First non-null unit across stage producers (benchmark-sourced
+        # stages carry shares only, so the first row may have no unit).
+        unit=next((p.unit_of_measure for p in producers if p.unit_of_measure), None),
         as_of=as_of_date,
         freshness_years=FRESHNESS_YEARS,
         governance_beta=GOVERNANCE_AMPLIFIER_BETA,

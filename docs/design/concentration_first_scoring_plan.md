@@ -1,10 +1,65 @@
 # Concentration-First Scoring Launch — Plan
 
-*Drafted 2026-08-04 from Nicole's direction. PLANNING DOCUMENT ONLY — no
-code, workbook, or data changes have been made. Everything cited was
-verified against the repo on 2026-08-04. Supersedes the Phase 6 flip as
+*Drafted 2026-08-04 from Nicole's direction. Supersedes the Phase 6 flip as
 written in `event_triage_pipeline_plan.md` §5 once approved (that doc's
 status ledger should be updated on approval, not before).*
+
+## 0a. Status ledger (updated 2026-08-05)
+
+**Workstream A is substantially complete.** What happened, in order:
+
+- **A2 instrument BUILT + audit RUN (2026-08-05).** The Supply
+  Concentration transparency surface is the freshness-exposure report:
+  `/api/v1/concentration/overview` (+`?as_of=` for pinned artifacts) and
+  `/materials/{id}`, plus the two frontend pages. Route-side stale-stage
+  snapshots use the engine's exact dedupe rules; per-geo understatement is
+  computed against pre-amplifier scores; the overview carries a launch-list
+  audit tally and CSV export. Batched loaders hold the overview at a
+  constant ~7 queries (11s N+1 fixed; query-budget regression test ≤10).
+  First audit export (2026-08-05, pre-USGS-fix): launch list 9 fully fresh
+  / 1 stale (Cobalt battery_grade@2022) / 0 understated / 0 no-stage.
+- **A1 was WRONG AS WRITTEN and is closed.** Benchmark shares are audited
+  and have been since the last rescore (Nicole, 2026-08-05).
+- **A3 closed the hard way: the audit surfaced three real USGS ingest
+  defects** (Nicole caught Copper ≠ MCS PDF; the "renormalisation bug" as
+  originally suspected was subsumed by these):
+  1. material-level shares summed mine + refinery per country (CN copper
+     1,800 + 14,000 = 15,800 kt — a quantity existing at no single point
+     in the chain);
+  2. share denominators excluded "Other countries" — every share and HHI
+     inflated (Cu refined CN 52.1% vs true 48.3%; ore HHI 0.137 vs ~0.105);
+  3. `reference_year` carried the MCS **edition** year (2026) instead of
+     the CSV's data years (2024/25) — freshness one year optimistic.
+  **All three fixed 2026-08-05** (`mcs2026_parser.py` + `cli.py` writer +
+  8 pinning tests): material table now carries a single earliest-stage
+  stream; unattributed tonnage enters denominators but gets no share row
+  and no HHI term (remainder treated as atomistic); data-year stamping
+  with an idempotent old-convention cleanup built into `ingest-usgs`;
+  units now persisted on HS rows. Corpus corrected by re-running
+  `ingest-usgs --force` (re-ingest, not backfill — consistent with the
+  no-backfill rule). Known adjacent gap, explicitly deferred: capacity
+  extraction likely shares defect 2 (awaiting go).
+- **Producers surface redesigned (2026-08-05, Nicole's ruling:** "producing
+  refined material is still being a producer"**).** Detail-page producers
+  are now per-stage rows derived from the SAME snapshots the engine scores
+  (country × stage matrix, all sources, volumes+units where published,
+  primary-source attribution preferred over propagated copies) — the
+  table can no longer disagree with the score, which is the incoherence
+  that exposed defect 1.
+- **A4 DONE:** WGI vintage 2024 loaded = current. Refresh cadence to be
+  stated in A5/A6.
+- **Remaining in Workstream A:** re-export the audit CSV from corrected
+  data → **A7** formal band re-cut (ON HOLD until that export; pre-fix
+  distribution: launch 8 CRIT/1 HIGH/1 MOD under 30/50/65, corpus ~69%
+  CRIT, preliminary direction ~35/60/85 — all HHIs shift down some with
+  corrected denominators) → **A5** cadence/versioning statement (must name
+  the freshness cliff — binding stages at 2024 data years go stale
+  2027-01-01 — and the mandatory annual MCS + benchmark refresh) → **A6**
+  methodology page (must document: data-year convention, single-stream
+  material table, Other-countries denominator treatment, criticality
+  signals staying edition-stamped, propagation provenance). Nicole's
+  chores: cobalt battery-grade benchmark vintage refresh (could flip
+  driving geo CD→CN), ribbons eyeball.
 
 ## 0. The decision and why
 
@@ -78,6 +133,9 @@ criteria are written down**. Workstreams C and D exist for exactly these.
   evidence and would hollow out silently otherwise.
 
 ## 2. Workstream A — prove concentration can carry it (BLOCKING, first)
+
+*Status 2026-08-05: A1 closed (was already done), A2 built+run, A3 fixed
+(three ingest defects), A4 verified. A5–A7 remain — see §0a ledger.*
 
 The pillar must be audited before it stands alone. Known debts, in order:
 
