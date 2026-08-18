@@ -296,6 +296,96 @@ class MaterialCapacityShare(Base):
     )
 
 
+class CountryMaterialRelevance(Base):
+    """
+    Per-(country, material, role) relevance flag.  Captures the fact that
+    each material has a distinct set of relevant producing and consuming
+    countries — Australia is a top lithium producer but a minor cobalt
+    producer; DRC dominates cobalt but not nickel; China is a major
+    refiner of cathode chemistry but only a moderate raw-ore producer.
+
+    Replaces (eventually) the per-country binary ``countries.is_major_producer``
+    and ``is_major_consumer`` flags, and the global ``{CN, CD, RU}`` HCG
+    set in the scoring engine.  In Phase 1 (the migration introducing
+    this table) the data is purely informational — the scoring engine
+    still reads the global HCG set.  Phase 2 swaps the scoring engine
+    to read ``is_hcg`` from this table on a per-(material, country)
+    basis.
+
+    Producer rows are auto-seeded from ``material_production_shares``
+    using share-based thresholds (top ≥ 30%, mid 10-30%, minor 1-10%,
+    HCG ≥ 40%).  Consumer rows start as placeholders for each
+    ``is_major_consumer`` country and are refined by partner curation
+    or by future Comtrade-import-share calculations.
+
+    Granularity: one row per (material, country, role).  A single
+    country can have BOTH a producer row and a consumer row for the
+    same material (e.g. Germany imports lithium AND has minor lithium
+    production).
+    """
+
+    __tablename__ = "country_material_relevance"
+    __table_args__ = (
+        UniqueConstraint(
+            "material_id", "country_code", "role",
+            name="uq_country_material_relevance",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    material_id: Mapped[int] = mapped_column(
+        ForeignKey("materials.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    country_code: Mapped[str] = mapped_column(
+        String(2), nullable=False, index=True,
+        comment="ISO-3166-1 alpha-2 country code.  Joins to countries.iso2.",
+    )
+    role: Mapped[str] = mapped_column(
+        String(16), nullable=False,
+        comment="'producer' or 'consumer'.",
+    )
+    tier: Mapped[Optional[str]] = mapped_column(
+        String(16), nullable=True,
+        comment=(
+            "Relevance tier: 'top' (≥30% share for producers), "
+            "'mid' (10-30%), 'minor' (1-10%), 'emerging' "
+            "(announced but not yet producing)."
+        ),
+    )
+    is_hcg: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+        comment=(
+            "High-Concentration Geography flag, per-(material, country). "
+            "Default threshold: share ≥ 40%.  Phase 2: scoring engine "
+            "reads this column instead of the global HCG set."
+        ),
+    )
+    source: Mapped[str] = mapped_column(
+        String(32), nullable=False,
+        comment=(
+            "'mcs_share' (auto-seeded), 'partner_curated' (manual), "
+            "or 'derived' (computed from another source)."
+        ),
+    )
+    derived_share: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment="Production share snapshot at seed time (0.0–1.0).",
+    )
+    reference_year: Mapped[Optional[int]] = mapped_column(
+        SmallInteger, nullable=True,
+        comment="Year of the derived_share snapshot.",
+    )
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(),
+    )
+
+    material: Mapped["Material"] = relationship()
+
+
 class TradeFlow(Base):
     """
     A single import or export observation from Comtrade trade data.

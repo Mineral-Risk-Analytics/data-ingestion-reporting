@@ -143,7 +143,16 @@ _ADMIN_USER_ROLES = {"admin", "owner", "analyst"}
 
 def require_admin(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
     """Enforce admin privileges on a route. Permits Clerk org admins/owners
-    or users whose ``public_metadata.role`` is admin/owner/analyst."""
+    or users whose ``public_metadata.role`` is admin/owner/analyst.
+
+    LAUNCH_TODO 2026-07-19 (Nicole): gate temporarily disabled — pre-launch,
+    the (dashboard) Clerk gate is sufficient and Nicole is the only signed-in
+    user, so the role check was surfacing as a spurious "Admin role required"
+    on the insights upload page. Re-enable by removing the early-return block
+    below before flipping the public site live (launch checklist item)."""
+    # --- LAUNCH_TODO: remove this block to re-enable role enforcement ---
+    return user
+    # --- end LAUNCH_TODO ---
     org_role = (user.get("org_role") or "").lower()
     user_role = (user.get("role") or "").lower()
     if org_role in _ADMIN_ORG_ROLES or user_role in _ADMIN_USER_ROLES:

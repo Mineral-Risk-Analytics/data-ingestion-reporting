@@ -25,7 +25,7 @@ hard-coded uplift points in ``regulatory_risk.py``:
 
 Other seeded regulations (CRMA_2024, EU_CBAM, EU_CSDDD, EU_CONFLICT_MINERALS,
 EU_REACH_COBALT, SEC_CLIMATE_2024) are tracked for evidence and reporting but
-generate no uplift until ``COMPLIANCE_OBLIGATIONS`` is extended.
+generate no uplift until ``obligation_points`` is set on the row (Build 2).
 
 Trust model — verified flag
 ---------------------------
@@ -87,7 +87,7 @@ _ASSESSED_AT = date(2025, 1, 1)
 #   EU_CONFLICT_MINERALS         : Cobalt removed (mis-scoped),
 #                                   Tin/Tantalum/Tungsten added at
 #                                   disclosure_required (3TG actual scope)
-#   EU_CBAM                      : Iron Ore (LFP Grade) added at covered
+#   EU_CBAM                      : Iron Ore added at covered
 #
 # 2026-05-17 (later same session) — Section 3 material-scope expansions:
 #   IRA_DOMESTIC                 : metadata_json severity_overrides
@@ -96,13 +96,13 @@ _ASSESSED_AT = date(2025, 1, 1)
 #   CRMA_2024                    : Nd/Pr/Dy/Tb promoted strategic →
 #                                   restricted (already in 65%-cap
 #                                   violation today, bite is real)
-#                                : Phosphate (Battery Grade) +
+#                                : Phosphate +
 #                                   Rare Earth Elements (bundled)
 #                                   added at strategic_raw_material
 #                                   (closes phosphate + bundled-REE
 #                                   coverage gaps)
-#   EU_BATTERY_REG_2023          : Phosphate (Battery Grade) +
-#                                   Iron Ore (LFP Grade) added at
+#   EU_BATTERY_REG_2023          : Phosphate +
+#                                   Iron Ore added at
 #                                   restricted; Aluminum added at
 #                                   covered (cell-component coverage,
 #                                   no recycled-content threshold)
@@ -115,18 +115,21 @@ _ASSESSED_AT = date(2025, 1, 1)
 #                                   (reflects single-non-EU-country
 #                                   supply concentration risk for
 #                                   strategic materials)
-_SEED_VERSION = "2026-05-17c"
+_SEED_VERSION = "2026-06-11"
 
 # ---------------------------------------------------------------------------
 # 1. Regulation definitions
 # ---------------------------------------------------------------------------
-# regulation_key MUST match the keys in regulatory_risk.COMPLIANCE_OBLIGATIONS
+# regulation_key is the stable lookup key; obligation_points/is_obligation on the
 # for the three scored regulations. Additional regulations can be seeded for
-# report context but won't affect scores until COMPLIANCE_OBLIGATIONS is extended.
+# row drive the uplift (Build 2, migration 063) — no code edit needed to extend.
 
 _REGULATIONS: list[dict] = [
     {
         "regulation_key": "UFLPA",
+        "applies_all_materials": True,
+        "is_obligation": True,
+        "obligation_points": 25,
         "title": "Uyghur Forced Labor Prevention Act",
         "issuing_body": "US Department of Homeland Security",
         "geography": "US",
@@ -148,9 +151,18 @@ _REGULATIONS: list[dict] = [
             "battery_materials_focus": ["Natural Graphite", "Cobalt", "Lithium"],
             "rebuttable_presumption": True,
         },
+        # Producer-country enforcement risk.  Xinjiang-origin rebuttable
+        # presumption — only CN-origin material falls under UFLPA scope;
+        # non-CN producers aren't subject to the presumption.
+        "geography_compliance_weights": {
+            "CN": 1.0,
+            "DEFAULT": 0.0,
+        },
     },
     {
         "regulation_key": "IRA_DOMESTIC",
+        "is_obligation": True,
+        "obligation_points": 15,
         "title": "IRA FEOC & Domestic Content Framework",
         "issuing_body": "US Department of the Treasury / IRS",
         "geography": "US",
@@ -201,9 +213,22 @@ _REGULATIONS: list[dict] = [
                 "garden-variety effective regulation."
             ),
         },
+        # Producer-country enforcement risk.  FEOC binary per Treasury
+        # guidance — materials originating from CN/RU/IR/KP disqualify
+        # battery components from IRA §45X credits.  Non-FEOC producers
+        # are out of scope.
+        "geography_compliance_weights": {
+            "CN": 1.0,
+            "RU": 1.0,
+            "IR": 1.0,
+            "KP": 1.0,
+            "DEFAULT": 0.0,
+        },
     },
     {
         "regulation_key": "CRMA_2024",
+        "is_obligation": True,
+        "obligation_points": 15,
         "title": "EU Critical Raw Materials Act",
         "issuing_body": "European Council",
         "geography": "EU",
@@ -225,9 +250,21 @@ _REGULATIONS: list[dict] = [
             "recycling_target_pct": 25,
             "target_year": 2030,
         },
+        # Producer-country enforcement risk.  CRMA's 65% single-country
+        # cap targets concentration most heavily.  CN faces strongest
+        # pressure (REE, graphite, refined Li/Co/Ni dominance); CD
+        # secondary (cobalt concentration).  DEFAULT 0.3 captures that
+        # any supplier inherits some EU diversification pressure.
+        "geography_compliance_weights": {
+            "CN": 1.0,
+            "CD": 0.5,
+            "DEFAULT": 0.3,
+        },
     },
     {
         "regulation_key": "EU_CBAM",
+        "is_obligation": True,
+        "obligation_points": 5,
         "title": "EU Carbon Border Adjustment Mechanism",
         "issuing_body": "European Commission",
         "geography": "EU",
@@ -246,6 +283,17 @@ _REGULATIONS: list[dict] = [
             "transitional_phase_end": "2025-12-31",
             "full_implementation": "2026-01-01",
             "covered_sectors": ["iron_steel", "aluminium", "cement", "fertilisers", "electricity", "hydrogen", "copper"],
+        },
+        # Producer-country enforcement risk.  Carbon-border certificates
+        # bite hardest where grid carbon intensity is highest.  CN coal-
+        # heavy grid → high-carbon Al / steel / Cu.  IN similar carbon
+        # profile.  RU high-carbon refining footprint.  DEFAULT 0.3
+        # captures baseline certificate cost for cleaner producers.
+        "geography_compliance_weights": {
+            "CN": 1.0,
+            "IN": 1.0,
+            "RU": 0.8,
+            "DEFAULT": 0.3,
         },
     },
     {
@@ -276,6 +324,8 @@ _REGULATIONS: list[dict] = [
 
     {
         "regulation_key": "EU_BATTERY_REG_2023",
+        "is_obligation": True,
+        "obligation_points": 20,
         "title": "EU Battery Regulation (EU) 2023/1542 — batteries and waste batteries",
         "issuing_body": "European Parliament and Council",
         "geography": "EU",
@@ -298,9 +348,25 @@ _REGULATIONS: list[dict] = [
             "recycled_content_nickel_2031_pct": 6,
             "battery_passport_effective": "2027-02-18",
         },
+        # Producer-country enforcement risk.  Article 47 due-diligence
+        # obligations on Co/Li/Ni/Graphite.  CD (DRC cobalt) is the
+        # canonical target.  CN dominates Co/Li refining + graphite
+        # processing.  DEFAULT 0.5 reflects baseline due-diligence
+        # exposure for all four scoped materials' producer countries
+        # (AU, CA, CL, ID etc.) — the regulation has broad applicability,
+        # but lower-risk jurisdictions face less scrutiny than the named
+        # high-weight countries.
+        "geography_compliance_weights": {
+            "CD": 1.0,
+            "CN": 0.8,
+            "DEFAULT": 0.5,
+        },
     },
     {
         "regulation_key": "EU_CSDDD",
+        "applies_all_materials": True,
+        "is_obligation": True,
+        "obligation_points": 10,
         "title": "Corporate Sustainability Due Diligence Directive (EU) 2024/1760",
         "issuing_body": "European Parliament and Council",
         "geography": "EU",
@@ -320,9 +386,23 @@ _REGULATIONS: list[dict] = [
             "covers_value_chain": True,
             "civil_liability": True,
         },
+        # Producer-country enforcement risk.  Broad human-rights +
+        # environmental due diligence across full value chain.  CD
+        # (DRC artisanal mining), MM (Myanmar REE/tin governance), and
+        # CN (Xinjiang labour + Inner Mongolia environment) carry the
+        # heaviest scrutiny.  DEFAULT 0.5 reflects baseline due-diligence
+        # exposure for the regulation's broad applicability.
+        "geography_compliance_weights": {
+            "CD": 1.0,
+            "MM": 1.0,
+            "CN": 0.8,
+            "DEFAULT": 0.5,
+        },
     },
     {
         "regulation_key": "EU_CONFLICT_MINERALS",
+        "is_obligation": True,
+        "obligation_points": 3,
         "title": "EU Conflict Minerals Regulation (EU) 2017/821",
         "issuing_body": "European Parliament and Council",
         "geography": "EU",
@@ -341,9 +421,22 @@ _REGULATIONS: list[dict] = [
             "covered_minerals": ["tin", "tantalum", "tungsten", "gold"],
             "due_diligence_framework": "OECD_5_step",
         },
+        # Producer-country enforcement risk.  3TG sourcing from CAHRAs
+        # (Conflict-Affected and High-Risk Areas).  CD (Eastern DRC)
+        # canonical conflict zone.  RW (Rwanda) smuggling concerns
+        # over CD-origin minerals.  MM (Myanmar) tin from contested
+        # areas.  DEFAULT 0.0 — non-CAHRA sources are out of scope.
+        "geography_compliance_weights": {
+            "CD": 1.0,
+            "RW": 0.7,
+            "MM": 0.7,
+            "DEFAULT": 0.0,
+        },
     },
     {
         "regulation_key": "EU_REACH_COBALT",
+        "is_obligation": True,
+        "obligation_points": 8,
         "title": "REACH Regulation (EC) 1907/2006 — Cobalt SVHC restrictions",
         "issuing_body": "European Parliament and Council",
         "geography": "EU",
@@ -368,6 +461,14 @@ _REGULATIONS: list[dict] = [
                 "cobalt diacetate",
             ],
         },
+        # Producer-country enforcement risk.  REACH SVHC authorisation
+        # applies to the USE of cobalt compounds in EU manufacturing —
+        # it's an origin-agnostic use-side regulation.  All cobalt
+        # producers face uniform downstream EU customer pressure
+        # regardless of source; no named-country differentiation.
+        "geography_compliance_weights": {
+            "DEFAULT": 0.5,
+        },
     },
 ]
 
@@ -390,6 +491,30 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Natural Graphite", "scope_type": "banned", "notes": "Significant Xinjiang processing concentration. Primary UFLPA battery enforcement focus."},
         {"material": "Cobalt", "scope_type": "banned", "notes": "DRC cobalt routed through Chinese processors with potential Xinjiang exposure."},
         {"material": "Lithium", "scope_type": "banned", "notes": "Some Chinese lithium processing in Xinjiang. Secondary enforcement focus."},
+        # 2026-06-11 partner-direction (REE seed gap): China dominates light-
+        # and heavy-REE processing — separation and oxide manufacture are
+        # concentrated in Inner Mongolia, Sichuan, Jiangxi, and some Xinjiang
+        # adjacents.  Xinjiang-nexus sourcing is a real (if secondary) UFLPA
+        # enforcement path for REE-derived inputs in traction motors and
+        # electronics.  Aggregate REE covers bundle-attributed events; the
+        # four named magnet REEs travel separately for events that name a
+        # specific element.
+        {"material": "Rare Earth Elements", "scope_type": "banned", "notes": "Chinese REE separation/processing has Xinjiang-adjacent exposure (Inner Mongolia, Sichuan, Jiangxi)."},
+        {"material": "Neodymium", "scope_type": "banned", "notes": "Traction-motor magnet REE; Chinese processing dominance creates UFLPA exposure."},
+        {"material": "Praseodymium", "scope_type": "banned", "notes": "Traction-motor magnet REE; Chinese processing dominance creates UFLPA exposure."},
+        {"material": "Dysprosium", "scope_type": "banned", "notes": "Heavy-REE magnet additive; Chinese processing dominance creates UFLPA exposure."},
+        {"material": "Terbium", "scope_type": "banned", "notes": "Heavy-REE magnet additive; Chinese processing dominance creates UFLPA exposure."},
+        # 2026-06-11 broader seed-coverage sweep: Xinjiang concentration is
+        # direct and significant for three more battery-relevant materials.
+        # Silicon (Anode Grade) is the largest gap — Xinjiang produces
+        # 40%+ of global polysilicon and the UFLPA Withhold Release Order
+        # on Hoshine Silicon Industry (June 2021) is the textbook UFLPA
+        # action on a battery-adjacent material.  Xinjiang aluminum
+        # production and ferromanganese / electrolytic-manganese-metal
+        # output are both real but secondary to Silicon.
+        {"material": "Silicon (Anode Grade)", "scope_type": "banned", "notes": "Xinjiang produces 40%+ of global polysilicon; Hoshine Silicon WRO (June 2021) is the textbook UFLPA action on battery-adjacent material."},
+        {"material": "Aluminum", "scope_type": "banned", "notes": "Xinjiang is a major Chinese aluminum-smelting province; coal-fueled smelters there are direct UFLPA enforcement targets."},
+        {"material": "Manganese", "scope_type": "banned", "notes": "Xinjiang ferromanganese and electrolytic manganese metal production create UFLPA exposure for battery-grade Mn supply chains."},
     ],
     "IRA_DOMESTIC": [
         {"material": "Lithium", "scope_type": "covered", "notes": "Critical mineral — FEOC sourcing disqualifies from tax credit."},
@@ -397,6 +522,28 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Nickel", "scope_type": "covered", "notes": "Critical mineral under FEOC rules."},
         {"material": "Manganese", "scope_type": "covered", "notes": "Critical mineral under FEOC rules."},
         {"material": "Natural Graphite", "scope_type": "covered", "notes": "Battery component input — FEOC restrictions apply."},
+        # 2026-06-11 partner-direction (REE seed gap): Nd, Pr, Dy, and Tb
+        # are explicit US critical minerals under DOE/USGS designations, and
+        # NdFeB magnets are core components of EV traction motors that
+        # qualify under §45X manufacturing credits.  FEOC sourcing of these
+        # REEs disqualifies the resulting magnet from credit eligibility.
+        # Aggregate REE covers events that attribute generically.
+        {"material": "Rare Earth Elements", "scope_type": "covered", "notes": "REE supply chain in §45X scope for traction-motor magnet production."},
+        {"material": "Neodymium",   "scope_type": "covered", "notes": "Critical mineral — NdFeB magnet feedstock; FEOC sourcing disqualifies §45X credit."},
+        {"material": "Praseodymium", "scope_type": "covered", "notes": "Critical mineral — NdFeB magnet feedstock; FEOC sourcing disqualifies §45X credit."},
+        {"material": "Dysprosium",  "scope_type": "covered", "notes": "Critical mineral — high-temperature magnet additive; FEOC sourcing disqualifies §45X credit."},
+        {"material": "Terbium",     "scope_type": "covered", "notes": "Critical mineral — magnet additive; FEOC sourcing disqualifies §45X credit."},
+        # 2026-06-11 broader seed-coverage sweep: launch-list materials
+        # that are §45X-eligible battery components but were missing from
+        # the IRA scope.  Aluminum, Copper, and Silicon are all on the
+        # current US critical-minerals list; Phosphate is
+        # the LFP cathode active material directly named in §45X eligible
+        # component lists.  FEOC-sourced versions of any of these
+        # disqualify the resulting battery / component from §45X credits.
+        {"material": "Aluminum",                "scope_type": "covered", "notes": "US critical mineral; Al collector foil + casings are §45X-eligible battery components."},
+        {"material": "Copper",                  "scope_type": "covered", "notes": "Added to US critical mineral list (USGS 2024); Cu current-collector foil is a §45X-eligible battery component."},
+        {"material": "Phosphate", "scope_type": "covered", "notes": "LFP cathode active material is explicitly §45X-eligible; FEOC-sourced phosphate disqualifies LFP-cathode credit."},
+        {"material": "Silicon (Anode Grade)",   "scope_type": "covered", "notes": "US critical mineral; Si anode active material is a §45X-eligible battery component."},
     ],
     # NOTE: ``EU_BATTERY_REG_2023`` material scopes are defined further down
     # in this dict (after CRMA / CBAM) so the strategic-raw-material context
@@ -424,8 +571,14 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Manganese",              "scope_type": "strategic_raw_material"},
         {"material": "Natural Graphite",       "scope_type": "strategic_raw_material"},
         {"material": "Copper",                 "scope_type": "strategic_raw_material"},
+        # 2026-06-11 broader seed-coverage sweep: CRMA Annex II names
+        # "Bauxite / alumina / aluminium" together as a strategic raw
+        # material — current seed missed it.  EU has binding 2030 benchmarks
+        # against Al concentration (China + Russia dominate primary smelting).
+        {"material": "Aluminum",               "scope_type": "strategic_raw_material",
+         "notes": "CRMA Annex II Strategic Raw Material (bauxite/alumina/aluminium)."},
         # LFP-chemistry materials (2026-05-17 addition)
-        {"material": "Phosphate (Battery Grade)", "scope_type": "strategic_raw_material",
+        {"material": "Phosphate", "scope_type": "strategic_raw_material",
          "notes": "LFP cathode active material; closes phosphate coverage gap identified in v2 walkthrough."},
         # Industrial / electronics
         {"material": "Boron",                  "scope_type": "strategic_raw_material"},
@@ -461,14 +614,14 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         # iron/steel, aluminium, fertilisers, electricity, hydrogen, plus
         # copper from 2026 under the aluminium-sector expansion.  We seed
         # the battery-relevant materials only.
-        # 2026-05-17 partner-direction addition: Iron Ore (LFP Grade)
+        # 2026-05-17 partner-direction addition: Iron Ore
         # added to reflect CBAM's iron/steel coverage.  LFP-chemistry
         # companies have meaningful CBAM exposure on the iron-ore side
         # that was missing from the previous seed.
         {"material": "Aluminum",              "scope_type": "covered"},
         {"material": "Nickel",                "scope_type": "covered"},
         {"material": "Copper",                "scope_type": "covered", "notes": "Copper included under aluminium sector extension from 2026."},
-        {"material": "Iron Ore (LFP Grade)",  "scope_type": "covered", "notes": "CBAM covers iron and steel imports — relevant to LFP-chemistry supply chains."},
+        {"material": "Iron Ore",  "scope_type": "covered", "notes": "CBAM covers iron and steel imports — relevant to LFP-chemistry supply chains."},
     ],
     "EU_BATTERY_REG_2023": [
         # 2026-05-17 partner-direction recalibration: scope_type bumped
@@ -482,9 +635,9 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         # per-material event impact by ~2.2× (1.10× multiplier vs 0.50×).
         #
         # 2026-05-17 partner-direction additions:
-        #   * Phosphate (Battery Grade): LFP cathode-active material —
+        #   * Phosphate: LFP cathode-active material —
         #     closes phosphate coverage gap identified in v2 walkthrough
-        #   * Iron Ore (LFP Grade): LFP cathode-active material —
+        #   * Iron Ore: LFP cathode-active material —
         #     parallel to phosphate addition above
         #   * Aluminum: cell-component (current-collector foil, cell
         #     casings, module structural) — `covered` not `restricted`
@@ -497,14 +650,44 @@ _MATERIAL_SCOPES: dict[str, list[dict]] = {
         {"material": "Nickel",                    "scope_type": "restricted", "notes": "Battery passport + due diligence from 2025. Recycled-content target 6% by 2031."},
         {"material": "Manganese",                 "scope_type": "restricted", "notes": "Battery passport + due diligence from 2025."},
         {"material": "Natural Graphite",          "scope_type": "restricted", "notes": "Battery passport + due diligence from 2025."},
-        {"material": "Phosphate (Battery Grade)", "scope_type": "restricted", "notes": "LFP cathode active material — regulated under battery-component composition framework."},
-        {"material": "Iron Ore (LFP Grade)",      "scope_type": "restricted", "notes": "LFP cathode active material — parallel to phosphate."},
+        {"material": "Phosphate", "scope_type": "restricted", "notes": "LFP cathode active material — regulated under battery-component composition framework."},
+        {"material": "Iron Ore",      "scope_type": "restricted", "notes": "LFP cathode active material — parallel to phosphate."},
         {"material": "Aluminum",                  "scope_type": "covered",    "notes": "Cell-component coverage (cathode current-collector foil, casings, module structural) — no per-material recycled-content threshold."},
+        # 2026-06-11 broader seed-coverage sweep: parallel to Aluminum
+        # above.  Copper foil is the anode-side current collector; Silicon
+        # is increasingly used in anode active material blends.  Both are
+        # in the battery-component scope of EU 2023/1542 but without per-
+        # material composition thresholds, so 'covered' (not 'restricted').
+        {"material": "Copper",                "scope_type": "covered", "notes": "Anode-side current-collector foil — in battery-component scope; no per-material composition threshold."},
+        {"material": "Silicon (Anode Grade)", "scope_type": "covered", "notes": "Silicon anode active material — in battery-component scope as cells shift to higher Si content."},
     ],
     "EU_CSDDD": [
         {"material": "Cobalt",           "scope_type": "disclosure_required", "notes": "Mandatory human-rights / environmental due diligence across supply chain."},
         {"material": "Lithium",          "scope_type": "disclosure_required"},
         {"material": "Natural Graphite", "scope_type": "disclosure_required"},
+        # 2026-06-11 partner-direction (REE seed gap): CSDDD due-diligence
+        # obligation extends across the EU's strategic-raw-material supply
+        # chain (CRMA-mapped) — REE supply chain is one of the highest-
+        # concentration single-country dependencies and a top CSDDD audit
+        # target.  Includes aggregate REE for bundle-attributed events
+        # plus the four named magnet elements.
+        {"material": "Rare Earth Elements", "scope_type": "disclosure_required", "notes": "Strategic raw material per CRMA — CSDDD due diligence extends to REE supply chain (mining + processing + magnet manufacture)."},
+        {"material": "Neodymium",   "scope_type": "disclosure_required", "notes": "Traction-motor magnet REE — CSDDD due-diligence target."},
+        {"material": "Praseodymium", "scope_type": "disclosure_required", "notes": "Traction-motor magnet REE — CSDDD due-diligence target."},
+        {"material": "Dysprosium",  "scope_type": "disclosure_required", "notes": "Heavy-REE magnet additive — CSDDD due-diligence target."},
+        {"material": "Terbium",     "scope_type": "disclosure_required", "notes": "Heavy-REE magnet additive — CSDDD due-diligence target."},
+        # 2026-06-11 broader seed-coverage sweep: CSDDD applies to large EU
+        # companies' supply chains broadly.  These six battery materials
+        # all have well-documented supply-chain due-diligence concerns
+        # (forced labor, environmental, indigenous-land, artisanal mining)
+        # that are explicit CSDDD audit targets.  Each entry names the
+        # primary concentration of concern.
+        {"material": "Aluminum",                "scope_type": "disclosure_required", "notes": "Bauxite from Guinea (50%+ global bauxite share) — forced-labor and indigenous-land due-diligence concerns."},
+        {"material": "Copper",                  "scope_type": "disclosure_required", "notes": "DRC artisanal copper-cobalt sourcing — child-labor and environmental due-diligence concerns."},
+        {"material": "Nickel",                  "scope_type": "disclosure_required", "notes": "Indonesian laterite nickel HPAL (Sulawesi) — environmental and indigenous-land due-diligence concerns."},
+        {"material": "Manganese",               "scope_type": "disclosure_required", "notes": "South African and Gabonese manganese — labor-rights due-diligence concerns."},
+        {"material": "Phosphate", "scope_type": "disclosure_required", "notes": "Western Sahara phosphate (~70% of MA phosphate exports) — occupation / indigenous-rights due-diligence concerns."},
+        {"material": "Silicon (Anode Grade)",   "scope_type": "disclosure_required", "notes": "Xinjiang polysilicon — UFLPA-overlapping forced-labor due-diligence concerns."},
     ],
     "EU_CONFLICT_MINERALS": [
         # 2026-05-17 partner-direction recalibration: the regulation
@@ -936,14 +1119,24 @@ _COMPANY_EXPOSURES: list[dict] = [
 # Seed function
 # ---------------------------------------------------------------------------
 
-def seed_regulations(session: Session) -> dict[str, int]:
+def seed_regulations(session: Session, *, force: bool = False) -> dict[str, int]:
     """Upsert regulations, material scopes, geography scopes, and company exposures.
 
     Four-pass operation:
-      Pass 1: Upsert regulations by regulation_key
+      Pass 1: Upsert regulations by regulation_key (always updates mutable fields)
       Pass 2: Upsert regulation_material_scope (needs regulation_id + material_id)
       Pass 3: Upsert regulation_geography_scope (needs regulation_id)
       Pass 4: Upsert company_regulation_exposure (needs company_id + regulation_id)
+
+    Normal run (force=False):
+        Passes 2–3 skip existing rows — their values in the DB are authoritative.
+        Pass 4 always updates changed fields (compliance status can change over time).
+
+    Force run (force=True):
+        Passes 2–3 overwrite ``scope_type`` and ``notes`` on existing scope rows
+        with the current seed values.  Use after correcting scope classifications
+        in ``_MATERIAL_SCOPES`` or ``_GEOGRAPHY_SCOPES``.
+        Does NOT delete scope rows that exist in the DB but not in the seed.
 
     Returns counts per table.
     """
@@ -959,8 +1152,8 @@ def seed_regulations(session: Session) -> dict[str, int]:
 
     reg_ids: dict[str, int] = {}
     regs_inserted = regs_updated = 0
-    mat_scopes_inserted = mat_scopes_skipped = 0
-    geo_scopes_inserted = geo_scopes_skipped = 0
+    mat_scopes_inserted = mat_scopes_updated = mat_scopes_skipped = 0
+    geo_scopes_inserted = geo_scopes_updated = geo_scopes_skipped = 0
     exposures_inserted = exposures_updated = exposures_skipped = 0
 
     # ── Pass 1: Regulations ──────────────────────────────────────────────────
@@ -994,9 +1187,14 @@ def seed_regulations(session: Session) -> dict[str, int]:
             reg_ids[key] = existing.id
             # Update mutable fields (including verified + metadata_json so
             # rows pre-dating the verified-flag rollout get upgraded on
-            # re-seed).
+            # re-seed).  geography_compliance_weights added 2026-06-06 —
+            # existing DB rows had NULL JSONB for all 8 partner-tier
+            # regulations, so the merge-on-re-seed path needs to update
+            # this field too (otherwise the weights would only flow
+            # through to fresh-environment first-time inserts).
             for field in ("title", "summary", "status", "effective_date",
-                          "metadata_json", "verified"):
+                          "metadata_json", "verified",
+                          "geography_compliance_weights"):
                 if getattr(existing, field) != payload.get(field):
                     setattr(existing, field, payload.get(field))
             regs_updated += 1
@@ -1031,7 +1229,12 @@ def seed_regulations(session: Session) -> dict[str, int]:
                 ))
                 mat_scopes_inserted += 1
             else:
-                mat_scopes_skipped += 1
+                if force:
+                    existing.scope_type = entry.get("scope_type", "covered")
+                    existing.notes = entry.get("notes")
+                    mat_scopes_updated += 1
+                else:
+                    mat_scopes_skipped += 1
 
     session.flush()
 
@@ -1055,7 +1258,11 @@ def seed_regulations(session: Session) -> dict[str, int]:
                 ))
                 geo_scopes_inserted += 1
             else:
-                geo_scopes_skipped += 1
+                if force:
+                    existing.scope_type = entry.get("scope_type", "jurisdiction")
+                    geo_scopes_updated += 1
+                else:
+                    geo_scopes_skipped += 1
 
     session.flush()
 
@@ -1129,8 +1336,10 @@ def seed_regulations(session: Session) -> dict[str, int]:
         "regulations_inserted": regs_inserted,
         "regulations_updated": regs_updated,
         "material_scopes_inserted": mat_scopes_inserted,
+        "material_scopes_updated": mat_scopes_updated,
         "material_scopes_skipped": mat_scopes_skipped,
         "geography_scopes_inserted": geo_scopes_inserted,
+        "geography_scopes_updated": geo_scopes_updated,
         "geography_scopes_skipped": geo_scopes_skipped,
         "exposures_inserted": exposures_inserted,
         "exposures_updated": exposures_updated,

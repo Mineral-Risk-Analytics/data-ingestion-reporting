@@ -16,7 +16,15 @@ from __future__ import annotations
 
 from typing import Optional
 
-SCORING_VERSION = "3.0"
+# 4.0 (2026-07-17): V1 scoring reset — docs/design/scoring_v1_spec.md.
+# Material Concentration = stage-max structural sub-scores from the share
+# tables (stage_concentration.py); non-producers score 0; §7b freshness
+# gate on share vintages.  L0 node composites, the stage-weighted rollup,
+# the material-HHI lift, and the legacy material_fallback no longer feed
+# the pillar.  (3.1 history: Fix A share>0 gating + Fix B hhi×sqrt(share);
+# see docs/design/concentration_share_weighting.md.)  Chemistry rollup
+# keeps its own methodology_version=2.0 tag (unrelated axis).
+SCORING_VERSION = "4.4"  # 4.4 (2026-07-27): operational event component top-3 mean + hardened export-restriction fold (primary/dupe/subtype gates). 4.3: obligation soft-cap. 4.2: geo sub-inputs avg→max. 4.1: governance amplifier
 
 PILLAR_WEIGHTS: dict[str, float] = {
     "material":                  0.25,

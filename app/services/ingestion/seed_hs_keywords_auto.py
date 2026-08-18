@@ -60,18 +60,18 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'ore and concentrates',
         'graphite, natural, other',
     ],
-    ("2510", "Phosphate (Battery Grade)"): [
+    ("2510", "Phosphate"): [
         'phosphate (battery grade)',
         'ore and concentrates',
         'natural calcium phosphates, unground',
         'natural calcium phosphates, ground',
     ],
-    ("251010", "Phosphate (Battery Grade)"): [
+    ("251010", "Phosphate"): [
         'phosphate (battery grade)',
         'ore and concentrates',
         'natural calcium phosphates, unground',
     ],
-    ("251020", "Phosphate (Battery Grade)"): [
+    ("251020", "Phosphate"): [
         'phosphate (battery grade)',
         'ore and concentrates',
         'natural calcium phosphates, ground',
@@ -108,14 +108,8 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'calcium',
         'colemanite',
     ],
-    ("252810", "Boron"): [
-        'boron',
-        'ore and concentrates',
-    ],
-    ("252890", "Boron"): [
-        'boron',
-        'ore and concentrates',
-    ],
+    # 2026-06-11: removed ("252810","Boron") and ("252890","Boron") — both
+    # codes were collapsed into 252800 in HS2022 audit; entries orphaned.
     ("2529", "Fluorspar"): [
         'fluorspar',
         'ore and concentrates',
@@ -146,7 +140,7 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'ore and concentrates',
         'natural cryolite',
     ],
-    ("2601", "Iron Ore (LFP Grade)"): [
+    ("2601", "Iron Ore"): [
         'iron ore (lfp grade)',
         'fe',
         'ore and concentrates',
@@ -157,14 +151,14 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'sinter',
         'roasted iron pyrites',
     ],
-    ("260111", "Iron Ore (LFP Grade)"): [
+    ("260111", "Iron Ore"): [
         'iron ore (lfp grade)',
         'fe',
         'ore and concentrates',
         'iron ores',
         'coarse',
     ],
-    ("260112", "Iron Ore (LFP Grade)"): [
+    ("260112", "Iron Ore"): [
         'iron ore (lfp grade)',
         'fe',
         'ore and concentrates',
@@ -173,7 +167,7 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'briquettes',
         'sinter',
     ],
-    ("260120", "Iron Ore (LFP Grade)"): [
+    ("260120", "Iron Ore"): [
         'iron ore (lfp grade)',
         'fe',
         'roasted iron pyrites',
@@ -344,25 +338,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'ore and concentrates',
         'zirconium ores and concentrates',
     ],
-    ("261500", "Niobium"): [
-        'niobium',
-        'nb',
-        'ore and concentrates',
-    ],
-    ("261500", "Tantalum"): [
-        'tantalum',
-        'ta',
-        'ore and concentrates',
-    ],
-    ("261500", "Vanadium"): [
-        'vanadium',
-        'ore and concentrates',
-    ],
-    ("261500", "Zirconium"): [
-        'zirconium',
-        'zr',
-        'ore and concentrates',
-    ],
     ("261510", "Zirconium"): [
         'zirconium',
         'zr',
@@ -486,10 +461,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'tb',
         'rare‑earth metals, scandium and yttrium, whether or not intermixed or interalloyed',
     ],
-    ("280512", "Lithium"): [
-        'lithium',
-        'li',
-    ],
     ("280530", "Dysprosium"): [
         'dysprosium',
         'dy',
@@ -516,13 +487,13 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'tb',
         'rare‑earth metals, scandium and yttrium, whether or not intermixed or interalloyed',
     ],
-    ("2809", "Phosphate (Battery Grade)"): [
+    ("2809", "Phosphate"): [
         'phosphate (battery grade)',
         'battery grade',
         'battery-grade',
         'high purity',
     ],
-    ("280920", "Phosphate (Battery Grade)"): [
+    ("280920", "Phosphate"): [
         'phosphate (battery grade)',
         'battery grade',
         'battery-grade',
@@ -791,15 +762,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'sodium phosphates, tribasic',
         'trisodium phosphate',
     ],
-    ("283526", "Sodium"): [
-        'sodium',
-        'na',
-        'battery grade',
-        'battery-grade',
-        'high purity',
-        'sodium phosphates, tribasic',
-        'trisodium phosphate',
-    ],
     ("2836", "Cobalt"): [
         'cobalt',
         'co',
@@ -892,14 +854,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'high purity',
         'other salts of oxometallic or peroxometallic acids, sodium salts',
         'other oxometallic and peroxometallic acid salts',
-    ],
-    ("284169", "Sodium"): [
-        'sodium',
-        'na',
-        'battery grade',
-        'battery-grade',
-        'high purity',
-        'other salts of oxometallic or peroxometallic acids, sodium salts',
     ],
     ("284170", "Molybdenum"): [
         'molybdenum',
@@ -1229,11 +1183,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'cu',
         'refined copper, unwrought',
     ],
-    ("740300", "Copper"): [
-        'copper',
-        'cu',
-        'refined copper, unwrought',
-    ],
     ("740311", "Copper"): [
         'copper',
         'cu',
@@ -1265,10 +1214,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'copper wire rod',
     ],
     ("7501", "Nickel"): [
-        'nickel',
-        'ni',
-    ],
-    ("750100", "Nickel"): [
         'nickel',
         'ni',
     ],
@@ -1419,10 +1364,6 @@ _HS_KEYWORDS_AUTO: dict[tuple[str, str], list[str]] = {
         'molybdenum',
         'mo',
         'molybdenum metal powders',
-    ],
-    ("810292", "Molybdenum"): [
-        'molybdenum',
-        'mo',
     ],
     ("810294", "Molybdenum"): [
         'molybdenum',

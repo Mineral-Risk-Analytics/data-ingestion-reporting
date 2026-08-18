@@ -27,8 +27,10 @@ run-api:
 ingest-federal:
 	python -m app.cli ingest federal-register
 
-ingest-census:
-	python -m app.cli ingest census-trade
+# ingest-census: removed in the June 2026 Trade Volumes audit — the
+# Census adapter is parked as a Phase 2 buyer-region scoping scaffold.
+# See app/services/ingestion/adapters/census_trade.py for the unpark
+# checklist.  Re-add this target only when those prerequisites are met.
 
 ingest-sec:
 	python -m app.cli ingest sec-edgar

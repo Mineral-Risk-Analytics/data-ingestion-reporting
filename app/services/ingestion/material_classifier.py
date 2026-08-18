@@ -62,28 +62,37 @@ log = structlog.get_logger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────
 _MODEL = "claude-haiku-4-5-20251001"
-_MAX_TEXT_CHARS = 8_000  # ~2K tokens — captures filing excerpts without runaway cost
+_MAX_TEXT_CHARS = 16_000 # ~4K tokens — sized for Tier 2 budget; captures
+                         # full preambles + first 2-3 operative articles on
+                         # long FR documents (raised from 8K on 2026-06-07
+                         # after tier upgrade).
 _MIN_TEXT_CHARS = 200    # below this, keyword detection is the only signal anyway
 _MAX_OUTPUT_TOKENS = 1024
 _REQUEST_TIMEOUT_S = 30
 
 # ── Rate-limit throttle ─────────────────────────────────────────────────
-# Bounds Haiku call rate to stay under Anthropic's tier-1 input-tokens-per-
-# minute ceiling (50K ITPM).  Per-call input is ~2.8K tokens (8K-char
-# document truncation + ~600-token materials taxonomy + ~200-token system
-# prompt), so the theoretical max is ~17 calls/min before ITPM throttles.
+# Bounds Haiku call rate to stay under Anthropic's input-tokens-per-minute
+# ceiling.  Per-call input is now ~5K tokens (16K-char document truncation
+# + ~600-token materials taxonomy + ~200-token system prompt), so the
+# theoretical maxes are:
 #
-# Default 5.0s = 12 calls/min, well under the cap with headroom for the
-# SDK's own retry overhead on transient 429s.  Override via the
-# BDI_HAIKU_MIN_INTERVAL_S env var when running on a higher tier:
+#   Tier 1 (50K ITPM)   →  ~10 calls/min before ITPM throttles
+#   Tier 2 (100K ITPM)  →  ~20 calls/min
+#   Tier 3 (200K ITPM)  →  ~40 calls/min
 #
-#   tier 2 (100K ITPM)  →  BDI_HAIKU_MIN_INTERVAL_S=2.5
-#   tier 3+ (200K+ITPM) →  BDI_HAIKU_MIN_INTERVAL_S=1.0
+# Default 2.0s = 30 calls/min (raised from 5.0s/12 calls on 2026-06-07
+# after the Tier 2 upgrade).  Leaves headroom on Tier 2 + buffers against
+# SDK retry overhead on transient 429s.  Override via the
+# BDI_HAIKU_MIN_INTERVAL_S env var:
+#
+#   Tier 1 (legacy / dev): BDI_HAIKU_MIN_INTERVAL_S=5.0
+#   Tier 2 (current):      BDI_HAIKU_MIN_INTERVAL_S=2.0   (default)
+#   Tier 3+:               BDI_HAIKU_MIN_INTERVAL_S=1.0
 #
 # Set to 0 to disable throttling (only safe when the caller has external
 # rate limiting in place, or the workload is small enough not to hit the
 # ceiling).
-_HAIKU_MIN_INTERVAL_S = float(os.environ.get("BDI_HAIKU_MIN_INTERVAL_S", "5.0"))
+_HAIKU_MIN_INTERVAL_S = float(os.environ.get("BDI_HAIKU_MIN_INTERVAL_S", "2.0"))
 
 # Class-level last-call timestamp + lock.  Module-level so it's shared
 # across every MaterialClassifier instance in the process — protects
@@ -260,6 +269,20 @@ _TOOL_SCHEMA = {
 # until/unless we add a 3-way junction table.
 
 _FR_EXTRACT_SYSTEM_PROMPT = (
+    # CALIBRATION HISTORY (load-bearing — edit with care):
+    # - The out-of-scope examples (ceremonial proclamations, IEEPA
+    #   continuations, PRA notices, agency reorganizations) were derived
+    #   from the 2026-05-06 Federal Register false-positive audit, where
+    #   ~30% of supposedly-CRM-adjacent events came from these scaffolding
+    #   document classes.  Removing or weakening these specific examples
+    #   will re-admit the same false positives.
+    # - The "ceremonial proclamations" line was added after the
+    #   "National Critical Minerals Month" proclamation incident — a
+    #   symbolic document that listed every battery mineral but
+    #   triggered no scoring impact.  The bias toward false (rejecting
+    #   even when minerals are named) is intentional.
+    # - The IN-SCOPE list mirrors the ten Federal Register query streams
+    #   the parser ingests; keep these aligned.
     "You are a domain expert on the EV battery supply chain and US critical-"
     "minerals trade policy.  Your job is to read a US Federal Register "
     "document and extract three things: (1) the canonical materials it "
@@ -487,6 +510,21 @@ _FR_EXTRACT_TOOL_SCHEMA = {
 
 
 _SYSTEM_PROMPT = (
+    # CALIBRATION HISTORY (load-bearing — edit with care):
+    # - The "bias toward rejecting incidental mentions" framing was
+    #   added after the 2026-05-09 SEC EDGAR Tier 3 audit where 10-K
+    #   risk-factor language was attributing 5-10 minerals per filing
+    #   simply because the filings name-drop the full critical-minerals
+    #   list defensively.  Without the rejection bias, every 10-K
+    #   produced a noisy per-mineral event feed.
+    # - The designation/listing carve-out (see _TOOL_SCHEMA.description
+    #   for the inline guidance) was added 2026-05-12 after the first
+    #   Haiku-enabled IEA run rejected 47% of sovereign critical-
+    #   minerals strategy documents (Morocco Mines Plan, Nigeria
+    #   Strategic Minerals List, Indonesia decree).  The tool-schema
+    #   description and this system prompt work together — the system
+    #   prompt sets the rejection bias, the tool schema carves out the
+    #   designation-list case from that bias.
     "You are a domain expert on critical-minerals supply chains.  Your job "
     "is to decide whether a source text is materially focused on each of a "
     "short list of candidate materials, or only mentions them in passing.  "
@@ -833,7 +871,26 @@ class MaterialClassifier:
         # materials table grows unexpectedly large; the per-line cost is
         # ~6 tokens so even 100 names is ~600 input tokens.
         materials_list = sorted(self._materials_by_id.values())
-        taxonomy_block = "\n".join(f"  - {n}" for n in materials_list[:120])
+        _TAXONOMY_CAP = 120
+        if len(materials_list) > _TAXONOMY_CAP:
+            # 2026-06-07 (audit fix F-MC-1): silent truncation guard.
+            # When the materials table grows past the prompt cap, the
+            # alphabetically-last materials silently drop out of Haiku's
+            # allowed canonical-name list.  Surface as a one-time WARN
+            # so an operator can raise the cap or refine the prompt.
+            log.warning(
+                "material_classifier.taxonomy_truncated",
+                total=len(materials_list),
+                cap=_TAXONOMY_CAP,
+                truncated_from=materials_list[_TAXONOMY_CAP] if len(materials_list) > _TAXONOMY_CAP else None,
+                hint=(
+                    "Materials beyond the cap are invisible to Haiku.  "
+                    "Either raise _TAXONOMY_CAP in material_classifier.py "
+                    "or curate the materials table down to the launch + "
+                    "secondary set actually used in scoring."
+                ),
+            )
+        taxonomy_block = "\n".join(f"  - {n}" for n in materials_list[:_TAXONOMY_CAP])
 
         user_text = (
             "Document text:\n"
@@ -997,10 +1054,18 @@ class MaterialClassifier:
             conf = float(c.get("confidence") or 0.0)
             conf = max(0.0, min(1.0, conf))
             evidence = (c.get("evidence") or "").strip()
-            # Translate to a multiplier on the keyword relevance:
-            #   - is_material=True  → conf (scales keyword relevance up or down)
-            #   - is_material=False with high confidence (≥0.7) → 0.0 (drop)
-            #   - is_material=False with lower confidence → keep at 0.5 (uncertain)
+            # Translate to a multiplier on the keyword relevance using a
+            # unified confidence-threshold structure.  At conf >= 0.7 we
+            # trust Haiku's verdict and act on it directly; below the
+            # threshold we treat the verdict as uncertain and preserve
+            # the attribution at half-weight regardless of direction.
+            #
+            # Resulting truth table:
+            #   is_material=True,  conf=0.95 →  0.95  (slight downscale)
+            #   is_material=True,  conf=0.70 →  0.70  (modest downscale)
+            #   is_material=True,  conf=0.05 →  0.50  (uncertain — preserve at half)
+            #   is_material=False, conf=0.95 →  0.00  (drop)
+            #   is_material=False, conf=0.05 →  0.50  (uncertain — preserve at half)
             #
             # 2026-05-12 calibration: rejection threshold raised from 0.5
             # to 0.7 after the first Haiku-enabled IEA run produced 47%
@@ -1011,16 +1076,21 @@ class MaterialClassifier:
             # supply discussion.  Combined with the prompt refinement
             # (see _TOOL_SCHEMA description) that explicitly tells Haiku
             # to count designation/listing as 'materially about', the
-            # threshold raise gives a safety net: even when Haiku's
-            # specific-mineral discussion read is technically valid,
-            # uncertain rejections (conf < 0.7) keep the attribution at
-            # half-weight rather than dropping it.
+            # threshold raise gives a safety net.
+            #
+            # 2026-06-07 (audit fix F-MC-2): low-confidence YES verdicts
+            # now also preserve at 0.5 instead of dropping toward zero.
+            # Previously is_material=True with conf=0.05 produced
+            # multiplier 0.05 (near-drop), which was asymmetric with the
+            # is_material=False low-confidence preservation.  The
+            # unified threshold now treats epistemic uncertainty
+            # symmetrically: preserve under doubt, act under confidence.
             _HAIKU_REJECT_THRESHOLD = 0.7
-            if is_mat:
-                multiplier = conf
-            elif conf >= _HAIKU_REJECT_THRESHOLD:
-                multiplier = 0.0
+            if conf >= _HAIKU_REJECT_THRESHOLD:
+                # Confident verdict — trust and act.
+                multiplier = conf if is_mat else 0.0
             else:
+                # Uncertain — preserve at half-weight regardless of direction.
                 multiplier = 0.5
             decisions.append((mid, multiplier, evidence))
 

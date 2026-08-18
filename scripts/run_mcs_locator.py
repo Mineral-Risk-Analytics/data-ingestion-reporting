@@ -61,7 +61,7 @@ _HARDCODED_MATERIALS: list[str] = [
     "Gallium",
     "Germanium",
     "Indium",
-    "Iron Ore (LFP Grade)",
+    "Iron Ore",
     "Lithium",
     "Magnesium",
     "Manganese",
@@ -292,7 +292,7 @@ def main() -> int:
     print(f"  BAUXITE in skipped:        {'PASS' if bauxite_skipped else 'FAIL'}")
 
     # 2. The three previously-broken commodities should be present
-    expected_present = {"Aluminum", "Iron Ore (LFP Grade)", "Platinum-Group Metals"}
+    expected_present = {"Aluminum", "Iron Ore", "Platinum-Group Metals"}
     chapter_materials = {c.canonical_material for c in result.chapters}
     missing = expected_present - chapter_materials
     if not missing:

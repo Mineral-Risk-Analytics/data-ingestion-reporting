@@ -42,6 +42,37 @@ rows where dep_id is absent (rare).
 On re-run: existing rows matched by mrds_dep_id have mutable fields updated
 (status, capacity, coordinates). New rows are inserted.
 
+Partner curation — protected fields (F-MRDS-2, 2026-06-09)
+---------------------------------------------------------
+Partner-edited facility/link fields are protected from MRDS re-run clobbering
+via a curation list stored in ``Facility.metadata_json``.  Without this, any
+manual correction the partner made (e.g. status "operating" → "mothballed"
+because they have direct industry intel that MRDS hasn't caught up to, or
+facility_type "mine" → "refinery" because USGS's ``oper_type`` is wrong)
+gets reverted to MRDS's value on the next ingest.
+
+Pattern:
+
+  ``Facility.metadata_json["partner_curated_fields"]``
+      List[str] of Facility column names the partner has manually edited.
+      MRDS ingest reads this list and skips updating those fields.
+      Example: ``["status", "facility_type", "name"]``.
+
+  ``Facility.metadata_json["link_partner_curated_fields"]``
+      Dict[str(material_id), List[str]] of FacilityMaterialLink column names
+      the partner has manually edited, keyed by the link's material_id (as
+      a string so the JSONB column accepts it).
+      Example: ``{"301": ["supply_chain_stage", "annual_capacity_tpy"]}``.
+
+Partner workflow when editing a facility manually:
+  1. Update the facility / link field directly.
+  2. Append the field name to the appropriate curated list above.
+The ingester does the rest — those fields survive every subsequent re-run.
+
+The ``data_source`` and ``metadata_json`` fields themselves are never
+treated as partner-locked (they're MRDS-bookkeeping fields).  Metadata is
+merged (not overwritten) so the curation lists are preserved across re-runs.
+
 FacilityMaterialLink
 --------------------
 One row per (facility, material) pair. ``commod1`` → ``is_primary_product=True``;
@@ -174,11 +205,11 @@ MRDS_COMMODITY_MAP: dict[str, str] = {
     "silicon metal":                "Silicon (Anode Grade)",
     "si":                           "Silicon (Anode Grade)",
 
-    # ── Phosphate (Battery Grade) ─────────────────────────────────────────────
-    "phosphate":                    "Phosphate (Battery Grade)",
-    "phosphorite":                  "Phosphate (Battery Grade)",
-    "phosphate rock":               "Phosphate (Battery Grade)",
-    "p":                            "Phosphate (Battery Grade)",
+    # ── Phosphate ─────────────────────────────────────────────
+    "phosphate":                    "Phosphate",
+    "phosphorite":                  "Phosphate",
+    "phosphate rock":               "Phosphate",
+    "p":                            "Phosphate",
     # USGS MRDS uses this single hyphenated string for phosphate-bearing rows
     # — discovered 2026-05-12 when the DB showed 0 Phosphate facilities
     # despite ~3,100 MRDS rows mentioning phosphate.  Without this entry the
@@ -186,7 +217,7 @@ MRDS_COMMODITY_MAP: dict[str, str] = {
     # runs.  Many of these rows tag phosphate as a co-product in uranium/REE
     # deposits — those get is_primary_product=False on the link, which is
     # the right semantic.
-    "phosphorus-phosphates":        "Phosphate (Battery Grade)",
+    "phosphorus-phosphates":        "Phosphate",
 
     # ── Chromium ─────────────────────────────────────────────────────────────
     "chromium":                     "Chromium",
@@ -218,10 +249,10 @@ MRDS_COMMODITY_MAP: dict[str, str] = {
     "zircon":                       "Zirconium",
     "zr":                           "Zirconium",
 
-    # ── Iron Ore (LFP Grade) ─────────────────────────────────────────────────
-    "iron":                         "Iron Ore (LFP Grade)",
-    "iron ore":                     "Iron Ore (LFP Grade)",
-    "fe":                           "Iron Ore (LFP Grade)",
+    # ── Iron Ore ─────────────────────────────────────────────────
+    "iron":                         "Iron Ore",
+    "iron ore":                     "Iron Ore",
+    "fe":                           "Iron Ore",
 
     # ── Magnesium ────────────────────────────────────────────────────────────
     "magnesium":                    "Magnesium",
@@ -617,6 +648,67 @@ def _has_target_commodity(row: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Partner curation helpers (F-MRDS-2, 2026-06-09)
+# ---------------------------------------------------------------------------
+
+def _read_partner_locks(
+    facility: Optional[Facility],
+) -> tuple[frozenset[str], dict[str, frozenset[str]]]:
+    """Extract partner-curation locks from ``facility.metadata_json``.
+
+    Returns (facility_locks, link_locks_by_material_id_str).
+
+    Both return values default to empty when the facility is new, the
+    metadata is missing, or the keys are absent/malformed — i.e. the
+    fail-safe default is "no field is partner-locked", matching the
+    pre-fix behaviour.
+
+    Lists are normalised to sets of strings; non-list/non-dict values
+    are silently ignored (defensive against schema drift).
+    """
+    if facility is None:
+        return frozenset(), {}
+    meta = facility.metadata_json
+    if not isinstance(meta, dict):
+        return frozenset(), {}
+
+    fac_locks: set[str] = set()
+    raw_fac = meta.get("partner_curated_fields")
+    if isinstance(raw_fac, list):
+        fac_locks = {str(f) for f in raw_fac if isinstance(f, str)}
+
+    link_locks: dict[str, frozenset[str]] = {}
+    raw_link = meta.get("link_partner_curated_fields")
+    if isinstance(raw_link, dict):
+        for mid_key, fields in raw_link.items():
+            if isinstance(fields, list):
+                link_locks[str(mid_key)] = frozenset(
+                    str(f) for f in fields if isinstance(f, str)
+                )
+    return frozenset(fac_locks), link_locks
+
+
+def _merge_mrds_metadata(
+    existing: Optional[dict],
+    mrds_keys: dict,
+) -> dict:
+    """Merge MRDS-source bookkeeping keys into existing facility metadata.
+
+    The original code replaced ``metadata_json`` wholesale, which would
+    silently destroy any partner-curation lists (or other manually-added
+    annotation) stored on the facility.  This helper preserves the
+    existing metadata and overlays only the MRDS keys.
+
+    Empty/missing existing metadata returns just the MRDS keys.
+    """
+    if not isinstance(existing, dict):
+        return dict(mrds_keys)
+    merged = dict(existing)
+    merged.update(mrds_keys)
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # Main ingestion function
 # ---------------------------------------------------------------------------
 
@@ -797,6 +889,19 @@ def ingest_mrds(
                 )
             )
 
+        # Partner-curation locks (F-MRDS-2, 2026-06-09): any facility/link
+        # field the partner has manually edited is recorded in the
+        # facility's metadata and skipped during re-run updates.  Empty
+        # for new rows.
+        fac_locked, link_locked = _read_partner_locks(facility)
+
+        # Merge MRDS-source bookkeeping into existing metadata so partner-
+        # added keys (incl. the curation lists themselves) survive re-runs.
+        merged_metadata = _merge_mrds_metadata(
+            facility.metadata_json if facility is not None else None,
+            metadata,
+        )
+
         # facility_type is mutable now (added 2026-05-06) so re-running
         # ingest after the granularity expansion + name-keyword fallback
         # reclassifies existing rows.  Without this, old rows would keep
@@ -810,7 +915,7 @@ def ingest_mrds(
             "longitude":      lon,
             "region":         region,
             "data_source":    "mrds",
-            "metadata_json":  metadata,
+            "metadata_json":  merged_metadata,
         }
 
         if facility is None:
@@ -824,9 +929,17 @@ def ingest_mrds(
             session.flush()
             facilities_inserted += 1
         else:
-            changed = [f for f, v in mutable.items() if getattr(facility, f) != v]
-            for f in changed:
-                setattr(facility, f, mutable[f])
+            # F-MRDS-2: skip any field the partner has explicitly locked.
+            # ``data_source`` and ``metadata_json`` are never partner-locked
+            # (they're MRDS-bookkeeping fields and metadata is merged, not
+            # replaced, so partner annotations survive).
+            changed: list[str] = []
+            for f, v in mutable.items():
+                if f in fac_locked:
+                    continue
+                if getattr(facility, f) != v:
+                    setattr(facility, f, v)
+                    changed.append(f)
             if dep_id and facility.mrds_dep_id is None:
                 facility.mrds_dep_id = dep_id
                 changed.append("mrds_dep_id")
@@ -883,8 +996,16 @@ def ingest_mrds(
                     existing_link = pending_links.get((facility.id, material_id))
                     if existing_link is None:
                         continue
+                # F-MRDS-2 (2026-06-09): skip any link-level field the
+                # partner has locked via
+                # ``Facility.metadata_json["link_partner_curated_fields"]``.
+                locked_link_fields = link_locked.get(str(material_id), frozenset())
+
                 changed = False
-                if existing_link.is_primary_product != is_primary:
+                if (
+                    "is_primary_product" not in locked_link_fields
+                    and existing_link.is_primary_product != is_primary
+                ):
                     existing_link.is_primary_product = is_primary
                     changed = True
                 # Re-stage existing links so the granularity expansion +
@@ -893,7 +1014,10 @@ def ingest_mrds(
                 # write-once; rerunning ingest-mrds left old rows on the
                 # original conservative classification.
                 expected_stage = FACILITY_TYPE_TO_STAGE.get(facility_type)
-                if existing_link.supply_chain_stage != expected_stage:
+                if (
+                    "supply_chain_stage" not in locked_link_fields
+                    and existing_link.supply_chain_stage != expected_stage
+                ):
                     existing_link.supply_chain_stage = expected_stage
                     changed = True
                 if changed:

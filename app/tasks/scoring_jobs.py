@@ -20,12 +20,17 @@ Weekly scoring pipeline (four jobs, Monday UTC):
 
 Daily trade flow ingestion (one job):
 
-  Job D — ``ingest-comtrade-daily``      Daily 06:00 UTC
+  Job D — ``ingest-comtrade-daily``      Daily 04:00 UTC (midnight EDT)
       Fetches export + import trade flows from UN Comtrade for the 3 most
       recently complete calendar years.  Idempotent: already-committed
       (reporter × HS prefix × year) batches are skipped.  Designed to run
       daily until full coverage is reached (rate-limited to ~500 calls/day).
       Runs build-trade-signals after both flow directions complete.
+
+      Schedule moved from 06:00 → 04:00 UTC on 2026-06-06 when the 11.2 HS-
+      prefix expansion pushed expected runtime toward ~10-12 hours; starting
+      at midnight EDT keeps the finish before US business hours and avoids
+      overlap with the Monday 01:00-04:00 UTC rescore window.
 
 Timeout strategy
 ----------------
@@ -134,30 +139,15 @@ def _sync_score_material_geos(
             log.warning("scoring_jobs.step.geo.no_material", material_id=material_id)
             return {"material_id": material_id, "pairs_scored": 0, "skipped": True}
 
-        # Derive geographies: production share countries + any geo with events.
-        # primary_producing_countries was removed in migration 023; use
-        # material_production_shares as the authoritative source instead.
-        prod_share_geos = list(session.scalars(
-            select(MaterialProductionShare.country_code)
-            .where(
-                MaterialProductionShare.material_id == material.id,
-                MaterialProductionShare.production_share > 0,
-            )
-            .distinct()
-        ).all())
-        geos: list[str] = [g.upper() for g in prod_share_geos]
-
-        event_geo_stmt = (
-            select(RiskEventGeography.country_code)
-            .join(
-                RiskEventMaterial,
-                RiskEventMaterial.risk_event_id == RiskEventGeography.risk_event_id,
-            )
-            .where(RiskEventMaterial.material_id == material.id)
-            .distinct()
+        # V1 (4.0, 2026-07-18): scored-geography universe = producers +
+        # trade-gate exporters.  Event-only geographies are skipped — zero
+        # concentration by definition, zero L2 trade weight by
+        # construction, and they were ~85% of pairs (cobalt: 127 -> ~24).
+        # See stage_concentration.derive_scoring_geographies.
+        from app.services.scoring.stage_concentration import (
+            derive_scoring_geographies,
         )
-        event_geos = [row[0] for row in session.execute(event_geo_stmt).all()]
-        geos = list({*geos, *event_geos})
+        geos: list[str] = derive_scoring_geographies(session, material.id)
 
         if not geos:
             log.debug(
@@ -545,8 +535,43 @@ def _target_years() -> list[int]:
     return [end, end - 1, end - 2]
 
 
+def _derive_four_digit_prefixes(raw_prefixes: list[str]) -> list[str]:
+    """Truncate raw HS prefixes (any length) to 4-digit chapters, dedupe,
+    sort.  Pure helper extracted from ``_sync_get_hs_prefixes`` so the
+    derivation logic can be unit-tested without a DB session.
+
+    Mirrors ``comtrade.py::ingest_comtrade``'s prefix derivation at
+    lines 913-918 so the daily Inngest job and the CLI take the same
+    path on the same source data.
+    """
+    four_digit: set[str] = set()
+    for raw in raw_prefixes:
+        clean = raw.replace(".", "")
+        if len(clean) >= 4:
+            four_digit.add(clean[:4])
+    return sorted(four_digit)
+
+
 def _sync_get_hs_prefixes() -> list[str]:
-    """Return all distinct 4-digit HS prefixes from hs_code_material_mappings.
+    """Return all distinct 4-digit HS prefixes derived from
+    ``hs_code_material_mappings``.
+
+    Prior to the 11.2-followup fix (2026-06-06) this function pulled rows
+    where ``digit_count == 4`` only.  That diverged from the inner
+    ``comtrade.py::_build_hs_material_map`` logic, which derives 4-digit
+    prefixes from rows where ``digit_count IN (4, 6)`` by taking the
+    first four characters.  The divergence meant any newly seeded
+    6-digit mapping under a chapter that had no companion 4-digit
+    "umbrella" row was silently dropped from the daily Inngest job's
+    fetch list — even though a manual ``ingest_comtrade`` CLI invocation
+    would have picked it up.
+
+    The 11.2 easy adds surfaced the bug: HS 3801 / 7410 / 7607 / 8505
+    were seeded only at the 6-digit level (380110, 380130, 741011,
+    760711, 850511), so the daily run never queried Comtrade for them.
+
+    The current implementation matches comtrade.py: filter to
+    ``digit_count IN (4, 6)`` and truncate to the first four chars.
 
     Ordered deterministically for Inngest replay safety.
     """
@@ -555,13 +580,36 @@ def _sync_get_hs_prefixes() -> list[str]:
 
     session = get_session_factory()()
     try:
-        rows = session.scalars(
+        # Pull all 4- and 6-digit rows; derive the 4-digit prefix set.
+        # 10-digit US-scope rows are intentionally excluded — Comtrade
+        # only returns up to 6-digit cmdCodes, so deriving 4-digit
+        # umbrellas from 10-digit US-only rows would be misleading
+        # (it would imply we have global coverage we don't have).
+        raw_prefixes = session.scalars(
             select(HsCodeMaterialMapping.hs_code_prefix)
-            .where(HsCodeMaterialMapping.digit_count == 4)
+            .where(HsCodeMaterialMapping.digit_count.in_([4, 6]))
             .distinct()
-            .order_by(HsCodeMaterialMapping.hs_code_prefix)
         ).all()
-        return list(rows)
+
+        result = _derive_four_digit_prefixes(list(raw_prefixes))
+
+        # Surface which prefixes are present so an operator can spot
+        # newly onboarded chapters in the daily job log.  This is the
+        # blast-radius diagnostic referenced in the 11.2-followup fix:
+        # the very first run after this change will show a step count
+        # higher than the previous day, reflecting newly fetched
+        # chapters (3801/7410/7607/8505 for the 11.2 adds).
+        log.info(
+            "comtrade_job.prefixes_derived",
+            count=len(result),
+            prefixes=result,
+            note=(
+                "Derived from hs_code_material_mappings with "
+                "digit_count IN (4, 6).  An increase vs the previous "
+                "daily run indicates newly seeded 6-digit chapters."
+            ),
+        )
+        return result
     finally:
         session.close()
 
@@ -660,15 +708,131 @@ async def _step_build_trade_signals(years: list[int]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Authoritative-count helpers — DB-derived, retry-immune
+# ---------------------------------------------------------------------------
+#
+# Why these exist: ingest_comtrade_job's in-memory ``total_inserted`` and
+# ``total_api_calls`` counters undercount on Inngest step retries.  When a
+# step writes rows + commits the SourceDocument but its return payload
+# fails to make it back to the orchestrator (network blip, serialization
+# timeout right at the boundary), Inngest retries the step.  On retry,
+# the SourceDocument idempotency check at comtrade.py:979-1005 short-
+# circuits the inner loop and returns ``inserted=0``.  The orchestrator
+# then credits 0 even though the original writes are already in the DB.
+#
+# The DB query below counts trade_flows + source_documents created since
+# the run-start timestamp — that's authoritative regardless of how many
+# retries each step took.  Run on 2026-06-03 had counter=4648 but
+# authoritative=4930 (282-row undercount), which is why this exists.
+
+def _sync_capture_now() -> str:
+    """Return current UTC time as an ISO timestamp.
+
+    Used as a memoized Inngest step so retries see the same value — that
+    way the end-of-run count query has a stable lower-bound timestamp.
+    """
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+async def _step_capture_now() -> str:
+    return await asyncio.to_thread(_sync_capture_now)
+
+
+def _sync_count_comtrade_writes_since(since_iso: str) -> dict:
+    """Count Comtrade trade_flows + source_documents created since
+    ``since_iso`` (UTC ISO timestamp).
+
+    Returns ``{"inserted": N, "api_calls": M}`` where:
+      * ``inserted``  = COUNT(*) FROM trade_flows joined to the Comtrade
+                        SourceDocument set created since the cutoff.
+      * ``api_calls`` = COUNT(*) FROM source_documents in the same window
+                        (each successful API call writes exactly one
+                        SourceDocument — populated or empty-marker — so
+                        the document count is the call count).
+
+    Errors (DB connection, etc.) return ``{"error": str, "inserted": -1,
+    "api_calls": -1}`` so the orchestrator can fall back to the in-memory
+    counters rather than reporting zero.
+    """
+    from sqlalchemy import func as sa_func, select
+
+    from app.models.documents import SourceDocument
+    from app.models.source import Source
+    from app.models.supply import TradeFlow
+
+    session = get_session_factory()()
+    try:
+        source_id = session.scalar(
+            select(Source.id).where(Source.source_type == "comtrade")
+        )
+        if source_id is None:
+            return {"inserted": 0, "api_calls": 0}
+
+        since_dt = _dt.datetime.fromisoformat(since_iso)
+
+        api_calls = session.scalar(
+            select(sa_func.count())
+            .select_from(SourceDocument)
+            .where(
+                SourceDocument.source_id == source_id,
+                SourceDocument.created_at >= since_dt,
+            )
+        ) or 0
+
+        inserted = session.scalar(
+            select(sa_func.count())
+            .select_from(TradeFlow)
+            .join(
+                SourceDocument,
+                TradeFlow.source_document_id == SourceDocument.id,
+            )
+            .where(
+                SourceDocument.source_id == source_id,
+                SourceDocument.created_at >= since_dt,
+            )
+        ) or 0
+
+        return {"inserted": int(inserted), "api_calls": int(api_calls)}
+    except Exception as exc:
+        return {
+            "inserted": -1,
+            "api_calls": -1,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        session.close()
+
+
+async def _step_count_comtrade_writes_since(since_iso: str) -> dict:
+    return await asyncio.to_thread(_sync_count_comtrade_writes_since, since_iso)
+
+
+# ---------------------------------------------------------------------------
 # Job D — Daily Comtrade trade flow ingestion
 # ---------------------------------------------------------------------------
 
 @inngest_client.create_function(
-    fn_id="ingest-comtrade-daily",
-    trigger=inngest.TriggerCron(cron="0 6 * * *"),
+    fn_id="ingest-comtrade-weekly",
+    # 2026-07-27 (Nicole, scheduled-jobs review): daily → weekly Wednesday.
+    # Comtrade reporters update monthly at best; daily polling was 7x the
+    # API traffic for no freshness gain. Wednesday keeps data fresh ahead
+    # of the Sunday-ingest → Monday-rescore cycle.
+    trigger=inngest.TriggerCron(cron="0 4 * * WED"),
 )
 async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
-    """Daily UN Comtrade trade flow ingestion — runs every day at 06:00 UTC.
+    """Daily UN Comtrade trade flow ingestion — runs every day at 04:00 UTC
+    (midnight EDT / 21:00 PDT previous day).
+
+    Schedule history:
+
+    * Until 2026-06-06 the job ran at 06:00 UTC (02:00 EDT).
+    * Bumped to 04:00 UTC (midnight EDT) when the 11.2 HS-prefix expansion
+      pushed expected runtime from ~6 hours toward ~10-12 hours.  Starting
+      at midnight EDT keeps the finish before US business hours and avoids
+      any Monday-window overlap with the weekly rescore jobs at 01:00-04:00
+      UTC.  On Mondays the chemistry rescore (04:00 UTC) starts at the
+      same instant as this job, but chemistry reads pre-computed rollups —
+      not ``trade_flows`` — so there's no data-race concern.
 
     Fetches export (flow X) and import (flow M) annual trade data for all
     4-digit HS prefixes in hs_code_material_mappings, targeting the 3 most
@@ -716,6 +880,15 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
     today_iso = _today_utc().isoformat()
     years = _target_years()
     log.info("comtrade_job.start", today=today_iso, years=years)
+
+    # Step 0: capture run-start timestamp as a memoized step so all Inngest
+    # retries see the same lower bound.  The end-of-run count query uses
+    # this timestamp to derive authoritative inserted/api_calls totals
+    # from the DB — see _sync_count_comtrade_writes_since for why.
+    run_started_at: str = await ctx.step.run(
+        "capture-run-start",
+        _step_capture_now,
+    )
 
     # Step 1: resolve HS prefixes from DB (not hardcoded — picks up new mappings)
     hs_prefixes: list[str] = await ctx.step.run(
@@ -771,6 +944,46 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
         if rate_limited:
             break
 
+    # Authoritative end-of-run counts derived from the DB rather than from
+    # the in-memory per-step counters.  Step retries cause the counter
+    # to undercount (retried steps return inserted=0 even though the
+    # first attempt's writes already committed) — see the
+    # _sync_count_comtrade_writes_since docstring for the full reasoning.
+    # ``total_inserted_counter`` and ``total_api_calls_counter`` are
+    # preserved so the gap between the two is observable in the run
+    # summary; large gaps indicate frequent step retries.
+    authoritative = await ctx.step.run(
+        "count-run-writes",
+        _step_count_comtrade_writes_since,
+        run_started_at,
+    )
+    if authoritative.get("inserted", -1) >= 0:
+        total_inserted_actual = int(authoritative["inserted"])
+        total_api_calls_actual = int(authoritative["api_calls"])
+        retry_undercount = total_inserted_actual - total_inserted
+        if retry_undercount > 0:
+            log.warning(
+                "comtrade_job.retry_undercount_detected",
+                counter=total_inserted,
+                authoritative=total_inserted_actual,
+                gap_rows=retry_undercount,
+                hint=(
+                    "In-memory counter undercounted the DB. Likely cause: "
+                    "Inngest step retries where the first attempt committed "
+                    "but the return payload failed to deliver. Data integrity "
+                    "fine; only the run summary was previously affected."
+                ),
+            )
+    else:
+        # Fall back to the in-memory counters if the count query errored.
+        total_inserted_actual = total_inserted
+        total_api_calls_actual = total_api_calls
+        log.warning(
+            "comtrade_job.authoritative_count_failed",
+            error=authoritative.get("error"),
+            hint="Reporting in-memory counter values (may undercount).",
+        )
+
     # Final step: refresh synthetic risk events from trade flow data —
     # only after a clean run (a rate-limit halt mid-run leaves trade_flows
     # in a partial state that distorts the synthetic signals; tomorrow's
@@ -790,10 +1003,12 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
     # daily runs from this point forward are wasteful (~14k SELECT
     # queries/day for nothing).  Logging at WARNING so it's visible in
     # the Inngest dashboard as a flag.  Action: swap the cron from
-    # ``0 6 * * *`` to ``0 6 * * SUN`` (or monthly) when this fires.
+    # ``0 4 * * *`` to ``0 4 * * SUN`` (or monthly) when this fires.
+    # Uses the authoritative count so a counter-undercount can't spuriously
+    # fire this signal.
     backfill_complete = (
         not rate_limited
-        and total_api_calls == 0
+        and total_api_calls_actual == 0
         and total_errors == 0
         and len(hs_prefixes) > 0
     )
@@ -807,7 +1022,7 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
                 "All (year × prefix × reporter × flow) combinations are "
                 "already ingested.  Daily runs from now on do ~14k SELECTs "
                 "for nothing.  Switch the cron in scoring_jobs.py from "
-                "'0 6 * * *' to '0 6 * * SUN' (weekly) — Comtrade publishes "
+                "'0 4 * * *' to '0 4 * * SUN' (weekly) — Comtrade publishes "
                 "annual data with a 4-6 month lag, so weekly is sufficient "
                 "to pick up new releases within a week of publication."
             ),
@@ -817,8 +1032,10 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
         "comtrade_job.done",
         today=today_iso,
         years=years,
-        total_inserted=total_inserted,
-        total_api_calls=total_api_calls,
+        total_inserted=total_inserted_actual,
+        total_inserted_counter=total_inserted,
+        total_api_calls=total_api_calls_actual,
+        total_api_calls_counter=total_api_calls,
         total_errors=total_errors,
         rate_limited=rate_limited,
         backfill_complete=backfill_complete,
@@ -828,8 +1045,13 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
         "as_of_date": today_iso,
         "years": years,
         "prefixes_processed": len(hs_prefixes),
-        "total_inserted": total_inserted,
-        "total_api_calls": total_api_calls,
+        # Authoritative DB-derived counts (immune to Inngest step retries).
+        "total_inserted": total_inserted_actual,
+        "total_api_calls": total_api_calls_actual,
+        # In-memory per-step counters kept for diagnostic visibility;
+        # a gap between *_counter and the headline value flags retry churn.
+        "total_inserted_counter": total_inserted,
+        "total_api_calls_counter": total_api_calls,
         "total_errors": total_errors,
         "rate_limited": rate_limited,
         "backfill_complete": backfill_complete,
@@ -838,11 +1060,15 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
 
 
 SCHEDULED_FUNCTIONS = [
-    ingest_comtrade_job,            # Daily  — 06:00 UTC
+    ingest_comtrade_job,            # Weekly — Wed 04:00 UTC (2026-07-27: was daily)
     rescore_hs_nodes_job,           # Level 0 — Mon 01:00 UTC
     rescore_market_scores_job,      # Level 1 — Mon 02:00 UTC
     rescore_global_rollups_job,     # Level 2 — Mon 03:00 UTC
-    rescore_chemistries_job,        # Level 3 — Mon 04:00 UTC
+    # PARKED 2026-07-27 (Nicole): chemistry scores (L3) are unused and
+    # off the launch roadmap — the weekly pass wrote rows nothing reads.
+    # Function remains for manual CLI / future L3; backfillable from
+    # global rollups at any time.
+    # rescore_chemistries_job,      # Level 3 — Mon 04:00 UTC
 ]
 
 __all__ = [

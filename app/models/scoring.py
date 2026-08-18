@@ -220,6 +220,25 @@ class HsCodeGeographyRiskScore(Base):
         comment="0–100, weighted combination of sub-scores for this node",
     )
 
+    # ---- Fix B provenance (2026-07-15) ---------------------------------------
+    # The composite's hhi COMPONENT is ``hhi_at_stage × f(production_share)``
+    # so concentration risk accrues to countries that ARE the concentration.
+    # ``hhi_at_stage`` above keeps the unweighted MARKET value; the two fields
+    # below record the share-weighted value that actually fed the composite
+    # and the weighting function used (currently 'sqrt' per partner decision;
+    # 'linear' was evaluated and rejected — see
+    # docs/design/concentration_share_weighting.md).  Both are NULL for rows
+    # scored on event-only / operational_only paths where the hhi component
+    # is absent.
+    hhi_share_weighted: Mapped[Optional[float]] = mapped_column(
+        Float,
+        comment="hhi_at_stage × f(production_share) — the value that actually fed composite_node_score's hhi component",
+    )
+    share_weighting: Mapped[Optional[str]] = mapped_column(
+        String(16),
+        comment="Weighting function applied to production_share ('sqrt' | 'linear' | NULL if no hhi component)",
+    )
+
     # ---- metadata ------------------------------------------------------------
     market_scope: Mapped[str] = mapped_column(
         String(8), nullable=False, server_default="global",

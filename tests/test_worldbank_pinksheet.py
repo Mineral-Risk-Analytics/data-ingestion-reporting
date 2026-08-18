@@ -19,9 +19,72 @@ import pytest
 from app.services.ingestion.material_resolver import ResolveResult
 from app.services.ingestion.worldbank_pinksheet import (
     _HEADER_TO_HS_PREFIX,
+    _PINK_SHEET_URL_DISCOVERY_PATTERN,
     _normalise_unit,
     parse_pink_sheet,
 )
+
+
+# ---------------------------------------------------------------------------
+# 10.1 - URL discovery regex tests
+# ---------------------------------------------------------------------------
+
+class TestPinkSheetUrlDiscoveryRegex:
+    """Verify the landing-page scrape regex catches the canonical URL shape
+    AND survives small page redesigns without producing false matches."""
+
+    def test_canonical_url_matches(self) -> None:
+        # Mirror the exact URL shape we see on the live World Bank page.
+        html = (
+            '<a href="https://thedocs.worldbank.org/en/doc/'
+            '74e8be41ceb20fa0da750cda2f6b9e4e-0050012026/related/'
+            'CMO-Historical-Data-Monthly.xlsx">Monthly</a>'
+        )
+        m = _PINK_SHEET_URL_DISCOVERY_PATTERN.search(html)
+        assert m is not None
+        assert m.group(0).endswith("CMO-Historical-Data-Monthly.xlsx")
+        assert "thedocs.worldbank.org" in m.group(0)
+
+    def test_new_year_slug_matches(self) -> None:
+        # Forward-compatible: when the World Bank rotates the year slug
+        # in January 2027, the regex should still match the new URL.
+        html = (
+            '<a href="https://thedocs.worldbank.org/en/doc/'
+            'abc123def456-0050012027/related/'
+            'CMO-Historical-Data-Monthly.xlsx">Monthly</a>'
+        )
+        m = _PINK_SHEET_URL_DISCOVERY_PATTERN.search(html)
+        assert m is not None
+        assert "0050012027" in m.group(0)
+
+    def test_no_match_when_filename_differs(self) -> None:
+        # Annual file (different filename) must NOT match - we want only
+        # the monthly history file.  Otherwise discovery could silently
+        # surface the wrong source.
+        html = (
+            '<a href="https://thedocs.worldbank.org/en/doc/'
+            'abc/related/CMO-Historical-Data-Annual.xlsx">Annual</a>'
+        )
+        assert _PINK_SHEET_URL_DISCOVERY_PATTERN.search(html) is None
+
+    def test_no_match_on_pdf_link(self) -> None:
+        # Pink Sheet PDF links coexist on the page with the XLSX link.
+        # Must not match the PDF.
+        html = (
+            '<a href="https://thedocs.worldbank.org/en/doc/'
+            'abc/related/CMO-Pink-Sheet-March-2026.pdf">PDF</a>'
+        )
+        assert _PINK_SHEET_URL_DISCOVERY_PATTERN.search(html) is None
+
+    def test_no_match_on_non_worldbank_url(self) -> None:
+        # Defensive: a CMO-Historical-Data-Monthly.xlsx hosted elsewhere
+        # (mirror, archive, etc.) is NOT a discovery target.  Only the
+        # canonical thedocs.worldbank.org host should match.
+        html = (
+            '<a href="https://example.com/'
+            'CMO-Historical-Data-Monthly.xlsx">mirror</a>'
+        )
+        assert _PINK_SHEET_URL_DISCOVERY_PATTERN.search(html) is None
 
 
 # ---------------------------------------------------------------------------
@@ -328,10 +391,44 @@ def _alias_resolver_mock(material_id: int = 1) -> MagicMock:
 
 
 def _mock_session(existing: bool = False) -> MagicMock:
-    """Session mock: ``scalar`` answers CommodityPrice existence checks only."""
-    price_return = MagicMock() if existing else None
+    """Session mock for CommodityPrice existence checks.
+
+    10.3 (2026-06): the upsert loop's existence check moved from a
+    per-row ``session.scalar(...)`` to a pre-fetched set built from
+    ``session.execute(select(...)).all()``.  This mock now stubs
+    ``execute()`` to return key tuples that match the standard fixture
+    (Cobalt @ 2024-01 + 2024-02, material_id=1, hs_mapping_id=99,
+    price_form="Cobalt") when ``existing=True``, else an empty list.
+
+    ``scalar`` is still stubbed for backwards-compat with any legacy
+    test path that exercises it.
+    """
+    from datetime import date as _date
+
     session = MagicMock()
-    session.scalar.return_value = price_return
+    session.scalar.return_value = None
+
+    # 10.4 (2026-06): after the Pink Sheet header audit, "Cobalt" is no
+    # longer in _HEADER_TO_HS_PREFIX (Cobalt is not actually published by
+    # World Bank Pink Sheet).  Test fixtures still use "Cobalt" as a
+    # generic commodity name for parser-level testing because the alias
+    # resolver mock maps "Cobalt" -> material_id=1 regardless of the
+    # mapping dict.  But the resulting CommodityPrice rows now have
+    # hs_mapping_id=None and price_form=None (no stage attribution), so
+    # the existing-key mock must reflect that to test idempotency
+    # correctly.
+    if existing:
+        existing_rows = [
+            (1, _date(2024, 1, 1), None, None),
+            (1, _date(2024, 2, 1), None, None),
+        ]
+    else:
+        existing_rows = []
+
+    execute_result = MagicMock()
+    execute_result.all.return_value = existing_rows
+    session.execute.return_value = execute_result
+
     return session
 
 
@@ -344,7 +441,7 @@ class TestIngestPinkSheet:
         session = _mock_session(existing=False)
 
         with (
-            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "_days_since_latest_observation", return_value=None),
             patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(1)),
             patch.object(wbp, "MaterialResolver") as mock_hs,
             patch(
@@ -368,7 +465,7 @@ class TestIngestPinkSheet:
         session = _mock_session(existing=True)
 
         with (
-            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "_days_since_latest_observation", return_value=None),
             patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(1)),
             patch.object(wbp, "MaterialResolver") as mock_hs,
             patch(
@@ -399,7 +496,7 @@ class TestIngestPinkSheet:
         session = _mock_session(existing=False)
 
         with (
-            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "_days_since_latest_observation", return_value=None),
             patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(1)),
             patch.object(wbp, "MaterialResolver") as mock_hs,
             patch(
@@ -428,7 +525,7 @@ class TestIngestPinkSheet:
         empty_resolver._cache = {"worldbank_pinksheet": {}}
 
         with (
-            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "_days_since_latest_observation", return_value=None),
             patch.object(wbp, "MaterialAliasResolver", return_value=empty_resolver),
             patch(
                 "app.services.ingestion.worldbank_pinksheet.download_pink_sheet",
@@ -448,7 +545,7 @@ class TestIngestPinkSheet:
         session = _mock_session(existing=False)
 
         with (
-            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "_days_since_latest_observation", return_value=None),
             patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(7)),
             patch.object(wbp, "MaterialResolver") as mock_hs,
             patch(
@@ -469,7 +566,7 @@ class TestIngestPinkSheet:
         session = _mock_session(existing=False)
 
         with (
-            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "_days_since_latest_observation", return_value=None),
             patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(1)),
             patch.object(wbp, "MaterialResolver") as mock_hs,
             patch(
@@ -492,7 +589,7 @@ class TestIngestPinkSheet:
         custom_url = "https://example.com/custom-sheet.xlsx"
 
         with (
-            patch.object(wbp, "_days_since_last_run", return_value=None),
+            patch.object(wbp, "_days_since_latest_observation", return_value=None),
             patch.object(wbp, "MaterialAliasResolver", return_value=_alias_resolver_mock(1)),
             patch.object(wbp, "MaterialResolver") as mock_hs,
             patch(
@@ -511,16 +608,56 @@ class TestIngestPinkSheet:
 # ---------------------------------------------------------------------------
 
 class TestHeaderToHsPrefix:
-    """Headers listed here get ``hs_mapping_id`` when the prefix resolves in the DB."""
+    """Headers listed here get ``hs_mapping_id`` when the prefix resolves in the DB.
 
-    def test_cobalt_maps_to_refined_prefix(self):
-        assert _HEADER_TO_HS_PREFIX["Cobalt"] == "810520"
+    10.4 audit (2026-06): the set was reconciled against the live Pink
+    Sheet XLSX.  Dead headers that referenced columns the World Bank
+    does NOT actually publish were removed (Cobalt, Lithium carbonate,
+    Manganese ore, "Tin, LME", British-spelling "Aluminium").  Two new
+    entries were added for columns that DO exist but were previously
+    unmapped (Iron ore cfr spot, Phosphate rock).
+    """
 
-    def test_aluminium_maps_to_same_prefix_as_aluminum(self):
-        assert _HEADER_TO_HS_PREFIX["Aluminium"] == "760110"
+    def test_aluminum_maps_to_lme_refined_prefix(self):
+        # LME unalloyed primary ingots, min 99.7% purity
+        assert _HEADER_TO_HS_PREFIX["Aluminum"] == "760110"
 
-    def test_lithium_carbonate_battery_grade(self):
-        assert _HEADER_TO_HS_PREFIX["Lithium carbonate, battery grade"] == "283691"
+    def test_copper_maps_to_lme_grade_a_cathodes(self):
+        # LME grade A, min 99.9935% purity, cathodes + wire bar shapes
+        assert _HEADER_TO_HS_PREFIX["Copper"] == "740311"
+
+    def test_nickel_maps_to_lme_cathodes(self):
+        # LME cathodes, min 99.8% purity
+        assert _HEADER_TO_HS_PREFIX["Nickel"] == "750210"
+
+    def test_iron_ore_maps_to_cfr_china_fines(self):
+        # 10.4 addition: 62% Fe fines, CFR China, non-agglomerated
+        assert _HEADER_TO_HS_PREFIX["Iron ore, cfr spot"] == "260111"
+
+    def test_phosphate_rock_maps_to_natural_phosphates(self):
+        # 10.4 addition: FOB North Africa, natural calcium phosphates unground
+        assert _HEADER_TO_HS_PREFIX["Phosphate rock"] == "251010"
+
+    def test_dead_headers_not_in_dict(self):
+        # 10.4 removed: these columns do not exist in the live Pink Sheet
+        # XLSX.  The parser silently skipped them pre-10.4 but the dead
+        # entries documented false expectations.
+        for dead in (
+            "Cobalt",
+            "Lithium carbonate, battery grade",
+            "Manganese ore",
+            "Tin, LME",
+            "Aluminium",  # British spelling; XLSX uses American "Aluminum"
+        ):
+            assert dead not in _HEADER_TO_HS_PREFIX, (
+                f"{dead!r} was removed in 10.4 because the WB Pink Sheet "
+                "does not publish that column.  If WB starts publishing "
+                "it again, re-add with confirmed basis from the XLSX "
+                "Description tab."
+            )
 
     def test_bare_graphite_not_attributed(self):
+        # Graphite is not published by WB Pink Sheet at all (confirmed
+        # against XLSX inventory 2026-06).  This test guards against an
+        # accidental re-add without confirming the basis.
         assert "Graphite" not in _HEADER_TO_HS_PREFIX

@@ -34,6 +34,13 @@ from typing import Optional
 #                                 exposure than a restriction.
 #   disclosure_required     0.50  Standard disclosure / due-diligence mandate
 #                                 — the lowest-bite designation, attenuated.
+#   compliant               0.25  A material the regulation explicitly lists
+#                                 as out-of-concern or exempt.  Added
+#                                 2026-06-06 to close a code/handbook drift —
+#                                 the handbook described this multiplier but
+#                                 the dict was missing the entry, so
+#                                 'compliant' material scope was previously
+#                                 passing through at full severity.
 #
 # Severities are clamped to ``[0.0, 1.0]`` after multiplication so the
 # downstream ``compute_event_impact`` validator does not raise.  An unknown
@@ -46,6 +53,7 @@ SCOPE_SEVERITY_MULTIPLIER: dict[str, float] = {
     "strategic_raw_material":  1.00,
     "covered":                 0.80,
     "disclosure_required":     0.50,
+    "compliant":               0.25,
 }
 
 

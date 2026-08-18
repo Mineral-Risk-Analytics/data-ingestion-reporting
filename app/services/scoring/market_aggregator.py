@@ -46,9 +46,9 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.constants import RiskCategory
+from app.constants import EXPORT_RESTRICTION_SUBTYPES, RiskCategory
 from app.models.criticality_signal import MaterialCriticalitySignal
-from app.models.scoring import MaterialGeographyRiskScore
+from app.models.scoring import HsCodeGeographyRiskScore, MaterialGeographyRiskScore
 from app.models.supply import Material, MaterialProductionShare
 from app.services.scoring import (
     financial_pressure as fp_module,
@@ -71,6 +71,7 @@ from app.services.scoring.evidence_query import (
     get_hs_nodes_for_material,
 )
 from app.services.scoring.supplier_risk import SCORING_VERSION
+from app.services.scoring.stage_concentration import score_material_concentration
 
 log = structlog.get_logger(__name__)
 
@@ -84,11 +85,19 @@ log = structlog.get_logger(__name__)
 #   financial 0.10  →  sum = 0.85  →  renormalise each by /0.85
 # ---------------------------------------------------------------------------
 MARKET_PILLAR_WEIGHTS: dict[str, float] = {
-    "material":      0.25 / 0.85,   # ≈ 0.294
-    "geopolitical":  0.20 / 0.85,   # ≈ 0.235
-    "regulatory":    0.20 / 0.85,   # ≈ 0.235
-    "operational":   0.10 / 0.85,   # ≈ 0.118
-    "financial":     0.10 / 0.85,   # ≈ 0.118
+    # V1 (4.0, 2026-07-17): financial removed from the geography-level
+    # aggregate — its per-geo value carried no geographic information
+    # (flat 56.2 across every cobalt geography).  Weight redistributed
+    # pro-rata across the four remaining pillars (spec §7).  The key
+    # stays at 0.0 so every MARKET_PILLAR_WEIGHTS["financial"] consumer
+    # (completeness, L2 rescale, chemistry composite) degrades cleanly:
+    # financial_pressure_score is still computed, persisted, and shown
+    # as material-level context — it just doesn't move overall scores.
+    "material":      0.25 / 0.75,   # ≈ 0.333
+    "geopolitical":  0.20 / 0.75,   # ≈ 0.267
+    "regulatory":    0.20 / 0.75,   # ≈ 0.267
+    "operational":   0.10 / 0.75,   # ≈ 0.133
+    "financial":     0.0,
 }
 
 # ---------------------------------------------------------------------------
@@ -131,11 +140,8 @@ _STAGE_ROLLUP_MIN_NODES = 1
 # ── Facility-presence floor for country_concentration fallback ──────────
 # Set when no MaterialProductionShare row exists for the (material, country)
 # pair but MRDS has at least one FacilityMaterialLink row for that material
-# in that country.  See _derive_market_geopolitical_inputs for full
-# rationale.  0.02 sits below the smallest USGS-tracked producer share
-# (Cobalt AU = 0.01) so it's clearly a presence marker, not a real share.
-# Contribution to pillar: 0.40 × 0.02 = 0.8 score points out of 100.
-_FACILITY_PRESENCE_FLOOR = 0.02
+# _FACILITY_PRESENCE_FLOOR removed in 4.1 (spec §8): a facility link is not
+# a production share; missing MCS data reads as no signal (0.0), not a floor.
 
 # ── Pink Sheet (commodity_prices) thresholds — short-window ─────────────
 # CV (coefficient of variation = std/mean) over the look-back window
@@ -178,6 +184,54 @@ _CRITICALITY_SOURCE_PRIORITY: list[str] = [
 
 
 # ---------------------------------------------------------------------------
+# Step 2026-06-16 — Batch-mode preload cache
+# ---------------------------------------------------------------------------
+# Per-(material × geography) scoring did 30+ SQL roundtrips per row.  At
+# ~1,900 rows that was ~57,000 queries — slow even over fast networks,
+# brutal over WAN / pgbouncer.  This cache hoists the queries whose
+# results depend on ONLY material_id, ONLY country_code, or are constant
+# across the run, so they execute once at the top of
+# ``score_all_active_materials`` instead of once per row.
+#
+# Cached:
+#   criticality_signal_by_material_id  (one row per material)
+#   material_events  by (material_id, category)  (the cheap path through
+#                                                 evidence_query.get_events_for_material,
+#                                                 incl. HS-confidence multiplier)
+#   geo_events       by (country_code, category) (similarly hoists
+#                                                 get_events_for_geographies)
+#   governance_by_country                        (Step 3 WGI overlay lookup)
+#
+# Hot paths still query directly when ``cache`` is None — keeps
+# standalone calls to ``score_material_geography`` working.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field as _dc_field
+
+
+@dataclass
+class ScoringPreloadCache:
+    """Bulk-loaded data shared across a ``score_all_active_materials`` run.
+
+    Always-empty defaults are intentional so a caller can construct an
+    empty cache + selectively prefill fields if they only want a subset.
+    """
+
+    criticality_by_material_id: dict[int, Optional[MaterialCriticalitySignal]] = _dc_field(default_factory=dict)
+    # Cache of get_events_for_material results.  Key shape is
+    # (material_id, category_value_string) — string not enum so call sites
+    # can normalise without re-importing RiskCategory in random places.
+    material_events_by_material_and_category: dict[tuple[int, str], list] = _dc_field(default_factory=dict)
+    # Same for get_events_for_geographies.
+    geo_events_by_country_and_category: dict[tuple[str, str], list] = _dc_field(default_factory=dict)
+    # Step 3 — CountryGovernanceSignal by country_code.  Latest row per country.
+    governance_by_country_code: dict[str, object] = _dc_field(default_factory=dict)
+    # Sentinel marker so the WGI lookup can distinguish "no cache" from
+    # "cache says this country has no row" without re-querying.
+    governance_loaded: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
@@ -185,13 +239,21 @@ def _get_best_criticality_signal(
     db: Session,
     material_id: int,
     as_of_date: date,
+    *,
+    cache: Optional[ScoringPreloadCache] = None,
 ) -> Optional[MaterialCriticalitySignal]:
     """Return the most authoritative MaterialCriticalitySignal for this material.
 
     Selects the latest reference_year row for the highest-priority source that
     has a non-null criticality_score. Falls back through the source hierarchy
     defined in ``_CRITICALITY_SOURCE_PRIORITY``.
+
+    Cache-aware: when ``cache`` is provided and the material_id has been
+    preloaded, returns the cached value without a DB roundtrip.
     """
+    if cache is not None and material_id in cache.criticality_by_material_id:
+        return cache.criticality_by_material_id[material_id]
+
     stmt = (
         select(MaterialCriticalitySignal)
         .where(
@@ -215,6 +277,166 @@ def _get_best_criticality_signal(
     return rows[0]
 
 
+def _cached_events_for_material(
+    db: Session,
+    material_id: int,
+    category,
+    as_of_date: date,
+    *,
+    cache: Optional[ScoringPreloadCache] = None,
+):
+    """Cache-aware wrapper around ``get_events_for_material``.
+
+    ``category`` is a ``RiskCategory`` enum; the cache key uses
+    ``category.value`` to avoid importing the enum at every call site.
+    """
+    from app.services.scoring.evidence_query import get_events_for_material
+    if cache is not None:
+        key = (material_id, category.value)
+        cached = cache.material_events_by_material_and_category.get(key)
+        if cached is not None:
+            return cached
+    return get_events_for_material(db, material_id, category, as_of_date)
+
+
+def _cached_events_for_geographies(
+    db: Session,
+    country_code: str,
+    category,
+    as_of_date: date,
+    *,
+    cache: Optional[ScoringPreloadCache] = None,
+):
+    """Cache-aware wrapper around ``get_events_for_geographies`` for a
+    single country code.  Multi-country calls bypass the cache."""
+    from app.services.scoring.evidence_query import get_events_for_geographies
+    if cache is not None:
+        key = (country_code, category.value)
+        cached = cache.geo_events_by_country_and_category.get(key)
+        if cached is not None:
+            return cached
+    return get_events_for_geographies(db, {country_code}, category, as_of_date)
+
+
+def _cached_governance_signal(
+    db: Session,
+    country_code: str,
+    *,
+    cache: Optional[ScoringPreloadCache] = None,
+):
+    """Cache-aware lookup for the latest CountryGovernanceSignal row.
+
+    Returns ``None`` when no signal exists.  When the cache reports
+    ``governance_loaded=True`` it's authoritative — we don't fall back
+    to a DB query even if the country is absent (that absence IS the
+    answer).
+    """
+    if cache is not None and cache.governance_loaded:
+        return cache.governance_by_country_code.get(country_code)
+    from app.models import CountryGovernanceSignal as _CGS
+    return db.execute(
+        select(_CGS)
+        .where(
+            _CGS.country_code == country_code,
+            _CGS.source == "worldbank_wgi",
+        )
+        .order_by(_CGS.reference_year.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def build_scoring_preload_cache(
+    db: Session,
+    materials: list,
+    country_codes: list[str],
+    as_of_date: date,
+) -> ScoringPreloadCache:
+    """Preload the heavy per-row queries once for a full batch run.
+
+    Builds three cache buckets:
+      1. Criticality signal per material_id (priority-resolved).
+      2. Material events per (material_id, category) for GEOPOLITICAL_TRADE
+         and OPERATIONAL — the two categories ``score_material_geography``
+         pulls per row.  Other categories stay uncached because the
+         regulatory / financial derivations have their own narrower
+         query patterns.
+      3. Geography events per (country_code, category) — same two
+         categories as above.
+
+    Plus the Step 3 governance lookup (one row per country with WGI data).
+
+    Returns a fully-populated ``ScoringPreloadCache``.  Callers thread
+    it through ``score_material_geography(..., cache=cache)``.
+    """
+    from app.services.scoring.evidence_query import (
+        get_events_for_material,
+        get_events_for_geographies,
+        RiskCategory,
+    )
+    from app.models import CountryGovernanceSignal as _CGS
+
+    cache = ScoringPreloadCache()
+
+    log.info(
+        "market_aggregator.cache.build_start",
+        material_count=len(materials),
+        country_count=len(country_codes),
+    )
+
+    # ── 1. Criticality signals per material ──────────────────────────────
+    for material in materials:
+        cache.criticality_by_material_id[material.id] = _get_best_criticality_signal(
+            db, material.id, as_of_date,
+        )
+
+    # ── 2. Material events per (material, category) ──────────────────────
+    # GEOPOLITICAL_TRADE and OPERATIONAL are the only categories
+    # ``score_material_geography`` hits per row.  Other pillar
+    # derivations (regulatory, financial) have their own internal
+    # category queries which we don't hoist here.
+    for material in materials:
+        for category in (RiskCategory.GEOPOLITICAL_TRADE, RiskCategory.OPERATIONAL):
+            cache.material_events_by_material_and_category[(material.id, category.value)] = (
+                get_events_for_material(db, material.id, category, as_of_date)
+            )
+
+    # ── 3. Geo events per (country, category) ────────────────────────────
+    for country_code in country_codes:
+        for category in (RiskCategory.GEOPOLITICAL_TRADE, RiskCategory.OPERATIONAL):
+            cache.geo_events_by_country_and_category[(country_code, category.value)] = (
+                get_events_for_geographies(db, {country_code}, category, as_of_date)
+            )
+
+    # ── 4. Country governance signals (Step 3) ──────────────────────────
+    # One SELECT pulls the latest row per (country_code, source) using
+    # DISTINCT ON.  Cleaner + cheaper than the per-row LIMIT 1 query.
+    gov_rows = db.execute(
+        select(_CGS)
+        .where(
+            _CGS.country_code.in_(country_codes),
+            _CGS.source == "worldbank_wgi",
+        )
+        .order_by(_CGS.country_code, _CGS.reference_year.desc())
+    ).scalars().all()
+    # Walk in (country, year desc) order, take the FIRST row per country.
+    seen: set[str] = set()
+    for row in gov_rows:
+        if row.country_code not in seen:
+            cache.governance_by_country_code[row.country_code] = row
+            seen.add(row.country_code)
+    cache.governance_loaded = True
+
+    log.info(
+        "market_aggregator.cache.build_done",
+        criticality_signals=len(cache.criticality_by_material_id),
+        material_event_buckets=len(cache.material_events_by_material_and_category),
+        geo_event_buckets=len(cache.geo_events_by_country_and_category),
+        governance_signals=len(cache.governance_by_country_code),
+    )
+
+    return cache
+
+
 def _event_impact(
     ew: EventWithRelevance,
     category: RiskCategory,
@@ -223,7 +445,12 @@ def _event_impact(
     ev_date = ew.event.event_date.date() if ew.event.event_date else as_of_date
     recency = compute_recency_multiplier(category, ev_date, as_of_date)
     return compute_event_impact(
-        severity=float(ew.event.severity_score or 0.5),
+        # 11.4-Op (2026-06-06): changed `or 0.5` → `or 0.0` to remove the
+        # silent midpoint inflation when an event lands with NULL
+        # severity_score.  All current parsers explicitly set severity,
+        # but the schema column is nullable so this is defensive.  No-
+        # data-no-signal is consistent with the Material 11.4 fix.
+        severity=float(ew.event.severity_score or 0.0),
         confidence=float(ew.event.confidence_score or 0.5),
         recency_multiplier=recency,
         # ew.relevance_score is on [0, 1]; map to the [0.70, 1.30]
@@ -241,6 +468,29 @@ def _avg_impact_normalised(
         return 0.0
     impacts = [_event_impact(ew, category, as_of_date) for ew in events]
     return min(1.0, sum(impacts) / len(impacts) / _MAX_EVENT_IMPACT)
+
+
+def _max_impact_normalised(
+    events: list[EventWithRelevance],
+    category: RiskCategory,
+    as_of_date: date,
+) -> float:
+    """Strongest single event impact, normalised to 0-1.
+
+    4.2 (2026-07-23): the export / tariff / subsidy Geopolitical
+    sub-inputs switched from avg to max.  The strongest ACTIVE
+    restriction defines a trade lane's exposure; weaker corroborating
+    events must never dilute it, which is what an average structurally
+    does (cobalt/CD: a severity-0.07 sanctions-count stat next to the
+    severity-0.9 DRC export ban dragged the avg to 0.33 when the ban
+    alone decays to 0.64).  ``trade_volatility`` (Material pillar)
+    deliberately keeps the avg — breadth of disruption is the signal
+    there, not the single worst event.
+    """
+    if not events:
+        return 0.0
+    impacts = [_event_impact(ew, category, as_of_date) for ew in events]
+    return min(1.0, max(impacts) / _MAX_EVENT_IMPACT)
 
 
 def _classify_geo_events(
@@ -264,7 +514,7 @@ def _classify_geo_events(
         text = (ew.event.title or "").lower()
         if subtype == "EXPORT_SUBSIDY":
             subsidy_events.append(ew)
-        elif subtype == "EXPORT_RESTRICTION" or (
+        elif subtype in EXPORT_RESTRICTION_SUBTYPES or (
             "export" in text and ("restrict" in text or "ban" in text or "control" in text)
         ):
             export_events.append(ew)
@@ -296,20 +546,25 @@ def _derive_market_material_inputs(
     geography_code: str,
     trade_events: list[EventWithRelevance],
     as_of_date: date,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, dict]:
     """
-    Returns (criticality, concentration, trade_volatility) each on [0, 1.0].
+    Returns (criticality, concentration, trade_volatility, sub_input_diagnostic)
+    where the three numeric values are each on [0, 1.0] and
+    ``sub_input_diagnostic`` is a dict reporting which components were data-
+    backed vs defaulted.
 
     criticality:
         Blend of production HHI criticality_score (70%) and a reserve scarcity
-        signal derived from reserve_life_index (30%). Default 0.5 when no signal
-        exists (data gap — caller should log a warning; don't assume zero risk).
+        signal derived from reserve_life_index (30%).
 
         Reserve scarcity thresholds:
           RLI <= 20 years  → scarcity_signal = 1.0  (near-term constraint)
           RLI >= 80 years  → scarcity_signal = 0.0  (abundant; not a near-term risk)
           Linear interpolation between 20 and 80.
-        When RLI is absent the scarcity component defaults to 0.5 (unknown = neutral).
+
+        Defaults (pre-11.4 vs post-11.4):
+          criticality_score absent: pre 0.5 / post 0.0 (no data = no signal)
+          reserve_life_index absent: pre 0.5 / post 0.0 (no data = no signal)
 
     concentration:
         Five-component composite, each [0, 1]:
@@ -320,7 +575,20 @@ def _derive_market_material_inputs(
                                    MRDS knows about a facility here, else 0.0)
           0.10 × capacity stress (capacity_utilization normalised; high util = tight market)
           0.05 × supply trend    (production YoY contraction only; growth = no extra risk)
-        All weights sum to 1.0.  Any absent component falls back to a neutral 0.5.
+        All weights sum to 1.0.
+
+        11.4 (2026-06) fix
+        ------------------
+        Pre-11.4 every absent component defaulted to a neutral 0.5 midpoint,
+        which silently inflated concentration scores for materials with thin
+        MCS coverage.  Per the 11.0 coverage matrix, this affected Cobalt /
+        Lithium / Manganese / Natural Graphite / Phosphate / REE the most.
+        11.4 changes the defaults to 0.0 (no data = no signal), consistent
+        with the supply_trend default that was already on this pattern.
+        Affected components: prod_hhi, reserve_hhi, capacity_stress.
+
+        The producer_signal component already used 0.0 as its terminal
+        fallback (no MCS share + no facility) — that pattern is preserved.
 
         Producer-signal history: this sub-input was a hardcoded binary HCG flag
         (1.0 if geography ∈ {CN, CD, RU}, else 0.0) prior to 2026-05-12, which
@@ -333,18 +601,30 @@ def _derive_market_material_inputs(
     trade_volatility:
         Average normalised event_impact for GEOPOLITICAL_TRADE events for this
         (material, geography) pair. Default 0.3 when no events.
+
+    sub_input_diagnostic (11.4.C — 2026-06):
+        Dict mirroring the 11.6 data_completeness pattern at the sub-input
+        level.  Reports which of the five concentration components plus the
+        two criticality components and the trade_volatility were data-backed
+        vs defaulted, so the Level-1 rationale_json can surface "this
+        material's concentration was computed from 3 of 5 real components"
+        without forcing the caller to re-derive the same checks.
     """
     sig = criticality_signal  # alias for brevity
 
     # ── criticality ──────────────────────────────────────────────────────────
+    # 11.4 (2026-06): default changed 0.5 → 0.0 for both components.  See
+    # function docstring for the bias-correction rationale.
     if sig and sig.criticality_score is not None:
         hhi_criticality = float(sig.criticality_score)
+        crit_score_data_backed = True
     else:
         log.warning(
             "market_aggregator.no_criticality_signal",
             geography_code=geography_code,
         )
-        hhi_criticality = 0.5
+        hhi_criticality = 0.0
+        crit_score_data_backed = False
 
     # Reserve scarcity signal: lower RLI = higher scarcity risk.
     _RLI_HIGH = 80.0  # years — effectively no near-term scarcity concern
@@ -352,8 +632,10 @@ def _derive_market_material_inputs(
     if sig and sig.reserve_life_index is not None:
         rli = float(sig.reserve_life_index)
         scarcity_signal = max(0.0, min(1.0, (_RLI_HIGH - rli) / (_RLI_HIGH - _RLI_LOW)))
+        rli_data_backed = True
     else:
-        scarcity_signal = 0.5  # absent = neutral; don't penalise data-sparse materials
+        scarcity_signal = 0.0
+        rli_data_backed = False
 
     criticality = 0.70 * hhi_criticality + 0.30 * scarcity_signal
 
@@ -375,43 +657,74 @@ def _derive_market_material_inputs(
     )
     if _producer_share_row is not None:
         producer_signal = float(_producer_share_row.production_share)
+        producer_source = "mcs_share"
     else:
-        # No MCS row — check facility-presence floor.
-        from app.models.facility import Facility, FacilityMaterialLink
+        # No MCS production share → no signal. (4.1: the facility-presence
+        # floor was removed per spec §8 data-honesty — a facility link is
+        # not a production share and must not fabricate 0.02 concentration.)
+        producer_signal = 0.0
+        producer_source = "no_data"
 
-        _has_facility = db.scalar(
-            select(FacilityMaterialLink.id)
-            .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
-            .where(
-                FacilityMaterialLink.material_id == material_id,
-                Facility.country == geography_code,
-            )
-            .limit(1)
-        )
-        producer_signal = (
-            _FACILITY_PRESENCE_FLOOR if _has_facility is not None else 0.0
-        )
+    # 11.4.B (2026-06): defaults for prod_hhi / reserve_hhi changed 0.5 → 0.0
+    # (no data = no signal) to remove the silent score-inflation for
+    # materials where MCS doesn't compute HHI.
+    #
+    # 11.5-MC-A (2026-06 — JRC-aligned cliff mapping): the raw HHI from MCS
+    # was being passed through linearly (0.45 × raw_hhi), which collapsed
+    # the dynamic range — Cobalt's HHI 0.58 contributed ~9 points to the
+    # pillar where the structural reality merits ~40 points.  Spearman ρ
+    # against USGS criticality was -0.16 (slightly inverted ranking).  The
+    # ``hhi_concentration_risk`` helper applies a piecewise-linear cliff
+    # mapping aligned with the DOJ Horizontal Merger Guidelines HHI tiers
+    # before the existing 0.45 / 0.15 weights.  Same input data — same
+    # MCS-derived ``hhi_score`` / ``reserve_hhi_score`` — but the post-
+    # mapping value reaches 0.95+ for true single-supplier dominance
+    # (Cobalt-DRC, Graphite-CN) instead of saturating at the raw HHI value.
+    #
+    # No change to which materials have data backing the score; the
+    # ``prod_hhi_data_backed`` diagnostic still tracks the raw signal's
+    # presence.  See material_risk.hhi_concentration_risk() for the
+    # mapping table and JRC/USGS references.
+    from app.services.scoring.material_risk import hhi_concentration_risk
 
-    prod_hhi = float(sig.hhi_score) if sig and sig.hhi_score is not None else 0.5
-    res_hhi  = float(sig.reserve_hhi_score) if sig and sig.reserve_hhi_score is not None else 0.5
+    if sig and sig.hhi_score is not None:
+        prod_hhi = hhi_concentration_risk(float(sig.hhi_score))
+        prod_hhi_data_backed = True
+    else:
+        prod_hhi = 0.0
+        prod_hhi_data_backed = False
+
+    if sig and sig.reserve_hhi_score is not None:
+        res_hhi = hhi_concentration_risk(float(sig.reserve_hhi_score))
+        res_hhi_data_backed = True
+    else:
+        res_hhi = 0.0
+        res_hhi_data_backed = False
 
     # Capacity utilization stress: >= 0.90 → 1.0 (very tight), <= 0.50 → 0.0 (slack).
+    # 11.4.A (2026-06): default changed 0.5 → 0.0 (no data = no signal),
+    # consistent with supply_trend below.
     _CAP_HIGH = 0.90
     _CAP_LOW  = 0.50
     if sig and sig.capacity_utilization is not None:
         cap_util = float(sig.capacity_utilization)
         cap_stress = max(0.0, min(1.0, (cap_util - _CAP_LOW) / (_CAP_HIGH - _CAP_LOW)))
+        cap_stress_data_backed = True
     else:
-        cap_stress = 0.5  # absent = neutral
+        cap_stress = 0.0
+        cap_stress_data_backed = False
 
     # Supply trend: only contractions are a risk signal; growth eases pressure.
     # Max meaningful contraction for single-year shift: ~15%.
+    # Default already 0.0 pre-11.4 (the pattern the other defaults moved to).
     _YOY_CONTRACTION_MAX = 0.15
     if sig and sig.production_yoy_pct is not None:
         yoy_contraction = max(0.0, -float(sig.production_yoy_pct))  # positive = contraction
         trend_stress = min(1.0, yoy_contraction / _YOY_CONTRACTION_MAX)
+        trend_data_backed = True
     else:
-        trend_stress = 0.0  # absent = no extra stress (conservative; don't assume contraction)
+        trend_stress = 0.0
+        trend_data_backed = False
 
     concentration = (
         0.45 * prod_hhi
@@ -425,12 +738,37 @@ def _derive_market_material_inputs(
     # ── trade_volatility ─────────────────────────────────────────────────────
     if not trade_events:
         trade_volatility = 0.3
+        trade_data_backed = False
     else:
         trade_volatility = _avg_impact_normalised(
             trade_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
         )
+        trade_data_backed = True
 
-    return criticality, concentration, trade_volatility
+    # ── 11.4.C (2026-06) — per-sub-input diagnostic ──────────────────────────
+    # Mirrors the 11.6 data_completeness pattern at the sub-input level.
+    # Caller (score_material_geography) folds this into rationale_json so
+    # partner-facing UI can show "concentration was computed from N of 5
+    # real components" rather than just reporting the final number.
+    sub_input_diagnostic = {
+        "criticality": {
+            "criticality_score_data_backed": crit_score_data_backed,
+            "reserve_life_index_data_backed": rli_data_backed,
+        },
+        "concentration": {
+            "production_hhi_data_backed":  prod_hhi_data_backed,
+            "reserve_hhi_data_backed":     res_hhi_data_backed,
+            "producer_signal_source":      producer_source,  # mcs_share / facility_floor / no_data
+            "capacity_stress_data_backed": cap_stress_data_backed,
+            "supply_trend_data_backed":    trend_data_backed,
+        },
+        "trade_volatility": {
+            "trade_event_data_backed": trade_data_backed,
+            "trade_event_count": len(trade_events),
+        },
+    }
+
+    return criticality, concentration, trade_volatility, sub_input_diagnostic
 
 
 def _derive_market_geopolitical_inputs(
@@ -441,16 +779,39 @@ def _derive_market_geopolitical_inputs(
     as_of_date: date,
     *,
     eligible_nodes: Optional[list["HsCodeGeographyRiskScore"]] = None,
-) -> tuple[float, float, float, Optional[float], str]:
+    cache: Optional["ScoringPreloadCache"] = None,
+) -> tuple[float, float, float, Optional[float], str, dict]:
     """
     Returns (country_concentration, export_restriction_exposure, tariff_exposure,
-             production_subsidy_distortion, geopolitical_method) where the
-    floats are on [0, 1.0].  ``production_subsidy_distortion`` is
+             production_subsidy_distortion, geopolitical_method,
+             sub_input_diagnostic).
+
+    All numeric values are on [0, 1.0].  ``production_subsidy_distortion`` is
     ``None`` when no EXPORT_SUBSIDY events exist for this (material ×
     geography) pair (triggers the 3-component scoring profile in
     ``geopolitical_risk.score_geopolitical_trade``); any numeric value
     (including 0.0) triggers the 4-component profile.  Added 2026-05-09
     as part of the G-Cov-3 audit fix.
+
+    11.4-Geo (2026-06-06): the 6th return value, ``sub_input_diagnostic``,
+    mirrors the Material pillar's 11.4-C dict.  Reports which sub-inputs
+    were data-backed vs defaulted so the partner UI can show "this
+    Geopolitical score is computed from real MCS + real tariff events,
+    but no export-restriction events fired" instead of just the final
+    number.
+
+    Note on a known asymmetric default:  When ``subsidy_distortion is
+    None`` (no subsidy events for this material × country), the scoring
+    function drops the 10% subsidy weight and implicitly redistributes
+    it across the other three sub-inputs.  A country with NO subsidy
+    data therefore scores ~3.5 points higher than the same country with
+    subsidy_distortion explicitly equal to 0.0.  This is functionally
+    a "midpoint default" via weight redistribution — same family of
+    bias as the 0.5-midpoint defaults the Material pillar audit
+    removed in 11.4-A/B.  The 11.4-Geo audit chose to KEEP this math
+    (per the "fill data gaps over re-math" preference) and surface the
+    state via ``sub_input_diagnostic["subsidy_data_backed"]`` so the
+    bias is visible rather than silent.
 
     ``geopolitical_method`` is one of:
 
@@ -507,6 +868,7 @@ def _derive_market_geopolitical_inputs(
     )
     if share_row is not None:
         country_concentration = float(share_row.production_share)
+        country_concentration_source = "mcs_share"
     else:
         # Secondary: facility-presence floor (2026-05-12, audit fix).
         # USGS MCS only reports producers above ~1% of world output, so any
@@ -519,33 +881,14 @@ def _derive_market_geopolitical_inputs(
         # and RU on Lithium / Manganese.  The HCG fallback inflated 85-94%
         # of scored (material, country) pairs across the launch list.
         #
-        # New behavior: if MRDS knows about at least one facility for this
-        # material in this country, return a small floor value (0.02) to
-        # acknowledge "we know there's some production here, just below
-        # USGS's reporting threshold."  Otherwise 0.0 (no signal).
-        #
-        # Floor calibration: 0.02 sits below the smallest USGS-tracked
-        # share (Cobalt AU = 0.01) so it's identifiable as a presence
-        # marker rather than a real share.  Combined with the pillar's
-        # 0.40 weight on country_concentration that's worth 0.8 score
-        # points out of 100 — appreciable but not dominating.
-        from app.models.facility import Facility, FacilityMaterialLink
-
-        _has_facility = db.scalar(
-            select(FacilityMaterialLink.id)
-            .join(Facility, Facility.id == FacilityMaterialLink.facility_id)
-            .where(
-                FacilityMaterialLink.material_id == material_id,
-                Facility.country == geography_code,
-            )
-            .limit(1)
-        )
-        if _has_facility is not None:
-            country_concentration = _FACILITY_PRESENCE_FLOOR
-            fallback_label = "facility_presence_floor"
-        else:
-            country_concentration = 0.0
-            fallback_label = "no_signal"
+        # 4.1: no MCS production share → no signal. The facility-presence
+        # floor (a hardcoded 0.02 when MRDS knew of a facility here) was
+        # removed per spec §8 data-honesty — a facility link is not a
+        # production share and must not fabricate concentration. (The old
+        # HIGH_CONCENTRATION_GEOS phantom set was already gone before this.)
+        country_concentration = 0.0
+        fallback_label = "no_signal"
+        country_concentration_source = "no_data"
         log.debug(
             "market_aggregator.geo.production_share_fallback",
             material_id=material_id,
@@ -558,10 +901,10 @@ def _derive_market_geopolitical_inputs(
     export_events, tariff_events, subsidy_events = _classify_geo_events(
         geo_trade_events
     )
-    event_export = _avg_impact_normalised(
+    event_export = _max_impact_normalised(
         export_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
     )
-    event_tariff = _avg_impact_normalised(
+    event_tariff = _max_impact_normalised(
         tariff_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
     )
 
@@ -574,7 +917,7 @@ def _derive_market_geopolitical_inputs(
     # 4-component profile fires.  See docs/coverage-gap-plan-2026-05.md
     # § G-Cov-3.
     if subsidy_events:
-        subsidy_distortion: Optional[float] = _avg_impact_normalised(
+        subsidy_distortion: Optional[float] = _max_impact_normalised(
             subsidy_events, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
         )
     else:
@@ -584,6 +927,9 @@ def _derive_market_geopolitical_inputs(
     # Skip when no nodes were passed (caller hasn't fetched them) or when
     # there are too few to be representative.  Falls through to event-only.
     method = "event_classification"
+    hs_export = 0.0
+    hs_tariff = 0.0
+    hs_path_fired = False
     if eligible_nodes is not None and len(eligible_nodes) >= _STAGE_ROLLUP_MIN_NODES:
         # Stage-weighted average of HS-node sub-scores, normalised by the
         # sum of weights for stages actually present.  Same shape as
@@ -607,6 +953,7 @@ def _derive_market_geopolitical_inputs(
             export_exposure = max(event_export, hs_export)
             tariff_exposure = max(event_tariff, hs_tariff)
             method = "max_with_hs_nodes"
+            hs_path_fired = True
             log.debug(
                 "market_aggregator.geo.hs_node_aggregate",
                 material_id=material_id,
@@ -617,15 +964,108 @@ def _derive_market_geopolitical_inputs(
                 event_export=event_export,
                 hs_export=hs_export,
             )
-            return (
-                country_concentration, export_exposure, tariff_exposure,
-                subsidy_distortion, method,
-            )
+        else:
+            export_exposure = event_export
+            tariff_exposure = event_tariff
+    else:
+        export_exposure = event_export
+        tariff_exposure = event_tariff
+
+    # ── 4.1 (2026-07-20) — WGI overlay REMOVED from this pillar ────────────
+    # Through 4.0, a JRC-aligned WGI governance overlay discounted
+    # country_concentration here (well-governed suppliers cut up to ~half;
+    # see geopolitical_risk.apply_wgi_governance_overlay, retained for
+    # reference).  In 4.1 governance moved INTO the Material Concentration
+    # pillar as a production-share-anchored instability AMPLIFIER
+    # (stage_concentration.apply_governance_amplifier), which answers
+    # "how much, in how bad a place" far more directly.  Keeping the
+    # overlay here too would double-count instability across two pillars,
+    # so this pillar now uses the RAW country_concentration and captures
+    # only the ACUTE signals: export restrictions, tariffs, subsidies.
+    wgi_overlay_diag = {
+        "applied": False,
+        "reason": "removed_in_4.1_governance_moved_to_concentration_pillar",
+    }
+
+    # ── 11.4-Geo (2026-06) — per-sub-input diagnostic ──────────────────────
+    # Mirrors the 11.4-Material `sub_input_diagnostic` shape so the partner
+    # UI can render both pillars with the same template.
+    sub_input_diagnostic = {
+        "country_concentration": {
+            # data_backed = True only when MCS share is present.  The
+            # facility-presence floor (0.02) is a structural marker, not
+            # a quantitative share — we expose it as a separate source
+            # label rather than asserting it's "data-backed" in the same
+            # sense as a real MCS row.
+            "data_backed": country_concentration_source == "mcs_share",
+            "source": country_concentration_source,  # mcs_share / facility_floor / no_data
+            # Step 3 (2026-06-15): WGI governance overlay diagnostic.
+            # Records whether the overlay fired, the country's composite
+            # percentile, and the multiplier applied.  See
+            # geopolitical_risk.apply_wgi_governance_overlay.
+            "wgi_overlay": wgi_overlay_diag,
+        },
+        "export_restriction": {
+            # data_backed = True iff EITHER path produced a non-zero signal.
+            # Zero from both paths after the max() means we genuinely have
+            # no data, not a default-induced zero.
+            "data_backed": (event_export > 0.0) or (hs_export > 0.0),
+            "source": _classify_path_source(
+                event_value=event_export, hs_value=hs_export,
+                hs_path_fired=hs_path_fired,
+            ),
+        },
+        "tariff": {
+            "data_backed": (event_tariff > 0.0) or (hs_tariff > 0.0),
+            "source": _classify_path_source(
+                event_value=event_tariff, hs_value=hs_tariff,
+                hs_path_fired=hs_path_fired,
+            ),
+        },
+        "subsidy": {
+            # The 3-comp / 4-comp scoring asymmetry is the flag here.
+            # data_backed=False means scoring used the 3-component profile
+            # and silently redistributed the 10% subsidy weight across
+            # the other terms — see function docstring.
+            "data_backed": subsidy_distortion is not None,
+            "scoring_profile": (
+                "4_component" if subsidy_distortion is not None
+                else "3_component"
+            ),
+        },
+    }
 
     return (
-        country_concentration, event_export, event_tariff,
-        subsidy_distortion, method,
+        country_concentration, export_exposure, tariff_exposure,
+        subsidy_distortion, method, sub_input_diagnostic,
     )
+
+
+def _classify_path_source(
+    *, event_value: float, hs_value: float, hs_path_fired: bool,
+) -> str:
+    """Return the source label for export_restriction / tariff sub-inputs.
+
+    The Geopolitical pillar combines an event-classification path with an
+    HS-node aggregate path via ``max()``.  Partner-facing UI wants to know
+    which path actually contributed the signal, which max() alone hides.
+
+    Returns one of:
+
+      ``"both"``        — both paths produced a positive signal; max() picked one
+      ``"events_only"`` — events>0, HS path either didn't fire or was 0
+      ``"hs_only"``     — HS path>0, no event signal
+      ``"neither"``     — both zero (no data either way)
+    """
+    has_events = event_value > 0.0
+    has_hs = hs_path_fired and hs_value > 0.0
+    if has_events and has_hs:
+        return "both"
+    if has_events:
+        return "events_only"
+    if has_hs:
+        return "hs_only"
+    return "neither"
 
 
 def _resolve_compliance_weight(
@@ -636,14 +1076,50 @@ def _resolve_compliance_weight(
 
     Lookup order:
       1. Exact ISO2 match in ``geo_weights``
-      2. "DEFAULT" fallback within ``geo_weights``
-      3. Universal 0.50 default when the column is NULL or empty
+      2. Region alias containing the country (e.g. "EU" — see
+         constants.REGION_MEMBERS; added 2026-07-23)
+      3. "DEFAULT" fallback within ``geo_weights``
+      4. Universal 0.50 default when the column is NULL or empty
 
     Returns a value in [0.0, 1.0].
+
+    STALE-COMMENT FIX (2026-07-24, Build 2): the 11.4-Reg-A note that
+    "all 8 partner-tier regulations have NULL geography_compliance_weights"
+    no longer holds — all 8 obligation regs have curated JSONB weights in
+    the live DB. The 0.50 fallback remains for genuinely uncurated rows
+    (rare now); ``obligations.default_weight_count`` in the diagnostic
+    still surfaces how often it fires.
     """
     if not geo_weights:
         return 0.50
-    return float(geo_weights.get(geography_code, geo_weights.get("DEFAULT", 0.50)))
+    if geography_code in geo_weights:
+        return float(geo_weights[geography_code])
+    # Region alias (2026-07-23): a weights key like "EU" applies to every
+    # member country that has no exact row of its own — lets curation write
+    # {"EU": 0.0, "DEFAULT": 0.3} (CBAM exempting intra-EU sourcing) in one
+    # row. Exact country match above always wins over the region row.
+    from app.constants import REGION_MEMBERS
+    for region, members in REGION_MEMBERS.items():
+        if region in geo_weights and geography_code in members:
+            return float(geo_weights[region])
+    return float(geo_weights.get("DEFAULT", 0.50))
+
+
+def _resolve_enforcement_weight(
+    enforcement_weights: Optional[dict],
+    material_name: Optional[str],
+) -> float:
+    """Per-material enforcement weight for the obligation uplift (065).
+
+    Lookup: exact canonical-name match → "DEFAULT" → 1.0. The 1.0
+    fallback means uncurated regulations keep full points — the column
+    ships inert and only curation changes scores.
+    """
+    if not enforcement_weights or not material_name:
+        return 1.0
+    if material_name in enforcement_weights:
+        return float(enforcement_weights[material_name])
+    return float(enforcement_weights.get("DEFAULT", 1.0))
 
 
 def _derive_market_regulatory_inputs(
@@ -651,29 +1127,72 @@ def _derive_market_regulatory_inputs(
     material_id: int,
     geography_code: str,
     as_of_date: date,
-) -> tuple[list[float], list[tuple[str, float]], float]:
+) -> tuple[list[float], list[tuple[str, float]], float, dict, dict]:
     """
-    Returns (top_event_impacts, scope_obligations, policy_proximity_adjustment).
+    Returns (top_event_impacts, scope_obligations, policy_proximity_adjustment,
+             obligation_points, sub_input_diagnostic).
+
+    Build 2 (2026-07-24): ``obligation_points`` maps regulation_key → base
+    points read from ``regulations.obligation_points`` (coalesced to 0) —
+    passed to score_regulatory_profile in place of the retired hardcoded
+    COMPLIANCE_OBLIGATIONS dict.
+
+    11.4-Reg (2026-06-06): added the 4th return value, ``sub_input_diagnostic``,
+    mirroring the Material/Geopolitical/Operational 11.4 pattern.  Surfaces
+    visibility for three silent score-shaping behaviours the pillar has
+    today: uncurated regulation weights, top-3 event truncation, and the
+    40-point obligation cap.
 
     scope_obligations:
-        Regulations linked via RegulationMaterialScope to this material OR via
-        RegulationGeographyScope to this geography, each paired with its resolved
-        compliance risk weight for ``geography_code``.
+        Regulations linked via RegulationMaterialScope to this material OR
+        flagged ``applies_all_materials`` (all-goods rules — UFLPA, FLR,
+        CSDDD; migration 064 replaced the old RegulationGeographyScope
+        OR-gate, which leaked material-scoped regs into unlisted
+        materials). Each is paired with its resolved compliance risk
+        weight for ``geography_code``.
 
         Weights come from ``Regulation.geography_compliance_weights`` (JSONB):
           - Exact ISO2 match → that weight
           - "DEFAULT" key → fallback weight
           - NULL column (not yet curated) → 0.50 universal default
 
-        This replaces the previous hardcoded 0.50 for all obligations, allowing
-        UFLPA to score CN at 1.0 while US scores 0.05 for the same regulation.
+        11.4-Reg-A REVERT (2026-06-06): briefly flipped the NULL fallback
+        to 0.0 then reverted after discovering all 8 partner-tier
+        regulations have NULL JSONB today.  The diagnostic continues to
+        surface ``default_weight_count`` so the curation gap is visible.
 
     top_event_impacts:
         Normalised event_impact values for regulatory events scoped to this
-        material + geography. Passed to regulatory_risk.score_regulatory_profile().
+        material + geography. Passed to regulatory_risk.score_regulatory_profile()
+        which uses ONLY the top 3.  The diagnostic surfaces both the total
+        count and the top-3 used so partner UI can show "scored from 3 of 12."
 
     policy_proximity_adjustment:
-        1.15 if any event has an effective_date within 90 days of as_of_date.
+        1.15 if any event has an effective_date within 90 days of as_of_date,
+        else 1.0.  Diagnostic exposes the count of events with effective_date
+        metadata so partner can distinguish "no imminent regulations" from
+        "the parser didn't populate effective_date for any of these events."
+
+    sub_input_diagnostic:
+        {
+          "obligations": {
+            "data_backed": bool,                   # True iff any curated_weight_count > 0
+            "total_count": int,                    # all scoped regulations
+            "curated_weight_count": int,           # regulations whose weight came from the JSONB
+            "default_weight_count": int,           # regulations that hit the 0.0 fallback (11.4-Reg-A)
+            "raw_obligation_score": float,         # uncapped sum (post-weight, pre-cap)
+            "capped_at_40": bool,                  # whether the cap fired
+          },
+          "events": {
+            "data_backed": bool,                   # True iff total_count > 0
+            "total_count": int,                    # all regulatory events found
+            "top_3_used_count": int,               # 0/1/2/3 — the scoring subset
+          },
+          "proximity": {
+            "adjustment_active": bool,             # True iff 1.15 was applied
+            "events_with_effective_date_count": int,
+          },
+        }
     """
     from app.models.regulatory import (
         Regulation,
@@ -685,28 +1204,90 @@ def _derive_market_regulatory_inputs(
 
     # Scope-derived regulations (material + geography).
     # weights maps regulation_key → resolved compliance risk weight for this geography.
+    # weight_sources tracks where each weight came from: "curated" (from the JSONB)
+    # or "default" (the 0.0 fallback that fires when JSONB is NULL/empty).
     weights: dict[str, float] = {}
+    weight_sources: dict[str, str] = {}
+    # Build 2: obligation base points per regulation_key, straight from the
+    # row (coalesce(NULL,0) == the old COMPLIANCE_OBLIGATIONS.get(key, 0)).
+    obligation_points: dict[str, float] = {}
+
+    def _record_weight(key: str, geo_weights: Optional[dict]) -> None:
+        """Resolve + record the weight along with its source label."""
+        resolved = _resolve_compliance_weight(geo_weights, geography_code)
+        prev = weights.get(key, -1.0)
+        if resolved > prev:
+            weights[key] = resolved
+            # Source = "curated" iff the JSONB column was populated for ANY
+            # path, regardless of whether the resolved value happened to be
+            # 0.  An explicit ``{"US": 0.0}`` is partner-curated information
+            # (we know US is out of scope) and should not be conflated with
+            # the "no JSONB at all" 0.0 fallback.
+            weight_sources[key] = "curated" if geo_weights else "default"
+
+    # 065: enforcement weight scales the reg's points for THIS material.
+    # Resolve the scored material's canonical name once for the lookups.
+    _mat_name = db.scalar(
+        select(Material.canonical_name).where(Material.id == material_id)
+    )
 
     mat_stmt = (
-        select(Regulation.regulation_key, Regulation.geography_compliance_weights)
+        select(
+            Regulation.regulation_key,
+            Regulation.geography_compliance_weights,
+            Regulation.obligation_points,
+            Regulation.material_enforcement_weights,
+        )
         .join(RegulationMaterialScope, RegulationMaterialScope.regulation_id == Regulation.id)
         .where(RegulationMaterialScope.material_id == material_id)
     )
-    for key, geo_weights in db.execute(mat_stmt).all():
-        weights[key] = _resolve_compliance_weight(geo_weights, geography_code)
+    for key, geo_weights, ob_points, enf_weights in db.execute(mat_stmt).all():
+        _record_weight(key, geo_weights)
+        obligation_points[key] = float(ob_points or 0) * _resolve_enforcement_weight(
+            enf_weights, _mat_name
+        )
 
-    geo_stmt = (
-        select(Regulation.regulation_key, Regulation.geography_compliance_weights)
-        .join(RegulationGeographyScope, RegulationGeographyScope.regulation_id == Regulation.id)
-        .where(RegulationGeographyScope.country_code == geography_code)
+    # Gate change (2026-07-23, migration 064): all-goods regulations enter
+    # via the explicit applies_all_materials flag. The old
+    # RegulationGeographyScope OR-gate is gone from the market path — it
+    # leaked material-scoped regs (CRMA) into unlisted materials at their
+    # targeted countries. Geography scope rows are descriptive only now;
+    # geographic intensity lives entirely in geography_compliance_weights.
+    flag_stmt = (
+        select(
+            Regulation.regulation_key,
+            Regulation.geography_compliance_weights,
+            Regulation.obligation_points,
+            Regulation.material_enforcement_weights,
+        )
+        .where(Regulation.applies_all_materials.is_(True))
     )
-    for key, geo_weights in db.execute(geo_stmt).all():
-        resolved = _resolve_compliance_weight(geo_weights, geography_code)
-        # Take the higher weight if the regulation was already added via material scope
-        if resolved > weights.get(key, 0.0):
-            weights[key] = resolved
+    for key, geo_weights, ob_points, enf_weights in db.execute(flag_stmt).all():
+        _record_weight(key, geo_weights)
+        obligation_points[key] = float(ob_points or 0) * _resolve_enforcement_weight(
+            enf_weights, _mat_name
+        )
 
     scope_obligations = sorted(weights.items())
+
+    curated_weight_count = sum(
+        1 for src in weight_sources.values() if src == "curated"
+    )
+    default_weight_count = sum(
+        1 for src in weight_sources.values() if src == "default"
+    )
+
+    # Mirror the obligation-score math in score_regulatory_profile so we can
+    # surface raw vs capped values.  The scorer applies obligation_points
+    # (DB, Build 2) × weight, sums, then caps at 40.
+    raw_obligation_score = sum(
+        obligation_points.get(ob_key, 0.0) * weight
+        for ob_key, weight in scope_obligations
+    )
+    # 4.3: the hard cap is gone (scorer applies a 40-asymptote saturating
+    # curve). ``capped_at_40`` now flags "deep in the compressed zone" —
+    # raw > 40 — kept under its old name for diagnostic shape stability.
+    capped_at_40 = raw_obligation_score > 40.0
 
     # Events for scoped regulations
     reg_keys = set(weights.keys())
@@ -718,6 +1299,7 @@ def _derive_market_regulatory_inputs(
 
     top_event_impacts: list[float] = []
     policy_proximity_adjustment = 1.0
+    events_with_effective_date_count = 0
 
     for ew in reg_events:
         effective_date: Optional[date] = None
@@ -726,6 +1308,7 @@ def _derive_market_regulatory_inputs(
         if raw_eff and isinstance(raw_eff, str):
             try:
                 effective_date = _dt.fromisoformat(raw_eff).date()
+                events_with_effective_date_count += 1
             except ValueError:
                 pass
 
@@ -737,7 +1320,31 @@ def _derive_market_regulatory_inputs(
         impact = _event_impact(ew, RiskCategory.REGULATORY_COMPLIANCE, as_of_date)
         top_event_impacts.append(impact)
 
-    return top_event_impacts, scope_obligations, policy_proximity_adjustment
+    # ── 11.4-Reg (2026-06) — per-sub-input diagnostic ──────────────────────
+    sub_input_diagnostic = {
+        "obligations": {
+            "data_backed": curated_weight_count > 0,
+            "total_count": len(scope_obligations),
+            "curated_weight_count": curated_weight_count,
+            "default_weight_count": default_weight_count,
+            "raw_obligation_score": round(raw_obligation_score, 2),
+            "capped_at_40": capped_at_40,
+        },
+        "events": {
+            "data_backed": len(top_event_impacts) > 0,
+            "total_count": len(top_event_impacts),
+            "top_3_used_count": min(3, len(top_event_impacts)),
+        },
+        "proximity": {
+            "adjustment_active": policy_proximity_adjustment > 1.0,
+            "events_with_effective_date_count": events_with_effective_date_count,
+        },
+    }
+
+    return (
+        top_event_impacts, scope_obligations, policy_proximity_adjustment,
+        obligation_points, sub_input_diagnostic,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -751,8 +1358,10 @@ def _derive_market_regulatory_inputs(
 # forever" with "mine temporarily idled."  The N4 audit fix (2026-05-06)
 # also stops ingesting closed MRDS rows, so for new data this is moot;
 # kept here as defense for any older rows still in the DB.
-_AT_RISK_STATUSES = frozenset({"mothballed"})
-_PRODUCTION_ASSET_STATUSES = frozenset({"operating", "mothballed"})
+_AT_RISK_STATUSES = frozenset({"mothballed", "care_maintenance", "suspended"})
+_PRODUCTION_ASSET_STATUSES = frozenset({
+    "operating", "mothballed", "care_maintenance", "suspended",
+})
 
 
 def _facility_structural_dependency(
@@ -917,9 +1526,10 @@ def _derive_market_operational_inputs(
     geography_code: str,
     operational_events: list[EventWithRelevance],
     as_of_date: date,
-) -> tuple[Optional[float], list[float], str, Optional[dict]]:
+) -> tuple[Optional[float], list[float], str, Optional[dict], dict]:
     """
-    Returns (structural_dependency, weighted_event_impacts, dep_source, stage_breakdown).
+    Returns (structural_dependency, weighted_event_impacts, dep_source,
+    stage_breakdown, sub_input_diagnostic).
 
     ``structural_dependency`` is ``None`` when no facility data and no
     capacity-constraint events exist for the (material, geography) pair
@@ -927,6 +1537,12 @@ def _derive_market_operational_inputs(
     operational pillar doesn't impute a silent 12-point ghost from the
     legacy 0.3 placeholder.  Callers (``_score_operational_market``)
     redistribute pillar weight to events when this is None.
+
+    11.4-Op (2026-06-06): the 5th return value, ``sub_input_diagnostic``,
+    mirrors the Material/Geopolitical 11.4 dict pattern.  Reports which
+    sub-inputs are data-backed plus a null-severity event count surfacing
+    the `severity_score or 0.0` fallback (changed from `or 0.5` in 11.4
+    to remove a silent midpoint inflation when severity is NULL).
 
     structural_dependency — three-tier resolution:
 
@@ -938,13 +1554,14 @@ def _derive_market_operational_inputs(
          default-fill for missing stages — partner direction is to honestly
          reflect what's measurable.
 
-      2. MRDS global fallback: when no MRDS sites exist for this specific
-         geography, try the global material-level fraction (all geographies).
-         Discounted by 0.5 to reflect that it's a broader, less specific signal.
+      2. MRDS global fallback (DISABLED 2026-05-12): when no MRDS sites exist
+         for this specific geography, used to try the global material-level
+         fraction discounted by 0.5.  Now disabled to prevent cross-country
+         contamination; the path falls straight through to Tier 3.
 
       3. Event baseline: if no MRDS data exists for this material at all,
-         fall back to SINGLE_SOURCE / CAPACITY_CONSTRAINT event severity, or
-         the conservative 0.3 default.
+         fall back to SINGLE_SOURCE / CAPACITY_CONSTRAINT event severity.
+         When that's also empty, struct_dep is set to ``None`` (no signal).
 
     weighted_event_impacts:
         event_impact for each operational event, regardless of structural_dependency
@@ -955,9 +1572,12 @@ def _derive_market_operational_inputs(
         which (material, geography) pairs are hitting the conservative default
         rather than real facility data.  One of:
             "mrds_geography_stage_weighted"           — stage-weighted fraction for this geo
-            "mrds_global_discounted_stage_weighted"   — global stage-weighted × 0.5
             "event_derived"                            — capacity-constraint event severity avg
-            "default_0.3"                              — no data; conservative placeholder
+            "no_signal"                                — no MRDS, no events; struct_dep=None
+
+        (The legacy "mrds_global_discounted_stage_weighted" and "default_0.3"
+        labels are dead code post-2026-05-12 and have been removed from this
+        list.)
 
     stage_breakdown:
         The structured dict from ``_facility_structural_dependency`` describing
@@ -969,74 +1589,33 @@ def _derive_market_operational_inputs(
     stage_breakdown: Optional[dict] = None
     struct_dep: Optional[float] = None
 
-    # Tier 1: geography-specific MRDS stage-weighted fraction
-    geo_result = _facility_structural_dependency(db, material_id, geography_code)
-    if geo_result is not None:
-        struct_dep = geo_result["weighted"]
-        stage_breakdown = geo_result
-        dep_source = "mrds_geography_stage_weighted"
-
-    # Tier 2 (DISABLED 2026-05-12, Step 2 audit Fix B): global MRDS
-    # stage-weighted fraction × 0.5.  This path imputed a global structural-
-    # dependency value to countries with no per-material facility data,
-    # which mathematically produces JP-style inversions (a country with no
-    # graphite mines inheriting the global graphite mothballed-fraction).
-    # Currently the fallback returns 0 because no facility in the DB carries
-    # a mothballed status — Tier 2 is therefore moot in practice — but the
-    # principled fix is to skip it: countries with no facility data should
-    # surface as a coverage gap (Tier 3 / default), not be imputed.  When
-    # the MRDS parser fix (ticket #61) lands status-diverse data, this gate
-    # prevents accidental cross-country contamination on day one.
-    #
-    # If a future analysis wants a global comparison baseline, prefer
-    # rendering it as a UI annotation rather than folding it into the
-    # per-country score.
-
-    # Tier 3: event-derived baseline — when no MRDS data exists for this material
-    if struct_dep is None:
-        struct_events = [
-            ew for ew in operational_events
-            if (ew.event.event_subtype or "") in (  # typed col (migration 040)
-                "SINGLE_SOURCE", "CAPACITY_CONSTRAINT"
-            ) or any(
-                kw in (ew.event.title or "").lower()
-                for kw in ("single source", "single-source", "capacity constraint")
-            )
-        ]
-        if struct_events:
-            struct_dep = sum(
-                float(ew.event.severity_score or 0.5) for ew in struct_events
-            ) / len(struct_events)
-            dep_source = "event_derived"
-        else:
-            # Final tier: no MRDS data AND no capacity-constraint events.
-            # 2026-05-12 (Step 2 audit follow-up): switched from default
-            # 0.3 placeholder to None.  The placeholder was contributing a
-            # silent 12-point ghost (0.40 weight × 0.3 default × 100) to
-            # every (material, country) pair lacking facility data, which
-            # for the current launch list means every pair.  None signals
-            # honest "we don't have the data to score this," and
-            # _score_operational_market redistributes the operational
-            # pillar to 100% event-component when struct_dep is None.
-            # Revisit once curated facility data (G4c track) populates
-            # status-diverse MRDS rows.
-            struct_dep = None
-            dep_source = "no_signal"
-            log.debug(
-                "market_aggregator.structural_dependency_missing",
-                material_id=material_id,
-                geography_code=geography_code,
-                note=(
-                    "No MRDS facility data and no capacity-constraint events; "
-                    "structural_dependency = None.  Operational pillar will "
-                    "score from events only."
-                ),
-            )
+    # ── V1 (4.0, 2026-07-17) — event-only operational pillar ─────────────
+    # Spec: docs/design/scoring_v1_spec.md §6.  structural_dependency is
+    # forced to None: the MRDS-derived Tier-1 is retired (statuses are
+    # unvetted/stale outside the cobalt triage and carry no production
+    # weighting — Nicole's call: score only from facilities we've vetted),
+    # and the Tier-3 capacity-constraint baseline double-used events as
+    # pseudo-structural signal.  ``_score_operational_market``'s
+    # struct_dep=None path (100% curated-event component) is now the ONLY
+    # path.  Facility structural dependency returns as a versioned upgrade
+    # once the vetted watchlist + mining data feed land.
+    # ``_facility_structural_dependency`` is retained in the module for
+    # that future path but is no longer called here.
+    struct_dep = None
+    dep_source = "v1_event_only"
 
     weighted_event_impacts = [
         _event_impact(ew, RiskCategory.OPERATIONAL, as_of_date)
         for ew in operational_events
     ]
+
+    # 11.4-Op (2026-06-06): count NULL-severity operational events so the
+    # partner UI can flag when the `severity_score or 0.0` fallback fires.
+    # When the count is >0, those events effectively contributed 0 impact
+    # — surface this so it's visible rather than silent.
+    null_severity_event_count = sum(
+        1 for ew in operational_events if ew.event.severity_score is None
+    )
 
     # G-Cov-2 (2026-05-06): EXPORT_RESTRICTION events curtail supply, which
     # is operationally meaningful — but they're already tagged on the
@@ -1054,7 +1633,49 @@ def _derive_market_operational_inputs(
     )
     weighted_event_impacts.extend(export_restriction_impacts)
 
-    return struct_dep, weighted_event_impacts, dep_source, stage_breakdown
+    # ── 11.4-Op (2026-06) — per-sub-input diagnostic ──────────────────────
+    # Same shape as Material/Geopolitical 11.4 diagnostics.  Partner UI
+    # can render any pillar with the same template.
+    #
+    # data_backed semantics:
+    #   structural_dependency:
+    #     True  iff source == "mrds_geography_stage_weighted"
+    #     False for event_derived and no_signal (events shouldn't claim
+    #     they're "structural" data — they're event-derived proxies).
+    #   event_impacts:
+    #     True iff at least one operational event of any flavor exists.
+    sub_input_diagnostic = {
+        "structural_dependency": {
+            "data_backed": dep_source == "mrds_geography_stage_weighted",
+            "source": dep_source,  # mrds_geography_stage_weighted / event_derived / no_signal
+        },
+        "event_impacts": {
+            "data_backed": len(weighted_event_impacts) > 0,
+            "operational_event_count": len(operational_events),
+            # G-Cov-2 fold-in visibility: how many of the impacts in this
+            # pillar are "shadow" half-weighted EXPORT_RESTRICTION events
+            # vs primary operational events.
+            "export_restriction_event_count": len(export_restriction_impacts),
+            # 11.4-Op visibility: how many operational events had NULL
+            # severity (now resolved to 0.0 instead of the old 0.5
+            # midpoint).  A non-zero count means those events were
+            # effectively dropped from the score; partner should consider
+            # whether they're parser bugs worth backfilling.
+            "null_severity_event_count": null_severity_event_count,
+        },
+        # The scoring math redistributes 100% to events when struct_dep is
+        # None.  Surfacing the active scoring profile makes it explicit:
+        # is this score a 40/60 blend, or events-only?
+        "scoring_profile": (
+            "events_only" if struct_dep is None
+            else "structural_plus_events"
+        ),
+    }
+
+    return (
+        struct_dep, weighted_event_impacts, dep_source, stage_breakdown,
+        sub_input_diagnostic,
+    )
 
 
 # G-Cov-2 (2026-05-06): half-weight applied to EXPORT_RESTRICTION events
@@ -1090,13 +1711,26 @@ def _export_restriction_operational_impacts(
         RiskEventMaterial,
     )
 
+    # 2026-07-27 audit hardening: this fold deliberately borrows
+    # geopolitical-primary events at half weight — but it must still
+    # respect the platform-wide gates every other scoring query has:
+    #   * primary_category IS NOT NULL — display-only events (demoted
+    #     OpenSanctions matches, derived trade stats) were leaking into
+    #     the operational pillar through this side door (4 reachable in
+    #     the live DB at audit time; cobalt×CD's fold included the
+    #     severity-0.072 sanctions stat, diluting the event average).
+    #   * duplicate_of_id IS NULL — confirmed dupes must not double-fold.
+    #   * shared EXPORT_RESTRICTION_SUBTYPES — the manual quota/ban
+    #     subtypes fold too, consistent with the HS-node/market gates.
     rows = db.execute(
         select(RiskEvent)
         .join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
         .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
         .where(
             RiskEventMaterial.material_id == material_id,
-            RiskEvent.event_subtype == "EXPORT_RESTRICTION",
+            RiskEvent.event_subtype.in_(EXPORT_RESTRICTION_SUBTYPES),
+            RiskEvent.primary_category.isnot(None),
+            RiskEvent.duplicate_of_id.is_(None),
             RiskEventGeography.country_code == geography_code,
             RiskEventGeography.geography_context == "primary",
         )
@@ -1134,7 +1768,16 @@ def _score_operational_market(
 
     Result capped at 100.
     """
-    event_component = sum(op_impacts) / len(op_impacts) if op_impacts else 0.0
+    # 4.4 (2026-07-27, Nicole): top-3 mean instead of all-event mean —
+    # parity with the regulatory event component. A weak tail event
+    # (e.g. a half-weighted export-restriction fold) can no longer
+    # dilute a real disruption once three stronger impacts exist.
+    # Honest nuance: within the top 3 a weaker second event still
+    # lowers the mean vs a lone strong one — accepted for consistency
+    # with the regulatory component; pure max was rejected because
+    # simultaneous disruptions should register more than one.
+    top_3 = sorted(op_impacts, reverse=True)[:3]
+    event_component = sum(top_3) / len(top_3) if top_3 else 0.0
     if struct_dep is None:
         # No facility signal: pillar is 100% event-driven.
         raw = event_component * 100
@@ -1322,16 +1965,40 @@ def _derive_market_financial_inputs(
     material_id: int,
     geography_code: str,
     as_of_date: date,
-) -> tuple[float, float, float, int, dict]:
+) -> tuple[float, float, float, int, dict, dict]:
     """
     Market-level financial pressure sub-inputs.
 
-    Returns a 5-tuple: (base_filing_signal, leverage_warning_bonus,
-    liquidity_stress_bonus, filing_count, company_signal_meta).
+    Returns a 6-tuple: (base_filing_signal, leverage_warning_bonus,
+    liquidity_stress_bonus, evidence_count, company_signal_meta,
+    sub_input_diagnostic).
 
     ``company_signal_meta`` is a dict for rationale_json — it is NOT passed to
     ``fp_module.score_financial_pressure()``, which still takes the first four
     values unchanged.
+
+    11.4-Fin-A (2026-06-06): the 6th return value, ``sub_input_diagnostic``,
+    mirrors the Material/Geopolitical/Operational/Regulatory 11.4 pattern.
+    Surfaces visibility for the four silent score-shaping behaviours this
+    pillar has:
+
+      * Tier-source attribution for each of the three numeric sub-components
+        (Tier 1 Pink Sheet vs Tier 1.5 Fig 10 vs Tier 2 events vs Tier 3
+        SEC EDGAR) so partner can see which signal source dominated.
+      * Sparse-evidence cap state — ``filing_count < 2`` halves the score
+        in ``score_financial_pressure``; the diagnostic exposes both the
+        boolean and the cap factor (0 / 0.5 / 1.0).
+      * Tier 3 SEC EDGAR 15-pt cap firing — when the company signal would
+        have moved ``base_filing_signal`` more than 15 points but was capped.
+      * Coverage counts (Pink Sheet points / Fig 10 present / event count /
+        SEC EDGAR coverage_weight) so the partner UI can render a
+        "this score was computed from N price points, M events, and SEC
+        EDGAR coverage of X% of producers" sentence.
+
+    11.4-Fin-B (2026-06-06): ``filing_count`` was renamed ``evidence_count``
+    in the public scorer signature.  The local variable here is still
+    ``filing_count`` to minimise churn in the existing code paths;
+    semantically it's the same value.
 
     Signal sources (four tiers — Tier 1.5 added May 2026):
     ─────────────────────────────────────────────────────────────────────
@@ -1403,6 +2070,24 @@ def _derive_market_financial_inputs(
     liquidity_stress_bonus: float = 0.0
     filing_count = len(price_rows)
 
+    # 11.4-Fin-A tier-source tracking.  Each flag records whether the
+    # corresponding tier contributed a non-zero signal to that sub-input.
+    # The final diagnostic translates the flag combinations into a single
+    # source label (pink_sheet / fig10 / events / company / multiple / none).
+    base_pink_sheet_contrib = 0.0
+    base_fig10_contrib = 0.0
+    base_events_contrib = 0.0
+    base_company_contrib_uncapped = 0.0   # for the 15-pt cap visibility
+    base_company_contrib = 0.0            # post-cap
+
+    lev_pink_sheet_contrib = 0.0
+    lev_fig10_contrib = 0.0
+    lev_events_contrib = 0.0
+
+    liq_pink_sheet_contrib = 0.0
+    liq_fig10_contrib = 0.0
+    liq_events_contrib = 0.0
+
     if filing_count >= 2:
         prices = [float(row.price_usd) for row in price_rows]
         mean_price = sum(prices) / len(prices)
@@ -1412,6 +2097,7 @@ def _derive_market_financial_inputs(
             std_price = statistics.stdev(prices)
             cv = std_price / mean_price
             base_filing_signal = min(1.0, cv / _PRICE_CV_MAX) * 40.0
+            base_pink_sheet_contrib = base_filing_signal
 
         # Directional trend: compare last price vs. first price
         pct_change = (prices[-1] - prices[0]) / prices[0] if prices[0] > 0 else 0.0
@@ -1419,9 +2105,11 @@ def _derive_market_financial_inputs(
         if pct_change > 0:
             # Price spike → buyer leverage stress
             leverage_warning_bonus = min(1.0, pct_change / _PRICE_SPIKE_PCT) * 30.0
+            lev_pink_sheet_contrib = leverage_warning_bonus
         else:
             # Price crash → producer liquidity stress
             liquidity_stress_bonus = min(1.0, abs(pct_change) / _PRICE_CRASH_PCT) * 30.0
+            liq_pink_sheet_contrib = liquidity_stress_bonus
 
     # ── Tier 1.5 — USGS MCS Fig 10 price growth rates (annual + 5-yr) ──
     # Materials with no Pink Sheet coverage still get a financial-pressure
@@ -1465,16 +2153,19 @@ def _derive_market_financial_inputs(
         if f_cagr is not None:
             cagr_signal = min(1.0, abs(f_cagr) / _FIG10_CAGR_VOL_MAX) * 40.0
             base_filing_signal = max(base_filing_signal, cagr_signal)
+            base_fig10_contrib = cagr_signal
             fig10_meta["cagr_contribution_to_base_filing_signal"] = round(cagr_signal, 2)
 
         # YoY signed → spike (positive) or crash (negative).
         if f_yoy is not None and f_yoy > 0:
             spike_signal = min(1.0, f_yoy / _FIG10_YOY_SPIKE_PCT) * 30.0
             leverage_warning_bonus = max(leverage_warning_bonus, spike_signal)
+            lev_fig10_contrib = spike_signal
             fig10_meta["yoy_contribution_to_leverage_warning"] = round(spike_signal, 2)
         elif f_yoy is not None and f_yoy < 0:
             crash_signal = min(1.0, abs(f_yoy) / _FIG10_YOY_CRASH_PCT) * 30.0
             liquidity_stress_bonus = max(liquidity_stress_bonus, crash_signal)
+            liq_fig10_contrib = crash_signal
             fig10_meta["yoy_contribution_to_liquidity_stress"] = round(crash_signal, 2)
 
         fig10_meta.update({
@@ -1495,22 +2186,29 @@ def _derive_market_financial_inputs(
     for ew in fin_events:
         subtype = ew.event.event_subtype or ""  # typed col (migration 040)
         text = (ew.event.title or "").lower()
-        severity = float(ew.event.severity_score or 0.5)
+        # 11.4-Op (2026-06-06): same severity-default fix as line 226.
+        severity = float(ew.event.severity_score or 0.0)
 
         if subtype in ("PRICE_SURGE", "MARKET_SQUEEZE") or (
             "price surge" in text or "market squeeze" in text
         ):
-            leverage_warning_bonus = min(30.0, leverage_warning_bonus + severity * 10.0)
+            delta = min(30.0 - leverage_warning_bonus, severity * 10.0)
+            leverage_warning_bonus += delta
+            lev_events_contrib += delta
         elif subtype in ("PRODUCER_EXIT", "MINE_CLOSURE", "BANKRUPTCY") or (
             "producer exit" in text
             or "mine closure" in text
             or "mine shut" in text
             or "bankruptcy" in text
         ):
-            liquidity_stress_bonus = min(30.0, liquidity_stress_bonus + severity * 10.0)
+            delta = min(30.0 - liquidity_stress_bonus, severity * 10.0)
+            liquidity_stress_bonus += delta
+            liq_events_contrib += delta
         else:
             # Generic financial pressure event — contributes to base signal
-            base_filing_signal = min(40.0, base_filing_signal + severity * 5.0)
+            delta = min(40.0 - base_filing_signal, severity * 5.0)
+            base_filing_signal += delta
+            base_events_contrib += delta
 
     # Bump filing_count to include events so the sparse-evidence cap reflects
     # the full evidence pool (prices + events).
@@ -1524,7 +2222,10 @@ def _derive_market_financial_inputs(
     company_contribution = (
         (company_weighted_fp / 100.0) * _COMPANY_SIGNAL_MAX_CONTRIBUTION * coverage_weight
     )
+    base_company_contrib_uncapped = company_contribution
+    pre_company_base = base_filing_signal
     base_filing_signal = min(40.0, base_filing_signal + company_contribution)
+    base_company_contrib = base_filing_signal - pre_company_base
 
     company_signal_meta: dict = {
         "weighted_avg_fp": round(company_weighted_fp, 2),
@@ -1555,7 +2256,122 @@ def _derive_market_financial_inputs(
         leverage_bonus=round(leverage_warning_bonus, 2),
         liquidity_bonus=round(liquidity_stress_bonus, 2),
     )
-    return base_filing_signal, leverage_warning_bonus, liquidity_stress_bonus, filing_count, company_signal_meta
+
+    # ── 11.4-Fin-A (2026-06) — per-sub-input diagnostic ────────────────────
+    # Compute the sparse-evidence cap state up-front so the diagnostic
+    # mirrors what score_financial_pressure will apply.
+    sparse_cap_applied = filing_count < 2
+    sparse_cap_factor = (filing_count / 2.0) if sparse_cap_applied else 1.0
+    # Tier 3 SEC EDGAR 15-pt cap.  ``base_company_contrib_uncapped`` is the
+    # raw (company_weighted_fp/100) × 15 × coverage_weight value before the
+    # 40-pt sub-input cap was applied.  But the 15-pt cap fires on the
+    # contribution itself, NOT on the post-cap sub-input — so we compare
+    # against _COMPANY_SIGNAL_MAX_CONTRIBUTION × coverage_weight.  In
+    # practice the uncapped value is bounded by that same product (since
+    # we already multiplied by coverage_weight), so the cap fires only
+    # via the 40-pt outer min().
+    tier_3_capped_at_15 = base_company_contrib_uncapped >= _COMPANY_SIGNAL_MAX_CONTRIBUTION
+
+    sub_input_diagnostic = {
+        "base_filing_signal": {
+            "data_backed": base_filing_signal > 0.0,
+            "source": _classify_fin_source(
+                pink_sheet=base_pink_sheet_contrib,
+                fig10=base_fig10_contrib,
+                events=base_events_contrib,
+                company=base_company_contrib,
+            ),
+            "pink_sheet_contribution":  round(base_pink_sheet_contrib, 2),
+            "fig10_contribution":       round(base_fig10_contrib, 2),
+            "events_contribution":      round(base_events_contrib, 2),
+            "company_contribution":     round(base_company_contrib, 2),
+            "tier_3_capped_at_15":      tier_3_capped_at_15,
+        },
+        "leverage_warning_bonus": {
+            "data_backed": leverage_warning_bonus > 0.0,
+            "source": _classify_fin_source(
+                pink_sheet=lev_pink_sheet_contrib,
+                fig10=lev_fig10_contrib,
+                events=lev_events_contrib,
+            ),
+            "pink_sheet_contribution": round(lev_pink_sheet_contrib, 2),
+            "fig10_contribution":      round(lev_fig10_contrib, 2),
+            "events_contribution":     round(lev_events_contrib, 2),
+        },
+        "liquidity_stress_bonus": {
+            "data_backed": liquidity_stress_bonus > 0.0,
+            "source": _classify_fin_source(
+                pink_sheet=liq_pink_sheet_contrib,
+                fig10=liq_fig10_contrib,
+                events=liq_events_contrib,
+            ),
+            "pink_sheet_contribution": round(liq_pink_sheet_contrib, 2),
+            "fig10_contribution":      round(liq_fig10_contrib, 2),
+            "events_contribution":     round(liq_events_contrib, 2),
+        },
+        "sparse_evidence_cap": {
+            # The cap halves (or zeros) the final score when evidence_count
+            # < 2.  Same family of silent score-shaping as the Regulatory
+            # 40-pt cap + top-3 truncation; surface so partner can tell
+            # "score is low because evidence is thin" from "score is low
+            # because signal is weak."
+            "applied": sparse_cap_applied,
+            "factor": round(sparse_cap_factor, 2),
+            "evidence_count": filing_count,
+        },
+        "coverage": {
+            # Raw counts of what fed each tier.  Lets partner answer
+            # "how many price points / events / SEC filers contributed?"
+            # without parsing the full company_signal_meta block.
+            "pink_sheet_price_points": len(price_rows),
+            "fig10_signal_present": bool(fig10_meta),
+            "fin_event_count": len(fin_events),
+            "sec_edgar_coverage_weight": round(coverage_weight, 4),
+            "sec_edgar_company_count": len(company_details) if company_details else 0,
+        },
+    }
+
+    return (
+        base_filing_signal, leverage_warning_bonus, liquidity_stress_bonus,
+        filing_count, company_signal_meta, sub_input_diagnostic,
+    )
+
+
+def _classify_fin_source(
+    *,
+    pink_sheet: float = 0.0,
+    fig10: float = 0.0,
+    events: float = 0.0,
+    company: float = 0.0,
+) -> str:
+    """Return a single-string source label for a Financial Pressure sub-input.
+
+    Used by ``_derive_market_financial_inputs`` to give partner UI a
+    concise summary of which tiers contributed.  Combines arbitrary tier
+    contributions into one of six labels:
+
+      ``"none"``         — every tier was 0.0
+      ``"pink_sheet"``   — only Pink Sheet (Tier 1) contributed
+      ``"fig10"``        — only Fig 10 (Tier 1.5) contributed
+      ``"events"``       — only events (Tier 2) contributed
+      ``"company"``      — only SEC EDGAR (Tier 3) contributed
+      ``"multiple"``     — 2+ tiers contributed
+
+    The "multiple" label is intentionally coarse — for forensic detail
+    the per-tier numeric contributions are exposed alongside the label.
+    """
+    contribs = {
+        "pink_sheet": pink_sheet,
+        "fig10": fig10,
+        "events": events,
+        "company": company,
+    }
+    active = [name for name, v in contribs.items() if v > 0.0]
+    if not active:
+        return "none"
+    if len(active) == 1:
+        return active[0]
+    return "multiple"
 
 
 def _aggregate_market_score(
@@ -1576,6 +2392,164 @@ def _aggregate_market_score(
 
 
 # ---------------------------------------------------------------------------
+# 11.6 (2026-06) — Per-pillar data completeness
+# ---------------------------------------------------------------------------
+# Background
+# ----------
+# ``_aggregate_market_score`` is a fixed-weight sum that uses each pillar's
+# score as-is.  Each pillar function returns a score even when its inputs
+# are missing — falling back to either neutral midpoints (Material
+# Concentration components default around 0.3-0.5) or zero (Financial
+# Pressure, Regulatory).  The asymmetric defaults silently push scores
+# in different directions depending on which pillar is thin:
+#
+#   * Thin Material Concentration data -> neutral midpoint defaults pull
+#     the score UP relative to a material with rich-and-low-actual-risk
+#     data.
+#   * Thin Financial Pressure / Regulatory data -> zero defaults pull
+#     the score DOWN.
+#
+# The 2026-06 audit decided (Option E) to leave the scoring math alone
+# for Phase 1 but emit a per-pillar data-completeness diagnostic so:
+#
+#   * Partner-facing UI can surface "data confidence" alongside the
+#     score, letting customers see whether the number is backed by 5/5
+#     real pillars or, say, 3/5 with two defaulting.
+#   * Phase 1.5 has empirical data to validate whether the current
+#     scoring math should switch to score-time renormalisation
+#     (Option A/D) or per-pillar non-zero defaults (Option B).
+#
+# Definition
+# ----------
+# Per-pillar completeness is on [0.0, 1.0]: a fraction of the pillar's
+# inputs that came from real measured data vs default fallbacks.  The
+# value is informational only; it does NOT participate in the scoring
+# math at this layer (11.6).
+#
+# Overall completeness is the MARKET_PILLAR_WEIGHTS-weighted sum of
+# per-pillar values, so a material with all 5 pillars 100% real returns
+# 1.0; a material with Financial Pressure 0% real returns 0.882
+# (1.0 - 0.118 financial weight).
+
+
+def _compute_pillar_data_completeness(
+    criticality_signal,
+    *,
+    # Geopolitical inputs
+    geo_country_concentration: float,
+    geo_export_restriction: float,
+    geo_tariff: float,
+    # Regulatory inputs
+    reg_top_event_count: int,
+    reg_scope_obligation_count: int,
+    # Operational inputs
+    op_structural_dependency: Optional[float],
+    op_event_count: int,
+    # Financial Pressure inputs
+    fin_evidence_count: int,
+    fin_company_coverage: float,
+) -> dict[str, float]:
+    """Return a per-pillar + overall data-completeness diagnostic.
+
+    Each per-pillar value is on ``[0.0, 1.0]`` representing the fraction
+    of the pillar's input slots that came from real data rather than
+    default fallbacks.  Overall is the MARKET_PILLAR_WEIGHTS-weighted
+    mean of the five per-pillar values.
+
+    11.6 (2026-06): does NOT change scoring math.  Result is recorded in
+    the score's rationale_json for UI surfacing and Phase 1.5
+    methodology review.
+    """
+    # ── Material Concentration ──
+    # The Material Concentration pillar reads up to five fields from
+    # MaterialCriticalitySignal: criticality_score, hhi_score,
+    # reserve_hhi_score, capacity_utilization, production_yoy_pct.
+    # Plus the reserve_life_index for the scarcity component.  Treat
+    # each non-None field as one unit of completeness.
+    if criticality_signal is None:
+        material_completeness = 0.0
+    else:
+        slots = [
+            criticality_signal.criticality_score is not None,
+            criticality_signal.hhi_score is not None,
+            criticality_signal.reserve_hhi_score is not None,
+            criticality_signal.reserve_life_index is not None,
+            criticality_signal.capacity_utilization is not None,
+            criticality_signal.production_yoy_pct is not None,
+        ]
+        material_completeness = sum(slots) / len(slots)
+
+    # ── Geopolitical / Trade ──
+    # Three sub-inputs: country_concentration, export_restriction_exposure,
+    # tariff_exposure.  country_concentration is "real" when non-zero — it
+    # now comes only from a real MCS production share (4.1 removed the
+    # facility-presence floor).  exp_rest / tariff are real when non-zero
+    # (zero means no qualifying events).
+    geo_slots = [
+        geo_country_concentration > 0.0,
+        geo_export_restriction > 0.0,
+        geo_tariff > 0.0,
+    ]
+    geopolitical_completeness = sum(geo_slots) / len(geo_slots)
+
+    # ── Regulatory & Compliance ──
+    # Real when at least one regulation is in scope for this
+    # (material, geography) pair OR at least one scope obligation
+    # applies.  Binary because the pillar function does not blend in
+    # neutral defaults — it returns 0 when both inputs are absent.
+    regulatory_completeness = 1.0 if (
+        reg_top_event_count > 0 or reg_scope_obligation_count > 0
+    ) else 0.0
+
+    # ── Operational ──
+    # Two inputs: structural_dependency (defaults to 0.3 floor when no
+    # real signal, or None when no signal AND no floor was applied) +
+    # operational event impacts (count == 0 when none).
+    #
+    # 2026-06-13: guard for op_structural_dependency=None.  The pillar
+    # function can return None (not 0.3) when there's no operational
+    # signal at all for the (material, geography) pair — e.g. material
+    # 285 / TZ.  Treat None the same as "default 0.3" → no real signal.
+    op_slots = [
+        # struct_dep differs from 0.3 floor → real signal.
+        op_structural_dependency is not None
+            and abs(op_structural_dependency - 0.3) > 0.001,
+        op_event_count > 0,
+    ]
+    operational_completeness = sum(op_slots) / len(op_slots)
+
+    # ── Financial Pressure ──
+    # Three independent signal sources blend in fin_score via max():
+    # Pink Sheet (fin_evidence_count > 0 implies price observations
+    # were available), USGS MCS Fig 10 (folded into fin_evidence_count
+    # too — see market_aggregator price-volatility section), and SEC
+    # EDGAR coverage (fin_company_coverage > 0).  Treat each as a slot.
+    fin_slots = [
+        fin_evidence_count > 0,
+        fin_company_coverage > 0.0,
+    ]
+    financial_completeness = sum(fin_slots) / len(fin_slots)
+
+    # ── Overall: MARKET_PILLAR_WEIGHTS-weighted mean ──
+    overall = (
+        MARKET_PILLAR_WEIGHTS["material"]      * material_completeness
+        + MARKET_PILLAR_WEIGHTS["geopolitical"] * geopolitical_completeness
+        + MARKET_PILLAR_WEIGHTS["regulatory"]   * regulatory_completeness
+        + MARKET_PILLAR_WEIGHTS["operational"]  * operational_completeness
+        + MARKET_PILLAR_WEIGHTS["financial"]    * financial_completeness
+    )
+
+    return {
+        "material":      round(material_completeness, 3),
+        "geopolitical":  round(geopolitical_completeness, 3),
+        "regulatory":    round(regulatory_completeness, 3),
+        "operational":   round(operational_completeness, 3),
+        "financial":     round(financial_completeness, 3),
+        "overall":       round(overall, 3),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
 
@@ -1587,6 +2561,7 @@ def score_material_geography(
     *,
     run_id: Optional[str] = None,
     persist: bool = True,
+    cache: Optional[ScoringPreloadCache] = None,
 ) -> MaterialGeographyRiskScore:
     """
     Compute (and optionally persist) a market risk score for a material × geography pair.
@@ -1623,34 +2598,58 @@ def score_material_geography(
     )
 
     # --- STEP 1: Criticality signal ---
-    criticality_signal = _get_best_criticality_signal(db, material_id, as_of_date)
+    criticality_signal = _get_best_criticality_signal(
+        db, material_id, as_of_date, cache=cache,
+    )
 
     # --- STEP 2: Evidence ---
-    # Trade events: tagged to this material OR this geography
-    material_trade_events = get_events_for_material(
-        db, material_id, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
+    # Trade events: tagged to this material OR this geography.
+    # 2026-06-16: cache-aware wrappers — in batch runs the events were
+    # already preloaded once per (material × category) and once per
+    # (country × category), so these become dict lookups instead of
+    # DB roundtrips.  See ``build_scoring_preload_cache``.
+    material_trade_events = _cached_events_for_material(
+        db, material_id, RiskCategory.GEOPOLITICAL_TRADE, as_of_date, cache=cache,
     )
-    geo_trade_events = get_events_for_geographies(
-        db, {geography_code}, RiskCategory.GEOPOLITICAL_TRADE, as_of_date
+    geo_trade_events = _cached_events_for_geographies(
+        db, geography_code, RiskCategory.GEOPOLITICAL_TRADE, as_of_date, cache=cache,
     )
     all_trade_events = _dedup_events(material_trade_events, geo_trade_events)
 
     # Operational events
-    material_op_events = get_events_for_material(
-        db, material_id, RiskCategory.OPERATIONAL, as_of_date
+    material_op_events = _cached_events_for_material(
+        db, material_id, RiskCategory.OPERATIONAL, as_of_date, cache=cache,
     )
-    geo_op_events = get_events_for_geographies(
-        db, {geography_code}, RiskCategory.OPERATIONAL, as_of_date
+    geo_op_events = _cached_events_for_geographies(
+        db, geography_code, RiskCategory.OPERATIONAL, as_of_date, cache=cache,
     )
     all_op_events = _dedup_events(material_op_events, geo_op_events)
 
     # Regulatory inputs derived inline (includes regulation query)
-    top_reg_impacts, scope_obligations, prox_adj = _derive_market_regulatory_inputs(
+    # 11.4-Reg (2026-06-06): _derive_market_regulatory_inputs now returns
+    # a 4-tuple — the 4th element is sub_input_diagnostic with
+    # obligations.curated_weight_count / default_weight_count + the
+    # raw/capped obligation score + top-3 event truncation visibility +
+    # effective_date metadata coverage.  See function docstring for the
+    # full dict shape.  Also note the 11.4-Reg-A math change: NULL
+    # geography_compliance_weights now resolves to 0.0 instead of 0.50;
+    # uncurated regulations contribute 0 to obligation_score.
+    (
+        top_reg_impacts, scope_obligations, prox_adj, reg_obligation_points,
+        reg_sub_input_diag,
+    ) = _derive_market_regulatory_inputs(
         db, material_id, geography_code, as_of_date
     )
 
     # Financial pressure: commodity prices + producer events + SEC EDGAR weighted signal
-    base_sig, lev_bon, liq_bon, fin_count, company_fin_meta = _derive_market_financial_inputs(
+    # 11.4-Fin-A (2026-06-06): _derive_market_financial_inputs now returns
+    # a 6-tuple — the 6th element is sub_input_diagnostic with per-tier
+    # contribution attribution + sparse-evidence cap visibility + Tier 3
+    # 15-pt cap firing flag.  See function docstring for the dict shape.
+    (
+        base_sig, lev_bon, liq_bon, fin_count, company_fin_meta,
+        fin_sub_input_diag,
+    ) = _derive_market_financial_inputs(
         db, material_id, geography_code, as_of_date
     )
 
@@ -1688,7 +2687,45 @@ def score_material_geography(
     _geo_op_ids = {ew.event.id for ew in geo_op_events}
     _trade_intersect_ids = _mat_trade_ids & _geo_trade_ids
     _op_intersect_ids = _mat_op_ids & _geo_op_ids
-    geo_specific_event_count = len(_trade_intersect_ids | _op_intersect_ids)
+
+    # ── geo_specific_event_count: the analyst-facing "events about this
+    # material in this country" number surfaced in the Country Scores table.
+    #
+    # 2026-06-14: switched from the trade+operational category union to the
+    # TRUE all-category intersection so the column matches its docstring
+    # ("events tagged to BOTH this material AND this country").  Previously
+    # the column reflected only events categorised as GEOPOLITICAL_TRADE or
+    # OPERATIONAL — events tagged with REGULATORY_COMPLIANCE,
+    # FINANCIAL_PRESSURE, or MATERIAL_CONCENTRATION at the same (mat, geo)
+    # pair were excluded, causing the column to under-report when the
+    # dropdown drill-down listed more events.  The category-specific sets
+    # (_trade_intersect_ids, _op_intersect_ids) are kept unchanged because
+    # the trade and operational pillar derivations explicitly need
+    # category filtering — they consume `geo_specific_trade_events` and
+    # `geo_specific_op_events` below, not the full count.
+    # Inline import to match the existing pattern in this file — see the
+    # function-scoped imports at lines 916, 1443, and 2851.
+    from app.models.regulatory import (
+        RiskEventGeography as _REG,
+        RiskEventMaterial as _REM,
+    )
+
+    from app.models.regulatory import RiskEvent as _RE_dup
+    _all_intersect_ids = db.execute(
+        select(_REM.risk_event_id)
+        .join(_REG, _REG.risk_event_id == _REM.risk_event_id)
+        .join(_RE_dup, _RE_dup.id == _REM.risk_event_id)
+        .where(
+            _REM.material_id == material_id,
+            _REG.country_code == geography_code,
+            # 055: confirmed cross-source duplicates don't count — this is
+            # the partner-facing "events about this material in this
+            # country" number (was 3 for one event on the DRC export ban).
+            _RE_dup.duplicate_of_id.is_(None),
+        )
+        .distinct()
+    ).scalars().all()
+    geo_specific_event_count = len(set(_all_intersect_ids))
 
     # Build the actual intersection event lists for Material / Operational
     # pillar derivation.  Source from material_trade_events / material_op_events
@@ -1716,6 +2753,12 @@ def score_material_geography(
         and n.hs_mapping.supply_chain_stage in STAGE_ROLLUP_WEIGHTS
     ]
 
+    # V1 (4.0, 2026-07-17): the concentration-purity filter and the
+    # concentration_nodes list are gone — Level-0 node composites no longer
+    # feed the Material Concentration pillar at all (see the stage-max call
+    # in STEP 5).  ``eligible_nodes`` is retained solely for the G2
+    # Geopolitical HS-node aggregate path below.
+
     # --- STEP 4: Derive sub-inputs ---
     # Event-list-choice contract (2026-05-12, Step 2 audit Fix A/B):
     #   Material pillar       — geo_specific_trade_events (intersection)
@@ -1732,17 +2775,38 @@ def score_material_geography(
     #       Why: same logic as Material — weighted_event_impacts was leaky
     #       against the union.  Empty intersection → empty event_component
     #       (operational score becomes 100% structural_dependency).
-    crit, conc, trade_vol = _derive_market_material_inputs(
+    # 11.4 (2026-06-04): _derive_market_material_inputs now returns a
+    # 4-tuple — the 4th element is a per-sub-input data-backed diagnostic
+    # dict, surfaced via rationale_json.sub_inputs.material.data_backed.
+    # Production HHI / reserve HHI / capacity stress defaults flipped from
+    # neutral-midpoint (0.5) to no-data-no-signal (0.0); partner-side this
+    # means thin-data minerals no longer silently inflate Material
+    # Concentration scores.
+    crit, conc, trade_vol, mat_sub_input_diag = _derive_market_material_inputs(
         db, material_id, criticality_signal, geography_code,
         geo_specific_trade_events, as_of_date,
     )
+    # 11.4-Geo (2026-06-06): _derive_market_geopolitical_inputs now
+    # returns a 6-tuple — the 6th element is sub_input_diagnostic,
+    # mirroring the 11.4-Material pattern.  Surfaces source attribution
+    # for country_concentration / export_restriction / tariff / subsidy
+    # so the partner UI can show "this score used MCS share + tariff
+    # events but no export events".
     (
         ctry_conc, exp_rest, tariff, subsidy_distortion, geo_method,
+        geo_sub_input_diag,
     ) = _derive_market_geopolitical_inputs(
         db, material_id, geography_code, geo_trade_events, as_of_date,
         eligible_nodes=eligible_nodes,
+        cache=cache,
     )
-    struct_dep, op_impacts, dep_source, stage_breakdown = _derive_market_operational_inputs(
+    # 11.4-Op (2026-06-06): _derive_market_operational_inputs now returns
+    # a 5-tuple — the 5th element is sub_input_diagnostic, mirroring the
+    # Material/Geopolitical 11.4 pattern.
+    (
+        struct_dep, op_impacts, dep_source, stage_breakdown,
+        op_sub_input_diag,
+    ) = _derive_market_operational_inputs(
         db, material_id, geography_code, geo_specific_op_events, as_of_date
     )
 
@@ -1752,30 +2816,46 @@ def score_material_geography(
     # HsCodeGeographyRiskScore nodes exist.  Falls back to the legacy
     # material_risk path when Level-0 data is absent (eligible_nodes already
     # computed above so Geopolitical and Material pillars share the query).
-    if len(eligible_nodes) >= _STAGE_ROLLUP_MIN_NODES:
-        # Normalised weighted average of composite_node_scores across stages
-        weighted_sum = sum(
-            n.composite_node_score * STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
-            for n in eligible_nodes
-        )
-        weight_total = sum(
-            STAGE_ROLLUP_WEIGHTS[n.hs_mapping.supply_chain_stage]
-            for n in eligible_nodes
-        )
-        mat_score = weighted_sum / weight_total if weight_total > 0 else 0.0
-        stage_rollup_method = "stage_weighted"
-        stage_rollup_count = len(eligible_nodes)
+    # 11.7-HS-F8 (2026-06-07): tally the per-node score_method labels so
+    # the partner-facing rationale can show whether the rollup is built
+    # from signal-rich HHI-anchored nodes or from signal-thin
+    # event-only / operational-only nodes.  Histogram is built whether
+    # or not the rollup actually fires — useful even on material_fallback.
+    score_method_breakdown: dict[str, int] = {}
+    for n in eligible_nodes:
+        method = "unknown"
+        if n.metadata_json:
+            method = n.metadata_json.get("score_method", "unknown")
+        score_method_breakdown[method] = score_method_breakdown.get(method, 0) + 1
+    # ── V1 (4.0, 2026-07-17) — stage-max structural concentration ─────
+    # Spec: docs/design/scoring_v1_spec.md §3.  The pillar is computed
+    # directly from the per-stage share tables (stage_concentration.py):
+    # sub = hhi_cliff(HHI_stage) × √share × 100, pillar = max across
+    # FRESH stages (§7b freshness gate).  Replaces the 3.x chain
+    # (stage-weighted node rollup → material-HHI lift → legacy
+    # material_fallback), whose averaging diluted structural signal and
+    # whose non-producer fallback scored Belarus above DRC for cobalt.
+    # Non-producers score 0 — no material-level fallback.
+    # NOTE: crit/conc/trade_vol above are retained as rationale context
+    # only; they no longer participate in the concentration score.
+    conc_result = score_material_concentration(db, material_id, as_of_date)
+    geo_conc = conc_result.per_geo.get(geography_code)
+    if geo_conc is not None:
+        mat_score = geo_conc.score
+        stage_rollup_method = "stage_max"
+        stage_rollup_count = len(geo_conc.sub_scores)
     else:
-        mat_score = material_risk.score_material_exposure(crit, conc, trade_vol)
-        stage_rollup_method = "material_fallback"
-        stage_rollup_count = len(eligible_nodes)  # 0 or 1
+        mat_score = 0.0
+        stage_rollup_method = "no_share_data"
+        stage_rollup_count = 0
 
     geo_score = geopolitical_risk.score_geopolitical_trade(
         ctry_conc, exp_rest, tariff,
         production_subsidy_distortion=subsidy_distortion,
     )
     reg_score = regulatory_risk.score_regulatory_profile(
-        top_reg_impacts, scope_obligations, prox_adj
+        top_reg_impacts, scope_obligations, prox_adj,
+        obligation_points=reg_obligation_points,
     )
     op_score = _score_operational_market(struct_dep, op_impacts)
     fin_score = fp_module.score_financial_pressure(base_sig, lev_bon, liq_bon, fin_count)
@@ -1809,6 +2889,42 @@ def score_material_geography(
                 "trade_volatility": trade_vol,
                 "stage_rollup_method": stage_rollup_method,
                 "stage_rollup_count": stage_rollup_count,
+                # 11.7-HS-F8 (2026-06-07): histogram of the per-node
+                # score_method labels across the nodes that contributed
+                # to this rollup.  Lets a partner see whether the
+                # rollup is built from signal-rich HHI-anchored nodes
+                # ({"hhi_anchored": 5}) or from signal-thin event-only
+                # nodes ({"event_only_no_hhi": 5}) or a mix.  Empty
+                # dict when no nodes contributed.
+                "node_score_method_breakdown": score_method_breakdown,
+                # V1 (4.0): per-stage structural sub-scores for THIS
+                # geography and the stage driving the pillar (UI labels the
+                # driving stage — Nicole 2026-07-17).  stale_stages lists
+                # (stage, reference_year) snapshots excluded by the §7b
+                # freshness gate: display-only, never scored.
+                "driving_stage": geo_conc.driving_stage if geo_conc else None,
+                "stage_sub_scores": dict(geo_conc.sub_scores) if geo_conc else {},
+                # 4.1: governance amplifier diagnostics (None when the geo
+                # had no usable WGI row or amplifier is disabled).  raw =
+                # pre-amplifier stage-max; score above is the amplified value.
+                "governance_amplifier": geo_conc.governance if geo_conc else None,
+                "raw_stage_max": round(geo_conc.raw_score, 2) if geo_conc else None,
+                "stage_detail": {
+                    s: {
+                        "hhi_raw": round(d.hhi_raw, 4),
+                        "hhi_cliff": round(d.hhi_cliff, 4),
+                        "reference_year": d.reference_year,
+                        "share": d.shares.get(geography_code),
+                    }
+                    for s, d in conc_result.stages.items()
+                },
+                "stale_stages": conc_result.stale_stages,
+                # 11.4 (2026-06-04): per-sub-input data-backed flags so the
+                # partner UI can show *which* component of the Material
+                # Concentration pillar lacks real data — not just that the
+                # pillar's overall completeness is low.  See
+                # _derive_market_material_inputs for the dict shape.
+                "data_backed": mat_sub_input_diag,
             },
             "geopolitical": {
                 "country_concentration": ctry_conc,
@@ -1826,22 +2942,42 @@ def score_material_geography(
                 # aggregate.  See _derive_market_geopolitical_inputs docstring.
                 "method": geo_method,
                 "hs_node_count": len(eligible_nodes),
+                # 11.4-Geo (2026-06): per-sub-input data-backed flags +
+                # source attribution.  See _derive_market_geopolitical_inputs
+                # docstring for the dict shape and the note on the 3-comp
+                # subsidy asymmetric default — subsidy.data_backed=False
+                # is the partner-visible flag for that bias.
+                "data_backed": geo_sub_input_diag,
             },
             "regulatory": {
                 "top_event_count": len(top_reg_impacts),
                 "scope_obligations": scope_obligations,
                 "policy_proximity_adjustment": prox_adj,
+                # 11.4-Reg (2026-06): per-sub-input diagnostic with the
+                # uncurated-weights counter, top-3 truncation visibility,
+                # and 40-cap raw-vs-capped values.  See
+                # _derive_market_regulatory_inputs docstring.  The
+                # obligations.default_weight_count field is the partner-
+                # visible flag for the 11.4-Reg-A math change
+                # (0.50 → 0.0 fallback).
+                "data_backed": reg_sub_input_diag,
             },
             "operational": {
                 "structural_dependency": struct_dep,
                 "structural_dependency_source": dep_source,
                 "stage_breakdown": stage_breakdown,   # G4 Half 1 (2026-05-06)
                 "event_impact_count": len(op_impacts),
+                # 11.4-Op (2026-06): per-sub-input data-backed dict +
+                # null-severity event counter + scoring profile.  See
+                # _derive_market_operational_inputs docstring for the
+                # dict shape and field semantics.
+                "data_backed": op_sub_input_diag,
             },
             "financial_pressure": {
                 "note": (
-                    "Three-tier market signal: "
-                    "(1) commodity price volatility + directional trend, "
+                    "Four-tier market signal: "
+                    "(1) Pink Sheet commodity price volatility + directional trend, "
+                    "(1.5) Fig 10 annual + 5-yr CAGR price growth rates, "
                     "(2) producer stress events, "
                     "(3) SEC EDGAR company scores weighted by production share."
                 ),
@@ -1850,6 +2986,11 @@ def score_material_geography(
                 "liquidity_stress_bonus": liq_bon,
                 "evidence_count": fin_count,
                 "sec_edgar_company_signal": company_fin_meta,
+                # 11.4-Fin-A (2026-06): per-sub-input diagnostic with
+                # tier-source attribution + sparse-evidence cap state +
+                # Tier 3 15-pt cap firing flag + coverage counts.
+                # See _derive_market_financial_inputs docstring.
+                "data_backed": fin_sub_input_diag,
             },
         },
         "pillar_scores": {
@@ -1860,6 +3001,28 @@ def score_material_geography(
             "financial_pressure": fin_score,
         },
         "weights_used": MARKET_PILLAR_WEIGHTS,
+        # 11.6 (2026-06): per-pillar data completeness diagnostic.
+        # Informational; does NOT participate in the scoring math.  See
+        # _compute_pillar_data_completeness for the per-pillar slot
+        # definitions.  Each value is on [0.0, 1.0]; overall is the
+        # MARKET_PILLAR_WEIGHTS-weighted mean of the five per-pillar
+        # values.  A material with rich data across all pillars scores
+        # overall=1.0; a material with Financial Pressure fully missing
+        # scores overall=0.882; etc.  Surface in the UI to give
+        # customers visibility into when defaults are doing the work
+        # rather than real measurements.
+        "data_completeness": _compute_pillar_data_completeness(
+            criticality_signal,
+            geo_country_concentration=ctry_conc,
+            geo_export_restriction=exp_rest,
+            geo_tariff=tariff,
+            reg_top_event_count=len(top_reg_impacts),
+            reg_scope_obligation_count=len(scope_obligations),
+            op_structural_dependency=struct_dep,
+            op_event_count=len(op_impacts),
+            fin_evidence_count=fin_count,
+            fin_company_coverage=float(company_fin_meta.get("coverage_weight", 0.0)),
+        ),
         "event_counts": {
             "trade_events": len(all_trade_events),
             "operational_events": len(all_op_events),
@@ -2002,6 +3165,34 @@ def score_all_active_materials(
         geography_filter=geography_codes,
     )
 
+    # 2026-06-16 — build the bulk-preload cache before the per-pair loop.
+    # Discover the geography set we'll touch (union of per-material
+    # producer countries + event-bearing countries) so the geo-events
+    # cache covers everything score_material_geography will look up.
+    # Without this, the cache misses on (geo, category) keys and the
+    # per-row code falls back to DB queries — defeating the cache.
+    from app.models.regulatory import RiskEventGeography as _REG_BUILD, RiskEventMaterial as _REM_BUILD
+    if geography_codes is not None:
+        all_country_codes = sorted({g.upper() for g in geography_codes})
+    else:
+        # Materialise the same per-material geography set computed below,
+        # but at the batch level so we can build one cache for all materials.
+        prod_geos = db.execute(
+            select(MaterialProductionShare.country_code)
+            .where(MaterialProductionShare.production_share > 0)
+            .distinct()
+        ).scalars().all()
+        event_geos = db.execute(
+            select(_REG_BUILD.country_code)
+            .join(_REM_BUILD, _REM_BUILD.risk_event_id == _REG_BUILD.risk_event_id)
+            .distinct()
+        ).scalars().all()
+        all_country_codes = sorted({c.upper() for c in (*prod_geos, *event_geos) if c})
+
+    cache = build_scoring_preload_cache(
+        db, materials, all_country_codes, as_of_date,
+    )
+
     results: list[MaterialGeographyRiskScore] = []
 
     for material in materials:
@@ -2009,31 +3200,14 @@ def score_all_active_materials(
         if geography_codes is not None:
             geos = [g.upper() for g in geography_codes]
         else:
-            # Derive from material_production_shares (replaces removed
-            # primary_producing_countries column dropped in migration 023)
-            prod_share_geos = list(db.scalars(
-                select(MaterialProductionShare.country_code)
-                .where(
-                    MaterialProductionShare.material_id == material.id,
-                    MaterialProductionShare.production_share > 0,
-                )
-                .distinct()
-            ).all())
-            geos: list[str] = [g.upper() for g in prod_share_geos]
-
-            # Supplement with any geography that has events for this material
-            from app.models.regulatory import RiskEventGeography, RiskEventMaterial
-            event_geo_stmt = (
-                select(RiskEventGeography.country_code)
-                .join(
-                    RiskEventMaterial,
-                    RiskEventMaterial.risk_event_id == RiskEventGeography.risk_event_id,
-                )
-                .where(RiskEventMaterial.material_id == material.id)
-                .distinct()
+            # V1 (4.0, 2026-07-18): producers + trade-gate exporters only —
+            # event-only geographies skipped (zero concentration, zero L2
+            # trade weight; were ~85% of pairs).  See
+            # stage_concentration.derive_scoring_geographies.
+            from app.services.scoring.stage_concentration import (
+                derive_scoring_geographies,
             )
-            event_geos = [row[0] for row in db.execute(event_geo_stmt).all()]
-            geos = list({*geos, *event_geos})
+            geos: list[str] = derive_scoring_geographies(db, material.id)
 
         if not geos:
             log.debug(
@@ -2043,7 +3217,42 @@ def score_all_active_materials(
             )
             continue
 
+        # 2026-06-12: Batch commits with per-pair savepoints + defensive
+        # connection-drop recovery — same pattern as
+        # hs_node_scorer.score_all_hs_nodes.  See that function for the
+        # full explanation.  Short version: Neon serverless can drop the
+        # connection mid-batch (even via pooler endpoint), leaving the
+        # session in invalid state where every subsequent begin_nested()
+        # raises PendingRollbackError.  The outer try/except below catches
+        # that and does a full db.rollback() so the loop continues on a
+        # fresh connection.  Worst case: lose ``_COMMIT_BATCH_SIZE`` pairs
+        # of unflushed work; UPSERT semantics make re-run idempotent.
+        from sqlalchemy.exc import (
+            DBAPIError,
+            OperationalError,
+            PendingRollbackError,
+            InvalidRequestError,
+        )
+        _CONN_ERRORS: tuple = (
+            DBAPIError, OperationalError, PendingRollbackError, InvalidRequestError,
+        )
+
+        _COMMIT_BATCH_SIZE = 25  # smaller than HS (50) — pillar composite
+                                 # is heavier; limits drop-blast-radius
         for geo in geos:
+            try:
+                savepoint = db.begin_nested()
+            except _CONN_ERRORS as e:
+                log.warning(
+                    "market_aggregator.batch.connection_reset",
+                    reason=f"begin_nested failed: {type(e).__name__}",
+                )
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                continue
+
             try:
                 score_row = score_material_geography(
                     db,
@@ -2052,16 +3261,58 @@ def score_all_active_materials(
                     as_of_date,
                     run_id=f"{run_id}-{material.id}-{geo}",
                     persist=True,
+                    cache=cache,
                 )
                 results.append(score_row)
-                db.commit()
+                savepoint.commit()
+            except _CONN_ERRORS as e:
+                log.warning(
+                    "market_aggregator.batch.connection_reset",
+                    reason=f"score call failed: {type(e).__name__}",
+                    material_id=material.id,
+                    geography_code=geo,
+                )
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                continue
             except Exception:
-                db.rollback()
+                try:
+                    savepoint.rollback()
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
                 log.exception(
                     "market_aggregator.batch.error",
                     material_id=material.id,
                     geography_code=geo,
                 )
+
+            if (len(results) % _COMMIT_BATCH_SIZE) == 0 and len(results) > 0:
+                try:
+                    db.commit()
+                except _CONN_ERRORS as e:
+                    log.warning(
+                        "market_aggregator.batch.commit_failed",
+                        reason=type(e).__name__,
+                    )
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+
+    # Flush the trailing partial batch.
+    try:
+        db.commit()
+    except Exception:
+        log.exception("market_aggregator.batch.final_commit_failed")
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
     log.info(
         "market_aggregator.batch.done",
@@ -2076,4 +3327,6 @@ __all__ = [
     "STAGE_ROLLUP_WEIGHTS",
     "score_material_geography",
     "score_all_active_materials",
+    # 11.6: data-completeness diagnostic; informational only.
+    "_compute_pillar_data_completeness",
 ]

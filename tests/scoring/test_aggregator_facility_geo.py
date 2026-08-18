@@ -77,8 +77,10 @@ class TestGeopoliticalFacilityFold:
             as_of_date=AS_OF,
             facilities=facs,
         )
-        # source_share defaults to 0.5 (no exposures); facility_share = 0.5
-        assert cc == pytest.approx(0.5)
+        # 11.4-EvA-parity (2026-06-07): source_share defaults to 0.0 (was
+        # 0.5 pre-fix); facility_share = 0.5 (2/4 facilities in HCG).
+        # country_concentration = 0.5 * 0.0 + 0.5 * 0.5 = 0.25.
+        assert cc == pytest.approx(0.25)
 
     def test_facility_high_concentration_lifts_score(self):
         facs = [_facility("CN"), _facility("CN"), _facility("CN")]  # 100% HCG
@@ -88,8 +90,9 @@ class TestGeopoliticalFacilityFold:
             as_of_date=AS_OF,
             facilities=facs,
         )
-        # 0.5 (source default) + 0.5 (facility 100%) → 0.75
-        assert cc == pytest.approx(0.75)
+        # 11.4-EvA-parity (2026-06-07): 0.0 (source default) + 0.5 × 1.0
+        # (facility 100%) → 0.50.  Was 0.75 with the old 0.5 midpoint.
+        assert cc == pytest.approx(0.50)
 
     def test_facility_us_exposure_cn_balances(self):
         facs = [_facility("US"), _facility("US")]   # 0% HCG

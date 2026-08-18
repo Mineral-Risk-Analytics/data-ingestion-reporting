@@ -13,8 +13,9 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
 from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import event as sa_event
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.db.base import Base
 
@@ -64,6 +65,36 @@ class Regulation(Base):
         ),
     )
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # Build 2 (migration 063, 2026-07-24): DB-driven obligation uplift —
+    # replaces the hardcoded regulatory_risk.COMPLIANCE_OBLIGATIONS dict so
+    # curation can add obligations without code edits. Scoring math uses
+    # coalesce(obligation_points, 0); is_obligation is the curation-facing
+    # flag (admin UI / seed semantics).
+    is_obligation: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false",
+        comment="Hard legal obligation feeding the regulatory pillar's 0-40 uplift.",
+    )
+    obligation_points: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Obligation uplift base points (NULL/0 = no uplift; cap 40 total).",
+    )
+    # Migration 064 (2026-07-23): explicit all-goods gate. TRUE = the rule
+    # covers every material (UFLPA, EU FLR, CSDDD, S-211) and enters scoring
+    # for all of them; FALSE = only materials in regulation_material_scope.
+    # Geography scope rows are descriptive metadata, not a scoring gate.
+    applies_all_materials: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false",
+        comment="All-goods rule: gates into scoring for every material.",
+    )
+    # Migration 065 (2026-07-27): per-material ENFORCEMENT weight for the
+    # obligation uplift — all-goods laws apply everywhere but enforce
+    # unevenly (UFLPA: polysilicon >> rhenium). Keys = material canonical
+    # names + optional "DEFAULT"; resolution exact → DEFAULT → 1.0, so
+    # NULL keeps today's behavior exactly.
+    material_enforcement_weights: Mapped[Optional[Any]] = mapped_column(
+        JSONB, nullable=True,
+        comment="Material canonical name → enforcement weight 0-1; 'DEFAULT' fallback; NULL = 1.0.",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -268,12 +299,128 @@ class RiskEvent(Base):
     event_date: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), index=True
     )
+    # Cross-source duplicate suppression (migration 055, 2026-07-15).
+    # NULL = canonical event (the default).  Non-NULL = confirmed
+    # duplicate of the referenced canonical row — EXCLUDED from scoring
+    # and event counts.  Set only via the human-confirmed
+    # ``mark-duplicate-events`` flow; never at ingest.  Convention: the
+    # manual-walkthrough row is canonical when present.
+    duplicate_of_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("risk_events.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     title: Mapped[str] = mapped_column(String(1024), nullable=False)
     summary: Mapped[Optional[str]] = mapped_column(Text)
     severity_score: Mapped[Optional[float]] = mapped_column(Float)  # 0.0–1.0
     confidence_score: Mapped[Optional[float]] = mapped_column(Float)  # 0.0–1.0
     risk_categories_json: Mapped[Optional[Any]] = mapped_column(JSONB)
     # array of RiskCategory values: ["material_concentration", "geopolitical_trade"]
+
+    @validates("risk_categories_json")
+    def _normalise_categories(self, key, value):
+        # Normalise category strings to the RiskCategory taxonomy on every
+        # write path (all ingesters assign this attribute), so a mis-typed
+        # category (e.g. "geopolitical" → "geopolitical_trade") can't silently
+        # hide an event from a scoring pillar.  See constants.normalise_risk_categories.
+        from app.constants import normalise_risk_categories
+        return normalise_risk_categories(value) if value is not None else value
+
+    # Build 1 (migration 062, 2026-07-24): the ONE pillar this event scores
+    # in — pillar queries filter on THIS, not risk_categories_json, so a
+    # multi-tagged event can never double-count (spec Principle 3).
+    # NULL = display-only (SEC orphan stream, trade-signal derived stats,
+    # or no valid category). Autofilled on insert from risk_categories_json
+    # by precedence when not explicitly set — see _autofill_primary_category.
+    primary_category: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, index=True,
+        comment=(
+            "The ONE pillar this event scores in (RiskCategory value). "
+            "NULL = display-only. risk_categories_json remains the "
+            "multi-value display/filter tagging."
+        ),
+    )
+
+    @validates("primary_category")
+    def _validate_primary_category(self, key, value):
+        if value is None:
+            return value
+        from app.constants import RiskCategory
+        valid = {c.value for c in RiskCategory}
+        if value not in valid:
+            raise ValueError(
+                f"primary_category must be one of {sorted(valid)} or None, got {value!r}"
+            )
+        return value
+
+    # ── Triage status model (migration 066, 2026-07-31) ────────────────────
+    # Machine proposes, human disposes — see
+    # docs/design/event_triage_pipeline_plan.md.  ``triage_status`` is the
+    # event's actual state; ``suggested_category`` / ``direction`` are what
+    # the machine proposes; ``primary_category`` above is what a human
+    # confirmed.  Pillar queries filter on primary_category, so an event
+    # that has never been triaged structurally cannot score.
+    triage_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="pending_triage", index=True,
+        comment=(
+            "pending_triage | scoring | display_only | rejected. rejected = "
+            "soft dismiss (row retained for dedupe, hidden from all surfaces)."
+        ),
+    )
+
+    @validates("triage_status")
+    def _validate_triage_status(self, key, value):
+        valid = {"pending_triage", "scoring", "display_only", "rejected"}
+        if value not in valid:
+            raise ValueError(
+                f"triage_status must be one of {sorted(valid)}, got {value!r}"
+            )
+        return value
+
+    suggested_category: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True,
+        comment=(
+            "Machine-suggested pillar (RiskCategory value). primary_category "
+            "stays the human-confirmed pillar."
+        ),
+    )
+
+    @validates("suggested_category")
+    def _validate_suggested_category(self, key, value):
+        if value is None:
+            return value
+        from app.constants import RiskCategory
+        valid = {c.value for c in RiskCategory}
+        if value not in valid:
+            raise ValueError(
+                f"suggested_category must be one of {sorted(valid)} or None, "
+                f"got {value!r}"
+            )
+        return value
+
+    direction: Mapped[Optional[str]] = mapped_column(
+        String(16), nullable=True,
+        comment=(
+            "restrictive | supportive | neutral — supply-risk direction from "
+            "a buyer's perspective (GTA audit F1)."
+        ),
+    )
+
+    @validates("direction")
+    def _validate_direction(self, key, value):
+        if value is None:
+            return value
+        valid = {"restrictive", "supportive", "neutral"}
+        if value not in valid:
+            raise ValueError(
+                f"direction must be one of {sorted(valid)} or None, got {value!r}"
+            )
+        return value
+
+    triaged_by: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    triaged_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     geography_json: Mapped[Optional[Any]] = mapped_column(JSONB)
     # {"primary": "CN", "secondary": ["RU", "CD"]}
     content_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)
@@ -385,6 +532,17 @@ class RiskEventMaterial(Base):
         ForeignKey("materials.id", ondelete="CASCADE"), nullable=False, index=True
     )
     relevance_score: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    # Direct-vs-broad distinction (migration 056, 2026-07-15).  TRUE when
+    # the event is tagged to <= 3 materials — a material-specific measure.
+    # FALSE = broad measure (omnibus tariff list, cleantech subsidy, ...)
+    # whose HS list happens to include this material.  Material-scoped UI
+    # surfaces show is_direct rows only; broad events stay visible in the
+    # cross-material industry-events surface.  Scoring uses ALL rows but
+    # broad links carry breadth-discounted relevance (min(1, 3/n) folded
+    # in at ingest for GTA/IEA).
+    is_direct: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, index=True,
+    )
     match_reason: Mapped[Optional[str]] = mapped_column(String(64))
     # named_material | hs_code | keyword_match
     # Copied from RegulationMaterialScope.scope_type when the junction is
@@ -394,6 +552,25 @@ class RiskEventMaterial(Base):
     # (disclosure_required 0.50×) per-material.  Nullable: non-regulation
     # events and pre-migration rows have no scope_type recorded.
     scope_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Triage status model (migration 066, 2026-07-31): machine-written links
+    # are suggestions until a human confirms them.  Pre-066 rows were
+    # backfilled to 'confirmed' (they had already been feeding scores — the
+    # grandfather rule).  Scoring's confirmed-only filter arrives with the
+    # Phase 6 flip; until then this column is bookkeeping for the triage UI.
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="suggested",
+        comment="suggested | confirmed | rejected",
+    )
+
+    @validates("status")
+    def _validate_status(self, key, value):
+        valid = {"suggested", "confirmed", "rejected"}
+        if value not in valid:
+            raise ValueError(
+                f"status must be one of {sorted(valid)}, got {value!r}"
+            )
+        return value
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -555,3 +732,46 @@ class RiskEventHsMapping(Base):
 
     risk_event: Mapped["RiskEvent"] = relationship(back_populates="hs_mapping_links")
     hs_mapping: Mapped["HsCodeMaterialMapping"] = relationship()
+
+# ── Suggestion inversion (2026-07-31, triage plan Phase 1) ─────────────────
+# INVERTED from the Build 1 autofill (2026-07-24 → 2026-07-31).  The old
+# listener wrote ``primary_category`` — an authoritative scoring assignment —
+# on every insert, which meant bulk ingestion decided what scores before any
+# human judged relevance.  Under the triage plan (machine proposes, human
+# disposes; docs/design/event_triage_pipeline_plan.md) the derived category
+# is now written to ``suggested_category`` instead, and ``primary_category``
+# stays NULL until a human confirms it in triage.  Because pillar queries
+# filter on primary_category (migration 062), an untriaged event
+# structurally cannot score — no evidence-query change needed.
+#
+# Callers that set primary_category explicitly (curated imports such as the
+# manual-walkthrough loader, or the triage flow itself) are respected
+# untouched, exactly as before.
+
+_DISPLAY_ONLY_EVENT_TYPES = frozenset({
+    "sec_filing_signal",
+    # Operational news candidates (ingest_operational_news.py, 2026-07-27):
+    # born display-only, promoted to primary_category='operational' only by
+    # partner triage. Belt-and-braces with metadata_json["scoring"].
+    "operational_news_candidate",
+})
+
+
+@sa_event.listens_for(RiskEvent, "before_insert")
+def _suggest_primary_category_on_insert(mapper, connection, target):  # noqa: ARG001
+    if target.primary_category is not None:
+        # Explicitly curated (manual loader, triage confirm) — the human (or
+        # a deliberate caller) has spoken; nothing to suggest.
+        return
+    if target.suggested_category is not None:
+        # Ingester already made its own suggestion (e.g. GTA writes it
+        # directly, with direction and confidence context).
+        return
+    if target.event_type in _DISPLAY_ONLY_EVENT_TYPES:
+        return
+    meta = target.metadata_json
+    if isinstance(meta, dict) and meta.get("scoring") == "display_only":
+        return
+    from app.constants import derive_primary_category
+    target.suggested_category = derive_primary_category(target.risk_categories_json)
+

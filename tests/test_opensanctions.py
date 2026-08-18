@@ -698,33 +698,19 @@ class TestMatchCompanies:
 
 class TestContentHash:
     def test_returns_64_char_hex_string(self):
-        h = _content_hash("title", "summary", datetime(2024, 1, 15, tzinfo=timezone.utc))
+        h = _content_hash("opensanctions_company|company_id=abc-123")
         assert len(h) == 64
         assert all(c in "0123456789abcdef" for c in h)
 
-    def test_same_inputs_same_hash(self):
-        dt = datetime(2024, 1, 15, tzinfo=timezone.utc)
-        h1 = _content_hash("title", "summary", dt)
-        h2 = _content_hash("title", "summary", dt)
+    def test_deterministic(self):
+        h1 = _content_hash("opensanctions_geo|country=CN")
+        h2 = _content_hash("opensanctions_geo|country=CN")
         assert h1 == h2
 
-    def test_different_title_different_hash(self):
-        dt = datetime(2024, 1, 15, tzinfo=timezone.utc)
-        h1 = _content_hash("title A", "summary", dt)
-        h2 = _content_hash("title B", "summary", dt)
+    def test_distinct_keys_differ(self):
+        h1 = _content_hash("opensanctions_geo|country=CN")
+        h2 = _content_hash("opensanctions_geo|country=RU")
         assert h1 != h2
-
-    def test_uses_only_date_portion(self):
-        """Two datetimes on the same date but different times → same hash."""
-        dt1 = datetime(2024, 1, 15, 8, 0, 0, tzinfo=timezone.utc)
-        dt2 = datetime(2024, 1, 15, 23, 59, 59, tzinfo=timezone.utc)
-        h1 = _content_hash("title", "summary", dt1)
-        h2 = _content_hash("title", "summary", dt2)
-        assert h1 == h2
-
-    def test_none_event_date(self):
-        h = _content_hash("title", "summary", None)
-        assert len(h) == 64
 
 
 # ---------------------------------------------------------------------------
@@ -802,8 +788,10 @@ class TestIngestOpensanctions:
         assert result["company_events_skipped_existing"] == 0
         assert result["companies_matched"] == 1
 
-    def test_company_event_skipped_when_existing(self):
-        """When content_hash already exists, company event must be skipped."""
+    def test_company_event_updated_when_existing(self):
+        """When content_hash already exists the ingest UPSERTs — it updates,
+        not skips.  company_events_updated is incremented; _skipped_existing
+        is always 0 under the post-2026-05-11 semantics."""
         from app.services.ingestion.opensanctions import ingest_opensanctions
 
         company = _mock_company("Rosneft Oil Company")
@@ -820,7 +808,8 @@ class TestIngestOpensanctions:
             result = ingest_opensanctions(session=session, high_concentration_geos=[])
 
         assert result["company_events_inserted"] == 0
-        assert result["company_events_skipped_existing"] == 1
+        assert result["company_events_updated"] == 1
+        assert result["company_events_skipped_existing"] == 0
 
     def test_geography_events_inserted(self):
         """When entities are present for a high-concentration geo, an event is created."""
