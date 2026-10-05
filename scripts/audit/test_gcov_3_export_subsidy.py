@@ -177,16 +177,18 @@ def main() -> int:
         if any("State loan" in (ew.event.title or "") for ew in tar):
             failures.append("State-loan event leaked into tariff bucket")
 
-        # ── Test 4: 5-tuple return from _derive_market_geopolitical_inputs ──
+        # ── Test 4: 6-tuple return from _derive_market_geopolitical_inputs ──
+        # Bumped from 5-tuple → 6-tuple on 2026-06-06 (11.4-Geo): the
+        # function now also returns sub_input_diagnostic.
         print("\nTest 4: _derive_market_geopolitical_inputs returns subsidy term")
         result = _derive_market_geopolitical_inputs(
             s, material.id, "CN", events, date(2024, 9, 1),
             eligible_nodes=None,
         )
-        if len(result) != 5:
-            failures.append(f"function returned {len(result)}-tuple, expected 5")
+        if len(result) != 6:
+            failures.append(f"function returned {len(result)}-tuple, expected 6")
         else:
-            ctry_conc, exp_rest, tariff, sub_dist, method = result
+            ctry_conc, exp_rest, tariff, sub_dist, method, diag = result
             if sub_dist is None:
                 failures.append(
                     "subsidy_distortion is None but 2 EXPORT_SUBSIDY events exist for CN"
@@ -194,7 +196,14 @@ def main() -> int:
             elif not (0.0 <= sub_dist <= 1.0):
                 failures.append(f"subsidy_distortion={sub_dist} outside [0,1]")
             else:
-                print(f"  [OK] returns 5-tuple; subsidy_distortion={sub_dist:.4f}")
+                print(f"  [OK] returns 6-tuple; subsidy_distortion={sub_dist:.4f}")
+            # 11.4-Geo: diagnostic dict shape sanity-check.
+            if not isinstance(diag, dict) or "subsidy" not in diag:
+                failures.append("sub_input_diagnostic dict missing 'subsidy' key")
+            elif diag["subsidy"]["data_backed"] is not True:
+                failures.append(
+                    "subsidy.data_backed=False but EXPORT_SUBSIDY events exist"
+                )
 
         # And: no subsidy events for a different country → subsidy stays None
         result_us = _derive_market_geopolitical_inputs(
@@ -207,6 +216,14 @@ def main() -> int:
             )
         else:
             print(f"  [OK] subsidy_distortion=None when no subsidy events present")
+            # 11.4-Geo: confirm diagnostic flags the asymmetric-default state.
+            if result_us[5]["subsidy"]["data_backed"] is not False:
+                failures.append("subsidy.data_backed=True but no events present")
+            if result_us[5]["subsidy"]["scoring_profile"] != "3_component":
+                failures.append(
+                    f"subsidy.scoring_profile={result_us[5]['subsidy']['scoring_profile']}, "
+                    "expected '3_component' when subsidy is None"
+                )
 
     # ── Test 5: score_geopolitical_trade 3-arg vs 4-arg semantics ────────
     print("\nTest 5: score_geopolitical_trade backwards-compat + 4-component")

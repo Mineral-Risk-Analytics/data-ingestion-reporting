@@ -149,6 +149,19 @@ _MATERIALS: list[dict] = [
         "notes": "Borate electrolyte additives (LiBOB, LiBF4). Geographically concentrated in Turkey/USA.",
     },
     {
+        "canonical_name": "Bromine",
+        "category": "component",
+        "symbol_or_code": "Br",
+        "hs_codes": ["2801", "2811"],
+        "is_ira_critical_mineral": False,
+        "is_eu_crma_critical": False,
+        "notes": "Bromine + brominated compounds. Not battery-primary but tracked because Albemarle "
+                 "Specialties segment (Arkansas brine + Dead Sea via Jordan Bromine Company JV) uses it as "
+                 "core input for fire-safety chemicals + specialty compounds. Also used in lithium-metal "
+                 "battery R&D. Supply concentrated in USA (Arkansas), Dead Sea basin (Israel + Jordan), "
+                 "and China.",
+    },
+    {
         "canonical_name": "Chromium",
         "category": "component",
         "symbol_or_code": "Cr",
@@ -212,7 +225,7 @@ _MATERIALS: list[dict] = [
         "notes": "BMS / power-electronics indium-tin-oxide. Limited direct cell role.",
     },
     {
-        "canonical_name": "Iron Ore (LFP Grade)",
+        "canonical_name": "Iron Ore",
         "category": "cathode_active",
         "symbol_or_code": "Fe",
         "hs_codes": ["2601"],
@@ -284,7 +297,7 @@ _MATERIALS: list[dict] = [
         "notes": "NbTi-O fast-charge anode candidate. Brazilian CBMM holds ~85% of primary supply.",
     },
     {
-        "canonical_name": "Phosphate (Battery Grade)",
+        "canonical_name": "Phosphate",
         "category": "cathode_active",
         "symbol_or_code": "P",
         "hs_codes": ["2510"],
@@ -345,6 +358,30 @@ _MATERIALS: list[dict] = [
         "is_ira_critical_mineral": False,
         "is_eu_crma_critical": False,
         "notes": "Conductive paste (limited use). Solid-state cell candidates explored Ag-rich anodes; not at scale.",
+    },
+    {
+        # Restored 2026-07-13: authored 2026-07-10 (Nicole's decision —
+        # full launch-scored material, NOT a Natural Graphite variant,
+        # because its upstream is genuinely different: petroleum needle
+        # coke, no mine) but the device commit of that edit never landed.
+        # Reconstructed from the live DB row (materials.id=326).
+        "canonical_name": "Synthetic Graphite",
+        "category": "anode_active",
+        "symbol_or_code": "C",
+        "hs_codes": ["3801"],
+        "is_ira_critical_mineral": True,   # IRA 45X graphite spec is purity-based, incl. synthetic
+        "is_eu_crma_critical": False,      # EU CRMA lists natural graphite only
+        "notes": (
+            "Majority anode material (~60-70% of anode market). No mine: "
+            "feedstock = calcined petroleum/needle coke (2713.12, "
+            "oil-refining byproduct; competes with EAF electrode demand) "
+            "-> graphitization ~3,000C (electricity-intensive; China "
+            "~90%+ incl. Inner Mongolia/Sichuan/Yunnan). Converges with "
+            "Natural Graphite at anode stage; mutually substitutable. "
+            "IRA 45X graphite spec is purity-based (incl. synthetic; "
+            "Treasury FEOC transition to 2027); EU CRMA lists natural "
+            "graphite only. Added 2026-07-10 per Nicole."
+        ),
     },
     {
         # Briefly renamed to "Sodium Carbonate (Battery Grade)" then reverted
@@ -527,10 +564,6 @@ _MATERIALS: list[dict] = [
 ]
 
 
-# Backwards-compatibility alias.  Previously exported as _NON_USGS_MATERIALS;
-# the list now contains all 39 materials, so the new name is _MATERIALS.
-_NON_USGS_MATERIALS = _MATERIALS
-
 # ---------------------------------------------------------------------------
 # Battery chemistry material compositions
 #
@@ -552,6 +585,7 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     ("nmc", "Manganese",        "cathode_active",    0.20, False),
     ("nmc", "Cobalt",           "cathode_active",    0.20, False),
     ("nmc", "Natural Graphite", "anode",             0.85, True),   # can use synthetic
+    ("nmc", "Synthetic Graphite", "anode",           0.85, True),   # mirror of natural (mutually substitutable)
     ("nmc", "Copper",           "current_collector", 0.30, True),
     ("nmc", "Aluminum",         "current_collector", 0.30, True),
     ("nmc", "Fluorspar",        "electrolyte",       0.20, False),
@@ -564,9 +598,10 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     # LFP (Lithium Iron Phosphate)
     # ------------------------------------------------------------------
     ("lfp", "Lithium",              "cathode_active",    0.90, False),
-    ("lfp", "Iron Ore (LFP Grade)", "cathode_active",    0.90, False),
-    ("lfp", "Phosphate (Battery Grade)", "cathode_active", 0.90, False),
+    ("lfp", "Iron Ore", "cathode_active",    0.90, False),
+    ("lfp", "Phosphate", "cathode_active", 0.90, False),
     ("lfp", "Natural Graphite",     "anode",             0.85, True),
+    ("lfp", "Synthetic Graphite",   "anode",             0.85, True),
     ("lfp", "Copper",               "current_collector", 0.30, True),
     ("lfp", "Aluminum",             "current_collector", 0.30, True),
     ("lfp", "Fluorspar",            "electrolyte",       0.20, False),
@@ -579,6 +614,7 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     ("nca", "Cobalt",           "cathode_active",    0.15, False),
     ("nca", "Aluminum",         "cathode_active",    0.05, False),  # structural doping
     ("nca", "Natural Graphite", "anode",             0.85, True),
+    ("nca", "Synthetic Graphite", "anode",           0.85, True),
     ("nca", "Copper",           "current_collector", 0.30, True),
     ("nca", "Fluorspar",        "electrolyte",       0.20, False),
 
@@ -586,10 +622,11 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     # LFMP (Lithium Iron Manganese Phosphate)
     # ------------------------------------------------------------------
     ("lfmp", "Lithium",              "cathode_active",    0.90, False),
-    ("lfmp", "Iron Ore (LFP Grade)", "cathode_active",    0.70, False),
+    ("lfmp", "Iron Ore", "cathode_active",    0.70, False),
     ("lfmp", "Manganese",            "cathode_active",    0.30, False),
-    ("lfmp", "Phosphate (Battery Grade)", "cathode_active", 0.90, False),
+    ("lfmp", "Phosphate", "cathode_active", 0.90, False),
     ("lfmp", "Natural Graphite",     "anode",             0.85, True),
+    ("lfmp", "Synthetic Graphite",   "anode",             0.85, True),
     ("lfmp", "Copper",               "current_collector", 0.30, True),
     ("lfmp", "Aluminum",             "current_collector", 0.30, True),
     ("lfmp", "Fluorspar",            "electrolyte",       0.20, False),
@@ -600,9 +637,10 @@ _JUNCTION_ROWS: list[tuple[str, str, str, float, bool]] = [
     # Materials more geographically distributed, reducing concentration risk.
     # ------------------------------------------------------------------
     ("sodium_ion", "Sodium",              "cathode_active",    0.90, False),
-    ("sodium_ion", "Iron Ore (LFP Grade)","cathode_active",    0.70, True),   # NFPP variant
+    ("sodium_ion", "Iron Ore","cathode_active",    0.70, True),   # NFPP variant
     ("sodium_ion", "Manganese",           "cathode_active",    0.50, True),   # layered oxide
     ("sodium_ion", "Natural Graphite",    "anode",             0.50, True),   # hard carbon better
+    ("sodium_ion", "Synthetic Graphite",  "anode",             0.50, True),   # hard carbon better
     ("sodium_ion", "Aluminum",            "current_collector", 0.50, True),   # can replace Cu
     ("sodium_ion", "Copper",              "current_collector", 0.20, True),
     ("sodium_ion", "Fluorspar",           "electrolyte",       0.20, False),
@@ -683,16 +721,6 @@ def seed_materials_register(
     if inserted or updated:
         session.flush()
     return {"inserted": inserted, "updated": updated, "skipped_existing": skipped}
-
-
-# Backwards-compatibility wrapper.  Old callers (CLI etc.) continue to work.
-def seed_non_usgs_materials(session: Session) -> int:
-    """Deprecated — wraps seed_materials_register for compatibility.
-
-    Returns only the inserted count to preserve the old return type.
-    """
-    stats = seed_materials_register(session)
-    return stats["inserted"]
 
 
 def seed_battery_chemistry_junctions(session: Session) -> dict[str, int]:

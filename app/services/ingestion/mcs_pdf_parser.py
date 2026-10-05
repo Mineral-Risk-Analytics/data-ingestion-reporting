@@ -83,6 +83,15 @@ log = structlog.get_logger(__name__)
 # the stage-preference dict can be reinstated; until then it's dead
 # configuration.
 # ---------------------------------------------------------------------------
+# 6-digit truncations of US HTS lines that are NOT valid WCO H6 subheadings.
+# 7403.00.xxxx exists in the US schedule as an aggregate line, but H6 splits
+# 7403 into .11-.29 with no .00 — deriving a global node from it creates a
+# dead mapping (deleted from the DB twice: 2026-07-13 ×2).  Extend this set
+# if future MCS editions surface more .00-style aggregates; verify against
+# https://comtradeapi.un.org/files/v1/app/reference/H6.json before adding.
+_DERIVED_GLOBAL_DENYLIST: frozenset[str] = frozenset({"740300"})
+
+
 # Stage assignment for parser-derived 6-digit and 10-digit rows
 # ---------------------------------------------------------------------------
 # Resolution order at insert time (refactored May 2026 — single source of
@@ -634,6 +643,16 @@ class MCSPdfParser:
                 six_digit_desc: dict[str, str] = {}
                 for entry in section.tariff_entries:
                     six = entry.hts_code[:6]
+                    if six in _DERIVED_GLOBAL_DENYLIST:
+                        # US-HTS truncations that are NOT valid H6 subheadings.
+                        # A derived global row for these can never receive
+                        # Comtrade flows or H6-keyed production shares — it
+                        # only pollutes the mapping table (and keyword-based
+                        # event attribution would route events to a dead
+                        # node).  Verified against comtradeapi.un.org H6.json
+                        # 2026-07-13.  The 10-digit market_scope='us' rows
+                        # are unaffected.
+                        continue
                     if six not in six_digit_conf or entry.confidence > six_digit_conf[six]:
                         six_digit_conf[six] = entry.confidence
                         six_digit_desc[six] = entry.description

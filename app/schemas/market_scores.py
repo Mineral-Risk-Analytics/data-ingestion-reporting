@@ -104,3 +104,122 @@ class RescoredResult(BaseModel):
     scored: int
     as_of_date: date
     run_id: str
+
+
+# ---------------------------------------------------------------------------
+# Market-score evidence drill-down
+# ---------------------------------------------------------------------------
+#
+# Schemas powering ``GET /materials/{material_id}/market-scores/{geography_code}
+# /evidence``.  Frontend renders this in the expanded country-scores dropdown
+# instead of the raw sub-input numbers it used to show — same data the scoring
+# engine consumed, surfaced for analyst trust.
+#
+# Membership rule: each list is the strict INTERSECTION of (this material)
+# and (this country) — not the union the scoring engine consumes.  Surfacing
+# only the intersection prevents misattribution when an analyst sees "10 events"
+# under Phosphate × Morocco that actually came from "Phosphate ANY country" +
+# "ANY material in Morocco".  Tradeoff: list lengths may look small compared
+# to the table's pillar scores, which IS the right behaviour — a high
+# Geopolitical score driven by global material events shouldn't lie about
+# being country-specific.
+
+
+class EvidenceRegulationItem(BaseModel):
+    """One regulation that scopes BOTH this material and this country."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    regulation_key: str
+    title: Optional[str] = None
+    issuing_body: Optional[str] = None
+    status: Optional[str] = None
+    effective_date: Optional[date] = None
+    summary: Optional[str] = None
+
+    material_scope_type: str
+    """``covered`` | ``restricted`` | ``banned`` | ``disclosure_required``.
+    Copied from RegulationMaterialScope.scope_type for this material."""
+
+    geography_scope_type: str
+    """``jurisdiction`` | ``origin_country`` | ``targeted_country``.
+    Copied from RegulationGeographyScope.scope_type for this country."""
+
+    geography_compliance_weight: Optional[float] = None
+    """Per-geography curation from Regulation.geography_compliance_weights
+    (0.0–1.0); None when no curation exists (universal 0.50 default applies)."""
+
+
+class EvidenceFacilityItem(BaseModel):
+    """One facility located in this country and linked to this material."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    """UUID — serialised as string for the JSON response."""
+    name: Optional[str] = None
+    facility_type: str
+    """mine | refinery | cell_factory | pack_plant | recycling | r_and_d | hq"""
+    status: str
+    """operating | planned | under_construction | mothballed | closed"""
+    region: Optional[str] = None
+    city: Optional[str] = None
+    capacity_notes: Optional[str] = None
+    is_primary_product: bool
+    """From FacilityMaterialLink.is_primary_product — True when this material
+    is the facility's primary commodity (vs. a co-product)."""
+    annual_capacity_tpy: Optional[float] = None
+    """Nameplate capacity in tonnes/year, when published.  Null when MRDS
+    did not surface a figure."""
+    supply_chain_stage: Optional[str] = None
+    """ore | concentrate | intermediate | refined | battery_grade | fabricated
+    | scrap.  Null on rows pre-dating migration 029."""
+
+
+class EvidenceRiskEventItem(BaseModel):
+    """One risk event tagged to BOTH this material AND this country."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    event_type: str
+    event_subtype: Optional[str] = None
+    severity_score: Optional[float] = None
+    confidence_score: Optional[float] = None
+    event_date: Optional[date] = None
+    summary: Optional[str] = None
+    source_system: Optional[str] = None
+    """Which ingester produced the event — gta | federal_register | eurlex |
+    iea | opensanctions | sec_edgar — derived from the source document."""
+
+
+class MarketScoreEvidence(BaseModel):
+    """Aggregated evidence for one (material, geography) pair.
+
+    Single round-trip response so the dropdown doesn't have to orchestrate
+    three concurrent requests + their loading states.
+    """
+
+    material_id: int
+    geography_code: str
+    regulations: list[EvidenceRegulationItem]
+    facilities: list[EvidenceFacilityItem]
+    risk_events: list[EvidenceRiskEventItem]
+
+    regulation_total: int
+    """How many regulations matched the (material × country) intersection
+    before truncation.  ``len(regulations)`` may be smaller — partner can
+    compare to know how much was hidden."""
+    facility_total: int
+    risk_event_total: int
+    # 056: broad multi-material measures excluded from the risk_events list
+    # (scoring consumed them at breadth-discounted relevance).  Frontend
+    # renders "+ N broad measures" when > 0.
+    risk_event_broad_total: int = 0
+
+    risk_event_window_days: int
+    """How many days back risk events were drawn from.  Matches the longest
+    scoring lookback window so the analyst sees the same evidence the
+    score consumed."""

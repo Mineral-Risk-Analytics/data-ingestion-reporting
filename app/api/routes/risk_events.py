@@ -42,7 +42,21 @@ def list_risk_events(
     _user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[RiskEventRead]:
-    q = select(RiskEvent)
+    # 055: confirmed cross-source duplicates are hidden from the list —
+    # the canonical row carries the event.
+    #
+    # 066 follow-up (2026-08-03): soft-dismissed events are hidden too.  The
+    # triage plan's contract is that ``rejected`` rows are retained *only* so
+    # dedupe cannot resurrect the same story — "hidden from scoring, triage,
+    # and the content site".  This endpoint was written before the status
+    # column existed and was the one surface still serving them.  There is
+    # deliberately no ``?include_rejected`` escape hatch: reviewing dismissals
+    # is triage work and belongs on the triage surface, which has the actions
+    # to un-dismiss.
+    q = select(RiskEvent).where(
+        RiskEvent.duplicate_of_id.is_(None),
+        RiskEvent.triage_status != "rejected",
+    )
 
     if search:
         q = q.where(
@@ -53,6 +67,13 @@ def list_risk_events(
         )
     if event_type:
         q = q.where(RiskEvent.event_type == event_type)
+    else:
+        # Quarantine (2026-07-24, Build 1): orphan SEC filing signals are
+        # excluded from the default event view — they carry no company/
+        # material/geography links and score nowhere (stream paused).
+        # Explicitly filtering ?event_type=sec_filing_signal still shows
+        # them, so nothing is hidden from a deliberate search.
+        q = q.where(RiskEvent.event_type != "sec_filing_signal")
     if severity_min is not None:
         q = q.where(RiskEvent.severity_score >= severity_min)
     if date_from:

@@ -58,7 +58,8 @@ from openpyxl import load_workbook
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
-from app.models.company import Company
+from app.models.company import Company, CompanyAlias
+from app.models.enums import FacilityStatus, FacilityType
 from app.models.facility import CompanyFacility, Facility, FacilityMaterialLink
 from app.models.supply import HsCodeMaterialMapping, Material
 
@@ -70,15 +71,10 @@ log = structlog.get_logger(__name__)
 # here must also be added to facility_seed_template.xlsx so the partner
 # sees them in her Excel drop-down.
 
-_FACILITY_TYPES = {
-    "mine", "refinery", "smelter", "concentrator",
-    "processing", "recycling", "cell_factory", "pack_plant",
-    "r_and_d", "hq", "other",
-}
-_STATUSES = {
-    "operating", "planned", "under_construction",
-    "mothballed", "closed", "care_maintenance",
-}
+# Derived from the FacilityType enum (single source of truth) since
+# 2026-07-07 — extend app.models.enums.FacilityType, not this set.
+_FACILITY_TYPES = {ft.value for ft in FacilityType}
+_STATUSES = {fs.value for fs in FacilityStatus}
 _STAGES = {
     "ore", "concentrate", "intermediate", "refined",
     "battery_grade", "fabricated", "scrap",
@@ -228,9 +224,6 @@ def _read_rows(
                 break
         if excel_row is None or excel_row <= header_row_num:
             continue
-        # Skip the hint row immediately after the header (italic guidance).
-        if excel_row == header_row_num + 1:
-            continue
         record: dict[str, Any] = {"__row_num__": excel_row}
         any_value = False
         for cell in row:
@@ -248,8 +241,18 @@ def _read_rows(
             record[name] = v
             if v is not None:
                 any_value = True
-        if any_value:
-            out.append(record)
+        if not any_value:
+            continue
+        # Skip the template's guidance/hint row by CONTENT, not position —
+        # cleaned seed files (v43+) have real data directly under the
+        # header; an unconditional header_row+1 skip silently swallowed
+        # the first data row (found 2026-07-11: Albemarle/Greenbushes).
+        cn = record.get("company_name")
+        if isinstance(cn, str) and (
+            len(cn) > 120 or "must match" in cn.lower() or cn.lower().startswith("e.g.")
+        ):
+            continue
+        out.append(record)
 
     return out, errors
 
@@ -334,27 +337,37 @@ def _resolve_hs_mapping_id(
 ) -> Optional[int]:
     """Resolve (material_id, hs_code) to an HsCodeMaterialMapping.id.
 
-    Accepts either dotted (``2836.91``) or undotted (``283691``) prefixes.
-    Tries exact match first, then 4-digit prefix match.  Returns ``None``
-    if no mapping exists — caller flags the miss.
+    Accepts either dotted (``2836.91``) or undotted (``283691``) prefixes,
+    and semicolon/comma-separated LISTS (``2603;7402`` — multi-stage sites
+    like integrated smelter-refineries).  Codes are tried IN THE ORDER
+    GIVEN (exact match, then 4-digit prefix, per code) and the first that
+    resolves wins — the link carries one hs_mapping_id, so put the most
+    representative code first in the workbook cell.  Returns ``None`` if
+    nothing resolves — caller flags the miss.
     """
     if not hs_code:
         return None
-    raw = str(hs_code).strip()
-    candidates = {raw, raw.replace(".", ""), raw.replace(" ", "")}
-    # Pad to 4 digits; also try the 4-digit prefix.
-    for c in list(candidates):
-        if len(c) >= 4 and c.isdigit():
-            candidates.add(c[:4])
-    for c in candidates:
-        row = session.scalar(
-            select(HsCodeMaterialMapping).where(
-                HsCodeMaterialMapping.material_id == material_id,
-                HsCodeMaterialMapping.hs_code_prefix == c,
+    for part in re.split(r"[;,]", str(hs_code)):
+        raw = part.strip()
+        if not raw:
+            continue
+        cleaned = raw.replace(".", "").replace(" ", "")
+        ordered = [raw, cleaned]
+        if len(cleaned) >= 4 and cleaned.isdigit():
+            ordered.append(cleaned[:4])
+        seen: set[str] = set()
+        for c in ordered:
+            if c in seen:
+                continue
+            seen.add(c)
+            row = session.scalar(
+                select(HsCodeMaterialMapping).where(
+                    HsCodeMaterialMapping.material_id == material_id,
+                    HsCodeMaterialMapping.hs_code_prefix == c,
+                )
             )
-        )
-        if row is not None:
-            return row.id
+            if row is not None:
+                return row.id
     return None
 
 
@@ -363,11 +376,26 @@ def _find_or_create_company(
     canonical_name: str,
     country: Optional[str],
 ) -> tuple[Company, bool]:
-    """Returns (company, created).  Looks up by canonical_name; updates
-    headquarters_country if it was previously NULL."""
+    """Returns (company, created).
+
+    Resolution is canonical_name FIRST, then company_aliases — partner
+    workbooks carry full legal names ('Vale S.A.', 'Glencore plc') while
+    the engine canon is short ('Vale', 'Glencore'); legal names are
+    registered as aliases (alias_type='legal_name').  Without the alias
+    fallback every legal-name spelling creates a DUPLICATE company
+    (re-fixed 2026-07-11 — the 2026-07-10 alias patch did not land).
+
+    Updates headquarters_country if it was previously NULL.
+    """
     existing = session.scalar(
         select(Company).where(Company.canonical_name == canonical_name)
     )
+    if existing is None:
+        existing = session.scalar(
+            select(Company)
+            .join(CompanyAlias, CompanyAlias.company_id == Company.id)
+            .where(CompanyAlias.alias == canonical_name)
+        )
     if existing is not None:
         if country and not existing.headquarters_country:
             existing.headquarters_country = country
@@ -383,6 +411,66 @@ def _find_or_create_company(
     return company, True
 
 
+# Facility column names whose presence in the partner sheet implies
+# partner authority over that field (so MRDS re-runs should not clobber it
+# — see F-MRDS-2 protection in mrds.py).  Kept narrow on purpose: only
+# fields the partner literally writes through this loader.
+_FACILITY_PARTNER_LOCK_FIELDS = (
+    "name", "facility_type", "region", "city", "status",
+    "latitude", "longitude",
+)
+
+
+def _merge_partner_lock_metadata(
+    existing_metadata: Optional[dict],
+    facility_locks: set[str],
+) -> dict:
+    """Merge partner-curation lock list into existing facility metadata.
+
+    Preserves any annotations (incl. MRDS-side ``source``/``dep_id``
+    bookkeeping) and unions the facility-level locks so subsequent MRDS
+    re-runs respect the partner's authority.  See the F-MRDS-2 pattern
+    documented in ``mrds.py``.
+    """
+    merged = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+    current = merged.get("partner_curated_fields")
+    locked: set[str] = set()
+    if isinstance(current, list):
+        locked = {str(f) for f in current if isinstance(f, str)}
+    locked |= facility_locks
+    if locked:
+        merged["partner_curated_fields"] = sorted(locked)
+    return merged
+
+
+def _merge_link_lock_metadata(
+    facility_metadata: Optional[dict],
+    material_id: int,
+    link_locks: set[str],
+) -> dict:
+    """Same as above, but for per-link locks keyed by material_id.
+
+    Stored at ``Facility.metadata_json["link_partner_curated_fields"]``
+    because ``FacilityMaterialLink`` has no metadata column today.
+    """
+    merged = dict(facility_metadata) if isinstance(facility_metadata, dict) else {}
+    link_map = merged.get("link_partner_curated_fields")
+    if not isinstance(link_map, dict):
+        link_map = {}
+    else:
+        link_map = dict(link_map)
+    key = str(material_id)
+    current = link_map.get(key)
+    locked: set[str] = set()
+    if isinstance(current, list):
+        locked = {str(f) for f in current if isinstance(f, str)}
+    locked |= link_locks
+    if locked:
+        link_map[key] = sorted(locked)
+        merged["link_partner_curated_fields"] = link_map
+    return merged
+
+
 def _find_or_create_facility(
     session: Session,
     name: str,
@@ -396,7 +484,23 @@ def _find_or_create_facility(
     The ``created`` flag is required because ``session.flush()`` clears
     ``session.new`` immediately, so the caller can't distinguish inserts
     from updates by inspecting the session.
+
+    Partner-curation locks (added 2026-06-09): every field the partner
+    actually wrote through the seed (any non-None value in
+    ``_FACILITY_PARTNER_LOCK_FIELDS``) is recorded in
+    ``Facility.metadata_json["partner_curated_fields"]`` so subsequent
+    MRDS re-runs skip those fields rather than reverting them to USGS
+    values.  See F-MRDS-2 in ``mrds.py``.
     """
+    # Compute the set of partner-authoritative fields from this row.
+    facility_locks: set[str] = {
+        f for f in _FACILITY_PARTNER_LOCK_FIELDS
+        if seed.get(f) is not None or (f == "name")
+    }
+    # Facility ``name`` is always partner-authoritative since the loader
+    # ingested the partner's literal facility_name; include it explicitly
+    # in case the seed dict doesn't carry it under that key.
+
     existing = session.scalar(
         select(Facility).where(
             and_(Facility.name == name, Facility.country == country)
@@ -414,6 +518,7 @@ def _find_or_create_facility(
             longitude=seed.get("longitude"),
             data_source=DEFAULT_DATA_SOURCE,
             verified=True,
+            metadata_json=_merge_partner_lock_metadata(None, facility_locks),
         )
         session.add(facility)
         session.flush()
@@ -428,6 +533,13 @@ def _find_or_create_facility(
     if seed.get("facility_type") and existing.facility_type != seed["facility_type"]:
         existing.facility_type = seed["facility_type"]
         updated = True
+    # Refresh the partner-curation lock list every re-run so newly-added
+    # fields get protected (e.g. partner fills in lat/lon in v2 of the
+    # sheet that was blank in v1).
+    new_meta = _merge_partner_lock_metadata(existing.metadata_json, facility_locks)
+    if new_meta != existing.metadata_json:
+        existing.metadata_json = new_meta
+        updated = True
     return existing, False, updated
 
 
@@ -437,8 +549,42 @@ def _upsert_company_facility(
     facility_id: Any,
     ownership_type: str,
     ownership_pct: Optional[float],
-) -> tuple[CompanyFacility, bool, bool]:
-    """Returns (link, created, updated)."""
+    pending_ownerships: dict[tuple, CompanyFacility],
+) -> tuple[CompanyFacility, bool, bool, Optional[str]]:
+    """Returns ``(link, created, updated, conflict_msg)``.
+
+    ``pending_ownerships`` is the run-level registry keyed
+    ``(company_id, facility_id)`` — same autoflush=False blindness as
+    material links: CO-PRODUCT rows repeat the same company+facility once
+    per material (KCC Co+Cu, Kidd Zn+Cu, Murrin Ni+Co…), and without the
+    registry the second row's existence SELECT misses the first row's
+    pending INSERT → uq_company_facility violation at commit.
+
+    Same-run duplicates: first row wins; a later row carrying DIFFERENT
+    non-null ownership values is reported via ``conflict_msg`` (ownership
+    should be identical across a facility's co-product rows).
+    Cross-run duplicates keep overwrite semantics (re-running a corrected
+    workbook must update).
+    """
+    key = (company_id, facility_id)
+    pending = pending_ownerships.get(key)
+    if pending is not None:
+        conflicts: list[str] = []
+        filled = False
+        if ownership_type and pending.ownership_type != ownership_type:
+            conflicts.append(
+                f"ownership_type: kept {pending.ownership_type!r}, "
+                f"ignored {ownership_type!r}")
+        if ownership_pct is not None:
+            if pending.ownership_pct is None:
+                pending.ownership_pct = ownership_pct
+                filled = True
+            elif pending.ownership_pct != ownership_pct:
+                conflicts.append(
+                    f"ownership_pct: kept {pending.ownership_pct!r}, "
+                    f"ignored {ownership_pct!r}")
+        return pending, False, filled, ("; ".join(conflicts) or None)
+
     existing = session.scalar(
         select(CompanyFacility).where(
             and_(
@@ -456,7 +602,8 @@ def _upsert_company_facility(
             verified=True,
         )
         session.add(link)
-        return link, True, False
+        pending_ownerships[key] = link
+        return link, True, False, None
     updated = False
     if existing.ownership_type != ownership_type:
         existing.ownership_type = ownership_type
@@ -464,19 +611,99 @@ def _upsert_company_facility(
     if existing.ownership_pct != ownership_pct:
         existing.ownership_pct = ownership_pct
         updated = True
-    return existing, False, updated
+    pending_ownerships[key] = existing
+    return existing, False, updated, None
+
+
+# FacilityMaterialLink columns whose presence in the partner sheet implies
+# partner authority over that field (so MRDS re-runs should not clobber
+# them — see F-MRDS-2 protection in mrds.py).  Only the two fields MRDS
+# actually touches on re-run (`is_primary_product`, `supply_chain_stage`)
+# are recorded since the others are partner-only anyway.
+_LINK_PARTNER_LOCK_FIELDS = ("is_primary_product", "supply_chain_stage")
 
 
 def _upsert_material_link(
     session: Session,
-    facility_id: Any,
+    facility: Facility,
     material_id: int,
     capacity_tpy: Optional[float],
     capacity_unit: str,
     is_primary: bool,
     stage: Optional[str],
     hs_mapping_id: Optional[int],
-) -> tuple[FacilityMaterialLink, bool, bool]:
+    pending_links: dict[tuple, FacilityMaterialLink],
+) -> tuple[FacilityMaterialLink, bool, bool, Optional[str]]:
+    """Upsert one FacilityMaterialLink row from the partner seed.
+
+    Returns ``(link, created, updated, conflict_msg)``.
+
+    ``pending_links`` is the run-level registry of links already touched
+    THIS run, keyed ``(facility_id, material_id)``.  It exists because the
+    session runs with ``autoflush=False``: when a JV facility repeats one
+    row per owner (Wodgina, Greenbushes), the second row's existence
+    SELECT cannot see the first row's still-pending INSERT, so both rows
+    used to insert and violate ``uq_facility_material_link`` at commit.
+
+    Same-run duplicate semantics (JV row pattern): the FIRST row's values
+    win; later rows only fill fields the first left NULL.  A later row
+    carrying a CONFLICTING non-null value is reported via
+    ``conflict_msg`` (kept out of the DB) — facility-total capacity
+    belongs on the link; per-owner splits belong in
+    ``company_facilities.ownership_pct``.
+
+    Cross-run duplicates (the row existed in the DB before this run) keep
+    the original overwrite semantics — re-running a corrected workbook
+    must update values.
+
+    Also records partner-curation locks in
+    ``facility.metadata_json["link_partner_curated_fields"][str(material_id)]``
+    so subsequent MRDS re-runs do not revert ``is_primary_product`` or
+    ``supply_chain_stage`` back to USGS-derived values (F-MRDS-2 pattern).
+    """
+    facility_id = facility.id
+    key = (facility_id, material_id)
+
+    # Compute link-level partner locks based on which sheet fields the
+    # partner actually wrote.  ``stage`` is the seed sheet's
+    # ``supply_chain_stage``; ``is_primary`` comes from
+    # ``is_primary_product`` (always written when row loads).
+    link_locks: set[str] = {"is_primary_product"}
+    if stage is not None:
+        link_locks.add("supply_chain_stage")
+
+    # Refresh the link-level lock list on every row regardless of whether
+    # this is an insert or update — newly-written fields get protected.
+    new_meta = _merge_link_lock_metadata(
+        facility.metadata_json, material_id, link_locks,
+    )
+    if new_meta != facility.metadata_json:
+        facility.metadata_json = new_meta
+
+    # ── same-run duplicate (JV row pattern): first row wins ──────────
+    pending = pending_links.get(key)
+    if pending is not None:
+        filled = False
+        conflicts: list[str] = []
+        for attr, val in (
+            ("annual_capacity_tpy", capacity_tpy),
+            ("capacity_unit", capacity_unit),
+            ("supply_chain_stage", stage),
+            ("hs_mapping_id", hs_mapping_id),
+        ):
+            if val is None:
+                continue
+            cur = getattr(pending, attr)
+            if cur is None:
+                setattr(pending, attr, val)
+                filled = True
+            elif cur != val:
+                conflicts.append(f"{attr}: kept {cur!r}, ignored {val!r}")
+        if is_primary and not pending.is_primary_product:
+            pending.is_primary_product = True
+            filled = True
+        return pending, False, filled, ("; ".join(conflicts) or None)
+
     existing = session.scalar(
         select(FacilityMaterialLink).where(
             and_(
@@ -485,6 +712,7 @@ def _upsert_material_link(
             )
         )
     )
+
     if existing is None:
         link = FacilityMaterialLink(
             facility_id=facility_id,
@@ -496,7 +724,8 @@ def _upsert_material_link(
             hs_mapping_id=hs_mapping_id,
         )
         session.add(link)
-        return link, True, False
+        pending_links[key] = link
+        return link, True, False, None
     updated = False
     for attr, val in (
         ("annual_capacity_tpy", capacity_tpy),
@@ -508,18 +737,24 @@ def _upsert_material_link(
         if val is not None and getattr(existing, attr) != val:
             setattr(existing, attr, val)
             updated = True
-    return existing, False, updated
+    pending_links[key] = existing
+    return existing, False, updated, None
 
 
 # ─────────────────────────────────────────────────────────────────────
 # Public entrypoint
 # ─────────────────────────────────────────────────────────────────────
 
-# The two example rows in the template (Albemarle + Mineral Resources at
-# Kemerton) are skipped by default so the partner can leave them in place
-# as documentation.  Pass ``include_examples=True`` for fixture builds.
+# Template example rows skipped by default so the partner can leave them
+# in place as documentation.  Pass ``include_examples=True`` for fixture
+# builds.
+#
+# 2026-07-11: the ("Albemarle Corporation", "Kemerton…") key was REMOVED —
+# facility seed v42+ carries a REAL walkthrough-verified Albemarle/Kemerton
+# row (100% ALB, battery_grade, from the 10-K) that this key was silently
+# swallowing.  The Mineral Resources key stays: MinRes no longer holds a
+# Kemerton stake, so any row with that pairing is stale template content.
 _EXAMPLE_ROW_KEYS: set[tuple[str, str]] = {
-    ("Albemarle Corporation", "Kemerton Lithium Hydroxide Plant"),
     ("Mineral Resources Ltd", "Kemerton Lithium Hydroxide Plant"),
 }
 
@@ -558,6 +793,14 @@ def load_partner_facility_seed(
 
     # Cache material lookups by lowercase canonical name.
     material_cache: dict[str, Optional[Material]] = {}
+
+    # Run-level registries of rows touched this run — required because
+    # autoflush=False hides pending inserts from existence checks.
+    # JV facilities repeat one row per owner (→ material-link dupes);
+    # co-product facilities repeat one row per material (→ ownership
+    # dupes).  See _upsert_material_link / _upsert_company_facility.
+    pending_links: dict[tuple, FacilityMaterialLink] = {}
+    pending_ownerships: dict[tuple, CompanyFacility] = {}
 
     for row in rows:
         report.rows_seen += 1
@@ -704,28 +947,44 @@ def load_partner_facility_seed(
         elif f_updated:
             report.facilities_updated += 1
 
-        cf, cf_created, cf_updated = _upsert_company_facility(
+        cf, cf_created, cf_updated, cf_conflict = _upsert_company_facility(
             session, company.id, facility.id, ownership_type, ownership_pct,
+            pending_ownerships=pending_ownerships,
         )
         if cf_created:
             report.company_facilities_inserted += 1
         elif cf_updated:
             report.company_facilities_updated += 1
+        if cf_conflict:
+            report.errors.append(RowError(
+                rownum, "company_facility",
+                f"duplicate (company, facility) within this file — first "
+                f"row's ownership kept; {cf_conflict}. Co-product rows for "
+                f"one facility must carry identical ownership values.",
+            ))
 
-        ml, ml_created, ml_updated = _upsert_material_link(
+        ml, ml_created, ml_updated, ml_conflict = _upsert_material_link(
             session,
-            facility_id=facility.id,
+            facility=facility,
             material_id=material.id,
             capacity_tpy=capacity_tpy,
             capacity_unit=capacity_unit,
             is_primary=is_primary,
             stage=stage,
             hs_mapping_id=hs_mapping_id,
+            pending_links=pending_links,
         )
         if ml_created:
             report.material_links_inserted += 1
         elif ml_updated:
             report.material_links_updated += 1
+        if ml_conflict:
+            report.errors.append(RowError(
+                rownum, "material_link",
+                f"duplicate (facility, material) within this file — first "
+                f"row's values kept; {ml_conflict}. Facility-total capacity "
+                f"belongs on one row; per-owner splits go in ownership_pct.",
+            ))
 
         report.rows_loaded += 1
 

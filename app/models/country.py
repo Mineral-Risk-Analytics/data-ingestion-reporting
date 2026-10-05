@@ -29,7 +29,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -116,4 +126,50 @@ class Country(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class CountryGovernanceSignal(Base):
+    """Step 3 (migration 050) — World Bank WGI governance scores per country.
+
+    One row per (country_code, reference_year, source).  Powers the JRC-aligned
+    governance overlay on the Geopolitical pillar's ``country_concentration``
+    sub-input.  See ``alembic/versions/050_country_governance_signals.py`` for
+    the full rationale and the WGI percentile-rank scale.
+
+    Read pattern: callers want the latest available row for a given
+    country with ``reference_year <= as_of_date.year``.  Annual ingestion
+    accumulates history rather than replacing it.
+
+    ``composite_pct`` is the denormalised mean of the six dimension
+    percentile ranks (NULL-safe over the non-NULL subset).  This is what
+    ``apply_wgi_governance_overlay`` reads — stored rather than recomputed
+    so we don't pay a six-column read per overlay call.
+    """
+
+    __tablename__ = "country_governance_signals"
+    __table_args__ = (
+        UniqueConstraint(
+            "country_code", "reference_year", "source",
+            name="uq_country_governance_signal",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    country_code: Mapped[str] = mapped_column(String(2), nullable=False, index=True)
+    reference_year: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="worldbank_wgi")
+
+    voice_accountability_pct: Mapped[Optional[float]] = mapped_column(Float)
+    political_stability_pct: Mapped[Optional[float]] = mapped_column(Float)
+    government_effectiveness_pct: Mapped[Optional[float]] = mapped_column(Float)
+    regulatory_quality_pct: Mapped[Optional[float]] = mapped_column(Float)
+    rule_of_law_pct: Mapped[Optional[float]] = mapped_column(Float)
+    control_of_corruption_pct: Mapped[Optional[float]] = mapped_column(Float)
+    composite_pct: Mapped[Optional[float]] = mapped_column(Float)
+    n_dimensions_present: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=0
+    )
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )

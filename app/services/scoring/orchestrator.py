@@ -47,6 +47,7 @@ from datetime import date
 from typing import Optional
 
 import structlog
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.constants import RiskCategory
@@ -276,7 +277,21 @@ def rescore_company(
     # --- STEP 3: Score each component ---
     mat_score = material_risk.score_material_exposure(crit, conc, trade_vol)
     geo_score = geopolitical_risk.score_geopolitical_trade(ctry_conc, exp_rest, tariff)
-    reg_score = regulatory_risk.score_regulatory_profile(top_impacts, obligations, prox)
+    # Build 2 (2026-07-24): obligation base points come from the DB
+    # (regulations.obligation_points, coalesced to 0) instead of the
+    # retired COMPLIANCE_OBLIGATIONS dict.
+    from app.models.regulatory import Regulation as _Regulation
+    _ob_keys = {k for k, _ in obligations}
+    _ob_points: dict[str, float] = {}
+    if _ob_keys:
+        for _k, _p in db.execute(
+            select(_Regulation.regulation_key, _Regulation.obligation_points)
+            .where(_Regulation.regulation_key.in_(_ob_keys))
+        ):
+            _ob_points[_k] = float(_p or 0)
+    reg_score = regulatory_risk.score_regulatory_profile(
+        top_impacts, obligations, prox, obligation_points=_ob_points
+    )
     op_score = _score_operational(struct_dep, op_impacts)
     fin_score = fp_module.score_financial_pressure(base_sig, lev_bon, liq_bon, fc)
 

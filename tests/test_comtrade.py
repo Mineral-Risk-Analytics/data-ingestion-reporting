@@ -296,16 +296,23 @@ class TestResolveMaterialId:
 
 class TestExternalId:
     def test_format(self):
-        # flow_code defaults to "X" (exports); see _external_id signature.
-        # Imports would produce comtrade_M_A_HS_... ; the flow_code is part
-        # of the key so export/import runs against the same reporter/HS/year
-        # don't trip each other's idempotency check.
-        assert _external_id("CN", "8507", 2023) == "comtrade_X_A_HS_8507_CN_2023"
+        # v2 format (post-2026-06): includes version tag + breakdown_mode.
+        # flow_code defaults to "X" (exports); breakdown_mode defaults to
+        # the module-level _BREAKDOWN_MODE ("plus").  The flow_code and
+        # breakdown_mode are part of the key so different combinations
+        # for the same reporter/HS/year don't trip each other's
+        # idempotency check.
+        assert _external_id("CN", "8507", 2023) == "comtrade_v2_X_A_HS_plus_8507_CN_2023"
 
     def test_flow_code_distinguishes_export_from_import(self):
         export_id = _external_id("CN", "8507", 2023, flow_code="X")
         import_id = _external_id("CN", "8507", 2023, flow_code="M")
         assert export_id != import_id
+
+    def test_breakdown_mode_distinguishes_plus_from_classic(self):
+        plus_id = _external_id("CN", "8507", 2023, breakdown_mode="plus")
+        classic_id = _external_id("CN", "8507", 2023, breakdown_mode="classic")
+        assert plus_id != classic_id
 
     def test_unique_per_combination(self):
         ids = {
@@ -564,8 +571,12 @@ class TestIngestComtrade:
         # One batch with one row → exactly one commit
         session.commit.assert_called_once()
 
-    def test_session_commit_not_called_when_empty_response(self):
-        """No commit is issued when all API responses are empty — nothing to persist."""
+    def test_empty_response_commits_marker_source_document(self):
+        """6.2 fix (2026-06): an empty API response now commits an empty
+        SourceDocument so the next run skips the same (reporter, prefix, year)
+        combination via the idempotency check rather than wasting another
+        daily-quota call on a chronically-empty combination.
+        """
         from app.services.ingestion.comtrade import ingest_comtrade
 
         session = _make_ingest_session(existing_doc=False)
@@ -578,11 +589,14 @@ class TestIngestComtrade:
             mock_settings.return_value.comtrade_api_key = "test-key"
             mock_settings.return_value.comtrade_rate_limit_delay = 0
             mock_settings.return_value.comtrade_base_url = "https://example.com"
-            ingest_comtrade(
+            result = ingest_comtrade(
                 session=session,
                 years=[2023],
                 reporters={"CN": 156},
                 hs_prefixes=["8507"],
             )
 
-        session.commit.assert_not_called()
+        # One empty-marker commit per (reporter × prefix × year × flow).
+        session.commit.assert_called_once()
+        assert result["inserted"] == 0
+        assert result["skipped_empty_response"] == 1

@@ -34,6 +34,18 @@ class Company(Base):
     canonical_name: Mapped[str] = mapped_column(
         String(512), unique=True, nullable=False, index=True
     )
+    # ── public-profile columns (migration 054) ──────────────────────────
+    slug: Mapped[Optional[str]] = mapped_column(
+        String(160), unique=True, index=True,
+        comment="URL-safe public identifier, backfilled from canonical_name.",
+    )
+    is_published: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", index=True,
+        comment=(
+            "Public-site visibility gate. TRUE only for partner-reviewed "
+            "companies (workbook publish flag). Loader never un-sets it."
+        ),
+    )
     legal_name: Mapped[Optional[str]] = mapped_column(String(512))
     # Free-string stage (legacy, Axis-B activity vocabulary). Migration 044
     # added the normalised FK column ``primary_activity_stage_fk`` alongside
@@ -90,6 +102,11 @@ class Company(Base):
     data_confidence: Mapped[Optional[float]] = mapped_column(Float)  # 0.0–1.0
     data_source: Mapped[Optional[str]] = mapped_column(String(128))  # sec_edgar | manual | etc.
     notes: Mapped[Optional[str]] = mapped_column(Text)
+    # Public profile copy (migration 057).  The ONLY free-text company
+    # field the public intelligence API exposes — written by the partner
+    # workbook's public_intro column (or a future admin flow), NEVER
+    # derived from ``notes`` (internal commentary must not leak).
+    public_intro: Mapped[Optional[str]] = mapped_column(Text)
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -169,6 +186,22 @@ class CompanyMaterialExposure(Base):
         ForeignKey("source_documents.id", ondelete="SET NULL")
     )
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+    # ── filing facts (migration 053, partner workbook CME tab) ──────────
+    # exposure_score stays the judgment column; these carry the auditable
+    # facts behind it. See migration 053 docstring for full semantics.
+    production_tonnage: Mapped[Optional[float]] = mapped_column(Float)
+    production_unit: Mapped[Optional[str]] = mapped_column(String(64))
+    # Free-form on purpose ('kt LCE', 't Au', 'Mt') — commodity bases must
+    # not be silently normalised.
+    production_year: Mapped[Optional[int]] = mapped_column(Integer)
+    revenue_share_pct: Mapped[Optional[float]] = mapped_column(Float)  # 0-1
+    revenue_year: Mapped[Optional[int]] = mapped_column(Integer)
+    battery_grade_relevance: Mapped[Optional[float]] = mapped_column(Float)  # 0-1
+    source_url: Mapped[Optional[str]] = mapped_column(Text)
+    score_derivation: Mapped[Optional[str]] = mapped_column(String(32))
+    # curated_seed | derived_revenue_share | default_unscored | NULL(pre-053)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -221,6 +254,16 @@ class CompanySupplyRelationship(Base):
     valid_from: Mapped[Optional[date]] = mapped_column(Date)
     valid_to: Mapped[Optional[date]] = mapped_column(Date)
     verified: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+    # ── agreement detail (migration 053, partner workbook SR tab) ───────
+    agreement_type: Mapped[Optional[str]] = mapped_column(String(32))
+    # offtake | supply_agreement | joint_development | equity_offtake |
+    # framework | spot | jv | unknown — complements relationship_type
+    # (which stays evidential: direct | indirect | estimated | framework).
+    contract_term_years: Mapped[Optional[float]] = mapped_column(Float)  # 0 = spot
+    announced_date: Mapped[Optional[date]] = mapped_column(Date)
+    source_url: Mapped[Optional[str]] = mapped_column(Text)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

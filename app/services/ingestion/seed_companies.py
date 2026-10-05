@@ -92,6 +92,158 @@ _COMPANIES: list[dict] = [
             {"alias": "GLEN", "alias_type": "ticker"},
         ],
     },
+    # ── 2026-07-10: walked/seed-file companies pre-curated so the partner
+    # facility loader resolves them via legal-name alias instead of creating
+    # long-canonical duplicates (mixed-canon prevention). ──────────────────
+    {
+        "canonical_name": "Alcoa",
+        "legal_name": "Alcoa Corporation",
+        "supply_chain_stage": "miner",
+        "headquarters_country": "US",
+        "headquarters_region": "North America",
+        "is_public": True,
+        "public_ticker": "NYSE:AA",
+        "data_confidence": 0.9,
+        "data_source": "manual",
+        "notes": "Major bauxite-alumina-aluminum producer; walked 10-K FY2025 (22 facilities seeded).",
+        "aliases": [
+            {"alias": "Alcoa Corporation", "alias_type": "legal_name"},
+        ],
+    },
+    {
+        "canonical_name": "Southern Copper",
+        "legal_name": "Southern Copper Corporation",
+        "supply_chain_stage": "miner",
+        "headquarters_country": "US",
+        "headquarters_region": "North America",
+        "is_public": True,
+        "public_ticker": "NYSE:SCCO",
+        "data_confidence": 0.9,
+        "data_source": "manual",
+        "notes": "Major Cu producer (Peru/Mexico, Grupo Mexico); walked 10-K FY2025 (21 facilities).",
+        "aliases": [
+            {"alias": "Southern Copper Corporation", "alias_type": "legal_name"},
+        ],
+    },
+    {
+        "canonical_name": "Nutrien",
+        "legal_name": "Nutrien Ltd.",
+        "supply_chain_stage": "miner",
+        "headquarters_country": "CA",
+        "headquarters_region": "North America",
+        "is_public": True,
+        "public_ticker": "NYSE:NTR",
+        "data_confidence": 0.85,
+        "data_source": "manual",
+        "notes": "Largest N.American purified phosphoric acid producer; phosphate-scoped walkthrough FY2025.",
+        "aliases": [
+            {"alias": "Nutrien Ltd.", "alias_type": "legal_name"},
+        ],
+    },
+    {
+        "canonical_name": "South32",
+        "legal_name": "South32 Ltd",
+        "supply_chain_stage": "miner",
+        "headquarters_country": "AU",
+        "headquarters_region": "Asia-Pacific",
+        "is_public": True,
+        "public_ticker": "ASX:S32",
+        "data_confidence": 0.9,
+        "data_source": "manual",
+        "notes": "Diversified: manganese (GEMCO/Hotazel), alumina/Al, Cannington; walked ASX AR FY-Jun-2025.",
+        "aliases": [
+            {"alias": "South32 Ltd", "alias_type": "legal_name"},
+        ],
+    },
+    {
+        "canonical_name": "Mineral Resources",
+        "legal_name": "Mineral Resources Ltd",
+        "supply_chain_stage": "miner",
+        "headquarters_country": "AU",
+        "headquarters_region": "Asia-Pacific",
+        "is_public": True,
+        "public_ticker": "ASX:MIN",
+        "data_confidence": 0.85,
+        "data_source": "manual",
+        "notes": "Mt Marion 50% JV partner (operator) + Wodgina; lithium + iron ore.",
+        "aliases": [
+            {"alias": "Mineral Resources Ltd", "alias_type": "legal_name"},
+        ],
+    },
+    {
+        "canonical_name": "Samarco",
+        "legal_name": "Samarco Mineração S.A.",
+        "supply_chain_stage": "miner",
+        "headquarters_country": "BR",
+        "headquarters_region": "South America",
+        "is_public": False,
+        "data_confidence": 0.8,
+        "data_source": "manual",
+        "notes": "Vale/BHP 50-50 iron ore pellets JV; Fundão dam context.",
+        "aliases": [
+            {"alias": "Samarco Mineração S.A.", "alias_type": "legal_name"},
+        ],
+    },
+    {
+        "canonical_name": "PT Vale Indonesia",
+        "legal_name": "PT Vale Indonesia Tbk",
+        "supply_chain_stage": "miner",
+        "headquarters_country": "ID",
+        "headquarters_region": "Asia-Pacific",
+        "is_public": True,
+        "public_ticker": "IDX:INCO",
+        "data_confidence": 0.8,
+        "data_source": "manual",
+        "notes": "Indonesian nickel (Sorowako laterite); key Indonesia midstream window.",
+        "aliases": [
+            {"alias": "PT Vale Indonesia Tbk", "alias_type": "legal_name"},
+        ],
+    },
+    {
+        "canonical_name": "Iluka Resources",
+        "legal_name": "Iluka Resources Ltd",
+        "supply_chain_stage": "miner",
+        "headquarters_country": "AU",
+        "headquarters_region": "Asia-Pacific",
+        "is_public": True,
+        "public_ticker": "ASX:ILU",
+        "data_confidence": 0.75,
+        "data_source": "manual",
+        "notes": "Mineral sands (Ti/Zr) + Eneabba REE refinery build; monazite REE feed.",
+        "aliases": [
+            {"alias": "Iluka Resources Ltd", "alias_type": "legal_name"},
+        ],
+    },
+    {
+        "canonical_name": "Energy Fuels",
+        "legal_name": "Energy Fuels Inc.",
+        "supply_chain_stage": "miner",
+        "headquarters_country": "US",
+        "headquarters_region": "North America",
+        "is_public": True,
+        "public_ticker": "NYSE:UUUU",
+        "data_confidence": 0.75,
+        "data_source": "manual",
+        "notes": "US uranium producer pivoting to REE separation (White Mesa monazite).",
+        "aliases": [
+            {"alias": "Energy Fuels Inc.", "alias_type": "legal_name"},
+        ],
+    },
+    {
+        "canonical_name": "China Northern Rare Earth",
+        "legal_name": "China Northern Rare Earth (Group) High‑Tech Co., Ltd.",
+        "supply_chain_stage": "miner",
+        "headquarters_country": "CN",
+        "headquarters_region": "Asia-Pacific",
+        "is_public": True,
+        "public_ticker": "SSE:600111",
+        "data_confidence": 0.7,
+        "data_source": "manual",
+        "notes": "Largest REE producer globally (Bayan Obo); legacy seed rows, walkthrough pending.",
+        "aliases": [
+            {"alias": "China Northern Rare Earth (Group) High‑Tech Co., Ltd.", "alias_type": "legal_name"},
+        ],
+    },
     {
         "canonical_name": "CMOC Group",
         "legal_name": "CMOC Group Limited",
@@ -1124,6 +1276,33 @@ _ALLOWED_STAGES = {
 }
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Legal-name aliases (2026-07-10)
+# Partner seed workbooks key companies by full legal entity name; engine
+# canon stays short. Upserted as alias_type='legal_name' in Pass 3 below.
+# Kept separate from per-company dicts so the mapping is greppable here.
+# ─────────────────────────────────────────────────────────────────────
+LEGAL_NAME_ALIASES: dict[str, str] = {
+    "CMOC Group Limited":                                   "CMOC Group",
+    "Contemporary Amperex Technology Co., Limited (CATL)":  "CATL",
+    "Freeport-McMoRan Inc.":                                "Freeport-McMoRan",
+    "Ganfeng Lithium Co., Ltd.":                            "Ganfeng Lithium",
+    "Jiangxi Ganfeng Lithium Group Co., Ltd.":              "Ganfeng Lithium",
+    "Glencore plc":                                         "Glencore",
+    "Lynas Rare Earths Ltd":                                "Lynas Rare Earths",
+    "MP Materials Corp.":                                   "MP Materials",
+    "Rio Tinto plc":                                        "Rio Tinto",
+    "Sociedad Química y Minera de Chile S.A.":              "SQM",
+    "Vale S.A.":                                            "Vale",
+    "Syrah Resources Ltd":                                  "Syrah Resources",
+    "Tenke Fungurume Mining S.A.":                          "Tenke Fungurume Mining",
+    "PLS Group Limited (Pilbara Minerals)":                 "Pilbara Minerals",
+    "Pilbara Minerals Ltd.":                                "Pilbara Minerals",
+    "Tianqi Lithium Corp":                                  "Tianqi Lithium",
+    "Sociedad Minera Cerro Verde S.A.A.":                   "Cerro Verde",
+}
+
+
 def seed_companies(session: Session) -> dict[str, int]:
     """Upsert all curated companies and their aliases, then resolve parent links.
 
@@ -1250,6 +1429,27 @@ def seed_companies(session: Session) -> dict[str, int]:
                 parent_canonical_name=pcn,
             )
             parents_linked += 1
+
+    # ── Pass 3 (2026-07-10): legal-name aliases ─────────────────────────
+    # Partner workbooks key companies by full legal name; map them to the
+    # short engine canonicals so loaders resolve instead of duplicating.
+    for legal, canon in LEGAL_NAME_ALIASES.items():
+        target = session.scalar(
+            select(Company).where(Company.canonical_name == canon)
+        )
+        if target is None:
+            log.warning(
+                "seed_companies.legal_alias_target_missing", canonical=canon,
+            )
+            continue
+        exists = session.scalar(
+            select(CompanyAlias).where(CompanyAlias.alias == legal)
+        )
+        if exists is None:
+            session.add(CompanyAlias(
+                company_id=target.id, alias=legal, alias_type="legal_name",
+            ))
+            aliases_added += 1
 
     session.commit()
 

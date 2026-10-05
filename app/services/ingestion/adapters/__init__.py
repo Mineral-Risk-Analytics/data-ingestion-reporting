@@ -1,7 +1,11 @@
 """Source adapters.
 
-Live (Phase 1): CensusTradeAdapter, FederalRegisterAdapter, NewsAdapter, SecEdgarAdapter.
-Placeholders (Phase 2/3): imported from ``adapters.future`` — all raise NotImplementedError.
+Live (Phase 1): FederalRegisterAdapter, NewsAdapter, SecEdgarAdapter.
+Parked scaffolds: CensusTradeAdapter — Phase 2 buyer-region scoping scaffold
+    (raises ``NotImplementedError`` on ``fetch``; see the module docstring
+    for the unpark checklist).
+Placeholders (Phase 2/3): imported from ``adapters.future`` — all raise
+    ``NotImplementedError``.
 """
 
 from app.models.enums import SourceType
@@ -21,9 +25,14 @@ from app.services.ingestion.adapters.future import (
 ADAPTER_BY_TYPE: dict[str, type] = {
     # Phase 1 — live
     SourceType.FEDERAL_REGISTER.value: FederalRegisterAdapter,
-    SourceType.CENSUS_TRADE.value: CensusTradeAdapter,
     SourceType.SEC_EDGAR.value: SecEdgarAdapter,
     SourceType.NEWS.value: NewsAdapter,
+    # Parked scaffold — registered so SourceType.CENSUS_TRADE still routes,
+    # but the adapter's fetch() raises NotImplementedError to prevent
+    # accidental invocation against the bit-rotted Phase 1 defaults.
+    # Unpark when buyer-region scoping (Phase 2) is built — see the
+    # module docstring on census_trade.py for prerequisites.
+    SourceType.CENSUS_TRADE.value: CensusTradeAdapter,
     # Phase 2/3 — placeholders (raise NotImplementedError on fetch)
     SourceType.SUSTAINABILITY_REPORT.value: SustainabilityReportsAdapter,
     SourceType.POLICY_PAGE.value: PolicyPagesAdapter,

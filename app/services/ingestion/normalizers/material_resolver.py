@@ -335,7 +335,7 @@ class MaterialCache:
             # plain "phosphate" mention in text matches "Phosphate (Battery
             # Grade)".  Unblocks keyword scan for launch-list materials whose
             # canonical names carry a grade qualifier — Phosphate (Battery
-            # Grade), Iron Ore (LFP Grade), Silicon (Anode Grade).
+            # Grade), Iron Ore, Silicon (Anode Grade).
             #
             # NOTE: this path BYPASSES the _add()-internal _NOISE_KEYWORDS /
             # _SYMBOL_STOPLIST filters.  Those filters exist to drop generic
@@ -398,8 +398,8 @@ class MaterialCache:
         """Strip a trailing ``" (...)"`` qualifier from a canonical name.
 
         Examples (input → output):
-            "Phosphate (Battery Grade)"  → "Phosphate"
-            "Iron Ore (LFP Grade)"       → "Iron Ore"
+            "Phosphate"  → "Phosphate"
+            "Iron Ore"       → "Iron Ore"
             "Silicon (Anode Grade)"      → "Silicon"
             "Lithium"                    → "Lithium"   (unchanged)
             "(Header) name with (suffix)"→ "(Header) name with"  (only trailing)
