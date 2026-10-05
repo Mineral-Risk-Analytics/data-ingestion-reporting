@@ -1061,9 +1061,22 @@ async def ingest_comtrade_job(ctx: inngest.Context) -> dict:
 
 SCHEDULED_FUNCTIONS = [
     ingest_comtrade_job,            # Weekly — Wed 04:00 UTC (2026-07-27: was daily)
-    rescore_hs_nodes_job,           # Level 0 — Mon 01:00 UTC
-    rescore_market_scores_job,      # Level 1 — Mon 02:00 UTC
-    rescore_global_rollups_job,     # Level 2 — Mon 03:00 UTC
+    # PARKED 2026-08-17 (Nicole, scheduled-ingestion enablement pass):
+    # ALL rescore jobs stay unscheduled through the concentration-first
+    # cutover. SCORING_VERSION 5.0 (concentration-only weights) is
+    # committed but the cutover rescore is a MANUAL, diff-reviewed step
+    # (plan §3 B2: frozen 4.4 grid → live 5.0 in one attributable step,
+    # diffed against the 2026-08-10 audit export before publishing).
+    # A scheduled Monday run would execute that cutover unsupervised.
+    # Re-register only AFTER the cutover rescore is published — and then
+    # deliberately, as part of the post-cutover cadence decision
+    # (docs/design/concentration_cadence_versioning.md §2 requires a
+    # diff review on every refresh, so re-enabling these means building
+    # that review step into the job or keeping rescores manual).
+    # Functions remain defined for the manual CLI path.
+    # rescore_hs_nodes_job,         # Level 0 — Mon 01:00 UTC
+    # rescore_market_scores_job,    # Level 1 — Mon 02:00 UTC
+    # rescore_global_rollups_job,   # Level 2 — Mon 03:00 UTC
     # PARKED 2026-07-27 (Nicole): chemistry scores (L3) are unused and
     # off the launch roadmap — the weekly pass wrote rows nothing reads.
     # Function remains for manual CLI / future L3; backfillable from

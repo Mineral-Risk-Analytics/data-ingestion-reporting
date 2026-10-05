@@ -995,6 +995,17 @@ _MAPPINGS: list[tuple[str, str, str, float, str, int, str]] = [
     ("7204", "Chromium",
      "Iron and steel scrap — stainless component recovers chromium",
      0.5, "scrap", 4, "global"),
+    # 2026-08-18 (reset-#2 fix batch, triage finding 2026-08-04): 7204 mapped
+    # ONLY to Chromium, so steel-scrap trade measures (a common GTA
+    # export-restriction family — ferrous scrap is the top recycled input to
+    # steelmaking) never linked to Iron Ore and either missed the admission
+    # gate's material attribution or mono-attributed to Chromium.  Ferrous
+    # scrap IS the steel chain's secondary feedstock; scrap export measures
+    # are iron/steel supply events first, chromium (stainless fraction)
+    # second.  Confidence 0.7 vs Chromium's 0.5 reflects that ordering.
+    ("7204", "Iron Ore",
+     "Ferrous waste and scrap — steel-chain secondary feedstock; scrap trade measures",
+     0.7, "scrap", 4, "global"),
     ("7202", "Manganese",
      "Ferroalloys — ferromanganese (720211/720219), silicomanganese (720230)",
      0.7, "intermediate", 4, "global"),
@@ -1473,6 +1484,17 @@ _HS_KEYWORDS_BY_MAPPING: dict[tuple[str, str], list[str]] = {
         "iron(II) sulfate",
         "copperas",
         "battery-grade iron sulphate",
+    ],
+    # 2026-08-18: companion to the new (7204, Iron Ore) mapping — scrap
+    # vocabulary so the suggestion engine can anchor steel-scrap measures.
+    ("7204", "Iron Ore"): [
+        "steel scrap",
+        "ferrous scrap",
+        "iron scrap",
+        "iron and steel waste",
+        "scrap metal export",
+        "shredded scrap",
+        "HMS",
     ],
     ("284290", "Iron Ore"): [
         "iron phosphate",

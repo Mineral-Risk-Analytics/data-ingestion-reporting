@@ -49,7 +49,10 @@ class Regulation(Base):
     geography: Mapped[Optional[str]] = mapped_column(String(256))  # ISO2 or region
     policy_theme: Mapped[Optional[str]] = mapped_column(String(256))
     status: Mapped[Optional[str]] = mapped_column(String(128))
-    # proposed | enacted | effective | superseded
+    # proposed | enacted | effective | superseded | suspended
+    # (067: only enacted/effective rows contribute standing floor weight;
+    # suspended = regime paused, no standing entry — loader warns if a
+    # suspended row still carries a non-zero floor.)
     publication_date: Mapped[Optional[date]] = mapped_column(Date)
     effective_date: Mapped[Optional[date]] = mapped_column(Date)
     summary: Mapped[Optional[str]] = mapped_column(Text)
@@ -95,6 +98,70 @@ class Regulation(Base):
         JSONB, nullable=True,
         comment="Material canonical name → enforcement weight 0-1; 'DEFAULT' fallback; NULL = 1.0.",
     )
+    # Migration 067 (2026-09-20): pillar reassignment — stock vs flow
+    # (docs/design/regulation_pillar_reassignment.md; evidence pass:
+    # standing_measure_floor_evidence.md). The registry distinguishes
+    # compliance burden from trade-flow interference. ``pillar`` is the
+    # functional classification for display/primary grouping; the two
+    # standing floors are the arithmetic — each feeds exactly ONE pillar's
+    # standing layer, so a regime cannot double-count by construction
+    # (``dual`` rows carry reduced obligation_points AND a floor, each
+    # feeding its own pillar). Floors enter scoring as
+    # max(event_signal, hs_signal, floor) in the geo pillar's sub-inputs
+    # (aggregator term is 067 piece 3 — nothing reads these columns until
+    # it lands). Only enacted/effective rows contribute standing weight;
+    # the workbook loader enforces the vocabulary and ranges (piece 2).
+    pillar: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True,
+        comment=(
+            "regulatory_compliance | geopolitical_trade | dual — the "
+            "regime's functional classification (display/primary). The "
+            "standing floors, not this enum, decide the arithmetic."
+        ),
+    )
+    standing_export_restriction: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "[0,1] persistent floor under the geopolitical pillar's export "
+            "sub-input; 1.0 = total, fully-enforced block of all exports "
+            "of the material from the implementing country. NULL = no floor."
+        ),
+    )
+    standing_tariff_exposure: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True,
+        comment=(
+            "[0,1] persistent floor under the geopolitical pillar's tariff "
+            "sub-input. NULL = no floor."
+        ),
+    )
+    floor_review_date: Mapped[Optional[date]] = mapped_column(
+        Date, nullable=True,
+        comment=(
+            "When this floor is known to change character (suspension "
+            "expiry, phased ban taking effect). Workbook chore, not "
+            "enforced in code."
+        ),
+    )
+
+    @validates("pillar")
+    def _validate_pillar(self, key, value):
+        if value is None:
+            return value
+        valid = {"regulatory_compliance", "geopolitical_trade", "dual"}
+        if value not in valid:
+            raise ValueError(
+                f"pillar must be one of {sorted(valid)} or None, got {value!r}"
+            )
+        return value
+
+    @validates("standing_export_restriction", "standing_tariff_exposure")
+    def _validate_standing_floor(self, key, value):
+        if value is None:
+            return value
+        if not (0.0 <= float(value) <= 1.0):
+            raise ValueError(f"{key} must be in [0, 1] or None, got {value!r}")
+        return value
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

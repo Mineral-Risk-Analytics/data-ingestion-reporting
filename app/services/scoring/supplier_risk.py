@@ -24,7 +24,7 @@ from typing import Optional
 # the pillar.  (3.1 history: Fix A share>0 gating + Fix B hhi×sqrt(share);
 # see docs/design/concentration_share_weighting.md.)  Chemistry rollup
 # keeps its own methodology_version=2.0 tag (unrelated axis).
-SCORING_VERSION = "4.4"  # 4.4 (2026-07-27): operational event component top-3 mean + hardened export-restriction fold (primary/dupe/subtype gates). 4.3: obligation soft-cap. 4.2: geo sub-inputs avg→max. 4.1: governance amplifier
+SCORING_VERSION = "5.0"  # 5.0 (2026-08-16): concentration-first launch — MARKET_PILLAR_WEIGHTS demoted to material=1.0, others 0.0 (shadow-scored); overall == concentration pillar ("Structural Supply Risk"). 4.4 (2026-07-27): operational event component top-3 mean + hardened export-restriction fold (primary/dupe/subtype gates). 4.3: obligation soft-cap. 4.2: geo sub-inputs avg→max. 4.1: governance amplifier
 
 PILLAR_WEIGHTS: dict[str, float] = {
     "material":                  0.25,

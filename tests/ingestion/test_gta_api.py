@@ -423,15 +423,20 @@ class TestParseApiCapturesNewFields:
         # Official + 0 sources + inferred = 0.90 - 0.10 = 0.80
         assert parsed[0]["confidence_override"] == 0.80
 
-    def test_latest_action_used_as_event_date_when_more_recent(self):
+    def test_latest_action_captured_as_metadata_only(self):
+        # 2026-08-18: renamed from *_used_as_event_date_when_more_recent —
+        # the downstream event-date substitution was REMOVED (it re-dated
+        # 6.3% of the corpus to amendment vintage, action-type-blind).
+        # The parse layer still captures the field; it is metadata only.
         row = _make_api_row(
             date_implemented="2025-01-01",
             latest_action_date="2026-03-15",
         )
         parsed = parse_gta_api_response([row])
-        # latest_action captured for downstream substitution
         assert parsed[0]["latest_action_date"] is not None
         assert parsed[0]["latest_action_date"].date() == date(2026, 3, 15)
+        # event_date resolution ignores it entirely.
+        assert parsed[0]["event_date"].date() == date(2025, 1, 1)
 
 
 # ---------------------------------------------------------------------------

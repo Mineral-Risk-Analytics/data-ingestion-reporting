@@ -24,6 +24,17 @@ Sync semantics (decided 2026-07-23, Nicole):
 Validation mirrors seed_facilities_partner.py: a bad row is rejected and
 reported; the rest of the workbook still loads. ``dry_run=True`` builds
 the full diff report and rolls back.
+
+067 (2026-09-22, pillar reassignment — stock vs flow): the Regulations
+sheet gains ``pillar`` (regulatory_compliance | geopolitical_trade | dual),
+``standing_export_restriction`` / ``standing_tariff_exposure`` ([0,1]
+floors under the geo pillar's sub-inputs), and ``floor_review_date``.
+Reject rules make double-counting structurally impossible (a
+geopolitical_trade row carries no obligation points; dual rows must
+explain their split in source_note; a floor requires an ISO2 geography and
+material scope). ``suspended`` joins the status vocabulary; a suspended
+row with a non-zero floor loads with a WARNING (new ``warnings`` list on
+the report).
 """
 
 from __future__ import annotations
@@ -47,7 +58,17 @@ from app.models.supply import Material
 
 log = structlog.get_logger(__name__)
 
-VALID_STATUSES = frozenset({"effective", "enacted", "proposed", "stayed", "archived"})
+VALID_STATUSES = frozenset(
+    {"effective", "enacted", "proposed", "stayed", "archived", "suspended"}
+)
+# 067 (2026-09-22): pillar reassignment — stock vs flow
+# (docs/design/regulation_pillar_reassignment.md §3.2). ``suspended`` joins
+# the status vocabulary (regime paused, e.g. the CN Oct-2025 escalations);
+# a suspended regime keeps its row but should carry no standing floor —
+# the loader WARNS (not rejects) so the row survives while the floor value
+# waits for the review date. Only enacted/effective rows contribute floor
+# weight at scoring time (aggregator-side filter, 067 piece 3).
+VALID_PILLARS = frozenset({"regulatory_compliance", "geopolitical_trade", "dual"})
 VALID_MATERIAL_SCOPE_TYPES = frozenset(
     {"banned", "restricted", "strategic_raw_material", "covered", "disclosure_required"}
 )
@@ -72,11 +93,17 @@ _EDITORIAL_SECTIONS = (
 )
 
 # Regulation columns synced verbatim from the sheet.
+# 067 adds pillar + the two standing floors + floor_review_date — required
+# columns like every other synced field (the workbook gained the headers in
+# the same commit).
 _SYNCED_FIELDS = (
     "title", "issuing_body", "geography", "policy_theme", "status",
     "publication_date", "effective_date", "is_obligation",
     "obligation_points", "verified", "summary", "applies_all_materials",
+    "pillar", "standing_export_restriction", "standing_tariff_exposure",
+    "floor_review_date",
 )
+_FLOOR_FIELDS = ("standing_export_restriction", "standing_tariff_exposure")
 
 
 @dataclass
@@ -86,6 +113,9 @@ class WorkbookReport:
     unchanged: list[str] = field(default_factory=list)
     archived: list[str] = field(default_factory=list)
     rejected: list[dict[str, Any]] = field(default_factory=list)
+    # 067: non-fatal curation flags (e.g. a suspended regime still carrying
+    # a standing floor). The row LOADS; the warning surfaces the chore.
+    warnings: list[dict[str, Any]] = field(default_factory=list)
     dry_run: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -95,6 +125,7 @@ class WorkbookReport:
             "unchanged": self.unchanged,
             "archived": self.archived,
             "rejected": self.rejected,
+            "warnings": self.warnings,
             "dry_run": self.dry_run,
             "counts": {
                 "created": len(self.created),
@@ -102,12 +133,19 @@ class WorkbookReport:
                 "unchanged": len(self.unchanged),
                 "archived": len(self.archived),
                 "rejected": len(self.rejected),
+                "warnings": len(self.warnings),
             },
         }
 
 
 def _reject(report: WorkbookReport, sheet: str, row: int, key: Any, reason: str) -> None:
     report.rejected.append(
+        {"sheet": sheet, "row": row, "regulation_key": key, "reason": reason}
+    )
+
+
+def _warn(report: WorkbookReport, sheet: str, row: int, key: Any, reason: str) -> None:
+    report.warnings.append(
         {"sheet": sheet, "row": row, "regulation_key": key, "reason": reason}
     )
 
@@ -365,7 +403,83 @@ def load_regulation_workbook(
                     "is_obligation=TRUE requires obligation_points >= 1")
             continue
 
+        # ── 067: pillar + standing floors ───────────────────────────────
+        # (docs/design/regulation_pillar_reassignment.md §3.2.) The enum
+        # records the regime's functional character; the floors are the
+        # arithmetic. Reject rules keep the double-count structurally
+        # impossible: a flow row carries no obligation points, a dual row
+        # must explain its split, and a floor with no geography or material
+        # scope would apply nowhere.
+        pillar = _cell_str(vals[cols["pillar"]])
+        if pillar is not None and pillar not in VALID_PILLARS:
+            _reject(report, _REG_SHEET, rn, key, f"invalid pillar '{pillar}'")
+            continue
+
+        floors: dict[str, Optional[float]] = {}
+        floor_bad = False
+        for fname in _FLOOR_FIELDS:
+            raw = vals[cols[fname]]
+            if _cell_str(raw) is None:
+                floors[fname] = None
+                continue
+            try:
+                fv = float(raw)
+            except (TypeError, ValueError):
+                _reject(report, _REG_SHEET, rn, key, f"{fname} is not a number")
+                floor_bad = True
+                break
+            if not 0.0 <= fv <= 1.0:
+                _reject(report, _REG_SHEET, rn, key, f"{fname} {fv} outside [0, 1]")
+                floor_bad = True
+                break
+            floors[fname] = fv
+        if floor_bad:
+            continue
+        has_floor = any(v is not None for v in floors.values())
+
         source_url = _cell_str(vals[cols["source_url"]])
+        source_note = _cell_str(vals[cols["source_note"]])
+        geography = _cell_str(vals[cols["geography"]])
+        all_mats = bool(_cell_bool(vals[cols["applies_all_materials"]]))
+
+        if pillar == "geopolitical_trade" and (pts or 0) > 0:
+            _reject(
+                report, _REG_SHEET, rn, key,
+                "pillar=geopolitical_trade requires obligation_points empty/0 "
+                "(the floor, not the compliance uplift, carries a flow regime)",
+            )
+            continue
+        if pillar == "dual" and not source_note:
+            _reject(
+                report, _REG_SHEET, rn, key,
+                "pillar=dual requires source_note explaining the "
+                "compliance-points/floor split",
+            )
+            continue
+        if has_floor:
+            if not geography or len(geography) != 2 or not geography.isalpha():
+                _reject(
+                    report, _REG_SHEET, rn, key,
+                    "standing floor requires geography = ISO2 of the "
+                    f"implementing state (got '{geography}')",
+                )
+                continue
+            if not all_mats and key not in mat_scopes_by_key:
+                _reject(
+                    report, _REG_SHEET, rn, key,
+                    "standing floor requires at least one MaterialScopes row "
+                    "or applies_all_materials=TRUE (a floor with no scope "
+                    "applies nowhere)",
+                )
+                continue
+            if status == "suspended" and any((v or 0) > 0 for v in floors.values()):
+                _warn(
+                    report, _REG_SHEET, rn, key,
+                    "suspended regime carries a non-zero standing floor — "
+                    "floors only score on enacted/effective rows; zero it or "
+                    "record the snap-back in floor_review_date",
+                )
+
         reg = existing.get(key)
         if reg is None and not source_url:
             _reject(report, _REG_SHEET, rn, key, "new regulation requires source_url")
@@ -383,9 +497,12 @@ def load_regulation_workbook(
             "obligation_points": pts,
             "verified": bool(verified),
             "summary": _cell_str(vals[cols["summary"]]),
-            "applies_all_materials": bool(
-                _cell_bool(vals[cols["applies_all_materials"]])
-            ),
+            "applies_all_materials": all_mats,
+            # 067: functional classification + standing floors.
+            "pillar": pillar,
+            "standing_export_restriction": floors["standing_export_restriction"],
+            "standing_tariff_exposure": floors["standing_tariff_exposure"],
+            "floor_review_date": _cell_date(vals[cols["floor_review_date"]]),
         }
         workbook_keys.add(key)
 

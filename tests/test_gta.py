@@ -208,6 +208,37 @@ class TestResolveCountry:
         assert _resolve_country("   ") is None
 
 
+class TestResolveCountryTwoLetterValidation:
+    """2026-09-24 XJ/JE audit: 2-letter tokens are no longer passed through
+    unvalidated when the DB-derived map is available."""
+
+    # A seeded-DB-shaped map, as _build_country_name_map now builds it:
+    # names + ISO3 keys + ISO2 identity entries.
+    MAP = {
+        "China": "CN", "CHN": "CN", "CN": "CN",
+        "Jersey": "JE", "JEY": "JE", "JE": "JE",
+    }
+
+    def test_subdivision_remaps_to_sovereign(self):
+        assert _resolve_country("XJ", self.MAP) == "CN"
+        assert _resolve_country("xj", self.MAP) == "CN"
+
+    def test_subdivision_remaps_even_without_map(self):
+        assert _resolve_country("XJ") == "CN"
+
+    def test_seeded_iso2_passes(self):
+        assert _resolve_country("CN", self.MAP) == "CN"
+        assert _resolve_country("JE", self.MAP) == "JE"
+
+    def test_unknown_two_letter_code_rejected_with_map(self):
+        # "ZZ" is not a seeded country: no more silent passthrough.
+        assert _resolve_country("ZZ", self.MAP) is None
+
+    def test_unseeded_fallback_keeps_old_behavior(self):
+        # No DB map (countries not seeded): old return-as-is behavior.
+        assert _resolve_country("ZZ") == "ZZ"
+
+
 class TestSeverityFor:
     def test_export_ban_high(self):
         assert _severity_for("Export bans", in_force=True) == 0.9
@@ -828,6 +859,97 @@ class TestApiRawCache:
         assert result["inserted"] == 1
         assert cache.exists()
         assert _json.loads(cache.read_text())[0]["intervention_id"] == 77001
+
+
+# ---------------------------------------------------------------------------
+# Event dates ignore latest_action_date (2026-08-18, reset-#2 fix batch)
+# ---------------------------------------------------------------------------
+
+
+class TestLatestActionDoesNotRedateEvents:
+    """Pin the 2026-08-18 reversal of the latest_action_date override.
+
+    The 2026-06-11 override re-dated events to their latest amendment
+    action; the pre-reset diagnostic measured 94/1,498 corpus rows
+    (6.3%) action-dated, 21 by more than a year, including removals
+    (action-type-blind). event_date must come from the ORIGINAL
+    announcement/implementation; latest_action_date stays metadata-only.
+    """
+
+    def _api_row(self, **overrides):
+        row = {
+            "intervention_id":         77002,
+            "state_act_id":            88002,
+            "state_act_title":         "China: export ban on graphite, later amended",
+            "intervention_description": [{"text": "<p>Amended measure</p>"}],
+            "gta_evaluation":           "Red",
+            "implementing_jurisdictions": [{"id": 156, "name": "China", "iso": "CHN"}],
+            "affected_jurisdictions":   [],
+            "intervention_type":        "Export ban",
+            "mast_chapter":             "P1",
+            "affected_sectors":         [],
+            "affected_products":        [{"product_id": 250410, "name": "Graphite"}],
+            "date_announced":           "2023-06-01",
+            "date_implemented":         "2023-07-01",
+            "latest_action_date":       "2026-03-15",
+            "latest_action_name":       "removal",
+            "is_in_force":              True,
+            "is_official_source":       True,
+        }
+        row.update(overrides)
+        return row
+
+    def _ingest_row(self, session, tmp_path, row):
+        import json as _json
+
+        cache = tmp_path / "gta_raw.json"
+        cache.write_text(_json.dumps([row]))
+        result = ingest_gta(
+            session, since_year=2018, use_api=True, api_raw_cache=str(cache)
+        )
+        assert result["inserted"] == 1
+        return next(
+            e for e in session.scalars(select(RiskEvent))
+            if (e.metadata_json or {}).get("gta_id") == row["intervention_id"]
+        )
+
+    def test_amended_measure_keeps_original_date(
+        self, session, seeded_materials_and_hs, tmp_path
+    ):
+        ev = self._ingest_row(session, tmp_path, self._api_row())
+        # Original implementation date, NOT the 2026 amendment action.
+        assert ev.event_date.date().isoformat() == "2023-07-01"
+        # The action stays visible as metadata for triage.
+        assert (ev.metadata_json or {}).get("latest_action_date", "").startswith("2026-03-15")
+
+    def test_removal_action_does_not_refresh_date(
+        self, session, seeded_materials_and_hs, tmp_path
+    ):
+        # A revoked measure must not decay as the freshest signal in the
+        # pool — the exact worst case of the removed override.
+        ev = self._ingest_row(
+            session, tmp_path,
+            self._api_row(intervention_id=77003,
+                          latest_action_name="removal",
+                          latest_action_date="2026-06-30"),
+        )
+        assert ev.event_date.date().isoformat() == "2023-07-01"
+
+    def test_future_implementation_still_anchors_to_announcement(
+        self, session, seeded_materials_and_hs, tmp_path
+    ):
+        # The 2026-07-30 future-date anchoring is unchanged by the
+        # override removal.
+        ev = self._ingest_row(
+            session, tmp_path,
+            self._api_row(intervention_id=77004,
+                          date_announced="2024-02-01",
+                          date_implemented="2030-01-01",
+                          latest_action_date="2026-01-15"),
+        )
+        assert ev.event_date.date().isoformat() == "2024-02-01"
+        meta = ev.metadata_json or {}
+        assert meta.get("scheduled_implementation_date", "").startswith("2030-01-01")
 
 
 # ---------------------------------------------------------------------------

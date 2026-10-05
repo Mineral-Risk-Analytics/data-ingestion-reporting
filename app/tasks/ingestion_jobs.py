@@ -85,10 +85,22 @@ def _run_ingest_opensanctions() -> dict:
 def _run_ingest_federal_register() -> dict:
     from app.services.ingestion.ingest_federal_register import ingest_federal_register
 
-    # Default since_date is last 90 days — sufficient for weekly runs.
+    # 2026-10-05: explicit 14-day window for the WEEKLY job (was the
+    # function's 90-day default). The 90-day scan re-paid Haiku on every
+    # off-scope candidate in the window each week (off-scope rejections are
+    # not recorded anywhere — only created events short-circuit by content
+    # hash), which pushed the single-invocation run past the hosting
+    # platform's HTTP timeout: Inngest reported "no step output / upstream
+    # error" on the 2026-10-04 run. 14 days keeps a 2x overlap safety
+    # margin over the weekly cadence at ~15% of the candidate volume. The
+    # real economizer — recording off-scope rejections so Haiku is never
+    # re-paid — is queued with the suggestion-engine quality work.
     session = get_session_factory()()
     try:
-        result = ingest_federal_register(session)
+        result = ingest_federal_register(
+            session,
+            since_date=_dt.date.today() - _dt.timedelta(days=14),
+        )
         return {"source": "federal_register", **result}
     finally:
         session.close()
@@ -505,7 +517,13 @@ INGESTION_FUNCTIONS = [
     # defined for manual CLI use.
     # ingest_opensanctions_job,
     ingest_federal_register_job,
-    ingest_worldbank_job,
+    # PARKED 2026-08-17 (Nicole, scheduled-ingestion enablement pass):
+    # WGI held back from the first enabled set — the governance amplifier
+    # reads the loaded vintage (2024, current) and refreshes annually per
+    # docs/design/concentration_cadence_versioning.md §2, so a weekly job
+    # buys nothing until the enablement set is proven. Re-register with
+    # the Q3/Q4 vintage refresh. Function remains for manual CLI use.
+    # ingest_worldbank_job,
     # 2026-07-27: automated GTA via REST API — incremental 30-day window,
     # graceful no-op until GTA_API_KEY is provisioned. Quarterly CSV
     # reminder below stays as the manual fallback.

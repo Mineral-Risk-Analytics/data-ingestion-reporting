@@ -322,5 +322,11 @@ class TestDiagnosticShape:
             geo_trade_events=[], as_of_date=AS_OF, eligible_nodes=None,
         )
         diag = result[5]
-        assert set(diag["export_restriction"].keys()) == {"data_backed", "source"}
-        assert set(diag["tariff"].keys()) == {"data_backed", "source"}
+        # 067: standing_floor joined the shape (names the flooring
+        # regulation_key — see tests/scoring/test_standing_floor.py).
+        assert set(diag["export_restriction"].keys()) == {
+            "data_backed", "source", "standing_floor",
+        }
+        assert set(diag["tariff"].keys()) == {
+            "data_backed", "source", "standing_floor",
+        }

@@ -1446,6 +1446,23 @@ _COUNTRIES: list[dict] = [
         "is_major_producer": False, "is_major_consumer": False,
         "notes": "Iron ore, bauxite (limited operations under sanctions).",
     },
+    {
+        # Added 2026-09-24 (XJ/JE geography-code audit): Jersey is a real
+        # ISO 3166-1 code with its own customs territory that appeared in a
+        # GTA measure but had no reference row, so its geography link
+        # joined to nothing. Also relevant as an incorporation domicile in
+        # the companies data (e.g. Glencore) — see future_features.md §2 on
+        # why incorporation is NOT control.
+        "iso2": "JE", "name": "Jersey", "iso3": "JEY", "region": "Europe",
+        "comtrade_code": 832,
+        "common_names": ["Jersey", "Bailiwick of Jersey"],
+        "detection_patterns": [
+            {"pattern": "jersey", "context": "primary"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Crown dependency; appears as implementing jurisdiction in trade measures and as an incorporation domicile.",
+    },
 ]
 
 

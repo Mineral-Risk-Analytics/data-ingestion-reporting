@@ -233,6 +233,105 @@ class TestHitsAndMisses:
         assert sims == sorted(sims, reverse=True)
 
 
+class TestNullSubtypeWildcardBar:
+    """2026-08-18 recalibration: NULL-subtype pairs with only broad anchors
+    (material/company) need >= 0.50 title similarity; a shared facility
+    keeps the 0.35 bar; matching known families keep 0.15."""
+
+    def test_broad_anchor_moderate_title_is_no_longer_hinted(self, session, world):
+        # tokens A: {vale, nickel, brazil, operations, update}
+        # tokens B: {vale, nickel, brazil, quarterly, results}
+        # Jaccard = 3/7 ≈ 0.43 — cleared the old 0.35 bar (the false-hint
+        # class this fix removes), fails the 0.50 broad-anchor bar.
+        _event(
+            session, "Vale nickel Brazil operations update",
+            company=world["vale"],
+        )
+        cand = _candidate(
+            session, "Vale nickel Brazil quarterly results",
+            company=world["vale"],
+        )
+        result = find_similar_events(session, [cand.id])[cand.id]
+        assert result["checked"] is True
+        assert result["hints"] == []
+
+    def test_same_titles_with_shared_facility_keep_standard_bar(self, session, world):
+        # Identical moderate-overlap pair, but anchored on a facility —
+        # locale-specific structure, so 0.43 >= 0.35 hints as before.
+        curated = _event(
+            session, "Vale nickel Brazil operations update",
+            facility=world["facility"],
+        )
+        cand = _candidate(
+            session, "Vale nickel Brazil quarterly results",
+            facility=world["facility"],
+        )
+        result = find_similar_events(session, [cand.id])[cand.id]
+        ids = [h["event_id"] for h in result["hints"]]
+        assert curated.id in ids
+        hit = next(h for h in result["hints"] if h["event_id"] == curated.id)
+        assert hit["match_reason"] == "similarity"
+        assert hit["bar"] == pytest.approx(0.35)
+
+    def test_matching_known_families_keep_low_bar(self, session, world):
+        # tokens A: {indonesia, nickel, ore, ban, january}
+        # tokens B: {indonesia, nickel, curbs, exporters, jakarta}
+        # Jaccard = 2/8 = 0.25 — below 0.35, but both subtypes map to the
+        # "export" family, so the 0.15 structural-agreement bar applies.
+        curated = _event(
+            session, "Indonesia nickel ore ban January",
+            subtype="national_export_ban", material=world["nickel"],
+        )
+        cand = _candidate(
+            session, "Indonesia nickel curbs exporters Jakarta",
+            subtype="EXPORT_RESTRICTION", material=world["nickel"],
+        )
+        result = find_similar_events(session, [cand.id])[cand.id]
+        ids = [h["event_id"] for h in result["hints"]]
+        assert curated.id in ids
+        hit = next(h for h in result["hints"] if h["event_id"] == curated.id)
+        assert hit["bar"] == pytest.approx(0.15)
+
+
+class TestSameStateActSiblings:
+    """2026-08-18: same-GTA-state-act rows surface as context hints
+    regardless of subtype family — previously hidden exactly when one
+    state act mixed measure types (tariff + export ban)."""
+
+    def test_sibling_with_mismatched_family_surfaces(self, session, world):
+        sibling = _event(
+            session, "Ruritania raises import duties on battery inputs",
+            subtype="TARIFF", material=world["cobalt"],
+            meta={"state_act_id": 555, "gta_id": 9001},
+        )
+        cand = _candidate(
+            session, "Ruritania bans nickel ore shipments abroad",
+            subtype="national_export_ban", material=world["nickel"],
+            meta={"state_act_id": 555, "gta_id": 9002},
+        )
+        result = find_similar_events(session, [cand.id])[cand.id]
+        hit = next(
+            (h for h in result["hints"] if h["event_id"] == sibling.id), None
+        )
+        # Families differ (tariff vs export) and no anchor is shared — the
+        # ONLY route in is the state-act bridge.
+        assert hit is not None
+        assert hit["match_reason"] == "same_state_act"
+        assert hit["shared"] == ["state act 555"]
+
+    def test_no_state_act_no_bridge(self, session, world):
+        _event(
+            session, "Ruritania raises import duties on battery inputs",
+            subtype="TARIFF", material=world["cobalt"],
+        )
+        cand = _candidate(
+            session, "Ruritania bans nickel ore shipments abroad",
+            subtype="national_export_ban", material=world["nickel"],
+        )
+        result = find_similar_events(session, [cand.id])[cand.id]
+        assert result["hints"] == []
+
+
 class TestHonestNegatives:
     def test_candidate_with_no_links_reports_unchecked(self, session, world):
         _event(

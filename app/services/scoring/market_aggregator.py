@@ -46,6 +46,8 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
+from sqlalchemy import or_
+
 from app.constants import EXPORT_RESTRICTION_SUBTYPES, RiskCategory
 from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.scoring import HsCodeGeographyRiskScore, MaterialGeographyRiskScore
@@ -85,18 +87,28 @@ log = structlog.get_logger(__name__)
 #   financial 0.10  →  sum = 0.85  →  renormalise each by /0.85
 # ---------------------------------------------------------------------------
 MARKET_PILLAR_WEIGHTS: dict[str, float] = {
+    # 5.0 (2026-08-16, Nicole — concentration-first launch, B1 of
+    # docs/design/concentration_first_scoring_plan.md §3): the published
+    # score is the material-concentration pillar ALONE ("Structural
+    # Supply Risk", Q4 decision 2026-08-16).  Geopolitical, regulatory,
+    # and operational are demoted to weight 0.0 via the same pattern
+    # financial has used since 4.0: still computed, persisted, and
+    # displayed as "signals — in validation" context, so the shadow
+    # record accumulates for the re-promotion gates (plan §5, D0-D4).
+    # Every weight consumer (L1 _aggregate_market_score, L2
+    # compute_overall_from_pillars, completeness, chemistry composite)
+    # degrades cleanly — L2 returns None when concentration is unscored
+    # (insufficient-data gate) instead of falling back to event pillars.
+    # Re-promotion is a deliberate versioned change, not a weight tweak.
+    #
     # V1 (4.0, 2026-07-17): financial removed from the geography-level
     # aggregate — its per-geo value carried no geographic information
-    # (flat 56.2 across every cobalt geography).  Weight redistributed
-    # pro-rata across the four remaining pillars (spec §7).  The key
-    # stays at 0.0 so every MARKET_PILLAR_WEIGHTS["financial"] consumer
-    # (completeness, L2 rescale, chemistry composite) degrades cleanly:
-    # financial_pressure_score is still computed, persisted, and shown
-    # as material-level context — it just doesn't move overall scores.
-    "material":      0.25 / 0.75,   # ≈ 0.333
-    "geopolitical":  0.20 / 0.75,   # ≈ 0.267
-    "regulatory":    0.20 / 0.75,   # ≈ 0.267
-    "operational":   0.10 / 0.75,   # ≈ 0.133
+    # (flat 56.2 across every cobalt geography); the 0.0-weight
+    # shadow-scoring pattern established there is what 5.0 generalises.
+    "material":      1.0,
+    "geopolitical":  0.0,
+    "regulatory":    0.0,
+    "operational":   0.0,
     "financial":     0.0,
 }
 
@@ -854,6 +866,15 @@ def _derive_market_geopolitical_inputs(
         precise where it has signal, but events tagged only to the
         geography (no HS code attribution) appear in path 1 and not 2.
         Taking max() ensures neither contribution is silently dropped.
+
+        3. Standing regulation floors (067, 2026-09-22): workbook-curated
+           regimes in force (status enacted/effective, geography == this
+           geography, material in scope) put a persistent floor under each
+           sub-input via a third max() term, scaled by the regulation's
+           per-material enforcement weight. Carries standing bans/quotas
+           whose announcement events have aged past the evidence window;
+           ``sub_input_diagnostic[...]["standing_floor"]`` names the
+           flooring regulation_key. See _derive_standing_floors.
     """
     # Primary: production share from MaterialProductionShare (USGS MCS).
     share_row = db.scalar(
@@ -971,6 +992,31 @@ def _derive_market_geopolitical_inputs(
         export_exposure = event_export
         tariff_exposure = event_tariff
 
+    # ── Path 3: standing regulation floors (067, 2026-09-22) ───────────────
+    # Stock vs flow: a regime in force (workbook floor) guarantees a minimum
+    # exposure that survives the evidence window. max(), not sum — fresh
+    # events win when they exceed the floor; the floor carries the regime
+    # when its announcement events have decayed out. See
+    # _derive_standing_floors and regulation_pillar_reassignment.md §3.3.
+    (
+        floor_export, floor_export_key, floor_tariff, floor_tariff_key,
+    ) = _derive_standing_floors(db, material_id, geography_code)
+    pre_floor_export, pre_floor_tariff = export_exposure, tariff_exposure
+    export_exposure = max(export_exposure, floor_export)
+    tariff_exposure = max(tariff_exposure, floor_tariff)
+    if floor_export_key or floor_tariff_key:
+        log.debug(
+            "market_aggregator.geo.standing_floor",
+            material_id=material_id,
+            geography_code=geography_code,
+            floor_export=floor_export,
+            floor_export_key=floor_export_key,
+            floor_tariff=floor_tariff,
+            floor_tariff_key=floor_tariff_key,
+            export_floor_applied=floor_export > pre_floor_export,
+            tariff_floor_applied=floor_tariff > pre_floor_tariff,
+        )
+
     # ── 4.1 (2026-07-20) — WGI overlay REMOVED from this pillar ────────────
     # Through 4.0, a JRC-aligned WGI governance overlay discounted
     # country_concentration here (well-governed suppliers cut up to ~half;
@@ -1006,21 +1052,42 @@ def _derive_market_geopolitical_inputs(
             "wgi_overlay": wgi_overlay_diag,
         },
         "export_restriction": {
-            # data_backed = True iff EITHER path produced a non-zero signal.
-            # Zero from both paths after the max() means we genuinely have
-            # no data, not a default-induced zero.
-            "data_backed": (event_export > 0.0) or (hs_export > 0.0),
+            # data_backed = True iff ANY path produced a non-zero signal.
+            # Zero from all paths after the max() means we genuinely have
+            # no data, not a default-induced zero. A standing floor (067)
+            # is curated data — a regime in force — so it counts.
+            "data_backed": (
+                (event_export > 0.0) or (hs_export > 0.0)
+                or (floor_export > 0.0)
+            ),
             "source": _classify_path_source(
                 event_value=event_export, hs_value=hs_export,
                 hs_path_fired=hs_path_fired,
             ),
+            # 067: which standing regime floors this sub-input, so the UI
+            # can say "floored by ID_NICKEL_ORE_BAN" instead of showing an
+            # unexplained number. applied = the floor beat both signal
+            # paths and set the final value.
+            "standing_floor": {
+                "regulation_key": floor_export_key,
+                "value": floor_export,
+                "applied": floor_export > pre_floor_export,
+            },
         },
         "tariff": {
-            "data_backed": (event_tariff > 0.0) or (hs_tariff > 0.0),
+            "data_backed": (
+                (event_tariff > 0.0) or (hs_tariff > 0.0)
+                or (floor_tariff > 0.0)
+            ),
             "source": _classify_path_source(
                 event_value=event_tariff, hs_value=hs_tariff,
                 hs_path_fired=hs_path_fired,
             ),
+            "standing_floor": {
+                "regulation_key": floor_tariff_key,
+                "value": floor_tariff,
+                "applied": floor_tariff > pre_floor_tariff,
+            },
         },
         "subsidy": {
             # The 3-comp / 4-comp scoring asymmetry is the flag here.
@@ -1120,6 +1187,93 @@ def _resolve_enforcement_weight(
     if material_name in enforcement_weights:
         return float(enforcement_weights[material_name])
     return float(enforcement_weights.get("DEFAULT", 1.0))
+
+
+# 067 piece 3 (2026-09-22): statuses whose standing floors score. A
+# suspended or proposed regime keeps its workbook row (and its floor value,
+# waiting for the review date) but contributes nothing here.
+_FLOOR_ELIGIBLE_STATUSES = ("enacted", "effective")
+
+
+def _derive_standing_floors(
+    db: Session,
+    material_id: int,
+    geography_code: str,
+) -> tuple[float, Optional[str], float, Optional[str]]:
+    """Standing regulation floors under the geo pillar's sub-inputs (067).
+
+    Pillar reassignment, stock vs flow
+    (docs/design/regulation_pillar_reassignment.md §3.3): a regime
+    currently in force — the Indonesia ore ban, the DRC cobalt quota —
+    guarantees a minimum export/tariff exposure for its (material ×
+    implementing geography) pairs that must NOT vanish when the regime's
+    announcement events age past the evidence window. The floor is that
+    guarantee. It enters the sub-inputs as ``max(event, hs, floor)`` at
+    the call site — fresh events win when they exceed it (a new
+    escalation), and nothing sums, so one regime never double-counts.
+
+    Eligibility: status enacted/effective; ``geography`` equal to the
+    scored geography (ISO2 of the implementing state — loader-enforced);
+    material in scope via RegulationMaterialScope or
+    ``applies_all_materials``. Each floor is scaled by the regulation's
+    per-material enforcement weight (065 — an all-goods control that
+    enforces unevenly stays uneven), then the MAX across matching
+    regulations wins per floor type.
+
+    Returns (floor_export, floor_export_key, floor_tariff,
+    floor_tariff_key) — the winning regulation_key per floor so the
+    diagnostic can say "floored by ID_NICKEL_ORE_BAN" (same transparency
+    contract as 11.4-Geo).
+    """
+    from app.models.regulatory import Regulation, RegulationMaterialScope
+
+    mat_name = db.scalar(
+        select(Material.canonical_name).where(Material.id == material_id)
+    )
+
+    cols = (
+        Regulation.regulation_key,
+        Regulation.standing_export_restriction,
+        Regulation.standing_tariff_exposure,
+        Regulation.material_enforcement_weights,
+    )
+    common = (
+        Regulation.status.in_(_FLOOR_ELIGIBLE_STATUSES),
+        Regulation.geography == geography_code,
+        or_(
+            Regulation.standing_export_restriction.isnot(None),
+            Regulation.standing_tariff_exposure.isnot(None),
+        ),
+    )
+    scoped_stmt = (
+        select(*cols)
+        .join(
+            RegulationMaterialScope,
+            RegulationMaterialScope.regulation_id == Regulation.id,
+        )
+        .where(RegulationMaterialScope.material_id == material_id, *common)
+    )
+    all_goods_stmt = select(*cols).where(
+        Regulation.applies_all_materials.is_(True), *common
+    )
+
+    floor_export, floor_export_key = 0.0, None
+    floor_tariff, floor_tariff_key = 0.0, None
+    seen: set[str] = set()
+    for key, exp, tar, enf_weights in (
+        *db.execute(scoped_stmt).all(),
+        *db.execute(all_goods_stmt).all(),
+    ):
+        if key in seen:  # scoped AND all-goods — count once
+            continue
+        seen.add(key)
+        enf = _resolve_enforcement_weight(enf_weights, mat_name)
+        if exp is not None and float(exp) * enf > floor_export:
+            floor_export, floor_export_key = float(exp) * enf, key
+        if tar is not None and float(tar) * enf > floor_tariff:
+            floor_tariff, floor_tariff_key = float(tar) * enf, key
+
+    return floor_export, floor_export_key, floor_tariff, floor_tariff_key
 
 
 def _derive_market_regulatory_inputs(

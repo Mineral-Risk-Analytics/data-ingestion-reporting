@@ -76,6 +76,16 @@ _STOPWORDS = frozenset(
 
 _MIN_SIMILARITY = 0.35
 
+# 2026-08-18 (reset-#2 fix batch, "NULL-subtype wildcard false hints"):
+# a NULL subtype matches ANY family, so with only a broad anchor
+# (material or company — Vale touches many stories) the family gate
+# contributes nothing and moderate title overlap produced unrelated
+# hints.  NULL-involved pairs that share no FACILITY anchor must clear a
+# higher title bar.  A shared facility is a locale-specific structural
+# agreement in its own right, so those pairs keep the standard bar —
+# which also preserves the canonical Onça-Puma true-positive (0.45).
+_NULL_SUBTYPE_BROAD_ANCHOR_BAR = 0.50
+
 
 def _title_tokens(title: str) -> set[str]:
     words = re.findall(r"[a-z0-9]+", (title or "").lower())
@@ -304,6 +314,9 @@ class _Anchored:
     status: str
     anchors: set[tuple[str, int]] = field(default_factory=set)
     tokens: set[str] = field(default_factory=set)
+    # GTA parent state act (metadata_json["state_act_id"]) — used to surface
+    # same-act siblings as hints regardless of family (2026-08-18).
+    state_act_id: int | None = None
 
 
 def _event_status(primary_category, event_type, meta) -> str:
@@ -359,6 +372,13 @@ def _load_anchored_events(
         .outerjoin(Source, Source.id == SourceDocument.source_id)
         .where(RiskEvent.duplicate_of_id.is_(None))
     ).all()
+    def _state_act(meta) -> int | None:
+        raw = (meta or {}).get("state_act_id")
+        try:
+            return int(raw) if raw else None
+        except (TypeError, ValueError):
+            return None
+
     events = {
         r.id: _Anchored(
             id=r.id, title=r.title, date=r.event_date, subtype=r.event_subtype,
@@ -366,6 +386,7 @@ def _load_anchored_events(
             source=r.source_name or "(uncredited)",
             status=_event_status(r.primary_category, r.event_type, r.metadata_json),
             tokens=_title_tokens(r.title),
+            state_act_id=_state_act(r.metadata_json),
         )
         for r in rows
     }
@@ -425,6 +446,22 @@ def find_similar_events(
     pair unrelated materials.  An empty ``hints`` list under
     ``checked=True`` is a real negative; the two are NOT interchangeable
     and the CLI renders them differently.
+
+    2026-08-18 quality recalibration (reset-#2 fix batch), two changes:
+
+    * **NULL-subtype wildcard bar.** A NULL subtype matches any family, so
+      pairs where either side lacks a subtype AND the only shared anchors
+      are broad (material/company) must clear
+      ``_NULL_SUBTYPE_BROAD_ANCHOR_BAR`` instead of the standard bar.  A
+      shared FACILITY anchor keeps the standard bar (locale-specific
+      structure).  Hints carry ``match_reason="similarity"`` and the
+      ``bar`` they cleared.
+    * **Same-state-act siblings.** Interventions under one GTA state act
+      (``metadata_json["state_act_id"]``) are appended as hints with
+      ``match_reason="same_state_act"`` regardless of family, dates or
+      similarity — they are separate events by design, surfaced as
+      context, and were previously hidden exactly when the act mixed
+      measure types.
     """
     if not event_ids:
         return {}
@@ -432,9 +469,12 @@ def find_similar_events(
     events, names = _load_anchored_events(db)
 
     by_anchor: dict[tuple[str, int], list[int]] = {}
+    by_state_act: dict[int, list[int]] = {}
     for e in events.values():
         for a in e.anchors:
             by_anchor.setdefault(a, []).append(e.id)
+        if e.state_act_id is not None:
+            by_state_act.setdefault(e.state_act_id, []).append(e.id)
 
     out: dict[int, dict] = {}
     for ev_id in event_ids:
@@ -465,18 +505,28 @@ def find_similar_events(
                 if not _dates_compatible(target.date, other.date):
                     continue
                 sim = _pair_similarity(target, other)
-                # Both families known implies they MATCH (mismatches were
-                # skipped above), so this is the same tiered bar the xlsx
-                # report uses: family + shared anchor + date window is
-                # already strong structural agreement, and the title bar
-                # drops to 0.15 so an editorial headline can pair with a
-                # bureaucratic ingester title.
-                bar = 0.15 if (fa is not None and fb is not None) else min_similarity
+                shared_anchor_keys = target.anchors & other.anchors
+                # Tiered bar (2026-08-18 recalibration for the NULL-subtype
+                # wildcard defect):
+                #   both families known → they MATCH (mismatches skipped
+                #     above): structural agreement is strong, bar 0.15 so an
+                #     editorial headline can pair with an ingester title;
+                #   NULL-involved + shared FACILITY → locale-specific
+                #     agreement, standard bar;
+                #   NULL-involved + broad anchors only (material/company) →
+                #     the family gate contributed nothing, titles must carry
+                #     the match: _NULL_SUBTYPE_BROAD_ANCHOR_BAR.
+                if fa is not None and fb is not None:
+                    bar = 0.15
+                elif any(kind == "facility" for kind, _ in shared_anchor_keys):
+                    bar = min_similarity
+                else:
+                    bar = max(min_similarity, _NULL_SUBTYPE_BROAD_ANCHOR_BAR)
                 if sim < bar:
                     continue
                 shared = sorted(
                     names.get(a, f"{a[0]}:{a[1]}")
-                    for a in target.anchors & other.anchors
+                    for a in shared_anchor_keys
                 )
                 scored.append((sim, {
                     "event_id": other.id,
@@ -489,12 +539,49 @@ def find_similar_events(
                     "scores_already": other.primary_category is not None,
                     "similarity": sim,
                     "shared": shared,
+                    "match_reason": "similarity",
+                    "bar": bar,
                 }))
         scored.sort(key=lambda t: (-t[0], t[1]["event_id"]))
+        hints = [h for _, h in scored[:limit]]
+
+        # 2026-08-18 ("same-state-act siblings excluded by family gate"):
+        # interventions under one GTA state act are separate events BY
+        # DESIGN, but they are the rows a reviewer most needs to see next
+        # to a candidate — and the family gate hid exactly those when the
+        # act mixes measure types (a tariff + an export ban).  Surface them
+        # unconditionally with their own match_reason; they are context,
+        # not duplicate suggestions, and skip every similarity gate.
+        if target.state_act_id is not None:
+            hinted_ids = {h["event_id"] for h in hints}
+            siblings = sorted(
+                by_state_act.get(target.state_act_id, ()),
+            )
+            sibling_hints = []
+            for sid in siblings:
+                if sid == ev_id or sid in hinted_ids:
+                    continue
+                sib = events[sid]
+                sibling_hints.append({
+                    "event_id": sib.id,
+                    "title": sib.title,
+                    "source": sib.source,
+                    "date": sib.date.date().isoformat() if sib.date else None,
+                    "subtype": sib.subtype,
+                    "primary_category": sib.primary_category,
+                    "status": sib.status,
+                    "scores_already": sib.primary_category is not None,
+                    "similarity": _pair_similarity(target, sib),
+                    "shared": [f"state act {target.state_act_id}"],
+                    "match_reason": "same_state_act",
+                    "bar": None,
+                })
+            hints.extend(sibling_hints[:limit])
+
         out[ev_id] = {
             "checked": True,
             "reason": None,
-            "hints": [h for _, h in scored[:limit]],
+            "hints": hints,
         }
     return out
 

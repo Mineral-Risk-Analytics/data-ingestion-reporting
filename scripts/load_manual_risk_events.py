@@ -133,6 +133,12 @@ CANONICAL_EVENT_TYPES = {
     "LITIGATION",
     "SETTLEMENT",
     "OPERATIONAL_DISRUPTION",
+    # 2026-08-17 (Nicole): supply capacity start / restart / expansion /
+    # closure-reversal events (GCMO/MCS report extractions). Pair with a
+    # POSITIVE_* subtype when supportive — the SUBTYPE (not the type) is
+    # what the triage promotion gate keys on to block positives from
+    # scoring (constants.POSITIVE_EVENT_SUBTYPES, 2026-07-28 rule).
+    "CAPACITY_CHANGE",
 }
 
 CANONICAL_RISK_CATEGORIES = {

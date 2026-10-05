@@ -1469,11 +1469,30 @@ def _matches_prefix(hs_code: str, prefixes: list[str]) -> bool:
     return any(hs_code.startswith(p) for p in prefixes)
 
 
+# Subdivision → country remap (2026-09-24, XJ/JE geography-code audit).
+# Source data occasionally carries sub-national region codes where an ISO2
+# country is expected; unvalidated, they wrote geography links that join to
+# nothing (a Xinjiang-anchored measure contributed ZERO geographic signal).
+# Remap to the sovereign — consistent with the evidence layer, which already
+# reads UFLPA/Xinjiang scope as CN. The region nuance stays in the event's
+# own title/summary text. Extend as new codes surface (the corpus audit
+# 2026-09-24 found exactly one: XJ).
+_SUBDIVISION_TO_COUNTRY: dict[str, str] = {
+    "XJ": "CN",  # Xinjiang Uyghur Autonomous Region
+}
+
+
 def _resolve_country(raw: str, country_name_map: Optional[dict[str, str]] = None) -> Optional[str]:
     """Map a GTA implementing-jurisdiction cell to ISO2, or ``None``.
 
     Resolution order:
-      1. Already a 2-letter alpha string → return as-is (upper-cased).
+      1. A 2-letter alpha string is treated as ISO2 — but no longer
+         unconditionally (2026-09-24): known subdivision codes remap to
+         their sovereign (``_SUBDIVISION_TO_COUNTRY``), and when the
+         DB-derived map is available the code must be a seeded country
+         (identity entries added by ``_build_country_name_map``) or it
+         falls through to name resolution / ``None`` with a warning.
+         Without a seeded map the old return-as-is behavior is kept.
       2. Lookup in ``country_name_map`` (built from ``countries.common_names``
          at ingest time via ``_build_country_name_map``).
       3. Fallback to the hardcoded ``GTA_COUNTRY_MAP`` (covers cases where the
@@ -1487,9 +1506,28 @@ def _resolve_country(raw: str, country_name_map: Optional[dict[str, str]] = None
     raw = raw.strip()
     if not raw:
         return None
-    # 1. Already ISO2.
+    # 1. 2-letter token: subdivision remap, then validated ISO2.
     if len(raw) == 2 and raw.isalpha():
-        return raw.upper()
+        code = raw.upper()
+        remapped = _SUBDIVISION_TO_COUNTRY.get(code)
+        if remapped:
+            log.info(
+                "gta.resolve_country.subdivision_remapped",
+                code=code,
+                country=remapped,
+            )
+            return remapped
+        if not country_name_map:
+            return code  # unseeded fallback: old behavior
+        if country_name_map.get(code):
+            return code
+        log.warning(
+            "gta.resolve_country.unknown_two_letter_code",
+            code=code,
+            hint="not a seeded country; add to seed_countries or _SUBDIVISION_TO_COUNTRY",
+        )
+        # fall through — a 2-letter token won't match names, so this
+        # resolves None unless GTA_COUNTRY_MAP knows it.
     # 2. DB-derived name map.
     if country_name_map:
         iso2 = country_name_map.get(raw)
@@ -1540,6 +1578,12 @@ def _build_country_name_map(session: Session) -> dict[str, str]:
     for row in rows:
         # Always map the canonical name itself.
         name_map[row.name] = row.iso2
+        # ISO2 identity entry (2026-09-24, XJ/JE audit): lets
+        # _resolve_country validate a bare 2-letter token against the
+        # seeded countries in O(1) instead of passing any 2-letter string
+        # through unvalidated. 2-letter upper keys cannot collide with
+        # country-name or ISO3 keys.
+        name_map[row.iso2.strip().upper()] = row.iso2
         # ISO3 → ISO2 (2026-07-13): the GTA API supplies ISO3 in every
         # jurisdiction record; 3-letter upper keys cannot collide with
         # country-name keys.  129/130 rows carry iso3 (EU is NULL — it
@@ -2592,16 +2636,26 @@ def ingest_gta(
         confidence_override = intervention.get("confidence_override")
         latest_action_date = intervention.get("latest_action_date")
         scheduled_implementation = intervention.get("scheduled_implementation_date")
-        # If the API recorded a more-recent action date, prefer it for
-        # recency-decay purposes — captures status changes (revocation,
-        # scope expansion) that occurred after the original implementation.
-        #
-        # 2026-07-30: bounded above by "now".  latest_action_date can itself be
-        # forward-dated, and pushing event_date into the future re-introduces
-        # exactly the defect _resolve_event_date exists to prevent.
-        if latest_action_date and isinstance(event_date, datetime):
-            if event_date < latest_action_date <= datetime.now(timezone.utc):
-                event_date = latest_action_date
+        # 2026-08-18 (Nicole, reset-#2 fix batch): the 2026-06-11
+        # latest_action_date OVERRIDE of event_date is REMOVED.  The
+        # pre-reset diagnostic (scripts/diagnose_gta_revision_dates.py)
+        # measured its effect on the live corpus: 94 of 1,498 GTA events
+        # (6.3%) were dated to their latest amendment action instead of
+        # the measure itself — 21 of them by more than a year (e.g. an
+        # annually-renewed duty permanently dated to its latest renewal,
+        # so it can never age out of a trailing evidence window).  The
+        # override was also action-type-blind: latest_action_name was
+        # never consulted, so a REMOVAL refreshed the date too — a revoked
+        # measure decaying as the freshest signal in the pool.  Standing
+        # "this measure is still alive" semantics belong to the regulation
+        # registry / standing floors (stock), not to event dates (flow);
+        # material amendments arrive as separate GTA interventions and are
+        # kept as separate events by triage design.  ``event_date`` is
+        # therefore whatever ``_resolve_event_date`` yields from the
+        # ORIGINAL announcement/implementation; ``latest_action_date`` and
+        # ``latest_action_name`` remain in metadata_json for triage
+        # display.  Stored rows keep their action-dated values until
+        # reset #2 re-ingests them (no-backfill rule).
 
         # GTA's parent "state act" id, when the row carries one.  Used only as
         # a permalink fallback for rows with no intervention id.
