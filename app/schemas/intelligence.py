@@ -261,3 +261,47 @@ class RiskSummary(BaseModel):
 
     as_of_date: Optional[date] = None
     materials: list[MaterialRiskBar]
+
+
+# ---------------------------------------------------------------------------
+# Public event feed — C3 "live signals" (concentration plan workstream C)
+# ---------------------------------------------------------------------------
+
+
+class PublicEventGeo(BaseModel):
+    """Primary-context geography on a feed item (code for linking, name
+    for display)."""
+
+    code: str
+    name: Optional[str] = None
+
+
+class PublicEventItem(BaseModel):
+    """One triaged event on the public feed (C3, 2026-10-24).
+
+    Scope rules (deliberate, per the C1 bridge language):
+
+      * Only ``scoring`` / ``display_only`` events appear — pending and
+        rejected are structurally excluded, as are duplicates.
+      * ``verified`` = human-confirmed for scoring (triage_status
+        ``scoring``); False = curated context (display_only — machine-
+        routed supportive/procedural measures or human display decisions).
+      * NO numeric severity: the public scope is bands + dates (A6);
+        severity calibration is an internal signal.
+      * ``materials`` lists DIRECT links only (migration 056 rule:
+        material-scoped public surfaces show is_direct rows), so an
+        omnibus tariff list doesn't sprawl 20 material chips wide.
+    """
+
+    id: int
+    title: str
+    summary: Optional[str] = None
+    event_date: Optional[date] = None
+    event_type: Optional[str] = None
+    event_subtype: Optional[str] = None
+    direction: Optional[str] = None
+    verified: bool
+    source_name: Optional[str] = None
+    source_url: Optional[str] = None
+    materials: list[str]
+    geographies: list[PublicEventGeo]

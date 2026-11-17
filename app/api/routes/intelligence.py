@@ -42,19 +42,28 @@ from app.api.deps import get_current_user, get_db, require_admin
 from app.core.config import get_settings
 from app.models.intelligence import InsightPost
 from app.services.content.docx_convert import convert_docx_stream
-from app.api.routes.intelligence_entities import _band_out
+from app.api.routes.intelligence_entities import _band_out, _material_slug
 from app.models.scoring import MaterialGlobalRiskScore
 from app.models.supply import Material
 from app.schemas.common import PaginatedResponse
 from app.models.company import Company
 from app.models.country import Country
-from app.models.regulatory import Regulation
+from app.models.regulatory import (
+    Regulation,
+    RiskEvent,
+    RiskEventGeography,
+    RiskEventMaterial,
+)
+from app.models.documents import SourceDocument
+from app.models.source import Source
 from app.schemas.intelligence import (
     InsightPostCreate,
     InsightPostDetail,
     InsightPostListItem,
     InsightPostUpdate,
     MaterialRiskBar,
+    PublicEventGeo,
+    PublicEventItem,
     EntityLinkOut,
     PdfUploadUrlIn,
     PdfUploadUrlOut,
@@ -258,6 +267,161 @@ def get_risk_summary(db: Session = Depends(get_db)) -> RiskSummary:
 
     bars.sort(key=lambda b: (-(b.band.score or 0.0), b.material_name))
     return RiskSummary(as_of_date=as_of, materials=bars)
+
+
+# ---------------------------------------------------------------------------
+# GET /intelligence/events — public "live signals" feed (C3, 2026-10-24)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/events", response_model=PaginatedResponse[PublicEventItem])
+def list_public_events(
+    material: Optional[str] = Query(
+        None,
+        description=(
+            "Material canonical name — matches DIRECT material links only "
+            "(the 056 rule for material-scoped public surfaces), so broad "
+            "omnibus measures don't flood every material page."
+        ),
+    ),
+    material_slug: Optional[str] = Query(
+        None,
+        description=(
+            "Material profile slug (e.g. rare-earth-elements) — same "
+            "DIRECT-links-only filter as `material`, resolvable without "
+            "first fetching the profile so the material page can load its "
+            "signals in parallel (2026-11-12). Ignored when `material` is "
+            "also given; an unknown slug returns an empty page."
+        ),
+    ),
+    verified_only: bool = Query(
+        False, description="Only human-confirmed (scoring) events."
+    ),
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> PaginatedResponse[PublicEventItem]:
+    """Public feed of triaged risk events, newest first (C3).
+
+    The live half of the product while the published score is structural:
+    scoring + display_only events with summaries and source permalinks.
+    Pending and rejected rows are structurally excluded, duplicates never
+    appear, and numeric severity is deliberately absent from the payload
+    (public scope = bands + dates, per the A6 methodology copy). C4 is
+    this endpoint filtered by material.
+    """
+    q = (
+        select(RiskEvent)
+        .where(
+            RiskEvent.triage_status.in_(("scoring", "display_only")),
+            RiskEvent.duplicate_of_id.is_(None),
+        )
+    )
+    if verified_only:
+        q = q.where(RiskEvent.triage_status == "scoring")
+    if material is not None:
+        q = (
+            q.join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
+            .join(Material, Material.id == RiskEventMaterial.material_id)
+            .where(
+                Material.canonical_name == material,
+                RiskEventMaterial.is_direct.is_(True),
+            )
+        )
+    elif material_slug is not None:
+        target = next(
+            (
+                m
+                for m in db.scalars(select(Material)).all()
+                if _material_slug(m.canonical_name) == material_slug
+            ),
+            None,
+        )
+        if target is None:
+            # The feed is a filter surface, not a lookup: an unknown slug
+            # is an empty page, not a 404.
+            return PaginatedResponse(data=[], total=0, page=page, limit=limit)
+        q = (
+            q.join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
+            .where(
+                RiskEventMaterial.material_id == target.id,
+                RiskEventMaterial.is_direct.is_(True),
+            )
+        )
+
+    total = db.scalar(select(func.count()).select_from(q.subquery()))
+    events = db.scalars(
+        q.order_by(RiskEvent.event_date.desc().nullslast(), RiskEvent.id.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+    ).all()
+    ids = [e.id for e in events]
+
+    # Batch the per-item context in three small queries instead of N+1.
+    mats: dict[int, list[str]] = {}
+    geos: dict[int, list[PublicEventGeo]] = {}
+    src: dict[int, tuple[Optional[str], Optional[str]]] = {}
+    if ids:
+        for eid, name in db.execute(
+            select(RiskEventMaterial.risk_event_id, Material.canonical_name)
+            .join(Material, Material.id == RiskEventMaterial.material_id)
+            .where(
+                RiskEventMaterial.risk_event_id.in_(ids),
+                RiskEventMaterial.is_direct.is_(True),
+            )
+            .order_by(Material.canonical_name)
+        ).all():
+            mats.setdefault(eid, []).append(name)
+        for eid, code, cname in db.execute(
+            select(
+                RiskEventGeography.risk_event_id,
+                RiskEventGeography.country_code,
+                Country.name,
+            )
+            .outerjoin(Country, Country.iso2 == RiskEventGeography.country_code)
+            .where(
+                RiskEventGeography.risk_event_id.in_(ids),
+                RiskEventGeography.geography_context == "primary",
+            )
+            .order_by(RiskEventGeography.country_code)
+        ).all():
+            geos.setdefault(eid, []).append(PublicEventGeo(code=code, name=cname))
+        doc_ids = {e.source_document_id for e in events if e.source_document_id}
+        if doc_ids:
+            doc_map = {
+                d_id: (s_name, d_url)
+                for d_id, d_url, s_name in db.execute(
+                    select(SourceDocument.id, SourceDocument.url, Source.name)
+                    .outerjoin(Source, Source.id == SourceDocument.source_id)
+                    .where(SourceDocument.id.in_(doc_ids))
+                ).all()
+            }
+            for e in events:
+                if e.source_document_id in doc_map:
+                    src[e.id] = doc_map[e.source_document_id]
+
+    return PaginatedResponse(
+        data=[
+            PublicEventItem(
+                id=e.id,
+                title=e.title,
+                summary=e.summary,
+                event_date=e.event_date.date() if e.event_date else None,
+                event_type=e.event_type,
+                event_subtype=e.event_subtype,
+                direction=e.direction,
+                verified=e.triage_status == "scoring",
+                source_name=src.get(e.id, (None, None))[0],
+                source_url=src.get(e.id, (None, None))[1],
+                materials=mats.get(e.id, []),
+                geographies=geos.get(e.id, []),
+            )
+            for e in events
+        ],
+        total=total or 0,
+        page=page,
+        limit=limit,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -608,6 +608,196 @@ def material_coverage(
     )
 
 
+# ---------------------------------------------------------------------------
+# Suggestion-engine quality statistics (triage plan §7; D0 gate 3)
+# ---------------------------------------------------------------------------
+
+class TriageSourceStats(BaseModel):
+    """Human-decision outcomes for one source.
+
+    ``machine_display_only`` (ingest-time routing, no ``triaged_at`` stamp)
+    and ``pending`` are context, never judgment — the /summary docstring's
+    backlog-vs-decision distinction, applied here per source.
+    """
+
+    source: str
+    pending: int
+    machine_display_only: int
+    human_decisions: int
+    scoring: int
+    display_only: int
+    rejected: int
+    # Pillar-suggestion quality, over human-confirmed events where both the
+    # machine's suggested_category and the human's primary_category exist.
+    category_confirmed: int
+    category_corrected: int
+    correction_rate: Optional[float] = None
+
+
+class TriageLinkQualityStats(BaseModel):
+    """Material-link suggestion quality per (source × match_reason).
+
+    ``confirm_rate`` is computed over DECIDED links only (confirmed +
+    rejected); ``untouched`` (still ``suggested``) is queue, not judgment.
+    Analyst-added links carry no ingester match_reason and land under
+    "(none)" — they inflate that bucket's confirm rate by construction,
+    which is fine: the buckets that matter for suggester tuning are the
+    ingester-written ones (named_material | hs_code | keyword_match).
+    """
+
+    source: str
+    match_reason: str
+    confirmed: int
+    rejected: int
+    untouched: int
+    decided: int
+    confirm_rate: Optional[float] = None
+
+
+class TriageStats(BaseModel):
+    generated_at: datetime
+    human_decisions_total: int
+    # Rates computed on fewer decisions than this are statistically weak;
+    # the UI renders a small-sample caution below it. 30 per bucket is the
+    # working bar until the D0 thresholds are set with the partner.
+    small_sample_threshold: int
+    sources: list[TriageSourceStats]
+    link_quality: list[TriageLinkQualityStats]
+
+
+_SMALL_SAMPLE_THRESHOLD = 30
+
+
+@router.get("/stats", response_model=TriageStats)
+def triage_stats(
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriageStats:
+    """Suggestion-engine quality measurement (triage plan §7).
+
+    The feedback loop the plan calls for: once a few hundred human triage
+    decisions exist, confirm/correct/dismiss rates per source and per
+    match_reason become measurable, and suggester changes can be calibrated
+    against measured error rates instead of guesswork.  The D0 re-promotion
+    gates read these same numbers (gate 3: machine confirm-rate ≥ X% per
+    source/match_reason).
+
+    Counting rules:
+
+      * ``duplicate_of_id IS NULL`` everywhere — duplicates never count.
+      * A HUMAN decision is a row with ``triaged_at`` set (this router
+        stamps it on every status transition).  Ingest-time machine routing
+        (supportive-direction / AD-CVD-procedural display_only) has no
+        stamp and is reported separately as ``machine_display_only``.
+      * Pillar quality: among human scoring/display_only decisions where
+        both ``suggested_category`` and ``primary_category`` are set,
+        ``category_confirmed`` means the human kept the machine's pillar
+        and ``category_corrected`` means they changed it.
+      * Link quality counts ALL material links by ``status``; rates use
+        decided links only.
+    """
+    from collections import defaultdict
+
+    # ── Events ──────────────────────────────────────────────────────────
+    ev_rows = db.execute(
+        select(
+            Source.name,
+            RiskEvent.triage_status,
+            RiskEvent.triaged_at,
+            RiskEvent.suggested_category,
+            RiskEvent.primary_category,
+        )
+        .select_from(RiskEvent)
+        .outerjoin(SourceDocument, SourceDocument.id == RiskEvent.source_document_id)
+        .outerjoin(Source, Source.id == SourceDocument.source_id)
+        .where(RiskEvent.duplicate_of_id.is_(None))
+    ).all()
+
+    ev_agg: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for name, status, triaged_at, suggested, primary in ev_rows:
+        key = name or "(no source document)"
+        agg = ev_agg[key]
+        if triaged_at is None:
+            if status == "display_only":
+                agg["machine_display_only"] += 1
+            else:
+                agg["pending"] += 1
+            continue
+        agg["human_decisions"] += 1
+        if status in ("scoring", "display_only", "rejected"):
+            agg[status] += 1
+        if status in ("scoring", "display_only") and suggested and primary:
+            if suggested == primary:
+                agg["category_confirmed"] += 1
+            else:
+                agg["category_corrected"] += 1
+
+    sources: list[TriageSourceStats] = []
+    for name, agg in ev_agg.items():
+        judged = agg["category_confirmed"] + agg["category_corrected"]
+        sources.append(TriageSourceStats(
+            source=name,
+            pending=agg["pending"],
+            machine_display_only=agg["machine_display_only"],
+            human_decisions=agg["human_decisions"],
+            scoring=agg["scoring"],
+            display_only=agg["display_only"],
+            rejected=agg["rejected"],
+            category_confirmed=agg["category_confirmed"],
+            category_corrected=agg["category_corrected"],
+            correction_rate=(
+                round(agg["category_corrected"] / judged, 3) if judged else None
+            ),
+        ))
+    sources.sort(key=lambda s: (-s.human_decisions, s.source))
+
+    # ── Material links ──────────────────────────────────────────────────
+    link_rows = db.execute(
+        select(
+            Source.name,
+            RiskEventMaterial.match_reason,
+            RiskEventMaterial.status,
+        )
+        .select_from(RiskEventMaterial)
+        .join(RiskEvent, RiskEvent.id == RiskEventMaterial.risk_event_id)
+        .outerjoin(SourceDocument, SourceDocument.id == RiskEvent.source_document_id)
+        .outerjoin(Source, Source.id == SourceDocument.source_id)
+        .where(RiskEvent.duplicate_of_id.is_(None))
+    ).all()
+
+    link_agg: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for name, reason, status in link_rows:
+        key = (name or "(no source document)", reason or "(none)")
+        if status == "confirmed":
+            link_agg[key]["confirmed"] += 1
+        elif status == "rejected":
+            link_agg[key]["rejected"] += 1
+        else:
+            link_agg[key]["untouched"] += 1
+
+    link_quality: list[TriageLinkQualityStats] = []
+    for (name, reason), agg in link_agg.items():
+        decided = agg["confirmed"] + agg["rejected"]
+        link_quality.append(TriageLinkQualityStats(
+            source=name,
+            match_reason=reason,
+            confirmed=agg["confirmed"],
+            rejected=agg["rejected"],
+            untouched=agg["untouched"],
+            decided=decided,
+            confirm_rate=round(agg["confirmed"] / decided, 3) if decided else None,
+        ))
+    link_quality.sort(key=lambda l: (-l.decided, l.source, l.match_reason))
+
+    return TriageStats(
+        generated_at=datetime.now(timezone.utc),
+        human_decisions_total=sum(s.human_decisions for s in sources),
+        small_sample_threshold=_SMALL_SAMPLE_THRESHOLD,
+        sources=sources,
+        link_quality=link_quality,
+    )
+
+
 @router.get("/events", response_model=TriageEventList)
 def list_triage_events(
     _user: dict = Depends(get_current_user),

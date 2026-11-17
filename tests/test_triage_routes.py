@@ -540,3 +540,106 @@ class TestCountryFilter:
         ]
         # Lowercase input matched too — codes are stored uppercase.
         assert sorted(titles) == ["china primary", "china secondary"]
+
+
+class TestStats:
+    """GET /triage/stats — suggestion-engine quality measurement (plan §7)."""
+
+    def _build_corpus(self, db):
+        now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+        # Human: kept the machine's pillar.
+        e1 = _seed(db, title="confirmed as suggested", content_hash="s1",
+                   triage_status="scoring", primary_category="geopolitical_trade",
+                   triaged_by="nicole", triaged_at=now, verified=True)
+        # Human: corrected the pillar.
+        _seed(db, title="pillar corrected", content_hash="s2",
+              triage_status="scoring", primary_category="regulatory_compliance",
+              triaged_by="nicole", triaged_at=now, verified=True)
+        # Human: display-only decision (stamped).
+        _seed(db, title="human display only", content_hash="s3",
+              triage_status="display_only", primary_category="geopolitical_trade",
+              triaged_by="nicole", triaged_at=now)
+        # Human: dismissed.
+        _seed(db, title="dismissed", content_hash="s4",
+              triage_status="rejected", triaged_by="nicole", triaged_at=now)
+        # Machine-routed display-only (no stamp) — context, not judgment.
+        _seed(db, title="machine routed", content_hash="s5",
+              triage_status="display_only")
+        # Pending queue.
+        _seed(db, title="pending one", content_hash="s6")
+        # Link decisions: the _seed default link is hs_code/suggested; give
+        # e1 a decided pair across two match_reasons.
+        # (e1 already carries _seed's default Nickel hs_code/suggested link;
+        # the (event, material) pair is unique, so decided links go on new
+        # materials.)
+        cobalt = Material(canonical_name="Cobalt", category="metal")
+        lithium = Material(canonical_name="Lithium", category="metal")
+        db.add_all([cobalt, lithium])
+        db.flush()
+        db.add(RiskEventMaterial(
+            risk_event_id=e1.id, material_id=cobalt.id, relevance_score=0.9,
+            match_reason="hs_code", status="rejected",
+        ))
+        db.add(RiskEventMaterial(
+            risk_event_id=e1.id, material_id=lithium.id, relevance_score=1.0,
+            match_reason="named_material", status="confirmed",
+        ))
+        db.commit()
+
+    def test_source_rows_split_human_from_machine(self, client, db):
+        self._build_corpus(db)
+        body = client.get("/api/v1/triage/stats").json()
+        assert body["human_decisions_total"] == 4
+        assert body["small_sample_threshold"] > 0
+        gta = next(s for s in body["sources"] if s["source"] == "Global Trade Alert")
+        assert gta["human_decisions"] == 4
+        assert gta["scoring"] == 2
+        assert gta["display_only"] == 1
+        assert gta["rejected"] == 1
+        assert gta["machine_display_only"] == 1
+        assert gta["pending"] == 1
+
+    def test_correction_rate(self, client, db):
+        self._build_corpus(db)
+        gta = next(
+            s for s in client.get("/api/v1/triage/stats").json()["sources"]
+            if s["source"] == "Global Trade Alert"
+        )
+        # 3 judged pillar decisions: 2 confirmed, 1 corrected.
+        assert gta["category_confirmed"] == 2
+        assert gta["category_corrected"] == 1
+        assert gta["correction_rate"] == pytest.approx(0.333, abs=1e-3)
+
+    def test_link_quality_per_match_reason(self, client, db):
+        self._build_corpus(db)
+        lq = client.get("/api/v1/triage/stats").json()["link_quality"]
+        by_key = {(l["source"], l["match_reason"]): l for l in lq}
+        hs = by_key[("Global Trade Alert", "hs_code")]
+        assert hs["rejected"] == 1          # the decided hs_code link
+        assert hs["untouched"] == 6         # every _seed event's default link
+        assert hs["decided"] == 1
+        assert hs["confirm_rate"] == 0.0
+        named = by_key[("Global Trade Alert", "named_material")]
+        assert named["confirmed"] == 1
+        assert named["confirm_rate"] == 1.0
+
+    def test_duplicates_excluded(self, client, db):
+        self._build_corpus(db)
+        canon = _seed(db, title="canonical", content_hash="s7",
+                      triage_status="scoring", primary_category="geopolitical_trade",
+                      triaged_by="nicole",
+                      triaged_at=datetime(2026, 10, 1, tzinfo=timezone.utc))
+        dup = _seed(db, title="duplicate decision", content_hash="s8",
+                    triage_status="scoring", primary_category="geopolitical_trade",
+                    triaged_by="nicole",
+                    triaged_at=datetime(2026, 10, 1, tzinfo=timezone.utc))
+        dup.duplicate_of_id = canon.id
+        db.commit()
+        body = client.get("/api/v1/triage/stats").json()
+        assert body["human_decisions_total"] == 5   # dup's decision not counted
+
+    def test_empty_db_returns_zeroes(self, client):
+        body = client.get("/api/v1/triage/stats").json()
+        assert body["human_decisions_total"] == 0
+        assert body["sources"] == []
+        assert body["link_quality"] == []

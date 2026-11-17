@@ -27,6 +27,7 @@ import uuid
 from datetime import date, datetime
 from typing import Optional
 
+from cachetools import TTLCache
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
@@ -46,11 +47,13 @@ from app.models.regulatory import (
     RegulationMaterialScope,
     RiskEvent,
     RiskEventCompany,
+    RiskEventMaterial,
     RiskEventRegulation,
 )
 from app.models.documents import SourceDocument
 from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
-from app.models.supply import Material
+from app.models.supply import HsCodeMaterialMapping, HsCodeProductionShare, Material
+from app.services.scoring.stage_concentration import score_material_concentration
 from app.schemas.common import PaginatedResponse
 from app.schemas.intelligence_entities import (
     CompanyCountryFacilitiesOut,
@@ -66,6 +69,11 @@ from app.schemas.intelligence_entities import (
     LinkedPostOut,
     MaterialScopeOut,
     PublicCompanyListItem,
+    PublicMaterialListItem,
+    PublicMaterialProfile,
+    PublicMaterialRegulationOut,
+    PublicShareOut,
+    PublicStageSharesOut,
     PublicCompanyProfile,
     PublicRegulationDetail,
     PublicRegulationListItem,
@@ -980,4 +988,251 @@ def get_public_regulation(
         linked_posts=linked_posts,
         linked_events=linked_events,
         linked_event_count=int(event_count),
+    )
+
+
+# ===========================================================================
+# Materials — public browse + profile (content-site unit Piece B, 2026-10-24)
+# ===========================================================================
+
+import re as _re_mat
+
+_MATERIAL_SLUG_RE = _re_mat.compile(r"[^a-z0-9]+")
+
+
+def _material_slug(name: str) -> str:
+    """URL slug from a canonical name ("Rare Earth Elements" -> "rare-earth-
+    elements"). Materials carry no slug column; with ~40 fixed canonical
+    names a derived slug is stable and collision-free."""
+    return _MATERIAL_SLUG_RE.sub("-", name.lower()).strip("-")
+
+
+def _latest_rollups(db: Session) -> dict[int, tuple[Optional[float], Optional[float], Optional[date]]]:
+    """material_id -> (overall, concentration, as_of) from the LATEST L2
+    rollup per material — the same rows the sidebar risk-summary reads."""
+    rn = (
+        func.row_number()
+        .over(
+            partition_by=MaterialGlobalRiskScore.material_id,
+            order_by=MaterialGlobalRiskScore.as_of_date.desc(),
+        )
+        .label("rn")
+    )
+    sub = select(
+        MaterialGlobalRiskScore.material_id,
+        MaterialGlobalRiskScore.overall_risk_score,
+        MaterialGlobalRiskScore.material_concentration_score,
+        MaterialGlobalRiskScore.as_of_date,
+        rn,
+    ).subquery()
+    return {
+        m_id: (overall, conc, as_of)
+        for m_id, overall, conc, as_of, _ in db.execute(
+            select(sub).where(sub.c.rn == 1)
+        ).all()
+    }
+
+
+def _latest_driving_stages(db: Session) -> dict[int, Optional[str]]:
+    """material_id -> driving stage of its top-concentration geography.
+
+    Read from the STORED rescore diagnostics (rationale_json.sub_inputs
+    .material.driving_stage) — never computed per request. rn=1 per
+    material ordered (as_of desc, concentration desc): the latest run's
+    most-concentrated geography, whose stage-max is what set the rating.
+    """
+    rn = (
+        func.row_number()
+        .over(
+            partition_by=MaterialGeographyRiskScore.material_id,
+            order_by=(
+                MaterialGeographyRiskScore.as_of_date.desc(),
+                MaterialGeographyRiskScore.material_concentration_score.desc().nullslast(),
+            ),
+        )
+        .label("rn")
+    )
+    sub = select(
+        MaterialGeographyRiskScore.material_id,
+        MaterialGeographyRiskScore.rationale_json,
+        rn,
+    ).subquery()
+    out: dict[int, Optional[str]] = {}
+    for m_id, rationale, _ in db.execute(select(sub).where(sub.c.rn == 1)).all():
+        stage = None
+        if isinstance(rationale, dict):
+            stage = (
+                rationale.get("sub_inputs", {})
+                .get("material", {})
+                .get("driving_stage")
+            )
+        out[m_id] = stage
+    return out
+
+
+@router.get("/materials", response_model=list[PublicMaterialListItem])
+def list_public_materials(db: Session = Depends(get_db)) -> list[PublicMaterialListItem]:
+    """Public ratings index: every RATED material with band + slug.
+
+    The insufficient-data gate matches risk-summary exactly: a material
+    whose concentration pillar is unscored is EXCLUDED, never shown as
+    false-low (methodology page: "absence of data is never low risk")."""
+    rollups = _latest_rollups(db)
+    driving = _latest_driving_stages(db)
+    items: list[PublicMaterialListItem] = []
+    for mat in db.scalars(select(Material)).all():
+        overall, conc, _ = rollups.get(mat.id, (None, None, None))
+        if overall is None or conc is None or conc <= 0:
+            continue
+        band = _band_out(overall)
+        if band is None:
+            continue
+        items.append(
+            PublicMaterialListItem(
+                slug=_material_slug(mat.canonical_name),
+                name=mat.canonical_name,
+                band=band,
+                driving_stage=driving.get(mat.id),
+            )
+        )
+    items.sort(key=lambda i: (-(i.band.score or 0.0), i.name))
+    return items
+
+
+# Profile stage computation cache — see the call site in
+# get_public_material for the invalidation story.
+_STAGE_CACHE: TTLCache = TTLCache(maxsize=256, ttl=900)
+
+
+def _build_profile_stages(
+    db: Session, material_id: int, as_of: Optional[date]
+) -> list[PublicStageSharesOut]:
+    """The expensive half of the material profile: run the concentration
+    scorer and shape its stage selection into the public payload."""
+    result = score_material_concentration(db, material_id, as_of_date=as_of or date.today())
+    driving_stage: Optional[str] = None
+    if result.per_geo:
+        driving_stage = max(result.per_geo.values(), key=lambda g: g.score).driving_stage
+
+    stages: list[PublicStageSharesOut] = []
+    country_names = {
+        c.iso2: c.name for c in db.scalars(select(Country)).all()
+    }
+    for stage, detail in sorted(result.stages.items()):
+        src_rows = db.execute(
+            select(HsCodeProductionShare.source)
+            .join(
+                HsCodeMaterialMapping,
+                HsCodeMaterialMapping.id == HsCodeProductionShare.hs_mapping_id,
+            )
+            .where(
+                HsCodeMaterialMapping.material_id == material_id,
+                HsCodeMaterialMapping.supply_chain_stage == stage,
+                HsCodeProductionShare.market_scope == "global",
+                HsCodeProductionShare.reference_year == detail.reference_year,
+            )
+            .distinct()
+        ).scalars().all()
+        shares = sorted(detail.shares.items(), key=lambda kv: -kv[1])[:8]
+        stages.append(
+            PublicStageSharesOut(
+                stage=stage,
+                reference_year=detail.reference_year,
+                is_driving=(stage == driving_stage),
+                sources=sorted(src_rows),
+                shares=[
+                    PublicShareOut(
+                        code=code,
+                        name=country_names.get(code),
+                        share=round(share, 4),
+                    )
+                    for code, share in shares
+                ],
+            )
+        )
+    return stages
+
+
+@router.get("/materials/{slug}", response_model=PublicMaterialProfile)
+def get_public_material(slug: str, db: Session = Depends(get_db)) -> PublicMaterialProfile:
+    """Public material profile — band + as-of headline, per-stage supply
+    shares (the scorer's OWN dedup/freshness selection, so the story shown
+    is exactly the data the rating stands on), related regulations, tagged
+    posts, and the C4 event count (events themselves come from
+    ``/intelligence/events?material=``)."""
+    material = next(
+        (
+            m
+            for m in db.scalars(select(Material)).all()
+            if _material_slug(m.canonical_name) == slug
+        ),
+        None,
+    )
+    if material is None:
+        raise HTTPException(status_code=404, detail="Material not found")
+
+    overall, conc, as_of = _latest_rollups(db).get(material.id, (None, None, None))
+    band = _band_out(overall) if (overall is not None and conc and conc > 0) else None
+    if band is None:
+        # Unrated materials have no public page — same exclusion rule as
+        # the index and the sidebar.
+        raise HTTPException(status_code=404, detail="Material not rated")
+
+    # Per-stage shares via the scorer itself (year selection, freshness
+    # gate, parent/child dedupe all included). Anchored on the rating's
+    # as-of date so the page shows the data behind the PUBLISHED number.
+    # Cached (2026-11-12): the computation only changes when a rescore or
+    # share ingest moves the rating, so keying on (material, as_of) makes
+    # a new rollup self-invalidate; the TTL bounds staleness from a
+    # same-as_of re-run to 15 minutes.
+    cache_key = (material.id, as_of.isoformat() if as_of else None)
+    cached = _STAGE_CACHE.get(cache_key)
+    if cached is None:
+        cached = _build_profile_stages(db, material.id, as_of)
+        _STAGE_CACHE[cache_key] = cached
+    stages = cached
+
+    # Related regulations: material-SCOPED registry rows only (all-goods
+    # rules like UFLPA would appear on every page — they live on the
+    # regulations index instead). Archived and discovery rows excluded.
+    reg_rows = db.execute(
+        select(Regulation)
+        .join(RegulationMaterialScope, RegulationMaterialScope.regulation_id == Regulation.id)
+        .where(RegulationMaterialScope.material_id == material.id)
+    ).scalars().all()
+    regulations = [
+        PublicMaterialRegulationOut(
+            regulation_key=r.regulation_key,
+            title=r.title,
+            geography=r.geography,
+            status=r.status,
+            pillar=r.pillar,
+        )
+        for r in reg_rows
+        if r.status != "archived" and not r.regulation_key.startswith("SUGGESTED_")
+    ][:12]
+
+    linked_posts = _tagged_posts(db, material.canonical_name)
+
+    event_count = db.scalar(
+        select(func.count(func.distinct(RiskEvent.id)))
+        .select_from(RiskEvent)
+        .join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
+        .where(
+            RiskEventMaterial.material_id == material.id,
+            RiskEventMaterial.is_direct.is_(True),
+            RiskEvent.duplicate_of_id.is_(None),
+            RiskEvent.triage_status.in_(("scoring", "display_only")),
+        )
+    )
+
+    return PublicMaterialProfile(
+        slug=slug,
+        name=material.canonical_name,
+        band=band,
+        as_of_date=as_of,
+        stages=stages,
+        regulations=regulations,
+        linked_posts=linked_posts,
+        linked_event_count=int(event_count or 0),
     )

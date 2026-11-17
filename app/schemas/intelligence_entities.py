@@ -248,3 +248,65 @@ class PublicRegulationDetail(BaseModel):
     linked_posts: list[LinkedPostOut] = []
     linked_events: list[LinkedEventOut] = []
     linked_event_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Materials — public profiles (content-site unit Piece B, 2026-10-24)
+# ---------------------------------------------------------------------------
+
+
+class PublicShareOut(BaseModel):
+    """One country's share of a stage — SOURCE data (USGS/IEA/benchmark),
+    not a score. share is the raw fraction [0,1]."""
+
+    code: str
+    name: Optional[str] = None
+    share: float
+
+
+class PublicStageSharesOut(BaseModel):
+    """Deduped shares for one FRESH stage, exactly as the published rating's
+    own scorer selects them (same year-selection/freshness/dedupe policy —
+    computed by ``stage_concentration``, never reimplemented here)."""
+
+    stage: str
+    reference_year: int
+    is_driving: bool
+    sources: list[str]
+    shares: list[PublicShareOut]
+
+
+class PublicMaterialRegulationOut(BaseModel):
+    regulation_key: str
+    title: Optional[str] = None
+    geography: Optional[str] = None
+    status: Optional[str] = None
+    pillar: Optional[str] = None
+
+
+class PublicMaterialListItem(BaseModel):
+    slug: str
+    name: str
+    band: RiskBandOut
+    # 2026-11-12 index redesign: the browse row's secondary fact ("most
+    # concentrated at refining"). Read from stored rescore diagnostics,
+    # never computed per request; None when no geo row carries it.
+    driving_stage: Optional[str] = None
+
+
+class PublicMaterialProfile(BaseModel):
+    """Payload for the public material profile page.
+
+    The headline is the BAND + as-of date (A6 public scope); the stages
+    block tells the concentration story from citable source data; events
+    come from ``GET /intelligence/events?material=`` (C4), so this payload
+    carries only their count."""
+
+    slug: str
+    name: str
+    band: RiskBandOut
+    as_of_date: Optional[date] = None
+    stages: list[PublicStageSharesOut]
+    regulations: list[PublicMaterialRegulationOut]
+    linked_posts: list[LinkedPostOut]
+    linked_event_count: int

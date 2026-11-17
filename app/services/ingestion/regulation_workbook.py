@@ -457,6 +457,19 @@ def load_regulation_workbook(
             )
             continue
         if has_floor:
+            # 2026-10-06 (self-review fix): a floor on a compliance-classified
+            # (or unclassified) row would feed BOTH pillars — the aggregator
+            # scores from the numbers, not the enum, so the enum must be made
+            # to agree before a floor is accepted. This closes the one data-
+            # entry path back to the double-count 067 exists to prevent.
+            if pillar not in ("geopolitical_trade", "dual"):
+                _reject(
+                    report, _REG_SHEET, rn, key,
+                    "standing floor requires pillar=geopolitical_trade or dual "
+                    f"(got '{pillar}') — a floor on a compliance row would "
+                    "feed both pillars",
+                )
+                continue
             if not geography or len(geography) != 2 or not geography.isalpha():
                 _reject(
                     report, _REG_SHEET, rn, key,

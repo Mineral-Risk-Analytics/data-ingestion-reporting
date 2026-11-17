@@ -381,6 +381,23 @@ class TestPillarAndStandingFloors:
             for r in report.rejected
         ) == 2
 
+    def test_floor_on_compliance_or_unclassified_pillar_rejected(self, session, tmp_path):
+        """2026-10-06: the double-count guard's other half — a floor is only
+        accepted on geopolitical_trade/dual rows, because the aggregator
+        scores from the numbers regardless of the enum."""
+        wb = _workbook([
+            _reg_row("COMPLIANCE_WITH_FLOOR", pillar="regulatory_compliance",
+                     pts=10, geo="US", floor_exp=0.4, all_mats=True),
+            _reg_row("UNCLASSIFIED_WITH_FLOOR", pillar=None, pts=None,
+                     ob=False, geo="US", floor_exp=0.4, all_mats=True),
+        ])
+        report = load_regulation_workbook(session, _save(tmp_path, wb))
+        assert report.created == []
+        assert sum(
+            "standing floor requires pillar=geopolitical_trade or dual" in r["reason"]
+            for r in report.rejected
+        ) == 2
+
     def test_floor_requires_material_scope(self, session, tmp_path):
         wb = _workbook(
             [_reg_row("NO_SCOPE", pillar="geopolitical_trade", pts=None,
