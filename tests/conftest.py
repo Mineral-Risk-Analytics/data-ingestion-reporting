@@ -16,9 +16,39 @@ to ship their own copy. Tests that defined ``_patch_sqlite_jsonb`` locally
 keep working because the SQLAlchemy compiler module is global state.
 """
 
-from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+from sqlalchemy.dialects.postgresql import JSONB as PG_JSONB
+from sqlalchemy.dialects.sqlite.base import SQLiteDialect, SQLiteTypeCompiler
+from sqlalchemy.dialects.sqlite.json import JSON as SQLITE_JSON
 
 if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
     SQLiteTypeCompiler.visit_JSONB = SQLiteTypeCompiler.visit_JSON
 if not hasattr(SQLiteTypeCompiler, "visit_ARRAY"):
     SQLiteTypeCompiler.visit_ARRAY = SQLiteTypeCompiler.visit_JSON
+
+# 2026-07-22: DDL rendering alone is NOT enough — binding a Python list to
+# an ARRAY column raised sqlite3.ProgrammingError on the first test that
+# actually WROTE an array (the tags PATCH regression test; every earlier
+# test only wrote NULLs, so this stayed latent and the docstring above
+# claiming arrays "survive round-trips" was aspirational). Map PG ARRAY /
+# JSONB to SQLite's JSON impl so values genuinely serialize/deserialize.
+
+
+class _PgTypeAsSqliteJson(SQLITE_JSON):
+    """Swallows the PG type's constructor args (item_type, astext_type…)."""
+
+    def __init__(self, *args, **kwargs):  # noqa: ARG002 — deliberate
+        super().__init__()
+
+
+# NB: patch the DRIVER dialect too — SQLiteDialect_pysqlite snapshots its
+# own ``colspecs`` dict at class-definition time (util.update_copy of the
+# base), so patching only the base class silently does nothing.
+from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
+
+for _dialect_cls in (SQLiteDialect, SQLiteDialect_pysqlite):
+    _dialect_cls.colspecs = {
+        **_dialect_cls.colspecs,
+        PG_ARRAY: _PgTypeAsSqliteJson,
+        PG_JSONB: _PgTypeAsSqliteJson,
+    }

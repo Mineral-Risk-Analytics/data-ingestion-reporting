@@ -139,9 +139,12 @@ def test_hhi_preserves_order_of_concentration():
         ("Production—crude ore",                   "ore"),
         ("Production—datolite ore",                "ore"),
         ("Production—ulexite",                     "ore"),
-        ("Production—refined borates",             "refined"),
-        ("Production—boric oxide equivalent",      "refined"),
-        ("Production—compounds",                   "refined"),
+        # 2026-07-13 retag: Boron's ladder has no 'refined' stage — these
+        # route to intermediate (HS 2810).  Test rows updated 2026-08-05;
+        # they had pinned the pre-retag expectation.
+        ("Production—refined borates",             "intermediate"),
+        ("Production—boric oxide equivalent",      "intermediate"),
+        ("Production—compounds",                   "intermediate"),
         # ── GALLIUM (added 2026-05-24) ──
         ("Primary production",                     "refined"),
         # ── TITANIUM sponge metal (added 2026-05-24) ──
@@ -311,7 +314,7 @@ def test_reserves_filters_to_latest_year():
         _row("LITHIUM", "World Reserves", "Reserves",
              "Reserves", "Chile", "2025", "10,000,000"),
     ]
-    _prod, reserves, _by_year, _latest, _unit = (
+    _prod, reserves, _by_year, _latest, _unit, _unattr, _unattr_res = (
         _extract_world_production_per_country(rows)
     )
     assert reserves == {"CL": 10000000.0}  # NOT 19,000,000
@@ -329,7 +332,7 @@ def test_production_extractor_skips_capacity_rows():
         _row("ALUMINUM", "World Smelter Capacity", "Capacity",
              "Yearend capacity", "China", "2025", "50,000"),
     ]
-    prod, reserves, _by_year, _latest, _unit = (
+    prod, reserves, _by_year, _latest, _unit, _unattr, _unattr_res = (
         _extract_world_production_per_country(rows)
     )
     assert prod == {"CN": 45000.0}  # capacity NOT mixed in
@@ -351,7 +354,7 @@ def test_per_stage_single_bucket_flag_is_none():
     ]
     result = _extract_per_stage_world_production(rows)
     assert len(result) == 1
-    stage, _detail, country_prod, _yr, _unit, dq_flag = result[0]
+    stage, _detail, country_prod, _yr, _unit, dq_flag, _unattr = result[0]
     assert stage == "ore"
     assert dq_flag == _DQ_NOT_CONSOLIDATED
     assert country_prod == {"CL": 55000.0, "AU": 88000.0}
@@ -370,7 +373,7 @@ def test_per_stage_additive_flag_for_disjoint_buckets():
              "Production—ulexite", "Argentina", "2025", "300"),
     ]
     result = _extract_per_stage_world_production(rows)
-    stage, _detail, country_prod, _yr, _unit, dq_flag = result[0]
+    stage, _detail, country_prod, _yr, _unit, dq_flag, _unattr = result[0]
     assert stage == "ore"
     assert dq_flag == _DQ_ADDITIVE  # 0% overlap → additive
     assert country_prod == {"TR": 1500.0, "AR": 300.0}
@@ -393,7 +396,7 @@ def test_per_stage_duplicate_suspect_flag_for_asymmetric_overlap():
              "Refinery production: concentrate", "China", "2025", "20"),
     ]
     result = _extract_per_stage_world_production(rows)
-    stage, _detail, country_prod, _yr, _unit, dq_flag = result[0]
+    stage, _detail, country_prod, _yr, _unit, dq_flag, _unattr = result[0]
     assert stage == "refined"
     assert dq_flag == _DQ_DUPLICATE_SUSPECT
     # China gets summed: 300 + 20 = 320 (the asymmetric distortion the
@@ -754,5 +757,352 @@ def test_per_stage_empty_bucket_skipped():
     result = _extract_per_stage_world_production(rows)
     # Only one stage entry — the empty 'estimate only' bucket dropped silently
     assert len(result) == 1
-    stage, _detail, country_prod, _yr, _unit, _dq = result[0]
+    stage, _detail, country_prod, _yr, _unit, _dq, _unattr = result[0]
     assert country_prod == {"CL": 55000.0}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 2026-08-05 USGS ingest defect fixes — single-stream material shares,
+# "Other countries" denominators, data-year stamping.  These pin the three
+# defects found in the Copper-vs-MCS-PDF investigation:
+#   1. material shares summed mine + refinery (CN 1,800+14,000=15,800)
+#   2. world totals excluded "Other countries" → inflated shares/HHIs
+#   3. reference_year carried the edition year (2026), not the data year
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _parse_rows(rows):
+    """Round-trip synthetic rows through a temp CSV into parse_mcs2026_csv."""
+    import csv as _csv
+    import os
+    import tempfile
+    from app.services.ingestion.seeds.mcs2026_parser import parse_mcs2026_csv
+
+    fd, path = tempfile.mkstemp(suffix=".csv")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            writer = _csv.DictWriter(f, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
+        return parse_mcs2026_csv(path)
+    finally:
+        os.unlink(path)
+
+
+def _copper_style_rows():
+    """Copper-shaped chapter: mine + refinery streams, each with an
+    "Other countries" remainder row and a world-total row."""
+    mk = lambda detail, country, year, value: _row(  # noqa: E731
+        "COPPER", "World Mine and Refinery Production", "Production",
+        detail, country, year, value, unit="thousand metric tons",
+    )
+    return [
+        # Mine stream — named 1,800 + 5,300 + Other 2,900 → true world 10,000
+        mk("Mine production", "China", "2025", "1,800"),
+        mk("Mine production", "Chile", "2025", "5,300"),
+        mk("Mine production", "Other countries", "2025", "2,900"),
+        # World-total row: must NOT enter any denominator (it's a sum)
+        mk("Mine production: rounded", "World total (rounded)", "2025", "10,000"),
+        # Refinery stream — named 14,000 + 1,900 + Other 2,100 → world 18,000
+        mk("Refinery production", "China", "2025", "14,000"),
+        mk("Refinery production", "Chile", "2025", "1,900"),
+        mk("Refinery production", "Other countries", "2025", "2,100"),
+    ]
+
+
+def test_material_shares_are_single_stream_not_cross_stage_sum():
+    """Defect 1: CN's material-level volume must be the MINE stream's
+    1,800 — never mine+refinery 15,800, a quantity that exists at no
+    single point in the supply chain."""
+    records = _parse_rows(_copper_style_rows())
+    assert len(records) == 1
+    shares = {
+        e["country_code"]: e for e in records[0]["production_shares"]
+    }
+    assert shares["CN"]["production_volume"] == 1800.0
+    # Share against the TRUE world total (defect 2): 1,800 / 10,000
+    assert shares["CN"]["production_share"] == pytest.approx(0.18)
+    assert shares["CL"]["production_share"] == pytest.approx(0.53)
+    assert records[0]["world_total"] == pytest.approx(10000.0)
+
+
+def test_hs_shares_denominator_includes_other_countries():
+    """Defect 2 at stage level: refined CN = 14,000 / 18,000 (with the
+    remainder), not 14,000 / 15,900 (named only)."""
+    records = _parse_rows(_copper_style_rows())
+    refined = [
+        e for e in records[0]["hs_production_shares"] if e["stage"] == "refined"
+    ]
+    by_country = {e["country_code"]: e for e in refined}
+    # Parser rounds shares to 6 decimals — compare at that tolerance.
+    assert by_country["CN"]["production_share"] == pytest.approx(
+        14000 / 18000, abs=1e-6
+    )
+    assert by_country["CL"]["production_share"] == pytest.approx(
+        1900 / 18000, abs=1e-6
+    )
+
+
+def test_unattributed_rows_get_no_share_row():
+    """"Other countries" contributes to denominators only — it must never
+    appear as a producer row (it has no ISO code)."""
+    records = _parse_rows(_copper_style_rows())
+    all_rows = (
+        records[0]["production_shares"] + records[0]["hs_production_shares"]
+    )
+    countries = {e["country_code"] for e in all_rows}
+    assert countries == {"CN", "CL"}
+
+
+def test_reference_year_is_data_year_not_edition_year():
+    """Defect 3: every share row carries the CSV Year column's data year
+    (2025 here) — never the 2026 edition year."""
+    records = _parse_rows(_copper_style_rows())
+    for e in records[0]["production_shares"]:
+        assert e["reference_year"] == 2025
+    for e in records[0]["hs_production_shares"]:
+        assert e["reference_year"] == 2025
+
+
+def test_reference_year_differs_per_stage():
+    """Stages keep their own vintages: a refinery stream published at 2024
+    stamps 2024 while the mine stream stamps 2025."""
+    mk = lambda detail, country, year, value: _row(  # noqa: E731
+        "COBALTITE", "World Mine and Refinery Production", "Production",
+        detail, country, year, value,
+    )
+    records = _parse_rows([
+        mk("Mine production", "Congo (Kinshasa)", "2025", "2,000"),
+        mk("Refinery production", "China", "2024", "1,500"),
+    ])
+    by_stage = {
+        e["stage"]: e for e in records[0]["hs_production_shares"]
+    }
+    assert by_stage["ore"]["reference_year"] == 2025
+    assert by_stage["refined"]["reference_year"] == 2024
+
+
+def test_material_stream_falls_through_stage_order():
+    """A chapter with no mine stream (GALLIUM-style primary production
+    only) carries its earliest available stage — refined — instead of
+    silently emitting nothing."""
+    records = _parse_rows([
+        _row("GALLIUM", "World Primary Production", "Production",
+             "Primary production", "China", "2025", "750", unit="kilograms"),
+        _row("GALLIUM", "World Primary Production", "Production",
+             "Primary production", "Japan", "2025", "150", unit="kilograms"),
+    ])
+    shares = {e["country_code"]: e for e in records[0]["production_shares"]}
+    assert shares["CN"]["production_share"] == pytest.approx(750 / 900)
+    assert shares["CN"]["reference_year"] == 2025
+
+
+def test_hhi_world_total_treats_remainder_as_atomistic():
+    """HHI terms use true-world shares; the unattributed remainder adds
+    nothing to the sum of squares (bag of small producers, not a phantom
+    single actor)."""
+    named = {"CN": 52.0, "CL": 8.0}
+    assert _hhi(named, world_total=100.0) == pytest.approx(
+        0.52**2 + 0.08**2
+    )
+    # A world_total at/below the named sum never inflates shares
+    assert _hhi(named, world_total=10.0) == _hhi(named)
+
+
+def test_material_hhi_uses_single_stream_and_true_world_total():
+    """criticality_score for the copper-style chapter = mine-stream HHI
+    against the 10,000 world total: 0.18² + 0.53² = 0.3133."""
+    records = _parse_rows(_copper_style_rows())
+    assert records[0]["criticality_score"] == pytest.approx(
+        0.18**2 + 0.53**2, abs=1e-4
+    )
+
+
+# ─── 2026-06-14: Salient Price extraction + YoY/CAGR derivation ──────────
+# Pins down the parser's new ability to preserve the Salient Price values
+# it had been reading-but-discarding.  See mcs2026_parser._extract_prices_from_salient
+# for the schema and _derive_yoy_and_cagr_from_prices for the derivation
+# math.  Failing one of these is almost always a sign of unit-conversion
+# math drift or a parser regression that broke the (Salient → Price)
+# row filtering.
+
+from app.services.ingestion.seeds.mcs2026_parser import (
+    _derive_yoy_and_cagr_from_prices,
+    _extract_prices_from_salient,
+    _to_usd_per_metric_ton,
+)
+
+
+class TestToUsdPerMetricTon:
+    def test_dollars_per_metric_ton_passthrough(self):
+        assert _to_usd_per_metric_ton(11700.0, "dollars per metric ton") == 11700.0
+
+    def test_cents_per_pound(self):
+        # 138.5 cents/lb × 2204.622 lb/MT ÷ 100 = $3,053 / MT
+        result = _to_usd_per_metric_ton(138.5, "cents per pound")
+        assert result is not None
+        assert 3050 < result < 3060
+
+    def test_dollars_per_pound_real_cobalt_2021(self):
+        # $24.21 / lb × 2204.622 lb/MT = $53,374 / MT — Cobalt 2021 US-spot
+        result = _to_usd_per_metric_ton(24.21, "dollars per pound")
+        assert result is not None
+        assert 53370 < result < 53380
+
+    def test_dollars_per_kilogram(self):
+        assert _to_usd_per_metric_ton(5.0, "dollars per kilogram") == 5000.0
+
+    def test_dollars_per_troy_ounce(self):
+        result = _to_usd_per_metric_ton(1998.0, "dollars per troy ounce")
+        assert result is not None
+        assert 64_237_000 < result < 64_238_000
+
+    def test_metric_ton_unit_unsupported(self):
+        # DMTU / MTU don't convert linearly without contained-element fraction
+        assert _to_usd_per_metric_ton(100.0, "dollars per dry metric ton unit") is None
+        assert _to_usd_per_metric_ton(100.0, "dollars per metric ton unit") is None
+
+    def test_unknown_unit_returns_none(self):
+        assert _to_usd_per_metric_ton(100.0, "dollars per furlong") is None
+
+    def test_none_value_returns_none(self):
+        assert _to_usd_per_metric_ton(None, "dollars per metric ton") is None
+
+
+class TestExtractPricesFromSalient:
+    @staticmethod
+    def _price_row(commodity, year, value, unit, detail):
+        return {
+            "Commodity": commodity,
+            "Section": "Salient Statistics—United States",
+            "Statistics": "Price",
+            "Statistics_detail": detail,
+            "Year": str(year),
+            "Value": str(value),
+            "Unit": unit,
+        }
+
+    def test_extracts_single_benchmark_full_series(self):
+        rows = [
+            self._price_row("Lithium", 2021, "11,700",
+                            "dollars per metric ton",
+                            "Price, annual average-real, battery-grade lithium carbonate"),
+            self._price_row("Lithium", 2022, "63,700",
+                            "dollars per metric ton",
+                            "Price, annual average-real, battery-grade lithium carbonate"),
+            self._price_row("Lithium", 2025, "9,000",
+                            "dollars per metric ton",
+                            "Price, annual average-real, battery-grade lithium carbonate"),
+        ]
+        prices = _extract_prices_from_salient(rows)
+        assert len(prices) == 3
+        assert prices[0]["year"] == 2021
+        assert prices[0]["value_raw"] == 11700.0
+        assert prices[0]["value_usd_per_mt"] == 11700.0
+        assert "battery-grade" in prices[0]["statistics_detail"]
+
+    def test_preserves_multi_benchmark_structure(self):
+        # Cobalt has both US-spot and LME — both must come through with
+        # their distinct Statistics_detail strings preserved.
+        rows = [
+            self._price_row("Cobalt", 2021, "24.21", "dollars per pound",
+                            "Price, average, dollars per pound: U.S. spot, cathode"),
+            self._price_row("Cobalt", 2021, "23.17", "dollars per pound",
+                            "Price, average, dollars per pound: London Metal Exchange"),
+        ]
+        prices = _extract_prices_from_salient(rows)
+        assert len(prices) == 2
+        details = {p["statistics_detail"] for p in prices}
+        assert any("U.S. spot" in d for d in details)
+        assert any("London Metal" in d for d in details)
+
+    def test_ignores_non_price_statistics(self):
+        rows = [
+            self._price_row("Lithium", 2025, "9000", "dollars per metric ton",
+                            "Price, annual average"),
+            # Non-price row — should be filtered out
+            {**self._price_row("Lithium", 2025, "10", "metric tons",
+                               "Production"), "Statistics": "Production"},
+        ]
+        prices = _extract_prices_from_salient(rows)
+        assert len(prices) == 1
+        assert prices[0]["statistics_detail"] == "Price, annual average"
+
+    def test_ignores_non_salient_sections(self):
+        rows = [
+            {**self._price_row("X", 2025, "100", "dollars per metric ton",
+                               "Price"), "Section": "World Production"},
+        ]
+        prices = _extract_prices_from_salient(rows)
+        assert prices == []
+
+    def test_skips_malformed_rows(self):
+        rows = [
+            self._price_row("Lithium", "not_a_year", "9000",
+                            "dollars per metric ton", "Price, annual"),
+            self._price_row("Lithium", 2025, "not_a_number",
+                            "dollars per metric ton", "Price, annual"),
+            self._price_row("Lithium", 2025, "", "dollars per metric ton",
+                            "Price, annual"),
+        ]
+        prices = _extract_prices_from_salient(rows)
+        assert prices == []
+
+
+class TestDeriveYoyAndCagrFromPrices:
+    @staticmethod
+    def _p(year, value, detail="Price, annual"):
+        return {
+            "year": year,
+            "value_raw": float(value),
+            "unit_raw": "dollars per metric ton",
+            "statistics_detail": detail,
+            "value_usd_per_mt": float(value),
+        }
+
+    def test_lithium_crash_real_numbers(self):
+        # Real Lithium 2021-2025 series. Expected YoY ≈ -23.7%, CAGR ≈ -6.3%
+        # (matches output seen in the smoke test against the real MCS CSV).
+        prices = [
+            self._p(2021, 11700), self._p(2022, 63700), self._p(2023, 39000),
+            self._p(2024, 11800), self._p(2025, 9000),
+        ]
+        yoy, cagr = _derive_yoy_and_cagr_from_prices(prices)
+        assert yoy is not None and -0.24 < yoy < -0.23
+        assert cagr is not None and -0.064 < cagr < -0.062
+
+    def test_picks_primary_benchmark_only(self):
+        # Cobalt-style multi-benchmark: derivation must use ONLY the first
+        # Statistics_detail, ignoring the secondary benchmark even when
+        # it appears in the same year.
+        prices = [
+            self._p(2021, 100, "US spot"),
+            self._p(2021, 80, "LME"),
+            self._p(2025, 200, "US spot"),
+            self._p(2025, 50, "LME"),
+        ]
+        yoy, cagr = _derive_yoy_and_cagr_from_prices(prices)
+        # YoY of primary = (200-100)/100 = +1.00 (only 2 obs of US spot)
+        # CAGR of primary over 4-year span = (200/100)^(1/4) - 1 = ~0.189
+        assert yoy is not None and abs(yoy - 1.0) < 0.001
+        assert cagr is not None and 0.18 < cagr < 0.20
+
+    def test_too_few_observations(self):
+        assert _derive_yoy_and_cagr_from_prices([]) == (None, None)
+        assert _derive_yoy_and_cagr_from_prices([self._p(2025, 100)]) == (None, None)
+
+    def test_handles_zero_first_value(self):
+        prices = [self._p(2021, 0), self._p(2022, 100)]
+        yoy, cagr = _derive_yoy_and_cagr_from_prices(prices)
+        # Division-by-zero guard returns (None, None) when the baseline is 0
+        assert yoy is None and cagr is None
+
+    def test_falls_back_to_raw_when_normalised_missing(self):
+        # DMTU rows leave value_usd_per_mt = None but value_raw is real;
+        # YoY/CAGR are dimensionless so the result still computes from raw.
+        prices = [
+            {**self._p(2021, 100), "value_usd_per_mt": None},
+            {**self._p(2025, 200), "value_usd_per_mt": None},
+        ]
+        yoy, cagr = _derive_yoy_and_cagr_from_prices(prices)
+        assert yoy is not None and abs(yoy - 1.0) < 0.001

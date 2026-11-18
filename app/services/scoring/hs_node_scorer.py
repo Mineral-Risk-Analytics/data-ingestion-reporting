@@ -49,8 +49,12 @@ from sqlalchemy.orm import Session
 from app.models.facility import Facility, FacilityMaterialLink
 from app.models.regulatory import RiskEvent, RiskEventGeography, RiskEventHsMapping
 from app.models.scoring import HsCodeGeographyRiskScore
-from app.models.supply import HsCodeMaterialMapping, HsCodeProductionShare
+from app.models.supply import HsCodeMaterialMapping, HsCodeProductionShare, TradeFlow
 from app.services.scoring.decay import compute_recency_multiplier
+from app.services.scoring.event_impact import (
+    compute_effective_confidence,
+    relevance_score_to_multiplier,
+)
 from app.constants import RiskCategory
 from app.services.scoring.supplier_risk import SCORING_VERSION
 
@@ -99,7 +103,10 @@ _AT_RISK_STATUSES = frozenset({"mothballed", "closed", "care_maintenance"})
 # the previous ``{"TARIFF"}`` constant matched zero events in production,
 # leaving ``tariff_exposure`` permanently 0.  See gta._INTERVENTION_SUBTYPE_MAP.
 _TARIFF_SUBTYPES = frozenset({"TARIFF", "IMPORT_DISRUPTION"})
-_EXPORT_SUBTYPES = frozenset({"EXPORT_RESTRICTION"})
+# 2026-07-27: widened to the shared constant — manual-walkthrough subtypes
+# (national_export_quota etc.) were invisible here (exact-match gate, no
+# title fallback), so e.g. the DRC quota event never fed HS-node exports.
+from app.constants import EXPORT_RESTRICTION_SUBTYPES as _EXPORT_SUBTYPES
 
 # ── Geography contexts consumed by Tariff / Export sub-scores ─────────────
 # Primary    = the implementing country.  For export-side interventions
@@ -116,6 +123,251 @@ _EXPORT_SUBTYPES = frozenset({"EXPORT_RESTRICTION"})
 _EXPORT_GEOGRAPHY_CONTEXT = "primary"
 _TARIFF_GEOGRAPHY_CONTEXT = "affected"
 
+# ── Trade-participation gate for event-only pairs (2026-07-15) ────────────
+# The event-pair source enumerates every (mapping × country) a tariff /
+# export event touches — ~21k pairs with no production share and no
+# facility.  Scoring a material × geography with zero evidence the country
+# PARTICIPATES in that node's market is misleading (Austria scored on
+# cobalt ore because an EU-wide tariff listed it).  An event-derived pair
+# with no share and no facility is kept only when the country's export
+# trade on the node clears BOTH:
+#   * relative:  ≥ ``_TRADE_GATE_MIN_NODE_SHARE`` of the 4-digit HS
+#     FAMILY's global export value in ``trade_flows`` (guards
+#     multi-material HS baskets like 2833 where a flat dollar floor lets
+#     incidental exporters in), and
+#   * absolute:  ≥ ``_TRADE_GATE_FLOOR_USD`` (guards tiny nodes where 1%%
+#     is pocket change).
+# GRANULARITY: trade evidence is matched at the 4-DIGIT FAMILY level
+# (``left(trade_flows.hs_code, 4)`` vs ``left(mapping.hs_code_prefix, 4)``),
+# NOT by exact hs_mapping_id.  Comtrade was ingested at 4-digit
+# aggregation (verified 2026-07-15: every flow's hs_code is 4 digits), so
+# exact-mapping matching would find zero trade for every 6-digit mapping —
+# and 6-digit mappings carry most of the events (810520: 413 events,
+# trade only on parent 8105).  Family matching keeps 1,495 of 21,452
+# event-only pairs (vs 162 under exact matching, which wrongly gated
+# CN's cobalt/lithium 6-digit rows).
+# Values are summed across all ingested periods (2023-2025 annual,
+# partner=WLD only, export flag).  Countries absent from trade_flows fail
+# the gate by construction — no participation evidence, no score row.
+# Share- or facility-anchored pairs are NEVER gated.
+_TRADE_GATE_MIN_NODE_SHARE = 0.01
+_TRADE_GATE_FLOOR_USD = 5_000_000.0
+
+
+# ---------------------------------------------------------------------------
+# 2026-06-16 — Batch-mode preload cache
+# ---------------------------------------------------------------------------
+# The hot loop in ``score_all_hs_nodes`` calls ``score_hs_node_geography``
+# for every (hs_mapping_id × country) pair.  Per pair we previously did
+# ~6 SQL roundtrips, four of which depend ONLY on hs_mapping_id (not on
+# country):
+#
+#   1. latest reference_year for production shares
+#   2. all production shares for that year
+#   3. the mapping's (material_id, supply_chain_stage)
+#   4. _get_related_hs_mapping_ids — 2 sub-queries per call
+#
+# At ~4,500 pairs × 6 queries = ~27,000 roundtrips.  Hoisting (1)-(4) once
+# per mapping (~500-1,000 mappings) cuts that to ~4,000 cache-build queries
+# plus 2-3 per pair = ~14,000 — roughly 50% fewer queries.
+#
+# Cache is in memory for the duration of one batch run, then garbage
+# collected.  Cache misses fall back to the original per-row queries so
+# standalone ``score_hs_node_geography(..., cache=None)`` keeps working.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass as _dc, field as _dc_field
+
+
+@_dc
+class HsNodeScoringCache:
+    """Bulk-loaded per-mapping data shared across a batch run.
+
+    Each field is keyed by ``hs_mapping_id`` and depends only on the
+    mapping (not on the country) — so the same value is reused across
+    every (mapping × country) pair the loop visits for that mapping.
+    """
+
+    # Mapping metadata: (material_id, supply_chain_stage, hs_code_prefix).
+    mapping_meta_by_id: dict[int, tuple] = _dc_field(default_factory=dict)
+    # Latest reference_year that has production_share data for this mapping
+    # in the requested market_scope.  ``None`` value means "we checked,
+    # there are no shares" so the cache miss path is unnecessary.
+    latest_year_by_mapping_id: dict[int, Optional[int]] = _dc_field(default_factory=dict)
+    # All shares for (mapping_id, latest_year, market_scope).  Empty list
+    # when no rows exist.
+    shares_by_mapping_id: dict[int, list] = _dc_field(default_factory=dict)
+    # Result of _get_related_hs_mapping_ids — (related_ids_set, meta_dict).
+    related_by_mapping_id: dict[int, tuple[set[int], dict]] = _dc_field(default_factory=dict)
+    # Flag the cache was fully populated — distinguishes "cache built,
+    # this mapping legitimately missing" from "cache wasn't given".
+    built: bool = False
+
+
+def build_hs_node_scoring_cache(
+    db: Session,
+    hs_mapping_ids: list[int],
+    market_scope: str,
+    as_of_date: date,
+) -> HsNodeScoringCache:
+    """Preload the per-mapping queries that ``score_hs_node_geography``
+    repeats for every country during a batch run.
+
+    Build pattern: ONE bulk SELECT per kind, walk rows in Python to
+    populate dict.  Total cost is O(N_mappings) queries instead of
+    O(N_pairs × 4).
+    """
+    cache = HsNodeScoringCache()
+    if not hs_mapping_ids:
+        cache.built = True
+        return cache
+
+    log.info(
+        "hs_node_scorer.cache.build_start",
+        mapping_count=len(hs_mapping_ids),
+        market_scope=market_scope,
+    )
+
+    # ── 1. Mapping metadata (one query) ─────────────────────────────────
+    meta_rows = db.execute(
+        select(
+            HsCodeMaterialMapping.id,
+            HsCodeMaterialMapping.material_id,
+            HsCodeMaterialMapping.supply_chain_stage,
+            HsCodeMaterialMapping.hs_code_prefix,
+        ).where(HsCodeMaterialMapping.id.in_(hs_mapping_ids))
+    ).all()
+    for r in meta_rows:
+        cache.mapping_meta_by_id[r.id] = (r.material_id, r.supply_chain_stage, r.hs_code_prefix)
+
+    # ── 2. Latest year per mapping (one query) ──────────────────────────
+    # GROUP BY mapping_id gives us the max year for each in a single
+    # roundtrip instead of one MAX() per pair.
+    year_rows = db.execute(
+        select(
+            HsCodeProductionShare.hs_mapping_id,
+            func.max(HsCodeProductionShare.reference_year).label("latest_year"),
+        )
+        .where(
+            HsCodeProductionShare.hs_mapping_id.in_(hs_mapping_ids),
+            HsCodeProductionShare.market_scope == market_scope,
+        )
+        .group_by(HsCodeProductionShare.hs_mapping_id)
+    ).all()
+    for r in year_rows:
+        cache.latest_year_by_mapping_id[r.hs_mapping_id] = r.latest_year
+    # Fill missing entries with None so the lookup is unambiguous.
+    for mid in hs_mapping_ids:
+        cache.latest_year_by_mapping_id.setdefault(mid, None)
+
+    # ── 3. All shares for each (mapping, latest_year) (one query) ───────
+    # Build (mapping_id, year) tuples we care about, then SELECT in one
+    # round-trip.  Most mappings share the same latest_year so this is
+    # heavily compressed.
+    by_mapping_and_year = [
+        (mid, yr) for mid, yr in cache.latest_year_by_mapping_id.items() if yr is not None
+    ]
+    if by_mapping_and_year:
+        # Pull all shares for the relevant (mapping, year) pairs in one shot.
+        # ``filter`` on the composite is cleanest via a tuple-in-VALUES list.
+        mapping_ids_with_year = [mid for mid, _ in by_mapping_and_year]
+        share_rows = db.execute(
+            select(HsCodeProductionShare).where(
+                HsCodeProductionShare.hs_mapping_id.in_(mapping_ids_with_year),
+                HsCodeProductionShare.market_scope == market_scope,
+            )
+        ).scalars().all()
+        # Group in Python: only keep the rows matching each mapping's
+        # latest_year.
+        for share in share_rows:
+            target_year = cache.latest_year_by_mapping_id.get(share.hs_mapping_id)
+            if share.reference_year == target_year:
+                cache.shares_by_mapping_id.setdefault(share.hs_mapping_id, []).append(share)
+    # Fill empties so the consumer doesn't have to .get() with default.
+    for mid in hs_mapping_ids:
+        cache.shares_by_mapping_id.setdefault(mid, [])
+
+    # ── 4. Related mapping IDs per mapping (parent/child propagation) ───
+    # _get_related_hs_mapping_ids does TWO queries per call: one for our
+    # row, one for siblings.  Hoist both into a single sibling-by-material
+    # SELECT.  First, group our cached mappings by material_id.
+    mappings_by_material: dict[int, list[tuple[int, str]]] = {}
+    for mid, (material_id, _stage, prefix) in cache.mapping_meta_by_id.items():
+        if material_id is None:
+            cache.related_by_mapping_id[mid] = (
+                {mid},
+                {
+                    "primary_mapping_id": mid,
+                    "parent_mapping_ids": [],
+                    "child_mapping_ids_excluded": [],
+                    "total_propagated": 0,
+                    "skipped_reason": "mapping_or_material_missing",
+                    "propagation_rule": "parent_to_child_only",
+                },
+            )
+            continue
+        mappings_by_material.setdefault(material_id, []).append(
+            (mid, (prefix or "").replace(".", "").strip())
+        )
+
+    # ALL siblings for ALL relevant materials in one query — keyed by
+    # material_id so the per-mapping classification stays cheap.
+    relevant_material_ids = list(mappings_by_material.keys())
+    sibling_index: dict[int, list[tuple[int, str]]] = {}
+    if relevant_material_ids:
+        sibling_rows = db.execute(
+            select(
+                HsCodeMaterialMapping.id,
+                HsCodeMaterialMapping.material_id,
+                HsCodeMaterialMapping.hs_code_prefix,
+            ).where(HsCodeMaterialMapping.material_id.in_(relevant_material_ids))
+        ).all()
+        for r in sibling_rows:
+            prefix = (r.hs_code_prefix or "").replace(".", "").strip()
+            if not prefix:
+                continue
+            sibling_index.setdefault(r.material_id, []).append((r.id, prefix))
+
+    # Now classify each mapping using its material's sibling list.
+    for material_id, mappings in mappings_by_material.items():
+        full_siblings = sibling_index.get(material_id, [])
+        for mid, our_prefix in mappings:
+            if not our_prefix:
+                cache.related_by_mapping_id[mid] = (
+                    {mid},
+                    {
+                        "primary_mapping_id": mid,
+                        "parent_mapping_ids": [],
+                        "child_mapping_ids_excluded": [],
+                        "total_propagated": 0,
+                        "skipped_reason": "empty_prefix",
+                        "propagation_rule": "parent_to_child_only",
+                    },
+                )
+                continue
+            # Exclude self from siblings before classifying.
+            siblings_for_us = [(sid, sp) for sid, sp in full_siblings if sid != mid]
+            parents, children = _classify_hs_relations(our_prefix, siblings_for_us)
+            cache.related_by_mapping_id[mid] = (
+                {mid, *parents},
+                {
+                    "primary_mapping_id": mid,
+                    "parent_mapping_ids": sorted(parents),
+                    "child_mapping_ids_excluded": sorted(children),
+                    "total_propagated": len(parents),
+                    "propagation_rule": "parent_to_child_only",
+                },
+            )
+
+    cache.built = True
+    log.info(
+        "hs_node_scorer.cache.build_done",
+        mapping_meta=len(cache.mapping_meta_by_id),
+        share_buckets=len(cache.shares_by_mapping_id),
+        related_buckets=len(cache.related_by_mapping_id),
+    )
+    return cache
+
 
 def _compute_hhi(shares: list[float]) -> float:
     """Herfindahl-Hirschman Index from a list of fractional production shares.
@@ -127,37 +379,64 @@ def _compute_hhi(shares: list[float]) -> float:
 
 
 def _compute_event_signal(
-    events: list[tuple[float, float, date]],
+    events: list[tuple[float, float, date, float]],
     as_of_date: date,
     category: RiskCategory,
-) -> float:
-    """Convert a list of (severity, confidence, event_date) tuples to a 0–1 signal.
+) -> tuple[float, int]:
+    """Convert (severity, confidence, event_date, relevance_score) tuples to a
+    0–1 signal, returning ``(signal_value, top_n_used)``.
 
-    Uses the standard ``severity × confidence × recency_multiplier`` formula
-    and returns the average of the top-3 non-zero impacts.  Returns 0.0 if
-    no events are present.
+    Uses the canonical ``severity × confidence × recency × relevance`` formula
+    (with the shared 0.60 confidence floor when severity ≥ 0.80) and returns
+    the average of the top-3 non-zero impacts.  Returns ``(0.0, 0)`` if no
+    events are present.
+
+    11.7-HS-F4 (2026-06-07): the relevance multiplier is now applied at the
+    HS-node level via ``relevance_score_to_multiplier``.  Previously the
+    function omitted it, which gave basket-fanout events (raw relevance 0.40
+    → multiplier 0.94) the same node-level weight as direct HS-code matches
+    (raw 0.90 → 1.24).  Aligns the node-level scoring with the same formula
+    every other pillar uses.
+
+    11.7-HS-F3 (2026-06-07): confidence-floor logic delegated to the shared
+    ``compute_effective_confidence`` helper to avoid duplication.
+
+    11.7-HS-F5 (2026-06-07): returns ``(signal_value, top_n_used)`` so the
+    caller can surface in node metadata how many events the top-3 truncation
+    dropped.
 
     Args:
-        events:     List of (severity, confidence, event_date) tuples.
+        events:     (severity, confidence, event_date, relevance_score) tuples.
+                    relevance_score is the raw 0-1 attribution confidence from
+                    the junction row (``RiskEventHsMapping.relevance_score``);
+                    it is mapped to the [0.70, 1.30] multiplier internally.
         as_of_date: Evaluation date for recency computation.
         category:   RiskCategory used to determine the decay function.
+
+    Returns:
+        ``(signal_value, top_n_used)`` — signal in [0, 1+] (typically ≤1.0
+        after recency caps), and the count of impacts that contributed to
+        the top-3 average (0, 1, 2, or 3).
     """
     if not events:
-        return 0.0
+        return 0.0, 0
 
     impacts: list[float] = []
-    for severity, confidence, event_date in events:
-        eff_conf = max(confidence, 0.60) if severity >= 0.80 else confidence
+    for severity, confidence, event_date, relevance_score in events:
+        eff_conf = compute_effective_confidence(severity, confidence)
         recency = compute_recency_multiplier(
             category=category,
             event_date=event_date if event_date is not None else as_of_date,
             as_of_date=as_of_date,
         )
-        impacts.append(severity * eff_conf * recency)
+        relevance_mult = relevance_score_to_multiplier(relevance_score)
+        impacts.append(severity * eff_conf * recency * relevance_mult)
 
     impacts.sort(reverse=True)
     top3 = impacts[:3]
-    return sum(top3) / len(top3) if top3 else 0.0
+    if not top3:
+        return 0.0, 0
+    return sum(top3) / len(top3), len(top3)
 
 
 def _compute_operational_signal(
@@ -234,6 +513,147 @@ def _compute_operational_signal(
 
 
 # ---------------------------------------------------------------------------
+# 11.1.A (2026-06) — Parent/child HS mapping propagation
+# ---------------------------------------------------------------------------
+# Pre-11.1.A the scorer joined events on ``RiskEventHsMapping.hs_mapping_id ==
+# hs_mapping_id`` (strict equality).  That meant a Federal Register tariff
+# tagged to the 4-digit chapter mapping (e.g. ``2601`` for iron ore) would
+# only lift ``tariff_exposure`` on the 4-digit node, NOT on its 6-digit
+# children ``260111`` / ``260112``.  At Level-1 the rollup averages the
+# children's zero-tariff scores with the parent's lifted score, diluting
+# the signal.
+#
+# 11.1.A closes this by treating events tagged to any (parent ∪ child)
+# mapping FOR THE SAME MATERIAL as in-scope for the current node.  Cross-
+# material contamination (e.g. HS 2615 covers Nb/Ta/V/Zr) is prevented by
+# the same-material filter.  Production shares + HHI + operational signal
+# remain strictly per-node — those are structural measurements that don't
+# logically propagate across granularities.
+
+
+def _classify_hs_relations(
+    our_prefix: str,
+    siblings: list[tuple[int, str]],
+) -> tuple[list[int], list[int]]:
+    """Classify same-material HS mappings as parents / children of ``our_prefix``.
+
+    Pure helper for testing.  Inputs are normalised (no dots).  Returns
+    ``(parent_ids, child_ids)``.
+
+    Parent: ``sibling_prefix`` is a strict prefix of ``our_prefix`` (e.g.
+    ``2601`` is a parent of ``260111``).
+
+    Child: ``our_prefix`` is a strict prefix of ``sibling_prefix`` (e.g.
+    ``260111`` is a child of ``2601``).
+
+    Equal prefixes are NEITHER parent nor child — they're the same node
+    (or a data duplicate that should have been caught by the unique
+    constraint on ``hs_code_material_mappings``).  Such rows are skipped
+    silently.
+    """
+    parents: list[int] = []
+    children: list[int] = []
+    for other_id, other_prefix in siblings:
+        if other_prefix == our_prefix:
+            continue
+        if our_prefix.startswith(other_prefix):
+            parents.append(other_id)
+        elif other_prefix.startswith(our_prefix):
+            children.append(other_id)
+        # Otherwise the prefixes are unrelated (e.g. both 6-digit
+        # codes under the same material, like 260111 and 260112).
+    return parents, children
+
+
+def _get_related_hs_mapping_ids(
+    db: Session,
+    hs_mapping_id: int,
+) -> tuple[set[int], dict]:
+    """Return mapping IDs for parent + child HS codes of the same material.
+
+    Returns ``(set_of_ids, propagation_metadata)``.  The current mapping
+    ID is always included in the set; if no parent/child relations exist
+    the set has exactly one element and the score is unchanged from
+    pre-11.1.A behaviour.
+
+    The same-material filter is intentional: HS 2615 ("Niobium /
+    Tantalum / Vanadium / Zirconium ores") is shared by FOUR distinct
+    mineral mappings.  Without the filter, a tariff tagged to the
+    Vanadium-at-2615 mapping would propagate to Niobium-at-261590 etc.
+    — cross-material contamination.
+    """
+    # Fetch our prefix + material_id in one query.
+    our = db.execute(
+        select(
+            HsCodeMaterialMapping.hs_code_prefix,
+            HsCodeMaterialMapping.material_id,
+        ).where(HsCodeMaterialMapping.id == hs_mapping_id)
+    ).one_or_none()
+    if our is None or our.material_id is None:
+        return {hs_mapping_id}, {
+            "primary_mapping_id": hs_mapping_id,
+            "parent_mapping_ids": [],
+            "child_mapping_ids": [],
+            "total_propagated": 0,
+            "skipped_reason": "mapping_or_material_missing",
+        }
+
+    our_prefix = (our.hs_code_prefix or "").replace(".", "").strip()
+    if not our_prefix:
+        return {hs_mapping_id}, {
+            "primary_mapping_id": hs_mapping_id,
+            "parent_mapping_ids": [],
+            "child_mapping_ids": [],
+            "total_propagated": 0,
+            "skipped_reason": "empty_prefix",
+        }
+
+    # Pull every other mapping for the same material.
+    sibling_rows = db.execute(
+        select(
+            HsCodeMaterialMapping.id,
+            HsCodeMaterialMapping.hs_code_prefix,
+        ).where(
+            HsCodeMaterialMapping.material_id == our.material_id,
+            HsCodeMaterialMapping.id != hs_mapping_id,
+        )
+    ).all()
+    siblings = [
+        (row.id, (row.hs_code_prefix or "").replace(".", "").strip())
+        for row in sibling_rows
+        if (row.hs_code_prefix or "").strip()
+    ]
+
+    parents, children = _classify_hs_relations(our_prefix, siblings)
+
+    # 11.7-HS-F7 (2026-06-07): propagation restricted to parent-to-child only.
+    # Events tagged to a 4-digit parent flow IN to a 6-digit child (the
+    # parent's broader scope subsumes the child).  Events tagged to a
+    # 6-digit child do NOT flow up to the 4-digit parent — a specific
+    # child does not by itself represent the broader category.  This
+    # asymmetric rule matches the handbook's stated propagation direction.
+    #
+    # ``parents`` in this context = mappings whose prefix is a STRICT
+    # prefix of ours (we are at a more specific level, they are at the
+    # broader chapter — their events propagate DOWN to us).
+    # ``children`` = mappings whose prefix WE are a strict prefix of
+    # (they are more specific than us — their events should NOT propagate
+    # UP to us under the asymmetric rule).
+    related = {hs_mapping_id, *parents}
+    return related, {
+        "primary_mapping_id": hs_mapping_id,
+        "parent_mapping_ids": sorted(parents),
+        # 11.7-HS-F7: children are STILL classified for diagnostic
+        # transparency, but they no longer contribute events to this
+        # node's score.  Surfaced so partner can see what would have
+        # propagated under the symmetric rule.
+        "child_mapping_ids_excluded": sorted(children),
+        "total_propagated": len(parents),
+        "propagation_rule": "parent_to_child_only",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Node scorer
 # ---------------------------------------------------------------------------
 
@@ -244,6 +664,7 @@ def score_hs_node_geography(
     as_of_date: date,
     *,
     market_scope: str = "global",
+    cache: Optional[HsNodeScoringCache] = None,
 ) -> Optional[HsCodeGeographyRiskScore]:
     """Compute and persist a Level-0 score for one (HS node × country) pair.
 
@@ -281,27 +702,46 @@ def score_hs_node_geography(
     """
     # ── 1. Find the most recent reference year with production share data ──
     # May be None — that triggers the event-only fallback path below.
-    latest_year: Optional[int] = db.scalar(
-        select(func.max(HsCodeProductionShare.reference_year)).where(
-            HsCodeProductionShare.hs_mapping_id == hs_mapping_id,
-            HsCodeProductionShare.market_scope == market_scope,
+    # 2026-06-16: cache-aware.  In batch mode the latest_year and the
+    # full share list are preloaded once per mapping by
+    # ``build_hs_node_scoring_cache``, so the per-pair code becomes a
+    # dict lookup instead of two DB roundtrips.
+    if cache is not None and cache.built and hs_mapping_id in cache.latest_year_by_mapping_id:
+        latest_year = cache.latest_year_by_mapping_id[hs_mapping_id]
+    else:
+        latest_year = db.scalar(
+            select(func.max(HsCodeProductionShare.reference_year)).where(
+                HsCodeProductionShare.hs_mapping_id == hs_mapping_id,
+                HsCodeProductionShare.market_scope == market_scope,
+            )
         )
-    )
 
     # ── 2. Load production shares (only if a year exists) ───────────────────
     all_shares: list[HsCodeProductionShare] = []
     production_share: float = 0.0
-    hhi_at_stage: Optional[float] = None
+    # Step 1.5 (2026-06-15): keep raw and cliff-mapped HHI as separate
+    # variables.  Raw value goes into ``metadata.hhi_raw`` for transparency
+    # (was the only field before this commit); cliff value is what feeds
+    # the composite_node_score below.  Composite math used raw HHI prior
+    # to this fix, which systematically under-scored producer countries
+    # with structural concentration — e.g. cobalt × DRC at raw HHI 0.59
+    # → composite 29.5, where the cliff mapping (per DOJ HMG tiers)
+    # gives 0.97 → composite 48.5.  See material_risk.hhi_concentration_risk.
+    hhi_raw_value: Optional[float] = None  # truly raw HHI from share squared sum
+    hhi_at_stage: Optional[float] = None   # cliff-mapped — used in scoring
     if latest_year is not None:
-        all_shares = list(
-            db.scalars(
-                select(HsCodeProductionShare).where(
-                    HsCodeProductionShare.hs_mapping_id == hs_mapping_id,
-                    HsCodeProductionShare.reference_year == latest_year,
-                    HsCodeProductionShare.market_scope == market_scope,
-                )
-            ).all()
-        )
+        if cache is not None and cache.built and hs_mapping_id in cache.shares_by_mapping_id:
+            all_shares = list(cache.shares_by_mapping_id[hs_mapping_id])
+        else:
+            all_shares = list(
+                db.scalars(
+                    select(HsCodeProductionShare).where(
+                        HsCodeProductionShare.hs_mapping_id == hs_mapping_id,
+                        HsCodeProductionShare.reference_year == latest_year,
+                        HsCodeProductionShare.market_scope == market_scope,
+                    )
+                ).all()
+            )
         # ── 3. This country's production share (0.0 if not in dataset) ──
         country_row = next(
             (s for s in all_shares if s.country_code == country_code), None
@@ -311,7 +751,30 @@ def score_hs_node_geography(
         share_values = [
             s.production_share for s in all_shares if s.production_share > 0
         ]
-        hhi_at_stage = _compute_hhi(share_values)
+        hhi_raw_value = _compute_hhi(share_values)
+        # Step 1.5 (2026-06-15): apply DOJ-aligned HHI cliff before the
+        # composite uses this value.  Without this, raw HHI 0.59 (cobalt
+        # at the cobalt-ore HS node) contributes only 29.5 to composite
+        # when the structural concentration story merits ~48.
+        from app.services.scoring.material_risk import hhi_concentration_risk
+        hhi_at_stage = hhi_concentration_risk(hhi_raw_value)
+
+    # ── 11.1.A (2026-06) ── parent/child HS propagation
+    # Events tagged to a parent (4-digit chapter) or child (6-digit
+    # subheading) of THIS mapping — for the same material — are
+    # in-scope for the current node's score.  Closes the vertical
+    # asymmetry where a FR tariff on ``2601`` previously only lifted
+    # the 4-digit node and not its 6-digit children.  Same-material
+    # filter prevents cross-material contamination on shared chapters
+    # (e.g. HS 2615 covers Nb/Ta/V/Zr).
+    # 2026-06-16: cache-aware.  Batch runs preload the parent/child
+    # propagation set once per mapping.
+    if cache is not None and cache.built and hs_mapping_id in cache.related_by_mapping_id:
+        related_mapping_ids, hs_propagation_meta = cache.related_by_mapping_id[hs_mapping_id]
+    else:
+        related_mapping_ids, hs_propagation_meta = _get_related_hs_mapping_ids(
+            db, hs_mapping_id,
+        )
 
     # ── 5. Tariff events scoped to this HS code AND this country ────────────
     # G11 (2026-05-06): tariff events are import-side interventions where the
@@ -322,21 +785,33 @@ def score_hs_node_geography(
     # no ``"affected"`` geography row are excluded entirely (strict
     # attribution; no global fallback).  Filter on typed ``event_subtype``
     # column (migration 040), not the ingester-specific ``event_type``.
+    #
+    # 11.1.A: ``hs_mapping_id IN (related_mapping_ids)`` instead of
+    # strict equality so parent + child HS mappings contribute events
+    # at the same material × country.
     tariff_rows = db.execute(
         select(
             RiskEvent.id,
             RiskEvent.severity_score,
             RiskEvent.confidence_score,
             RiskEvent.event_date,
+            # 11.7-HS-F4 (2026-06-07): pull the per-event relevance from the
+            # junction row so it flows into the standard event-impact formula.
+            # When the same event maps to multiple related HS codes (parent
+            # + own + propagated), the DISTINCT below would otherwise drop
+            # the relevance — wire it explicitly via the junction's value.
+            RiskEventHsMapping.relevance_score.label("relevance_score"),
         )
         .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
         .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
         .where(
-            RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
+            RiskEventHsMapping.hs_mapping_id.in_(related_mapping_ids),
             RiskEvent.event_subtype.in_(_TARIFF_SUBTYPES),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEventGeography.country_code == country_code,
             RiskEventGeography.geography_context == _TARIFF_GEOGRAPHY_CONTEXT,
         )
+        .distinct()  # events tagged to multiple related mappings count once
     ).all()
 
     # Normalise event_date (DateTime column) to date for the decay function.
@@ -345,10 +820,11 @@ def score_hs_node_geography(
             row.severity_score,
             row.confidence_score,
             row.event_date.date() if hasattr(row.event_date, "date") else row.event_date,
+            row.relevance_score,
         )
         for row in tariff_rows
     ]
-    tariff_exposure = _compute_event_signal(
+    tariff_exposure, tariff_top_n_used = _compute_event_signal(
         tariff_events, as_of_date, RiskCategory.GEOPOLITICAL_TRADE
     )
 
@@ -358,21 +834,26 @@ def score_hs_node_geography(
     # whose own producers' supply is being constrained.  A China graphite
     # export ban lifts CN's score on the graphite HS node only, not every
     # country's.
+    #
+    # 11.1.A: same parent/child propagation as tariff query above.
     export_rows = db.execute(
         select(
             RiskEvent.id,
             RiskEvent.severity_score,
             RiskEvent.confidence_score,
             RiskEvent.event_date,
+            RiskEventHsMapping.relevance_score.label("relevance_score"),
         )
         .join(RiskEventHsMapping, RiskEventHsMapping.risk_event_id == RiskEvent.id)
         .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
         .where(
-            RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
+            RiskEventHsMapping.hs_mapping_id.in_(related_mapping_ids),
             RiskEvent.event_subtype.in_(_EXPORT_SUBTYPES),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             RiskEventGeography.country_code == country_code,
             RiskEventGeography.geography_context == _EXPORT_GEOGRAPHY_CONTEXT,
         )
+        .distinct()  # events tagged to multiple related mappings count once
     ).all()
 
     export_events = [
@@ -380,10 +861,11 @@ def score_hs_node_geography(
             row.severity_score,
             row.confidence_score,
             row.event_date.date() if hasattr(row.event_date, "date") else row.event_date,
+            row.relevance_score,
         )
         for row in export_rows
     ]
-    export_restriction = _compute_event_signal(
+    export_restriction, export_top_n_used = _compute_event_signal(
         export_events, as_of_date, RiskCategory.GEOPOLITICAL_TRADE
     )
 
@@ -399,14 +881,19 @@ def score_hs_node_geography(
     # the facility query — load them once here.  ``stage_for_op`` is None
     # when the mapping pre-dates the stage column or wasn't seeded with
     # one; in that case operational stays None too.
-    mapping_row = db.execute(
-        select(
-            HsCodeMaterialMapping.material_id,
-            HsCodeMaterialMapping.supply_chain_stage,
-        ).where(HsCodeMaterialMapping.id == hs_mapping_id)
-    ).one_or_none()
-    material_id = mapping_row.material_id if mapping_row else None
-    stage_for_op = mapping_row.supply_chain_stage if mapping_row else None
+    # 2026-06-16: cache-aware.  Mapping metadata is preloaded once per
+    # mapping in batch runs.
+    if cache is not None and cache.built and hs_mapping_id in cache.mapping_meta_by_id:
+        material_id, stage_for_op, _prefix_unused = cache.mapping_meta_by_id[hs_mapping_id]
+    else:
+        mapping_row = db.execute(
+            select(
+                HsCodeMaterialMapping.material_id,
+                HsCodeMaterialMapping.supply_chain_stage,
+            ).where(HsCodeMaterialMapping.id == hs_mapping_id)
+        ).one_or_none()
+        material_id = mapping_row.material_id if mapping_row else None
+        stage_for_op = mapping_row.supply_chain_stage if mapping_row else None
     operational_signal: Optional[float] = None
     op_facility_count: int = 0
     op_at_risk: float = 0.0
@@ -444,7 +931,8 @@ def score_hs_node_geography(
     # fires.  Each weight set sums to 1.0.
     has_events = bool(tariff_events) or bool(export_events)
     has_operational = operational_signal is not None
-    if hhi_at_stage is None and not has_events and not has_operational:
+    if (hhi_at_stage is None or production_share <= 0.0) \
+            and not has_events and not has_operational:
         # Truly nothing to score.  Pre-fix this branch was the entire
         # short-circuit at top of function.
         log.debug(
@@ -462,10 +950,39 @@ def score_hs_node_geography(
         "hhi": None, "tariff": None, "export": None, "operational": None,
     }
 
-    if hhi_at_stage is not None and has_operational:
+    # Fix A (2026-07-15): the hhi-anchored paths additionally require the
+    # country to actually HOLD production share.  hhi_at_stage is a MARKET
+    # property (Σ share² across all countries); crediting it at full weight
+    # to zero-share countries — whose L0 pair exists only because an event
+    # touched them — produced inversions like Austria (share 0.000)
+    # scoring 73.2 on the cobalt ore node vs DRC (share 0.753) at 67.6.
+    # Zero-share countries now route to the event-only / operational paths,
+    # where their evidence is weighted consistently with other event-only
+    # rows.  Share-weighting the HHI component AMONG producers (Fix B,
+    # hhi × f(share)) is a separate partner-methodology decision — see
+    # docs/design/concentration_share_weighting.md.
+    country_holds_share = production_share > 0.0
+
+    # Fix B (2026-07-15, partner decision: sqrt): among producers, the HHI
+    # component is share-weighted — ``hhi × √share`` — so concentration
+    # risk accrues to the geographies that ARE the concentration.  Before
+    # this, every producer inherited the full market HHI (CN at 4% cobalt
+    # share scored the same concentration component as CD at 75%), and
+    # RU-cobalt (3% share + sanctions events) outscored CD.  √share keeps
+    # mid-tier producers visible (linear was evaluated and rejected — it
+    # empties the HIGH band; see docs/design/concentration_share_weighting.md
+    # for the full pre-computed scenario grid).  Fix A above guarantees
+    # production_share > 0 on these paths, so the sqrt is well-defined.
+    hhi_share_weighted: Optional[float] = (
+        hhi_at_stage * math.sqrt(production_share)
+        if hhi_at_stage is not None and country_holds_share
+        else None
+    )
+
+    if hhi_at_stage is not None and country_holds_share and has_operational:
         # HHI-anchored 4-component path
         components = {
-            "hhi":         hhi_at_stage * 100,
+            "hhi":         hhi_share_weighted * 100,
             "tariff":      tariff_exposure * 100,
             "export":      export_restriction * 100,
             "operational": (operational_signal or 0.0) * 100,
@@ -477,10 +994,10 @@ def score_hs_node_geography(
             "operational": _OPERATIONAL_WEIGHT,
         }
         score_method = "hhi_anchored_with_operational"
-    elif hhi_at_stage is not None:
+    elif hhi_at_stage is not None and country_holds_share:
         # HHI-anchored canonical (no operational data — most common today)
         components = {
-            "hhi":    hhi_at_stage * 100,
+            "hhi":    hhi_share_weighted * 100,
             "tariff": tariff_exposure * 100,
             "export": export_restriction * 100,
         }
@@ -550,9 +1067,23 @@ def score_hs_node_geography(
     metadata: dict = {
         "reference_year":      latest_year,    # None on event-only fallback
         "share_country_count": len(all_shares),
-        "hhi_raw":             round(hhi_at_stage, 4) if hhi_at_stage is not None else None,
+        # Step 1.5 (2026-06-15): ``hhi_raw`` is the truly raw Σ share².
+        # ``hhi_cliff`` is the DOJ-aligned cliff-mapped value that ACTUALLY
+        # feeds composite_node_score below.  Pre-1.5 ``hhi_raw`` carried
+        # the raw value and the composite math also used the raw value;
+        # we now split them so consumers can see both without ambiguity.
+        "hhi_raw":             round(hhi_raw_value, 4) if hhi_raw_value is not None else None,
+        "hhi_cliff":           round(hhi_at_stage, 4) if hhi_at_stage is not None else None,
         "tariff_event_count":  len(tariff_events),
         "export_event_count":  len(export_events),
+        # 11.7-HS-F5 (2026-06-07): top-3 truncation visibility.  When the
+        # *_used_count is less than the *_event_count the node-level signal
+        # was averaged from the top three events and the remainder were
+        # silently dropped — same family of truncation as the Regulatory
+        # pillar's top-three averaging.  Lets partner see when a long tail
+        # of low-severity events isn't moving the node score.
+        "tariff_top_n_used":   tariff_top_n_used,
+        "export_top_n_used":   export_top_n_used,
         "event_ids_consumed":  event_ids_consumed,
         # G5 (2026-05-09): operational sub-score from facility capacity data
         "operational_signal":  round(operational_signal, 4) if operational_signal is not None else None,
@@ -562,6 +1093,22 @@ def score_hs_node_geography(
         "score_method":        score_method,    # extended taxonomy 2026-05-09
         "weight_breakdown":    weights_used,
         "scoring_version":     SCORING_VERSION,
+        # 11.1.A (2026-06): which related mappings contributed events to
+        # this node's tariff_exposure / export_restriction values.
+        "hs_propagation":      hs_propagation_meta,
+        # 11.1.D (2026-06): per-component data-presence diagnostic.
+        # Mirrors the 11.6 data_completeness pattern at Level-0 so the
+        # Level-1 rollup can see which Level-0 nodes were thin.  Each
+        # field is True when real data fed the corresponding sub-score,
+        # False when the sub-score defaulted to 0 / None.  ``score_method``
+        # already encodes which scoring path fired; this block makes the
+        # individual component coverage queryable.
+        "data_stage_coverage": {
+            "hhi_data_present":         hhi_at_stage is not None,
+            "tariff_data_present":      bool(tariff_events),
+            "export_data_present":      bool(export_events),
+            "operational_data_present": operational_signal is not None,
+        },
     }
 
     stmt = (
@@ -583,6 +1130,11 @@ def score_hs_node_geography(
             constraint="uq_hs_geo_score",
             set_={
                 "production_share":     production_share,
+                # Fix B provenance: the composite's hhi component is
+                # hhi_at_stage × √production_share; the hhi_at_stage
+                # COLUMN keeps the unweighted market value.
+                "hhi_share_weighted":   hhi_share_weighted,
+                "share_weighting":      "sqrt",
                 "hhi_at_stage":         hhi_at_stage,
                 "tariff_exposure":      tariff_exposure,
                 "export_restriction":   export_restriction,
@@ -686,6 +1238,7 @@ def score_all_hs_nodes(
         .join(RiskEvent, RiskEvent.id == RiskEventHsMapping.risk_event_id)
         .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
         .where(
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
             (
                 (RiskEvent.event_subtype.in_(_TARIFF_SUBTYPES))
                 & (RiskEventGeography.geography_context == _TARIFF_GEOGRAPHY_CONTEXT)
@@ -734,9 +1287,80 @@ def score_all_hs_nodes(
     share_pairs = db.execute(share_pair_stmt).all()
     event_pairs = db.execute(event_pair_stmt).all()
     facility_pairs = db.execute(facility_pair_stmt).all()
-    pairs = list({
-        (mid, cc) for mid, cc in (*share_pairs, *event_pairs, *facility_pairs)
-    })
+
+    # ── Trade-participation gate (2026-07-15) ────────────────────────────
+    # Event-derived pairs with no share and no facility must show real
+    # export participation on the node before they earn a score row.  See
+    # the ``_TRADE_GATE_*`` constants for rationale and thresholds.
+    anchored_pairs = {(mid, cc) for mid, cc in (*share_pairs, *facility_pairs)}
+    raw_event_pairs = {(mid, cc) for mid, cc in event_pairs}
+    event_only_pairs = raw_event_pairs - anchored_pairs
+
+    gated_out: set = set()
+    if event_only_pairs:
+        # Trade evidence at the 4-digit family level — see the
+        # ``_TRADE_GATE_*`` comment block for why exact-mapping matching
+        # is wrong here (Comtrade ingested at 4-digit aggregation).
+        _family = func.substr(TradeFlow.hs_code, 1, 4).label("family")
+        _family_exports = (
+            select(
+                _family,
+                TradeFlow.reporter_country.label("country_code"),
+                func.sum(TradeFlow.trade_value_usd).label("export_value_usd"),
+            )
+            .where(
+                TradeFlow.import_export_flag == "export",
+                TradeFlow.hs_code.is_not(None),
+                TradeFlow.trade_value_usd.is_not(None),
+            )
+            .group_by(_family, TradeFlow.reporter_country)
+            .subquery()
+        )
+        _with_family_total = (
+            select(
+                _family_exports.c.family,
+                _family_exports.c.country_code,
+                _family_exports.c.export_value_usd,
+                func.sum(_family_exports.c.export_value_usd)
+                .over(partition_by=_family_exports.c.family)
+                .label("family_total_usd"),
+            )
+            .subquery()
+        )
+        trade_qualified_stmt = select(
+            _with_family_total.c.family,
+            _with_family_total.c.country_code,
+        ).where(
+            _with_family_total.c.export_value_usd >= _TRADE_GATE_FLOOR_USD,
+            _with_family_total.c.export_value_usd
+            >= _with_family_total.c.family_total_usd * _TRADE_GATE_MIN_NODE_SHARE,
+        )
+        trade_qualified = {
+            (fam, cc) for fam, cc in db.execute(trade_qualified_stmt).all()
+        }
+        # Map each event-only pair's mapping to its 4-digit family.
+        _eo_mapping_ids = sorted({mid for mid, _ in event_only_pairs})
+        _prefix_rows = db.execute(
+            select(HsCodeMaterialMapping.id, HsCodeMaterialMapping.hs_code_prefix)
+            .where(HsCodeMaterialMapping.id.in_(_eo_mapping_ids))
+        ).all()
+        _mapping_family = {mid: (prefix or "")[:4] for mid, prefix in _prefix_rows}
+        gated_out = {
+            (mid, cc)
+            for mid, cc in event_only_pairs
+            if (_mapping_family.get(mid, ""), cc) not in trade_qualified
+        }
+        log.info(
+            "hs_node_scorer.batch.trade_gate",
+            event_pairs_total=len(raw_event_pairs),
+            event_only_pairs=len(event_only_pairs),
+            kept_by_trade=len(event_only_pairs) - len(gated_out),
+            gated_out=len(gated_out),
+            min_node_share=_TRADE_GATE_MIN_NODE_SHARE,
+            floor_usd=_TRADE_GATE_FLOOR_USD,
+        )
+
+    pairs = list((anchored_pairs | raw_event_pairs) - gated_out)
     pairs_scored = pairs_skipped = 0
     processed_nodes: set[int] = set()
 
@@ -747,7 +1371,70 @@ def score_all_hs_nodes(
         market_scope=market_scope,
     )
 
+    # 2026-06-16 — preload per-mapping data once before the per-pair loop.
+    # Without this each pair re-issues ~4 metadata queries (latest_year,
+    # all_shares, related mappings, mapping meta) that depend only on
+    # hs_mapping_id.  See ``build_hs_node_scoring_cache`` for what's
+    # cached and the math behind the speedup.
+    distinct_mapping_ids = sorted({mid for mid, _ in pairs})
+    cache = build_hs_node_scoring_cache(
+        db, distinct_mapping_ids, market_scope, as_of_date,
+    )
+
+    # 2026-06-12: Batch commits with per-pair savepoints + defensive
+    # connection-drop recovery.
+    #
+    # The original per-pair commit (one db.commit() per iteration) paid one
+    # full WAL flush + Neon round-trip per pair (~500ms-2s on cold compute)
+    # and bottlenecked the job to ~1-5 pairs/min instead of ~47/min on the
+    # warm path.  Switching to batch commits gave the speedup but added a
+    # failure mode: Neon serverless can drop the connection mid-batch (even
+    # via the pooler endpoint), leaving the SQLAlchemy session in an
+    # invalid state where every subsequent begin_nested() raises
+    # PendingRollbackError until the outer transaction is rolled back.
+    #
+    # The outer try/except below catches that case: when the savepoint
+    # itself fails to start (or the score function raises a connection
+    # error), we do a full db.rollback() to reset the session, drop the
+    # in-flight batch counter, and continue with the next pair.  Worst case
+    # we lose ``_COMMIT_BATCH_SIZE`` pairs of unflushed work on a single
+    # drop; the UPSERT in score_hs_node_geography makes a re-run idempotent.
+    from sqlalchemy.exc import (
+        DBAPIError,
+        OperationalError,
+        PendingRollbackError,
+        InvalidRequestError,
+    )
+    _CONN_ERRORS: tuple = (
+        DBAPIError, OperationalError, PendingRollbackError, InvalidRequestError,
+    )
+
+    _COMMIT_BATCH_SIZE = 50
+    batch_pending = 0
+
+    def _full_reset_session(reason: str) -> None:
+        """Roll back the outer transaction so SQLAlchemy can reconnect."""
+        nonlocal batch_pending
+        log.warning(
+            "hs_node_scorer.batch.connection_reset",
+            reason=reason,
+            in_flight_batch=batch_pending,
+        )
+        try:
+            db.rollback()
+        except Exception:
+            log.exception("hs_node_scorer.batch.rollback_failed")
+        batch_pending = 0
+
     for hs_mapping_id, country_code in pairs:
+        try:
+            savepoint = db.begin_nested()
+        except _CONN_ERRORS as e:
+            # Outer transaction is in invalid state — most likely a Neon drop.
+            _full_reset_session(f"begin_nested failed: {type(e).__name__}")
+            pairs_skipped += 1
+            continue
+
         try:
             result = score_hs_node_geography(
                 db,
@@ -755,21 +1442,52 @@ def score_all_hs_nodes(
                 country_code=country_code,
                 as_of_date=as_of_date,
                 market_scope=market_scope,
+                cache=cache,
             )
             if result is None:
                 pairs_skipped += 1
             else:
                 pairs_scored += 1
                 processed_nodes.add(hs_mapping_id)
-            db.commit()
+            savepoint.commit()
+            batch_pending += 1
+        except _CONN_ERRORS as e:
+            # Connection-level error inside the score call.  Savepoint cleanup
+            # will likely also fail; go straight to a full reset.
+            _full_reset_session(f"score call failed: {type(e).__name__}")
+            pairs_skipped += 1
+            continue
         except Exception:
-            db.rollback()
+            # Ordinary pair-level error — savepoint rollback is sufficient.
+            try:
+                savepoint.rollback()
+            except Exception:
+                _full_reset_session("savepoint rollback after pair error failed")
             log.exception(
                 "hs_node_scorer.batch.pair_failed",
                 hs_mapping_id=hs_mapping_id,
                 country_code=country_code,
             )
             pairs_skipped += 1
+            continue
+
+        if batch_pending >= _COMMIT_BATCH_SIZE:
+            try:
+                db.commit()
+                batch_pending = 0
+            except _CONN_ERRORS as e:
+                _full_reset_session(f"batch commit failed: {type(e).__name__}")
+
+    # Flush the trailing partial batch.
+    if batch_pending > 0:
+        try:
+            db.commit()
+        except Exception:
+            log.exception("hs_node_scorer.batch.final_commit_failed")
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
     log.info(
         "hs_node_scorer.batch.complete",

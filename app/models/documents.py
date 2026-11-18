@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -55,6 +55,11 @@ class SourceDocument(Base):
     regulations: Mapped[list["Regulation"]] = relationship(back_populates="source_document")
     risk_events: Mapped[list["RiskEvent"]] = relationship(back_populates="source_document")
     trade_flows: Mapped[list["TradeFlow"]] = relationship(back_populates="source_document")
+    # SEC Workstream B (2026-06): bodies of fetched SEC filings live in a
+    # sibling table to keep this row lean for the hot scoring read path.
+    body_sections: Mapped[list["FilingBodySection"]] = relationship(
+        back_populates="source_document", cascade="all, delete-orphan"
+    )
 
 
 class DocumentChunk(Base):
@@ -83,3 +88,49 @@ class DocumentChunk(Base):
     )
 
     document: Mapped["SourceDocument"] = relationship(back_populates="chunks")
+
+
+class FilingBodySection(Base):
+    """One parsed section of a fetched SEC filing body.
+
+    SEC Workstream B (migration 049, 2026-06).  Replaces the previous
+    metadata-only state where every ``ParsedFiling.narrative_excerpt`` was
+    a hardcoded stub ``"<FORM> filing for <issuer>"`` and material
+    attribution was gated off via ``is_narrative_placeholder``.
+
+    Sections are emitted by the section parser (10-K → Item 1A/2/7;
+    20-F → Item 3.D/4.D/5).  The unique key (source_document_id,
+    section_code) means re-parsing replaces rather than duplicates.
+
+    See ``alembic/versions/049_filing_body_sections.py`` for the full
+    rationale and the ``section_code`` taxonomy.
+    """
+
+    __tablename__ = "filing_body_sections"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_document_id", "section_code", name="uq_filing_body_section"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source_document_id: Mapped[int] = mapped_column(
+        ForeignKey("source_documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    section_code: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    section_text: Mapped[str] = mapped_column(Text, nullable=False)
+    char_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    parser_method: Mapped[str] = mapped_column(String(32), nullable=False)
+    parser_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    source_document: Mapped["SourceDocument"] = relationship(
+        back_populates="body_sections"
+    )

@@ -1,7 +1,7 @@
 """ORM models — import side effects register all metadata with Base."""
 
 from app.models.battery_chemistry import BatteryChemistry, BatteryChemistryMaterial, ChemistryRiskScore
-from app.models.country import Country
+from app.models.country import Country, CountryGovernanceSignal
 from app.models.criticality_signal import MaterialCriticalitySignal
 from app.models.company import (
     Company,
@@ -10,7 +10,7 @@ from app.models.company import (
     CompanyScore,
     CompanySupplyRelationship,
 )
-from app.models.documents import DocumentChunk, SourceDocument
+from app.models.documents import DocumentChunk, FilingBodySection, SourceDocument
 from app.models.intelligence import InsightPost
 from app.models.facility import CompanyFacility, Facility, FacilityMaterialLink
 from app.models.ingestion import IngestionRun, RawApiPayload
@@ -59,6 +59,11 @@ from app.models.supply import (
     TradeFlow,
 )
 from app.models.vehicle import CompanyVehicleModel, VehicleModelChemistry
+from app.models.wmd import (  # noqa: F401
+    WmdCommodity,
+    WmdGroupProduction,
+    WmdProduction,
+)
 
 __all__ = [
     # Battery chemistry
@@ -67,6 +72,7 @@ __all__ = [
     "ChemistryRiskScore",
     # Country reference
     "Country",
+    "CountryGovernanceSignal",
     "MaterialCriticalitySignal",
     # Company layer
     "Company",
@@ -76,6 +82,7 @@ __all__ = [
     "CompanySupplyRelationship",
     # Documents
     "DocumentChunk",
+    "FilingBodySection",
     "SourceDocument",
     # Intelligence hub
     "InsightPost",
@@ -134,4 +141,8 @@ __all__ = [
     # Vehicle (chemistry mix)
     "CompanyVehicleModel",
     "VehicleModelChemistry",
+    # World Mining Data (migration 060) — cross-check layer, never feeds scoring
+    "WmdCommodity",
+    "WmdProduction",
+    "WmdGroupProduction",
 ]

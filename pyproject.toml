@@ -24,9 +24,21 @@ dependencies = [
     "lxml>=5.3.0",
     "pyjwt[crypto]>=2.9.0",
     "cachetools>=5.5.0",
+    "boto3>=1.35.0",
     "inngest>=0.5.18",
     "anthropic>=0.97.0",
     "python-dotenv>=1.2.2",
+    # SEC Workstream B (migration 049, 2026-06): edgartools provides
+    # iXBRL-aware section extraction for 10-K (Items 1A/2/7) and 20-F
+    # (Items 3.D/4.D/5).  MIT-licensed, actively maintained.  The
+    # filing_body_parser falls back to regex + LLM-locator when the
+    # library can't find a target section.
+    "edgartools>=4.0.0",
+    # Insight-post docx ingestion (scripts/ingest_insight_docx.py, 2026-07-08):
+    # partner authors in Word; mammoth converts docx→HTML with image
+    # extraction, markdownify produces the Markdown body for insight_posts.
+    "mammoth>=1.6",
+    "markdownify>=0.11",
 ]
 
 [project.optional-dependencies]

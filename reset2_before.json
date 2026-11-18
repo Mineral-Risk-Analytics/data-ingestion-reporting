@@ -1,0 +1,79 @@
+{
+  "captured_at": "2026-09-24T14:26:43.107508+00:00",
+  "sources": {
+    "EUR-Lex": {
+      "total": 6,
+      "by_status": {
+        "pending_triage": 6
+      },
+      "duplicate_marked": 0,
+      "verified": 6,
+      "gta_ids": 0
+    },
+    "Federal Register API": {
+      "total": 98,
+      "by_status": {
+        "pending_triage": 50,
+        "display_only": 40,
+        "scoring": 7,
+        "rejected": 1
+      },
+      "duplicate_marked": 0,
+      "verified": 7,
+      "gta_ids": 0
+    },
+    "Global Trade Alert": {
+      "total": 1498,
+      "by_status": {
+        "scoring": 11,
+        "pending_triage": 647,
+        "display_only": 839,
+        "rejected": 1
+      },
+      "duplicate_marked": 0,
+      "verified": 11,
+      "gta_ids": 1498
+    },
+    "IEA Critical Minerals Policy Tracker": {
+      "total": 436,
+      "by_status": {
+        "display_only": 200,
+        "pending_triage": 236
+      },
+      "duplicate_marked": 0,
+      "verified": 0,
+      "gta_ids": 0
+    },
+    "OpenSanctions": {
+      "total": 18,
+      "by_status": {
+        "display_only": 11,
+        "pending_triage": 7
+      },
+      "duplicate_marked": 0,
+      "verified": 0,
+      "gta_ids": 0
+    },
+    "Operational news watchlist": {
+      "total": 19,
+      "by_status": {
+        "pending_triage": 5,
+        "rejected": 11,
+        "scoring": 3
+      },
+      "duplicate_marked": 0,
+      "verified": 3,
+      "gta_ids": 0
+    },
+    "manual_walkthrough": {
+      "total": 272,
+      "by_status": {
+        "pending_triage": 272
+      },
+      "duplicate_marked": 0,
+      "verified": 0,
+      "gta_ids": 0
+    }
+  },
+  "grand_total": 2347
+}

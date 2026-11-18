@@ -66,3 +66,8 @@ def score_geopolitical_trade(
         + 0.20 * tariff_exposure
         + 0.10 * production_subsidy_distortion
     ) * 100)
+
+# NOTE: apply_wgi_governance_overlay (the JRC WGI governance overlay)
+# was removed in 4.1 — governance moved into the concentration pillar as
+# a production-share-anchored instability amplifier (spec §3), and the
+# geopolitical overlay was dropped to avoid double-counting.
