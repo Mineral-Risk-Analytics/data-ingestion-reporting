@@ -394,3 +394,94 @@ class TestIngestEndToEnd:
         )
         assert result["items_fetched"] == 0
         assert result["events_created"] == 0
+
+
+class TestEntityHygiene:
+    """2026-11-18: feeds deliver HTML entities (&nbsp;, &amp;, &#39;…) in
+    titles/descriptions — public signal rows showed literal ``&nbsp;``.
+    New rows are decoded at the ingest choke point; previously ingested
+    rows are decoded by the in-command cleanup, which preserves event ids
+    (triage survives) and recomputes content_hash so refetches of the
+    same article still dedupe."""
+
+    def test_feed_entities_decoded_on_new_rows(self, session, seeded):
+        # &amp;nbsp; in the XML parses to a literal "&nbsp;" in the title —
+        # exactly what Google News delivers.
+        client = _mock_client(
+            edgar_desc="Quarterly report",  # filtered out (not operational)
+            gnews_title="Pilgangoora operations halted&amp;nbsp;&amp;nbsp; after cyclone",
+        )
+        result = ingest_operational_news(
+            session, http_client=client, feeds=["google_news"],
+        )
+        session.commit()
+        assert result["events_created"] == 1
+        ev = session.scalars(select(RiskEvent)).one()
+        assert "&nbsp;" not in ev.title and "\xa0" not in ev.title
+        assert "halted after cyclone" in ev.title       # whitespace collapsed
+        assert "&nbsp;" not in (ev.summary or "")
+
+    def test_existing_dirty_rows_cleaned_rehashed_and_deduped(self, session, seeded):
+        from app.models.documents import SourceDocument
+        from app.models.source import Source
+        from app.services.ingestion.ingest_operational_news import (
+            _SOURCE_NAME,
+            _clean_text,
+            _content_hash,
+        )
+        from app.models.enums import ImplementationPhase, SourceType
+
+        pub = _FIXED_PUB
+        dirty_title = "Pilgangoora operations halted&nbsp;&nbsp; after cyclone"
+        dirty_summary = "Pilgangoora operations halted&nbsp;&nbsp; after cyclone details"
+        src = Source(
+            name=_SOURCE_NAME, source_type=SourceType.NEWS.value,
+            phase=ImplementationPhase.PHASE_1.value, is_active=True,
+        )
+        session.add(src)
+        session.flush()
+        doc = SourceDocument(
+            source_id=src.id, external_id="gnews:dirty1",
+            title=dirty_title, document_type="article",
+        )
+        session.add(doc)
+        session.flush()
+        ev = RiskEvent(
+            source_document_id=doc.id,
+            event_type=EVENT_TYPE_CANDIDATE,
+            title=dirty_title, summary=dirty_summary,
+            event_date=pub,
+            risk_categories_json=["operational"],
+            confidence_score=0.5,
+            triage_status="display_only",
+            triaged_at=pub,                       # human decision — must survive
+            content_hash=_content_hash(dirty_title, dirty_summary, pub),
+            verified=False,
+        )
+        session.add(ev)
+        session.commit()
+
+        # Refetch of the SAME article, now decoded at extraction: the
+        # cleanup (which runs first) must rehash the stored row so the
+        # refetched item dedupes instead of inserting a twin.
+        client = _mock_client(
+            edgar_desc="Quarterly report",
+            gnews_title="Pilgangoora operations halted&amp;nbsp;&amp;nbsp; after cyclone",
+        )
+        result = ingest_operational_news(
+            session, http_client=client, feeds=["google_news"],
+        )
+        session.commit()
+
+        assert result["entity_artifacts_cleaned"] == 1
+        assert result["events_created"] == 0
+        assert result["events_skipped_existing"] == 1
+        session.refresh(ev)
+        assert "&nbsp;" not in ev.title and "&nbsp;" not in (ev.summary or "")
+        assert ev.title == _clean_text(dirty_title)
+        assert ev.content_hash == _content_hash(ev.title, ev.summary, pub)
+        assert ev.triaged_at is not None          # triage preserved
+        assert ev.triage_status == "display_only"
+        session.refresh(doc)
+        assert "&nbsp;" not in (doc.title or "")
+        assert len(session.scalars(select(RiskEvent)).all()) == 1

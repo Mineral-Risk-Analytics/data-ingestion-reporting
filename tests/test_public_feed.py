@@ -5,7 +5,9 @@ test_triage_routes pattern): in-memory SQLite via StaticPool, JSONB/ARRAY
 shimmed by tests/conftest.py at collection time.
 
 Contract under test (concentration plan workstream C):
-  * scoring + display_only only; pending / rejected / duplicates never
+  * HUMAN-TRIAGED only (2026-11-17): triaged_at set AND status
+    scoring|display_only; machine-labeled / pending / rejected /
+    duplicates / excluded sources never
   * ``verified`` == human-confirmed (scoring); verified_only filter
   * material filter + listed materials = DIRECT links only (056 rule)
   * geographies = primary context only; source name + permalink carried
@@ -86,9 +88,19 @@ def _seed_corpus(db: Session) -> None:
     db.add_all([nickel, cobalt])
     db.flush()
 
-    def ev(title, status, day, ch, dup_of=None):
+    os_src = Source(name="OpenSanctions", source_type="opensanctions", phase="1", is_active=True)
+    db.add(os_src)
+    db.flush()
+    os_doc = SourceDocument(
+        source_id=os_src.id, external_id="os-1",
+        url="https://www.opensanctions.org/", document_type="x",
+    )
+    db.add(os_doc)
+    db.flush()
+
+    def ev(title, status, day, ch, dup_of=None, doc_id=None, triaged=True):
         e = RiskEvent(
-            source_document_id=doc.id,
+            source_document_id=doc_id if doc_id is not None else doc.id,
             event_type="Export ban",
             event_subtype="EXPORT_BAN",
             event_date=datetime(2026, 10, day, tzinfo=timezone.utc),
@@ -100,6 +112,9 @@ def _seed_corpus(db: Session) -> None:
             suggested_category="geopolitical_trade",
             direction="restrictive",
             triage_status=status,
+            # Human-reviewed rule (2026-11-17): triaged_at is what marks a
+            # human decision; machine-labeled rows have status but no stamp.
+            triaged_at=datetime(2026, 10, day, 12, tzinfo=timezone.utc) if triaged else None,
             duplicate_of_id=dup_of,
             content_hash=ch,
             verified=(status == "scoring"),
@@ -109,10 +124,24 @@ def _seed_corpus(db: Session) -> None:
         return e
 
     confirmed = ev("confirmed ban", "scoring", 20, "c1")
-    context = ev("context measure", "display_only", 18, "c2")
-    ev("still pending", "pending_triage", 19, "c3")
+    context = ev("context measure", "display_only", 18, "c2")  # human-KEPT context
+    ev("still pending", "pending_triage", 19, "c3", triaged=False)
     ev("dismissed", "rejected", 17, "c4")
     ev("dup of confirmed", "scoring", 16, "c5", dup_of=confirmed.id)
+    # Machine-labeled row (2026-11-17 human-reviewed rule): display_only
+    # STATUS but no triaged_at stamp — newest date + direct material link,
+    # still invisible on every public surface.
+    machine = ev("machine labeled display_only", "display_only", 22, "c7", triaged=False)
+    db.add(RiskEventMaterial(risk_event_id=machine.id, material_id=nickel.id,
+                             relevance_score=0.9, match_reason="keyword_match",
+                             status="suggested", is_direct=True))
+    # Excluded-source row (2026-11-17): HUMAN-triaged and feed-eligible by
+    # status, hidden by SOURCE alone — OpenSanctions bulk records never
+    # reach public surfaces.
+    os_event = ev("CN — 2020 Sanctioned Entities (OpenSanctions)", "display_only", 21, "c6", doc_id=os_doc.id)
+    db.add(RiskEventMaterial(risk_event_id=os_event.id, material_id=nickel.id,
+                             relevance_score=0.9, match_reason="named_material",
+                             status="suggested", is_direct=True))
 
     # confirmed: direct Nickel + broad Cobalt; context: direct Cobalt.
     db.add(RiskEventMaterial(risk_event_id=confirmed.id, material_id=nickel.id,
@@ -156,6 +185,31 @@ class TestPublicFeed:
         # the direct Cobalt link on the context measure matches.
         cobalt = client.get("/api/v1/intelligence/events", params={"material": "Cobalt"}).json()
         assert [i["title"] for i in cobalt["data"]] == ["context measure"]
+
+    def test_excluded_source_hidden(self, client, db):
+        """OpenSanctions rows are excluded by SOURCE: human-triaged,
+        feed-eligible status, newest date, direct material link — still
+        absent everywhere."""
+        _seed_corpus(db)
+        body = client.get("/api/v1/intelligence/events").json()
+        assert body["total"] == 2
+        assert all("OpenSanctions" not in i["title"] for i in body["data"])
+        nickel = client.get(
+            "/api/v1/intelligence/events", params={"material": "Nickel"}
+        ).json()
+        assert [i["title"] for i in nickel["data"]] == ["confirmed ban"]
+
+    def test_machine_labeled_hidden(self, client, db):
+        """2026-11-17 human-reviewed rule: a display_only row WITHOUT a
+        triaged_at stamp (machine-labeled) never appears — even newest,
+        even with a direct material link."""
+        _seed_corpus(db)
+        body = client.get("/api/v1/intelligence/events").json()
+        assert all("machine" not in i["title"] for i in body["data"])
+        nickel = client.get(
+            "/api/v1/intelligence/events", params={"material": "Nickel"}
+        ).json()
+        assert [i["title"] for i in nickel["data"]] == ["confirmed ban"]
 
     def test_material_slug_filter(self, client, db):
         """material_slug resolves to the same direct-only filter as

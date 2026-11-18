@@ -42,7 +42,11 @@ from app.api.deps import get_current_user, get_db, require_admin
 from app.core.config import get_settings
 from app.models.intelligence import InsightPost
 from app.services.content.docx_convert import convert_docx_stream
-from app.api.routes.intelligence_entities import _band_out, _material_slug
+from app.api.routes.intelligence_entities import (
+    _band_out,
+    _material_slug,
+    _public_event_visibility,
+)
 from app.models.scoring import MaterialGlobalRiskScore
 from app.models.supply import Material
 from app.schemas.common import PaginatedResponse
@@ -301,20 +305,23 @@ def list_public_events(
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
 ) -> PaginatedResponse[PublicEventItem]:
-    """Public feed of triaged risk events, newest first (C3).
+    """Public feed of HUMAN-TRIAGED risk events, newest first (C3).
 
-    The live half of the product while the published score is structural:
-    scoring + display_only events with summaries and source permalinks.
-    Pending and rejected rows are structurally excluded, duplicates never
-    appear, and numeric severity is deliberately absent from the payload
-    (public scope = bands + dates, per the A6 methodology copy). C4 is
-    this endpoint filtered by material.
+    The live half of the product while the published score is structural.
+    2026-11-17 (Nicole): only events a person has triaged and kept appear
+    — machine-labeled display_only rows, the pending queue, rejected rows
+    and duplicates are all structurally excluded (the shared
+    _public_event_visibility rule). Numeric severity is deliberately
+    absent from the payload (public scope = bands + dates, per the A6
+    methodology copy). C4 is this endpoint filtered by material.
     """
     q = (
         select(RiskEvent)
         .where(
-            RiskEvent.triage_status.in_(("scoring", "display_only")),
-            RiskEvent.duplicate_of_id.is_(None),
+            # 2026-11-17 (Nicole): human-triaged only — the one shared
+            # rule for every public event surface. See
+            # _public_event_visibility in intelligence_entities.py.
+            *_public_event_visibility(),
         )
     )
     if verified_only:

@@ -51,6 +51,7 @@ from app.models.regulatory import (
     RiskEventRegulation,
 )
 from app.models.documents import SourceDocument
+from app.models.source import Source
 from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
 from app.models.supply import HsCodeMaterialMapping, HsCodeProductionShare, Material
 from app.services.scoring.stage_concentration import score_material_concentration
@@ -222,6 +223,47 @@ def _band_out(score_0_100: Optional[float]) -> Optional[RiskBandOut]:
     if 0.0 <= s <= 1.0:
         s *= 100.0
     return RiskBandOut(label=label, level=level, score=round(s, 1))
+
+
+# Sources whose events never appear on PUBLIC surfaces, whatever their
+# triage state (2026-11-17). OpenSanctions rows are company-anchored bulk
+# records ("CN — 2020 Sanctioned Entities") — database exhaust, not signals;
+# the source stays out of events work until the company-events phase.
+_PUBLIC_EVENT_EXCLUDED_SOURCE_TYPES = ("opensanctions",)
+
+
+def _public_event_visibility() -> tuple:
+    """THE visibility rule for every public event surface (2026-11-17,
+    Nicole's call): an event appears publicly only when a HUMAN has
+    triaged it and kept it.
+
+      * triaged_at NOT NULL         — a person reviewed it; machine-labeled
+                                      display_only rows never qualify
+      * status scoring|display_only — kept (confirmed, or context);
+                                      pending_triage and rejected are out
+      * not a duplicate (055)
+      * not from an excluded bulk source — excluded by SOURCE, not status,
+        so a re-ingest can't leak them back; sourceless manual events pass
+
+    Applied at: GET /events (News tab, article and material signals), the
+    material profile's linked_event_count, and the company + regulation
+    "Related events" blocks. One rule, every surface — change it here only.
+    Splat into .where(): ``.where(junction_conditions, *_public_event_visibility())``.
+    """
+    excluded_docs = (
+        select(SourceDocument.id)
+        .join(Source, Source.id == SourceDocument.source_id)
+        .where(Source.source_type.in_(_PUBLIC_EVENT_EXCLUDED_SOURCE_TYPES))
+    )
+    return (
+        RiskEvent.triaged_at.is_not(None),
+        RiskEvent.triage_status.in_(("scoring", "display_only")),
+        RiskEvent.duplicate_of_id.is_(None),
+        or_(
+            RiskEvent.source_document_id.is_(None),
+            RiskEvent.source_document_id.not_in(excluded_docs),
+        ),
+    )
 
 
 def _reg_status(raw: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -595,8 +637,9 @@ def get_public_company(slug: str, db: Session = Depends(get_db)) -> PublicCompan
         .join(RiskEventCompany, RiskEventCompany.risk_event_id == RiskEvent.id)
         .where(
             RiskEventCompany.company_id == company.id,
-            RiskEvent.duplicate_of_id.is_(None),  # 055
-            RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
+            # 2026-11-17: shared public rule — human-triaged only (was
+            # merely != rejected, which leaked the untriaged queue).
+            *_public_event_visibility(),
         )
         .order_by(RiskEvent.event_date.desc().nulls_last())
         .limit(6)
@@ -935,16 +978,15 @@ def get_public_regulation(
 
     # ── linked events + posts ─────────────────────────────────────────
     # The count joins through to the event so it applies the same visibility
-    # rules as the list below — it used to count raw junction rows, so a page
-    # could claim more events than it would ever show once duplicates (055)
-    # and soft-dismissals (066) were filtered from the list.
+    # rule as the list below. 2026-11-17: both now use the shared public
+    # rule — human-triaged only (was merely != rejected, which leaked the
+    # untriaged queue).
     event_count = db.scalar(
         select(func.count(RiskEventRegulation.id))
         .join(RiskEvent, RiskEvent.id == RiskEventRegulation.risk_event_id)
         .where(
             RiskEventRegulation.regulation_id == reg.id,
-            RiskEvent.duplicate_of_id.is_(None),  # 055
-            RiskEvent.triage_status != "rejected",  # 066
+            *_public_event_visibility(),
         )
     ) or 0
     event_rows = db.execute(
@@ -952,8 +994,7 @@ def get_public_regulation(
         .join(RiskEventRegulation, RiskEventRegulation.risk_event_id == RiskEvent.id)
         .where(
             RiskEventRegulation.regulation_id == reg.id,
-            RiskEvent.duplicate_of_id.is_(None),  # 055
-            RiskEvent.triage_status != "rejected",  # 066: soft-dismissed, hidden everywhere
+            *_public_event_visibility(),
         )
         .order_by(RiskEvent.event_date.desc().nulls_last())
         .limit(6)
@@ -998,7 +1039,6 @@ def get_public_regulation(
 import re as _re_mat
 
 _MATERIAL_SLUG_RE = _re_mat.compile(r"[^a-z0-9]+")
-
 
 def _material_slug(name: str) -> str:
     """URL slug from a canonical name ("Rare Earth Elements" -> "rare-earth-
@@ -1221,8 +1261,8 @@ def get_public_material(slug: str, db: Session = Depends(get_db)) -> PublicMater
         .where(
             RiskEventMaterial.material_id == material.id,
             RiskEventMaterial.is_direct.is_(True),
-            RiskEvent.duplicate_of_id.is_(None),
-            RiskEvent.triage_status.in_(("scoring", "display_only")),
+            # Same shared rule as the /events feed this count labels.
+            *_public_event_visibility(),
         )
     )
 

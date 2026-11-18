@@ -85,6 +85,7 @@ GTA/FR/WorldBank block) in ``app/tasks/ingestion_jobs.py``. CLI:
 from __future__ import annotations
 
 import hashlib
+import html as _html
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -521,9 +522,67 @@ def _suggest_subtype(text: str) -> Optional[str]:
     return None
 
 
+def _clean_text(raw: str) -> str:
+    """Decode HTML entities the feeds leave in titles/descriptions
+    (2026-11-18: public signal rows showed literal ``&nbsp;&nbsp;``).
+
+    ``html.unescape`` turns entities into characters; non-breaking spaces
+    (and other unicode whitespace that decoding produces) collapse into
+    single plain spaces. Run twice so double-escaped feeds
+    (``&amp;nbsp;``) come out clean too.
+    """
+    text = _html.unescape(_html.unescape(raw or ""))
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _content_hash(title: str, summary: str, event_date: Optional[datetime]) -> str:
     date_part = event_date.isoformat() if event_date else ""
     return hashlib.sha256(f"{title}{summary}{date_part}".encode()).hexdigest()
+
+
+def _cleanup_entity_artifacts(session: Session, source_id) -> int:
+    """Decode HTML entities left in PREVIOUSLY ingested rows (2026-11-18).
+
+    Lives inside the ingest command per the working rules (no standalone
+    backfill scripts). Updates title/summary in place on this source's
+    events — event ids untouched, so triage decisions survive — and
+    recomputes content_hash from the decoded text so a refetch of the
+    same article (now decoded at extraction) still dedupes instead of
+    inserting a twin. SourceDocument titles are decoded alongside.
+    Returns the number of events changed.
+    """
+    fixed = 0
+    rows = session.scalars(
+        select(RiskEvent)
+        .join(SourceDocument, SourceDocument.id == RiskEvent.source_document_id)
+        .where(SourceDocument.source_id == source_id)
+    ).all()
+    for ev in rows:
+        new_title = _clean_text(ev.title or "")
+        new_summary = _clean_text(ev.summary) if ev.summary else ev.summary
+        if new_title == (ev.title or "") and new_summary == ev.summary:
+            continue
+        ev.title = new_title
+        ev.summary = new_summary
+        # Hash with an AWARE date: fresh items hash tz-aware UTC
+        # datetimes, and a naive read-back (SQLite tests) would change
+        # the isoformat and break dedupe against refetches.
+        ev_date = ev.event_date
+        if ev_date is not None and ev_date.tzinfo is None:
+            ev_date = ev_date.replace(tzinfo=timezone.utc)
+        ev.content_hash = _content_hash(new_title, new_summary or "", ev_date)
+        fixed += 1
+    docs = session.scalars(
+        select(SourceDocument).where(SourceDocument.source_id == source_id)
+    ).all()
+    for doc in docs:
+        if doc.title:
+            cleaned = _clean_text(doc.title)
+            if cleaned != doc.title:
+                doc.title = cleaned
+    if fixed:
+        log.info("operational_news.entity_artifacts_cleaned", events=fixed)
+    return fixed
 
 
 def _get_or_create_source(session: Session) -> Source:
@@ -589,6 +648,7 @@ def ingest_operational_news(
         "facility_links": 0,
         "company_links": 0,
         "material_links": 0,
+        "entity_artifacts_cleaned": 0,
         "dry_run": dry_run,
     }
 
@@ -624,8 +684,18 @@ def ingest_operational_news(
     summary["items_fetched"] = len(items)
 
     source = None if dry_run else _get_or_create_source(session)
+    if source is not None:
+        summary["entity_artifacts_cleaned"] = _cleanup_entity_artifacts(
+            session, source.id
+        )
 
     for item in items:
+        # One choke point for text hygiene (2026-11-18): every adapter's
+        # titles/descriptions pass through here, so the filter, the
+        # content hash, the SourceDocument and the RiskEvent all see
+        # decoded text.
+        item.title = _clean_text(item.title)
+        item.summary = _clean_text(item.summary)
         text = f"{item.title} {item.summary}"
         if not _OPERATIONAL_FILTER_RE.search(text):
             summary["items_filtered_out"] += 1

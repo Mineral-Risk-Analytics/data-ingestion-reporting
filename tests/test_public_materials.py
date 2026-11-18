@@ -34,7 +34,9 @@ from app.models.regulatory import (
     RiskEvent,
     RiskEventMaterial,
 )
+from app.models.documents import SourceDocument
 from app.models.scoring import MaterialGeographyRiskScore, MaterialGlobalRiskScore
+from app.models.source import Source
 from app.models.supply import HsCodeMaterialMapping, HsCodeProductionShare, Material
 
 
@@ -182,12 +184,21 @@ def _seed(db: Session) -> None:
     db.add(RegulationMaterialScope(regulation_id=archived.id, material_id=ree.id,
                                    scope_type="covered"))
 
-    # Events: one feed-eligible direct, one pending (not counted).
-    for title, status_, ch in (("counted", "scoring", "m1"), ("pending", "pending_triage", "m2")):
+    # Events against the shared public visibility rule (2026-11-17,
+    # human-reviewed only). Exactly ONE should count:
+    #   counted  — human-triaged scoring, direct link       -> counted
+    #   pending  — untriaged queue row                      -> hidden
+    #   machine  — display_only STATUS, no triaged_at stamp -> hidden
+    for title, status_, ch, triaged in (
+        ("counted", "scoring", "m1", True),
+        ("pending", "pending_triage", "m2", False),
+        ("machine labeled", "display_only", "m4", False),
+    ):
         e = RiskEvent(
             event_type="Export ban", title=title, summary="s",
             event_date=datetime(2026, 9, 1, tzinfo=timezone.utc),
             risk_categories_json=["geopolitical_trade"], triage_status=status_,
+            triaged_at=datetime(2026, 9, 1, 12, tzinfo=timezone.utc) if triaged else None,
             content_hash=ch, verified=False,
         )
         db.add(e)
@@ -195,6 +206,30 @@ def _seed(db: Session) -> None:
         db.add(RiskEventMaterial(risk_event_id=e.id, material_id=ree.id,
                                  relevance_score=0.9, match_reason="hs_code",
                                  status="suggested", is_direct=True))
+
+    # Excluded-source event (2026-11-17): HUMAN-triaged, feed-eligible
+    # status, direct REE link — hidden by SOURCE alone, must NOT inflate
+    # linked_event_count (the count labels the /events feed).
+    os_src = Source(name="OpenSanctions", source_type="opensanctions", phase="1", is_active=True)
+    db.add(os_src)
+    db.flush()
+    os_doc = SourceDocument(source_id=os_src.id, external_id="os-1",
+                            url="https://www.opensanctions.org/", document_type="x")
+    db.add(os_doc)
+    db.flush()
+    os_ev = RiskEvent(
+        source_document_id=os_doc.id,
+        event_type="Sanctioned entities", title="CN — Sanctioned Entities (OpenSanctions)",
+        summary="s", event_date=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        risk_categories_json=["geopolitical_trade"], triage_status="display_only",
+        triaged_at=datetime(2026, 9, 2, 12, tzinfo=timezone.utc),
+        content_hash="m3", verified=False,
+    )
+    db.add(os_ev)
+    db.flush()
+    db.add(RiskEventMaterial(risk_event_id=os_ev.id, material_id=ree.id,
+                             relevance_score=0.9, match_reason="named_material",
+                             status="suggested", is_direct=True))
     db.commit()
 
 
