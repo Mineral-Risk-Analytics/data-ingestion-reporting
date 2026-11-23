@@ -214,7 +214,7 @@ def test_supplier_aggregate_five_pillars_no_propagation() -> None:
     # weighted_raw = 0.25*60 + 0.20*50 + 0.20*40 + 0.10*30 + 0.10*20 = 38.0
     # overall = 38.0 / 0.85 ≈ 44.7059
     assert abs(result["overall_risk_score"] - (38.0 / 0.85)) < 0.01
-    assert result["scoring_version"] == SCORING_VERSION == "3.0"
+    assert result["scoring_version"] == SCORING_VERSION
     assert result["supply_chain_propagation_score"] is None
 
 

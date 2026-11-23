@@ -22,8 +22,10 @@ from app.services.ingestion.seed_materials import (
 # ---------------------------------------------------------------------------
 
 class TestMaterialsRegisterData:
-    def test_register_has_thirty_nine_entries(self):
-        assert len(_MATERIALS) == 39
+    def test_register_has_forty_one_entries(self):
+        # 41 (2026-11: register grew; keep this pin current on purpose —
+        # an unexplained count change is exactly what it exists to catch).
+        assert len(_MATERIALS) == 41
 
     def test_expected_motor_ree_and_sodium_names_present(self):
         names = {m["canonical_name"] for m in _MATERIALS}
@@ -253,12 +255,11 @@ class TestSeedBatteryChemistryJunctions:
 
         result = seed_battery_chemistry_junctions(session)
 
-        # 1 row inserted (nmc + Lithium found); everything else skipped:
-        # - 9 NMC rows where material not in mat_map → skipped_missing
-        # - 38 non-NMC rows where chemistry not in chem_map → skipped_missing
-        # Total skipped_missing = 47, inserted = 1
+        # 1 row inserted (nmc + Lithium found); everything else skipped.
+        # 2026-11: register growth (39→41 materials) added junction rows,
+        # so skipped_missing moved 47→52 — recount if the register grows.
         assert result["inserted"] == 1
-        assert result["skipped_missing_material"] == 47
+        assert result["skipped_missing_material"] == 52
 
     def test_flush_called_after_insertions(self):
         chems = [_make_chemistry("lfp", 1)]

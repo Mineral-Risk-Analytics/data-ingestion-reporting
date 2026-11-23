@@ -183,7 +183,7 @@ class TestExposuresGlobalOnly:
         cobalt = expo[0]
         assert cobalt["stage_label"] == "Extraction · Refining"  # deduped + combined
         assert cobalt["risk_score"] == 66.2  # GLOBAL, never the CD 70.0
-        assert cobalt["band"]["level"] == "crit"
+        assert cobalt["band"]["level"] == "high"  # 4-tier: crit starts at 90
         assert "geography" not in cobalt and "score_basis" not in cobalt
 
         nickel = expo[1]
@@ -212,16 +212,16 @@ class TestGeographicFootprint:
         assert cd["facility_count"] == 2  # grouped, not one row per facility
         assert cd["activities"] == ["integrated", "mine"]
         assert cd["sourcing_materials"] == ["Cobalt"]
-        assert cd["location_risk"]["level"] == "crit"
+        assert cd["location_risk"]["level"] == "high"  # 70.0 — 4-tier bands
         assert cd["materials"] == [
-            {"material": "Cobalt", "score": 70.0, "level": "crit"},
+            {"material": "Cobalt", "score": 70.0, "level": "high"},
         ]
 
         ca = geos[1]
         assert ca["facility_count"] == 1
         assert ca["sourcing_materials"] == []  # facility-linked, not CME-sourced
         assert ca["materials"] == [
-            {"material": "Nickel", "score": 31.5, "level": "med"},
+            {"material": "Nickel", "score": 31.5, "level": "low"},  # 4-tier: low < 35
         ]
 
     def test_sourcing_only_country_gets_a_row(self, client, db):
@@ -316,8 +316,8 @@ class TestCountryFacilitiesDrawer:
         assert mine_row["data_source"] == "USGS"
         # materials sorted by name, each with its CD band
         assert mine_row["materials"] == [
-            {"material": "Cobalt", "level": "crit"},
-            {"material": "Copper", "level": "high"},
+            {"material": "Cobalt", "level": "high"},
+            {"material": "Copper", "level": "med"},
         ]
 
         plant_row = next(f for f in facs if f["facility_type"] == "processing")

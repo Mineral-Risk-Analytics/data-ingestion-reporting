@@ -283,11 +283,12 @@ class TestRiskSummary:
         assert [m["material_name"] for m in body["materials"]] == ["Cobalt", "Lithium"]
 
         cobalt_bar = body["materials"][0]
+        # 4-tier cutover (35/60/90): 66.2 sits in HIGH, crit starts at 90.
         assert cobalt_bar["band"] == {
-            "label": "Critical", "level": "crit", "score": 66.2,
+            "label": "High", "level": "high", "score": 66.2,
         }
         lithium_bar = body["materials"][1]
-        assert lithium_bar["band"]["level"] == "high"  # 45 <= 54.3 < 60
+        assert lithium_bar["band"]["level"] == "med"  # 35 <= 54.3 < 60
         assert lithium_bar["band"]["score"] == 54.3
 
     def test_uses_only_latest_as_of_date_per_material(self, client, db):

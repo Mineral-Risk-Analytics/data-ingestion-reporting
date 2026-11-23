@@ -15,7 +15,7 @@ from app.services.ingestion.seed_companies import (
 )
 
 # Total expected company count (40 original + 35 new)
-_EXPECTED_TOTAL = 75
+_EXPECTED_TOTAL = 85  # 2026-11: register grew 75→85
 
 # Companies expected to carry a pre-seeded LEI
 _SEEDED_LEI_COMPANIES = {
@@ -98,7 +98,7 @@ class TestCompaniesData:
             assert isinstance(c["aliases"], list), f"{c['canonical_name']}: aliases must be a list"
 
     def test_all_alias_types_valid(self):
-        valid_types = {"aka", "ticker", "former_name", "abbreviation"}
+        valid_types = {"aka", "ticker", "former_name", "abbreviation", "legal_name"}
         for c in _COMPANIES:
             for alias in c["aliases"]:
                 assert alias["alias_type"] in valid_types, (
