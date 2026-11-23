@@ -69,6 +69,8 @@ from app.schemas.intelligence import (
     PublicEventGeo,
     PublicEventItem,
     EntityLinkOut,
+    ImageUploadUrlIn,
+    ImageUploadUrlOut,
     PdfUploadUrlIn,
     PdfUploadUrlOut,
     RiskSummary,
@@ -864,6 +866,31 @@ def create_pdf_upload_url(
             detail="PDF uploads are for report-type posts",
         )
 
+    # Sanitize: basename only, safe charset, force .pdf.
+    name = _re.sub(r"[^A-Za-z0-9._-]+", "-", body.filename.rsplit("/", 1)[-1]).strip("-.")
+    if not name:
+        name = "report"
+    if not name.lower().endswith(".pdf"):
+        name += ".pdf"
+
+    upload_url, public_url, expires = _r2_presign_put(
+        f"insights/pdf/{post.slug}/{name}", "application/pdf"
+    )
+    return PdfUploadUrlOut(
+        upload_url=upload_url,
+        public_url=public_url,
+        key=f"insights/pdf/{post.slug}/{name}",
+        expires_in=expires,
+    )
+
+
+def _r2_presign_put(key: str, content_type: str) -> tuple[str, str, int]:
+    """Shared R2 presign (2026-11-19, factored out of the PDF endpoint when
+    image uploads arrived): returns (upload_url, public_url, expires_in).
+
+    503 when the R2_* env vars are unset — deliberate, so a misconfigured
+    deploy fails loudly instead of minting URLs that can never resolve.
+    """
     settings = get_settings()
     if not all(
         (
@@ -878,14 +905,6 @@ def create_pdf_upload_url(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="R2 storage is not configured (set the R2_* env vars)",
         )
-
-    # Sanitize: basename only, safe charset, force .pdf.
-    name = _re.sub(r"[^A-Za-z0-9._-]+", "-", body.filename.rsplit("/", 1)[-1]).strip("-.")
-    if not name:
-        name = "report"
-    if not name.lower().endswith(".pdf"):
-        name += ".pdf"
-    key = f"insights/pdf/{post.slug}/{name}"
 
     import boto3  # lazy: only needed when R2 is actually used
 
@@ -902,15 +921,60 @@ def create_pdf_upload_url(
         Params={
             "Bucket": settings.r2_bucket,
             "Key": key,
-            "ContentType": "application/pdf",
+            "ContentType": content_type,
         },
         ExpiresIn=expires,
     )
-    return PdfUploadUrlOut(
+    return upload_url, f"{settings.r2_public_base_url.rstrip('/')}/{key}", expires
+
+
+# Image extensions the admin editor may upload (hero + body images).
+_IMAGE_CONTENT_TYPES = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+}
+
+
+@router.post(
+    "/posts/{post_id}/image-upload-url",
+    response_model=ImageUploadUrlOut,
+)
+def create_image_upload_url(
+    post_id: int,
+    body: ImageUploadUrlIn,
+    _user: dict = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> ImageUploadUrlOut:
+    """Presigned R2 PUT for a post image — hero or body (2026-11-19).
+
+    Same browser flow as the PDF endpoint: call this → PUT the file to
+    ``upload_url`` with the returned ``content_type`` → save
+    ``public_url`` into ``hero_image_url`` (or reference it from the
+    body). Any content type of post qualifies — heroes aren't
+    report-only. Content type is derived from the file extension
+    (jpg/jpeg/png/webp); anything else is a 422.
+    """
+    post = _get_post_or_404(db, post_id)
+
+    name = _re.sub(r"[^A-Za-z0-9._-]+", "-", body.filename.rsplit("/", 1)[-1]).strip("-.")
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    content_type = _IMAGE_CONTENT_TYPES.get(ext)
+    if not name or content_type is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Image must be one of: {sorted(set(_IMAGE_CONTENT_TYPES))}",
+        )
+
+    key = f"insights/images/{post.slug}/{name}"
+    upload_url, public_url, expires = _r2_presign_put(key, content_type)
+    return ImageUploadUrlOut(
         upload_url=upload_url,
-        public_url=f"{settings.r2_public_base_url.rstrip('/')}/{key}",
+        public_url=public_url,
         key=key,
         expires_in=expires,
+        content_type=content_type,
     )
 
 

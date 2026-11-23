@@ -892,3 +892,68 @@ class TestArticleEntityLinks:
         r = client.get("/api/v1/intelligence/posts/plain")
         assert r.status_code == 200
         assert r.json()["entity_links"] == []
+
+
+class TestImageUploadUrl:
+    """2026-11-19: presigned R2 PUT for post images (hero + body)."""
+
+    def _configure_r2(self, monkeypatch):
+        from app.core.config import get_settings
+        st = get_settings()
+        monkeypatch.setattr(st, "r2_account_id", "acct123")
+        monkeypatch.setattr(st, "r2_access_key_id", "AKIATEST")
+        monkeypatch.setattr(st, "r2_secret_access_key", "secret")
+        monkeypatch.setattr(st, "r2_bucket", "mra-assets")
+        monkeypatch.setattr(st, "r2_public_base_url", "https://assets.example.com")
+
+    def test_503_when_unconfigured(self, client, db, monkeypatch):
+        from app.core.config import get_settings
+        st = get_settings()
+        for f in ("r2_account_id", "r2_access_key_id", "r2_secret_access_key",
+                  "r2_bucket", "r2_public_base_url"):
+            monkeypatch.setattr(st, f, "")
+        post = _make_post(slug="hero-post", title="H", status="draft",
+                          content_type="analysis", published_at=None)
+        db.add(post)
+        db.commit()
+        db.refresh(post)
+        r = client.post(
+            f"/api/v1/intelligence/posts/{post.id}/image-upload-url",
+            json={"filename": "hero.png"},
+        )
+        assert r.status_code == 503
+
+    def test_any_content_type_allowed_and_presigned(self, client, db, monkeypatch):
+        # Unlike PDFs (report-only), heroes apply to every post type.
+        self._configure_r2(monkeypatch)
+        post = _make_post(slug="an-analysis", title="A", status="draft",
+                          content_type="analysis", published_at=None)
+        db.add(post)
+        db.commit()
+        db.refresh(post)
+        r = client.post(
+            f"/api/v1/intelligence/posts/{post.id}/image-upload-url",
+            json={"filename": "../Cover Photo (final)!.JPG"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["key"] == "insights/images/an-analysis/Cover-Photo-final-.JPG"
+        assert body["public_url"] == "https://assets.example.com/" + body["key"]
+        assert body["content_type"] == "image/jpeg"
+        assert body["expires_in"] == 900
+        assert "acct123.r2.cloudflarestorage.com" in body["upload_url"]
+        assert "X-Amz-Signature=" in body["upload_url"]
+
+    def test_non_image_extension_rejected(self, client, db, monkeypatch):
+        self._configure_r2(monkeypatch)
+        post = _make_post(slug="an-analysis-2", title="A2", status="draft",
+                          content_type="analysis", published_at=None)
+        db.add(post)
+        db.commit()
+        db.refresh(post)
+        for bad in ("malware.exe", "doc.pdf", "noextension"):
+            r = client.post(
+                f"/api/v1/intelligence/posts/{post.id}/image-upload-url",
+                json={"filename": bad},
+            )
+            assert r.status_code == 422, bad

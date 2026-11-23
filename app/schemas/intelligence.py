@@ -223,6 +223,22 @@ class PdfUploadUrlOut(BaseModel):
     expires_in: int   # seconds the presigned URL stays valid
 
 
+class ImageUploadUrlIn(BaseModel):
+    """Body for ``POST /posts/{id}/image-upload-url`` (hero + body images
+    → R2, 2026-11-19). Content type is derived from the extension
+    (jpg/jpeg/png/webp) — anything else is rejected."""
+
+    filename: str = Field(min_length=1, max_length=255)
+
+
+class ImageUploadUrlOut(BaseModel):
+    upload_url: str    # presigned PUT — browser uploads directly to R2
+    public_url: str    # what hero_image_url (or a body <img>) should use
+    key: str           # object key, e.g. insights/images/{slug}/{filename}
+    expires_in: int    # seconds the presigned URL stays valid
+    content_type: str  # the Content-Type the PUT must send (presign-bound)
+
+
 # ---------------------------------------------------------------------------
 # Risk summary — sidebar risk indicator bars
 # ---------------------------------------------------------------------------
