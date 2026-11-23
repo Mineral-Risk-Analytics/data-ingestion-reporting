@@ -32,6 +32,21 @@ SUPPLY-CHAIN ROLLUP:
   fetches the most recent persisted ``CompanyScore`` per company so the
   propagation pillar consumes already-computed scores rather than recursing
   into rescore.
+
+Build 1 (2026-07-24): every event-selection query filters on
+``RiskEvent.primary_category`` (exactly one pillar per event) instead of
+``risk_categories_json.contains`` — the containment form let multi-tagged
+events score in several pillars at once (spec Principle 3 violation).
+``risk_categories_json`` is display/filter-only now. NULL primary_category
+(display-only streams) is never selected here by construction.
+
+2026-07-28: every event-selection query used for SCORING also carries
+``_scores_as_risk()``, which drops ``POSITIVE_EVENT_SUBTYPES``. Risk falls
+when structure improves, not when good news arrives; a supportive policy is
+not a negative disruption. Before this, only the geopolitical pillar
+filtered positives (via its subtype allowlist) and the other four scored
+them as risk. ``get_evidence_for_material_x_geography`` is a DISPLAY query
+and deliberately does NOT carry the gate — positives stay visible there.
 """
 
 from __future__ import annotations
@@ -43,10 +58,10 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import structlog
-from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.orm import Session, defer, selectinload
 
-from app.constants import RiskCategory
+from app.constants import POSITIVE_EVENT_SUBTYPES, RiskCategory
 from app.models.battery_chemistry import (
     BatteryChemistry,
     BatteryChemistryMaterial,
@@ -57,7 +72,8 @@ from app.models.company import (
     CompanyScore,
     CompanySupplyRelationship,
 )
-from app.models.facility import CompanyFacility, Facility
+from app.models.documents import SourceDocument
+from app.models.facility import CompanyFacility, Facility, FacilityMaterialLink
 from app.models.regulatory import (
     CompanyRegulationExposure,
     Regulation,
@@ -97,6 +113,14 @@ HIGH_CONCENTRATION_GEOS = frozenset({"CN", "CD", "RU"})
 #                                 when no CompanyRegulationExposure status is recorded.
 #   covered                 0.40  Indirect coverage (e.g. CBAM carbon certificate); less direct
 #                                 enforcement exposure than a disclosure or restriction obligation.
+#   compliant               0.20  A material the regulation explicitly lists as out-of-concern
+#                                 or exempt.  Added 2026-06-07 to mirror the same entry in
+#                                 ``event_impact.SCOPE_SEVERITY_MULTIPLIER`` (which carries 0.25
+#                                 on the severity side).  Without this entry the relevance
+#                                 multiplier fell through to the 0.50 default — a material
+#                                 listed as 'compliant' was getting the same regulation-scope
+#                                 weight as one listed as 'disclosure_required', which
+#                                 contradicts the partner-curated semantics.
 #   targeted_country        0.50  Used only on geography scopes, not material scopes; included for
 #                                 completeness in case scope_type is ever added there.
 #
@@ -107,6 +131,7 @@ _SCOPE_TYPE_WEIGHT: dict[str, float] = {
     "restricted":             0.60,
     "disclosure_required":    0.50,
     "covered":                0.40,
+    "compliant":              0.20,
 }
 
 
@@ -149,12 +174,74 @@ class SupplierEdge:
     path: list[uuid.UUID]                       # buyer-to-this, exclusive of root
 
 
+def _scores_as_risk():
+    """WHERE clause every pillar-scoring query must carry.
+
+    Positive-direction events are excluded from risk arithmetic — see
+    ``POSITIVE_EVENT_SUBTYPES`` in ``app.constants`` for the reasoning and
+    for the measured effect of not having done this. The gate lives here,
+    in one expression, because the bug it fixes was caused by exactly the
+    opposite arrangement: each pillar decided independently what to do with
+    the list it was handed, and four of the five decided nothing.
+
+    The ``is_(None)`` arm is load-bearing, not defensive. SQL three-valued
+    logic evaluates ``NULL NOT IN ('POSITIVE_POLICY', …)`` to NULL, which
+    fails the WHERE — so a bare ``not_in`` would silently drop every event
+    with no subtype, which is most of the corpus (GTA interventions,
+    POLICY_MILESTONE rows, all Federal Register notices).
+
+    Display queries deliberately do NOT use this. Positives stay in the
+    evidence drawer, tagged with what they are; only the arithmetic
+    ignores them.
+    """
+    return or_(
+        RiskEvent.event_subtype.is_(None),
+        RiskEvent.event_subtype.not_in(tuple(sorted(POSITIVE_EVENT_SUBTYPES))),
+    )
+
+
 def _category_window_cutoff(category: RiskCategory, as_of_date: date) -> Optional[datetime]:
     window_days = EVIDENCE_WINDOWS[category]
     if window_days is None:
         return None
     cutoff_date = as_of_date - timedelta(days=window_days)
     return datetime(cutoff_date.year, cutoff_date.month, cutoff_date.day, tzinfo=timezone.utc)
+
+
+def _event_window_clause(cutoff: Optional[datetime], as_of_date: date):
+    """Both bounds of an evidence window, as one SQL clause.
+
+    Every window in this module used to be a lower bound only::
+
+        (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
+
+    which is a silent correctness bug rather than a missing nicety.  An event
+    dated in the future satisfies *every* trailing window, forever — a
+    2029-dated trade measure counts as evidence for "the last 365 days" in
+    2026, in 2027, and in 2028, and no amount of recency decay removes it
+    because decay is computed from the same future date.  Twelve GTA events in
+    production carried dates up to 2029-01-01 and two of them were live in the
+    Lithium / geopolitical evidence pool.
+
+    The upper bound is ``as_of_date`` end-of-day, so a score computed "as of"
+    a date can never see past it.  This also makes historical rescores honest:
+    re-running a 2026-01-01 score no longer picks up events ingested later.
+
+    NULL ``event_date`` is still admitted — sanctions programs and standing
+    regulations often have no single anchor date, and excluding them would
+    quietly drop real evidence.  This preserves the prior behaviour on that
+    branch and is why the null check appears on both sides.
+    """
+    horizon = datetime(
+        as_of_date.year, as_of_date.month, as_of_date.day,
+        23, 59, 59, tzinfo=timezone.utc,
+    )
+    if cutoff is None:
+        return or_(RiskEvent.event_date <= horizon, RiskEvent.event_date.is_(None))
+    return or_(
+        RiskEvent.event_date.is_(None),
+        and_(RiskEvent.event_date >= cutoff, RiskEvent.event_date <= horizon),
+    )
 
 
 def _dedup_event_rows(rows) -> list[EventWithRelevance]:
@@ -223,14 +310,19 @@ def get_events_for_company(
         .where(
             RiskEventCompany.company_id == company_id,
             RiskEventCompany.review_status != "excluded",
-            RiskEvent.risk_categories_json.contains([category.value]),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
+            RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
+        # 2026-07-15 EGRESS: defer Text columns that scoring never reads —
+        # traced callers (orchestrator → evidence_aggregator) touch title,
+        # metadata_json, event_date, severity/confidence_score, event_type,
+        # event_subtype, id — never summary or review_note. See
+        # feedback_scoring_egress memory.
+        .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
 
     # Scope: country / material filters apply via secondary joins so we still
     # only return events tagged to this company AND matching the scope facets.
@@ -388,10 +480,12 @@ def get_active_compliance_obligations(
         .join(RiskEventCompany, RiskEventCompany.risk_event_id == RiskEvent.id)
         .where(
             RiskEventCompany.company_id == company_id,
-            RiskEvent.risk_categories_json.contains(
-                [RiskCategory.REGULATORY_COMPLIANCE.value]
-            ),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
+            RiskEvent.primary_category == RiskCategory.REGULATORY_COMPLIANCE.value,  # Build 1
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
+        # 2026-07-15 EGRESS: this loop only reads ev.title — defer Text cols.
+        .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc())
         .limit(100)
     )
@@ -427,10 +521,12 @@ def get_filing_signals(
         .where(
             RiskEventCompany.company_id == company_id,
             RiskEventCompany.review_status != "excluded",
-            RiskEvent.risk_categories_json.contains(
-                [RiskCategory.FINANCIAL_PRESSURE.value]
-            ),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
+            RiskEvent.primary_category == RiskCategory.FINANCIAL_PRESSURE.value,  # Build 1
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
+        # 2026-07-15 EGRESS: defer Text cols (title/metadata_json used, summary/review_note not).
+        .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc().nullslast())
         .limit(max_quarters)
     )
@@ -543,14 +639,13 @@ def get_events_for_material(
         .join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
         .where(
             RiskEventMaterial.material_id == material_id,
-            RiskEvent.risk_categories_json.contains([category.value]),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
+            RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
     if scope.country_codes is not None:
         stmt = stmt.join(
             RiskEventGeography,
@@ -629,14 +724,15 @@ def get_events_for_geographies(
         )
         .where(
             RiskEventGeography.country_code.in_(country_codes),
-            RiskEvent.risk_categories_json.contains([category.value]),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
+            RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
+        # 2026-07-15 EGRESS: defer Text cols summary + review_note.
+        .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
     rows = db.execute(stmt).all()
     return _dedup_event_rows(rows)
 
@@ -732,14 +828,13 @@ def get_events_for_materials(
         )
         .where(
             RiskEventMaterial.material_id.in_(material_ids),
-            RiskEvent.risk_categories_json.contains([category.value]),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
+            RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
     rows = db.execute(stmt).all()
     results = _dedup_material_event_rows(rows)
     results = _apply_hs_confidence_multiplier_batch(db, material_ids, results)
@@ -803,14 +898,13 @@ def get_events_for_hs_mapping(
         )
         .where(
             RiskEventHsMapping.hs_mapping_id == hs_mapping_id,
-            RiskEvent.risk_categories_json.contains([category.value]),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
+            RiskEvent.primary_category == category.value,  # Build 1: one pillar per event
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
     if scope.country_codes is not None:
         stmt = stmt.join(
             RiskEventGeography,
@@ -943,16 +1037,15 @@ def get_events_for_regulations(
         .where(
             Regulation.regulation_key.in_(regulation_keys),
             Regulation.verified.is_(True),
-            RiskEvent.risk_categories_json.contains(
-                [RiskCategory.REGULATORY_COMPLIANCE.value]
-            ),
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
+            RiskEvent.primary_category == RiskCategory.REGULATORY_COMPLIANCE.value,  # Build 1
+            _scores_as_risk(),  # 2026-07-28: positives never enter risk math
         )
+        # 2026-07-15 EGRESS: defer Text cols summary + review_note.
+        .options(defer(RiskEvent.summary))
         .order_by(RiskEvent.event_date.desc())
     )
-    if cutoff is not None:
-        stmt = stmt.where(
-            (RiskEvent.event_date >= cutoff) | (RiskEvent.event_date.is_(None))
-        )
+    stmt = stmt.where(_event_window_clause(cutoff, as_of_date))
     rows = db.execute(stmt).all()
     return _dedup_event_rows(rows)
 
@@ -1374,10 +1467,321 @@ def get_hs_nodes_for_material(
     return list(db.scalars(stmt).all())
 
 
+# ---------------------------------------------------------------------------
+# Market-score drill-down evidence
+# ---------------------------------------------------------------------------
+#
+# Backs ``GET /materials/{material_id}/market-scores/{geography_code}/evidence``
+# which replaces the raw-pillar-sub-input dump in the country-scores dropdown
+# with the actual regulations / facilities / risk events the scoring engine
+# saw for this (material × country) pair.
+#
+# Membership rule across all three lists: strict INTERSECTION.  We only
+# return rows tagged to BOTH this material AND this country.  A regulation
+# whose ``material_scopes`` covers Phosphate but whose ``geography_scopes``
+# never mentions Morocco is excluded.  Same logic for facilities and events.
+# This mirrors ``MaterialGeographyRiskScore.event_count_geo_specific`` (the
+# intersection count surfaced in the table) — NOT ``event_count`` (the
+# union the scoring engine consumes).  We're optimising for analyst trust:
+# "the table says 9 events for MA × Phosphate; the dropdown shows those 9
+# events specifically" rather than "the dropdown also shows global Phosphate
+# events that contributed to the score but aren't Morocco-specific".
+
+# 730-day window mirrors the longest finite EVIDENCE_WINDOW
+# (GEOPOLITICAL_TRADE).  Events beyond that horizon have been fully decayed
+# out of the scoring engine's view, so showing them in the drill-down would
+# mislead about what the score "saw".  Same value used for OPERATIONAL +
+# FINANCIAL_PRESSURE (which have ``None`` windows in EVIDENCE_WINDOWS — they
+# rely on per-event half-life decay rather than a hard cutoff — but for a
+# UI surface we still need a finite cutoff so the analyst sees recent
+# events rather than the full event history).
+RISK_EVENT_EVIDENCE_WINDOW_DAYS: int = 730
+
+
+@dataclass
+class MarketScoreEvidenceBundle:
+    """Aggregated raw evidence rows for (material × country).
+
+    Wraps three ORM lists + their pre-truncation counts.  Caller is
+    responsible for serialising to Pydantic — this layer just queries.
+
+    Lists are ordered from most-impactful first:
+      - regulations: status='effective' first, then by severity-suggestive
+        scope_type (banned > restricted > covered), then by effective_date desc.
+      - facilities: operating > planned > under_construction > mothballed >
+        closed, then by relevance_score desc, then by name.
+      - risk_events: by event_date desc (so the analyst always sees newest
+        first; severity ordering would hide stale-but-major events).
+    """
+
+    regulations: list[Regulation]
+    """Each row carries ``material_scope_type`` and ``geography_scope_type``
+    derived attributes attached at query time."""
+    facilities: list[Facility]
+    """Each row carries attached ``link_is_primary_product``,
+    ``link_annual_capacity_tpy``, and ``link_supply_chain_stage`` attributes
+    pulled from the FacilityMaterialLink junction row."""
+    risk_events: list[RiskEvent]
+    """Each row carries a derived ``source_system`` attribute from the
+    associated SourceDocument (looked up at query time)."""
+
+    regulation_total: int
+    facility_total: int
+    risk_event_total: int
+    # 056: broad multi-material measures (is_direct=False) matching this
+    # (material × country) that are EXCLUDED from the list above.  Scoring
+    # still consumes them at breadth-discounted relevance; the UI can show
+    # "+ N broad measures" without listing them.  See migration 056.
+    risk_event_broad_total: int = 0
+
+
+# Per-list caps for the dropdown.  Tuned so the panel stays short
+# vertically (3 sections × ~5 rows × short text ≈ fits without scroll).
+_DROPDOWN_REGULATION_LIMIT = 6
+_DROPDOWN_FACILITY_LIMIT = 8
+_DROPDOWN_RISK_EVENT_LIMIT = 6
+
+# Ranking weights for regulation severity ordering — higher = more impactful.
+# Keys match RegulationMaterialScope.scope_type enum.
+_REG_SCOPE_RANK = {
+    "banned": 4,
+    "restricted": 3,
+    "covered": 2,
+    "disclosure_required": 1,
+    "compliant": 0,
+}
+
+# Facility status ordering — operating sites first.
+_FACILITY_STATUS_RANK = {
+    "operating": 0,
+    "planned": 1,
+    "under_construction": 2,
+    "care_maintenance": 3,
+    "mothballed": 4,
+    "closed": 5,
+}
+
+
+def get_evidence_for_material_x_geography(
+    db: Session,
+    material_id: int,
+    country_code: str,
+    *,
+    as_of_date: Optional[date] = None,
+    risk_event_window_days: int = RISK_EVENT_EVIDENCE_WINDOW_DAYS,
+    regulation_limit: int = _DROPDOWN_REGULATION_LIMIT,
+    facility_limit: int = _DROPDOWN_FACILITY_LIMIT,
+    risk_event_limit: int = _DROPDOWN_RISK_EVENT_LIMIT,
+) -> MarketScoreEvidenceBundle:
+    """Three-way intersection: regulations, facilities, risk events.
+
+    Each list is INTERSECTION-only (see module-level note above) — rows
+    tagged to BOTH this material AND this country.
+
+    Caller passes pre-uppercased ``country_code`` (ISO2) to match the
+    storage convention used by RiskEventGeography, RegulationGeographyScope,
+    and Facility.country.
+    """
+    if as_of_date is None:
+        as_of_date = datetime.now(timezone.utc).date()
+    cc = country_code.upper()
+
+    # ── Regulations ─────────────────────────────────────────────────────
+    # Join Regulation → both scope junctions, filtered to this material and
+    # this country.  Eager-load the scope rows so we can pluck scope_type
+    # without an N+1 follow-up.
+    reg_stmt = (
+        select(Regulation, RegulationMaterialScope.scope_type, RegulationGeographyScope.scope_type)
+        .join(
+            RegulationMaterialScope,
+            RegulationMaterialScope.regulation_id == Regulation.id,
+        )
+        .join(
+            RegulationGeographyScope,
+            RegulationGeographyScope.regulation_id == Regulation.id,
+        )
+        .where(
+            RegulationMaterialScope.material_id == material_id,
+            RegulationGeographyScope.country_code == cc,
+        )
+        # Distinct per regulation — a single reg can have multiple
+        # geography_scope rows for the same country (rare but possible
+        # post-migration), so we collapse on regulation_id.
+        .distinct(Regulation.id)
+        .order_by(Regulation.id)
+    )
+    reg_rows = db.execute(reg_stmt).all()
+
+    # In-memory sort by severity proxy: scope_type rank desc, then
+    # effective_date desc.  Keeps the query simple (single DISTINCT ON)
+    # and lets us use a derived rank without a CASE WHEN in SQL.
+    def _reg_sort_key(row):
+        reg, mat_scope, geo_scope = row
+        return (
+            -_REG_SCOPE_RANK.get(mat_scope or "covered", 0),
+            -(reg.effective_date.toordinal() if reg.effective_date else 0),
+        )
+
+    reg_rows_sorted = sorted(reg_rows, key=_reg_sort_key)
+    regulation_total = len(reg_rows_sorted)
+
+    # Attach the per-pair scope_type values to each Regulation as
+    # ad-hoc attributes so the API serialiser can read them without
+    # another query.
+    regulations: list[Regulation] = []
+    for reg, mat_scope, geo_scope in reg_rows_sorted[:regulation_limit]:
+        reg.material_scope_type = mat_scope or "covered"   # type: ignore[attr-defined]
+        reg.geography_scope_type = geo_scope or "jurisdiction"  # type: ignore[attr-defined]
+        regulations.append(reg)
+
+    # ── Facilities ──────────────────────────────────────────────────────
+    fac_stmt = (
+        select(
+            Facility,
+            FacilityMaterialLink.is_primary_product,
+            FacilityMaterialLink.annual_capacity_tpy,
+            FacilityMaterialLink.supply_chain_stage,
+        )
+        .join(
+            FacilityMaterialLink,
+            FacilityMaterialLink.facility_id == Facility.id,
+        )
+        .where(
+            FacilityMaterialLink.material_id == material_id,
+            Facility.country == cc,
+        )
+    )
+    fac_rows = db.execute(fac_stmt).all()
+    facility_total = len(fac_rows)
+
+    # Ordering: operating > planned > under_construction > mothballed > closed,
+    # then primary products before co-products, then by name alphabetically.
+    def _fac_sort_key(row):
+        fac, is_primary, _cap, _stage = row
+        return (
+            _FACILITY_STATUS_RANK.get(fac.status, 99),
+            0 if is_primary else 1,
+            (fac.name or "").lower(),
+        )
+
+    fac_rows_sorted = sorted(fac_rows, key=_fac_sort_key)
+    facilities: list[Facility] = []
+    for fac, is_primary, capacity_tpy, stage in fac_rows_sorted[:facility_limit]:
+        fac.link_is_primary_product = bool(is_primary)  # type: ignore[attr-defined]
+        fac.link_annual_capacity_tpy = (  # type: ignore[attr-defined]
+            float(capacity_tpy) if capacity_tpy is not None else None
+        )
+        fac.link_supply_chain_stage = stage  # type: ignore[attr-defined]
+        facilities.append(fac)
+
+    # ── Risk events ─────────────────────────────────────────────────────
+    # Strict intersection: events with BOTH a RiskEventMaterial row for
+    # this material AND a RiskEventGeography row for this country.  Two
+    # separate inner joins do the intersection.
+    cutoff = as_of_date - timedelta(days=risk_event_window_days)
+    ev_stmt = (
+        select(RiskEvent)
+        .join(
+            RiskEventMaterial,
+            RiskEventMaterial.risk_event_id == RiskEvent.id,
+        )
+        .join(
+            RiskEventGeography,
+            RiskEventGeography.risk_event_id == RiskEvent.id,
+        )
+        .where(
+            RiskEventMaterial.material_id == material_id,
+            RiskEventGeography.country_code == cc,
+            RiskEvent.duplicate_of_id.is_(None),  # 055: skip confirmed dupes
+            RiskEventMaterial.is_direct.is_(True),  # 056: list direct only
+        )
+        # Window filter: events with no event_date are kept (sanctions
+        # programs often lack a single anchor date) but cutoff applies to
+        # those that do.
+        .where(_event_window_clause(cutoff, as_of_date))
+        # Two-hop selectinload: SourceDocument → Source so we can name the
+        # ingester (global_trade_alert / federal_register / eurlex / iea /
+        # opensanctions / sec_edgar) without an N+1 follow-up.
+        #
+        # 2026-07-15 EGRESS FIX: defer SourceDocument.raw_text (full ingested
+        # source payload — Federal Register HTML, GTA notice, IEA doc, EUR-Lex
+        # text; 5–100 KB per event) and metadata_json.  This call site only
+        # touches ``sd.source.name`` (see ``ev.source_system = ...`` below) so
+        # neither field is ever read — but SQLAlchemy was materializing them
+        # anyway, driving multi-GB egress per rescore against remote Neon.
+        # If any downstream caller of ``get_evidence_for_material_x_geography``
+        # later needs raw_text, load it explicitly instead of un-deferring here.
+        .options(
+            # RiskEvent-level defers: caller uses id, event_date, event_type,
+            # event_subtype, severity_score, source_document (below).  Never
+            # summary or review_note.
+            defer(RiskEvent.summary),
+            selectinload(RiskEvent.source_document)
+                .options(
+                    defer(SourceDocument.raw_text),
+                    defer(SourceDocument.metadata_json),
+                )
+                .selectinload(SourceDocument.source),
+        )
+        .distinct(RiskEvent.id)
+        .order_by(RiskEvent.id)
+    )
+    ev_rows = list(db.scalars(ev_stmt).all())
+    risk_event_total = len(ev_rows)
+
+    # 056: count (don't list) the broad multi-material measures excluded
+    # above — scoring consumed them at discounted relevance, so the panel
+    # can honestly say "+ N broad measures" without the sift burden.
+    risk_event_broad_total = db.scalar(
+        select(func.count(func.distinct(RiskEvent.id)))
+        .select_from(RiskEvent)
+        .join(RiskEventMaterial, RiskEventMaterial.risk_event_id == RiskEvent.id)
+        .join(RiskEventGeography, RiskEventGeography.risk_event_id == RiskEvent.id)
+        .where(
+            RiskEventMaterial.material_id == material_id,
+            RiskEventGeography.country_code == cc,
+            RiskEvent.duplicate_of_id.is_(None),
+            RiskEventMaterial.is_direct.is_(False),
+            _event_window_clause(cutoff, as_of_date),
+        )
+    ) or 0
+
+    # In-memory sort: newest first (NULL event_date goes to end).
+    ev_rows_sorted = sorted(
+        ev_rows,
+        key=lambda e: (e.event_date is None, -(e.event_date.toordinal() if e.event_date else 0)),
+    )
+
+    risk_events: list[RiskEvent] = []
+    for ev in ev_rows_sorted[:risk_event_limit]:
+        # Derive source_system from SourceDocument → Source.name so the
+        # frontend can render a small badge identifying which ingester
+        # surfaced this event.  Defensive None-handling: pre-Phase-2 events
+        # and synthetically generated ones may lack a source_document.
+        sd = ev.source_document
+        ev.source_system = (  # type: ignore[attr-defined]
+            sd.source.name if sd is not None and sd.source is not None else None
+        )
+        risk_events.append(ev)
+
+    return MarketScoreEvidenceBundle(
+        regulations=regulations,
+        facilities=facilities,
+        risk_events=risk_events,
+        regulation_total=regulation_total,
+        facility_total=facility_total,
+        risk_event_total=risk_event_total,
+        risk_event_broad_total=risk_event_broad_total,
+    )
+
+
 __all__ = [
     "EventWithRelevance",
     "SupplierEdge",
     "HIGH_CONCENTRATION_GEOS",
+    "MarketScoreEvidenceBundle",
+    "get_evidence_for_material_x_geography",
+    "RISK_EVENT_EVIDENCE_WINDOW_DAYS",
     # Existing helpers (now scope-threaded)
     "get_events_for_company",
     "get_company_material_exposure",

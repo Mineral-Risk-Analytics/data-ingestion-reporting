@@ -1,5 +1,15 @@
 """SEC EDGAR filing ingestion — dedicated module.
 
+⏸  STREAM PAUSED (2026-07-31, per Nicole after the per-ingester audit —
+see docs/design/sec_edgar_stream_audit.md).  Do not schedule or run.
+Production state at pause: 144 events, 78% FILING_INDEX noise, zero
+material/company links, primary_category NULL on every row, stub
+summaries.  The Phase 4 reset deletes these events without re-ingesting.
+Revival requires, as ONE package: admission filtering to high-signal
+forms/items, LINK_EVENTS_TO_COMPANIES with a corrected CIK map, and
+Workstream B body text.  The sec_subtype_map two-axis classification is
+sound and should be kept as-is when reviving.
+
 Replaces the generic ``IngestionPipeline`` path for SEC EDGAR (May 2026
 refactor).  Pattern matches ``ingest_federal_register.py`` and the other
 dedicated ingester modules: explicit entry function, in-module fetcher,

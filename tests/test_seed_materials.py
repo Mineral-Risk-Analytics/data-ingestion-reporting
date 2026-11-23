@@ -12,22 +12,20 @@ import pytest
 from app.services.ingestion.seed_materials import (
     _JUNCTION_ROWS,
     _MATERIALS,
-    _NON_USGS_MATERIALS,
     seed_battery_chemistry_junctions,
-    seed_non_usgs_materials,
+    seed_materials_register,
 )
 
 
 # ---------------------------------------------------------------------------
-# Full materials register (_MATERIALS / _NON_USGS_MATERIALS alias)
+# Full materials register (_MATERIALS)
 # ---------------------------------------------------------------------------
 
 class TestMaterialsRegisterData:
-    def test_non_usgs_alias_is_full_register(self):
-        assert _NON_USGS_MATERIALS is _MATERIALS
-
-    def test_register_has_thirty_nine_entries(self):
-        assert len(_MATERIALS) == 39
+    def test_register_has_forty_one_entries(self):
+        # 41 (2026-11: register grew; keep this pin current on purpose —
+        # an unexplained count change is exactly what it exists to catch).
+        assert len(_MATERIALS) == 41
 
     def test_expected_motor_ree_and_sodium_names_present(self):
         names = {m["canonical_name"] for m in _MATERIALS}
@@ -90,8 +88,8 @@ class TestJunctionRowsData:
     def test_lfp_has_lithium_iron_phosphate(self):
         lfp_materials = {row[1] for row in _JUNCTION_ROWS if row[0] == "lfp"}
         assert "Lithium" in lfp_materials
-        assert "Iron Ore (LFP Grade)" in lfp_materials
-        assert "Phosphate (Battery Grade)" in lfp_materials
+        assert "Iron Ore" in lfp_materials
+        assert "Phosphate" in lfp_materials
 
     def test_sodium_ion_does_not_use_lithium(self):
         nai_materials = {row[1] for row in _JUNCTION_ROWS if row[0] == "sodium_ion"}
@@ -111,30 +109,24 @@ class TestJunctionRowsData:
 
 
 # ---------------------------------------------------------------------------
-# seed_non_usgs_materials
+# seed_materials_register
 # ---------------------------------------------------------------------------
 
 def _make_session_for_seed(existing_names: set[str]) -> MagicMock:
     """Return a mock session where materials with names in existing_names already exist."""
     session = MagicMock()
-
-    def scalar_side_effect(stmt):
-        # Detect which canonical_name is being queried from the WHERE clause.
-        # We can't inspect the stmt deeply in a unit test, so we track call order.
-        return None  # all new by default
-
     session.scalar.return_value = None
     return session
 
 
-class TestSeedNonUsgsMaterials:
+class TestSeedMaterialsRegister:
     def test_inserts_all_when_table_empty(self):
         session = MagicMock()
         session.scalar.return_value = None  # all materials are new
 
-        count = seed_non_usgs_materials(session)
+        stats = seed_materials_register(session)
 
-        assert count == len(_MATERIALS)
+        assert stats["inserted"] == len(_MATERIALS)
         assert session.add.call_count == len(_MATERIALS)
 
     def test_skips_existing_materials(self):
@@ -151,15 +143,16 @@ class TestSeedNonUsgsMaterials:
 
         session.scalar.side_effect = scalar_se
 
-        count = seed_non_usgs_materials(session)
+        stats = seed_materials_register(session)
 
-        assert count == len(_MATERIALS) - 1
+        assert stats["inserted"] == len(_MATERIALS) - 1
+        assert stats["skipped_existing"] == 1
 
     def test_flush_called_when_insertions_made(self):
         session = MagicMock()
         session.scalar.return_value = None
 
-        seed_non_usgs_materials(session)
+        seed_materials_register(session)
 
         session.flush.assert_called()
 
@@ -167,7 +160,7 @@ class TestSeedNonUsgsMaterials:
         session = MagicMock()
         session.scalar.return_value = MagicMock()  # all exist
 
-        seed_non_usgs_materials(session)
+        seed_materials_register(session)
 
         session.flush.assert_not_called()
 
@@ -221,8 +214,8 @@ class TestSeedBatteryChemistryJunctions:
         chems = [_make_chemistry("lfp", 1)]
         mats = [
             _make_material("Lithium", 1),
-            _make_material("Iron Ore (LFP Grade)", 2),
-            _make_material("Phosphate (Battery Grade)", 3),
+            _make_material("Iron Ore", 2),
+            _make_material("Phosphate", 3),
             _make_material("Natural Graphite", 4),
             _make_material("Copper", 5),
             _make_material("Aluminum", 6),
@@ -239,8 +232,8 @@ class TestSeedBatteryChemistryJunctions:
         chems = [_make_chemistry("lfp", 1)]
         mats = [
             _make_material("Lithium", 1),
-            _make_material("Iron Ore (LFP Grade)", 2),
-            _make_material("Phosphate (Battery Grade)", 3),
+            _make_material("Iron Ore", 2),
+            _make_material("Phosphate", 3),
             _make_material("Natural Graphite", 4),
             _make_material("Copper", 5),
             _make_material("Aluminum", 6),
@@ -262,19 +255,18 @@ class TestSeedBatteryChemistryJunctions:
 
         result = seed_battery_chemistry_junctions(session)
 
-        # 1 row inserted (nmc + Lithium found); everything else skipped:
-        # - 9 NMC rows where material not in mat_map → skipped_missing
-        # - 38 non-NMC rows where chemistry not in chem_map → skipped_missing
-        # Total skipped_missing = 47, inserted = 1
+        # 1 row inserted (nmc + Lithium found); everything else skipped.
+        # 2026-11: register growth (39→41 materials) added junction rows,
+        # so skipped_missing moved 47→52 — recount if the register grows.
         assert result["inserted"] == 1
-        assert result["skipped_missing_material"] == 47
+        assert result["skipped_missing_material"] == 52
 
     def test_flush_called_after_insertions(self):
         chems = [_make_chemistry("lfp", 1)]
         mats = [
             _make_material("Lithium", 1),
-            _make_material("Iron Ore (LFP Grade)", 2),
-            _make_material("Phosphate (Battery Grade)", 3),
+            _make_material("Iron Ore", 2),
+            _make_material("Phosphate", 3),
             _make_material("Natural Graphite", 4),
             _make_material("Copper", 5),
             _make_material("Aluminum", 6),

@@ -180,6 +180,26 @@ class CountryShareItem(BaseModel):
     share_pct: int  # rounded integer percentage, e.g. 47
 
 
+class CountryMaterialRelevanceItem(BaseModel):
+    """One row from country_material_relevance — a per-(material, country, role)
+    relevance flag with partner-curation surface.
+
+    Producer rows are auto-derived from material_production_shares; consumer
+    rows are initial placeholders or partner-curated.
+    """
+    model_config = ConfigDict(from_attributes=True)
+
+    country_code: str               # ISO-3166-1 alpha-2
+    country_name: Optional[str] = None  # joined from countries.name when available
+    role: str                       # 'producer' | 'consumer'
+    tier: Optional[str] = None      # 'top' | 'mid' | 'minor' | 'emerging'
+    is_hcg: bool
+    source: str                     # 'mcs_share' | 'partner_curated' | 'derived'
+    derived_share: Optional[float] = None
+    reference_year: Optional[int] = None
+    notes: Optional[str] = None
+
+
 class MaterialListPillarScore(BaseModel):
     """One pillar's score for the Materials list row.
 
@@ -235,6 +255,12 @@ class MaterialListItem(BaseModel):
     """Count of RiskEvent rows created in the last 90 days that map to
     this material via RiskEventMaterial.  Matches the coverage matrix
     and Coverage Gaps KPI window for consistency."""
+    concentration_scored: bool = True
+    """False when the material's concentration pillar has NO share data
+    (score exactly 0 at the global level — e.g. Germanium, the individual
+    REE elements, Sodium, Rhenium).  Drives the insufficient-data band
+    gate: the UI shows "Insufficient data" instead of a false-green LOW
+    chip (2026-07-20 band recalibration)."""
 
 
 class MaterialDetail(BaseModel):

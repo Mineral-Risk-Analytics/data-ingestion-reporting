@@ -114,30 +114,6 @@ _API_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=10.0, pool=10.0)
 _KEYWORD_BOOST = 0.12
 
 # ---------------------------------------------------------------------------
-# Geography detection
-# ---------------------------------------------------------------------------
-
-# NOTE: _GEO_PATTERNS and _detect_geographies() were removed in Phase 2.
-# Geography detection is now handled by GeographyCache (imported above), which
-# loads country detection patterns from countries.detection_patterns (DB-backed).
-# To add or update detection patterns, update seed_countries.py and re-run
-# `bdi-ingest seed-countries` — no code change required.
-#
-# _detect_geographies() is kept as a thin shim for any external callers.
-# Remove in Phase 3.
-
-def _detect_geographies(
-    text: str,
-    _cache: "GeographyCache | None" = None,
-) -> list[tuple[str, str, float]]:  # pragma: no cover
-    """Deprecated shim — callers should build a GeographyCache and call .detect()."""
-    if _cache is not None:
-        return _cache.detect(text)
-    # Fallback: return empty list if no cache provided (avoids DB call here).
-    return []
-
-
-# ---------------------------------------------------------------------------
 # Material detection
 # ---------------------------------------------------------------------------
 
@@ -823,6 +799,9 @@ def _persist_material_links(
                 material_id=material_id,
                 relevance_score=relevance,
                 match_reason=f"keyword_match:{matched_keyword[:48]}",
+                # 2026-07-31 (triage plan Phase 1): machine-written links
+                # are suggestions until confirmed in triage.
+                status="suggested",
             ))
             written += 1
 
@@ -1330,6 +1309,49 @@ def _severity(doc_type: str | None, abstract: str | None, title: str | None,
 
 
 # ---------------------------------------------------------------------------
+# Procedural-step detection (2026-07-31, triage plan Phase 1)
+# ---------------------------------------------------------------------------
+# The trade-remedy stream captures every Federal Register document in an
+# AD/CVD case's life, and most of them are administrative steps of an
+# already-known measure: the Türkiye aluminum-sheet case alone produced
+# four events in one week ("Preliminary Results", "Postponement", "Notice
+# of Court Decision", ...), each at ~0.54 severity.  One underlying trade
+# measure was being multiplied into a stream of procedural exhaust.
+#
+# Decision (Nicole, 2026-07-31): case initiations and FINAL determinations
+# remain real pending-triage events; intermediate procedural steps land
+# display_only at capped severity.  Detection is by title pattern —
+# deliberately conservative: an unmatched title stays a full event, so a
+# false negative costs a redundant triage row, never a lost measure.
+_PROCEDURAL_TITLE_PATTERNS: tuple[str, ...] = (
+    "postponement",
+    "preliminary results",
+    "preliminary determination",
+    "amended final results",
+    "supplemental schedule",
+    "schedule for the final",
+    "notice of court decision",
+    "extension of time",
+    "rescission",
+    "correction",
+    "initiation of administrative review",   # annual review of an EXISTING order
+    "opportunity to request administrative review",
+)
+
+# Severity cap for procedural steps — a postponement notice is not a
+# 0.5-severity risk event.  Chosen below every scoring-relevant band the
+# aggregator uses.
+_PROCEDURAL_SEVERITY_CAP = 0.25
+
+
+def _is_procedural_step(title: str) -> bool:
+    """True when the document is an administrative step in an ongoing
+    AD/CVD case rather than a new measure — see pattern list above."""
+    t = (title or "").lower()
+    return any(p in t for p in _PROCEDURAL_TITLE_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -1411,6 +1433,25 @@ def _insert_risk_event(
     agencies: list[str],
     content_hash: str,
 ) -> RiskEvent:
+    # ── Suggestion fields (2026-07-31, triage plan Phase 1) ────────────────
+    # Same inversion as GTA/IEA: category and direction are SUGGESTIONS —
+    # primary_category stays NULL until a human confirms in triage, so the
+    # event cannot enter a scoring pool (pillar queries filter on
+    # primary_category, migration 062).
+    #
+    # Direction: every FR query stream captures restriction-side measures
+    # (tariffs, export controls, sanctions, regulatory obligations) — there
+    # is no subsidy stream here, so direction is uniformly "restrictive".
+    # Category provenance is the query config itself (hardcoded per stream,
+    # never a keyword fallback) — recorded as "query_config" so the triage
+    # UI can distinguish it from keyword-derived suggestions.
+    procedural = _is_procedural_step(title)
+    if procedural:
+        severity = min(severity, _PROCEDURAL_SEVERITY_CAP)
+        triage_status = "display_only"
+    else:
+        triage_status = "pending_triage"
+
     ev = RiskEvent(
         source_document_id=doc.id,
         event_type="federal_register_notice",
@@ -1421,6 +1462,11 @@ def _insert_risk_event(
         severity_score=severity,
         confidence_score=0.70,
         risk_categories_json=risk_categories,
+        # Inverted 2026-07-31 (triage plan Phase 1): the machine suggests,
+        # a human assigns.  primary_category deliberately NOT set.
+        suggested_category=risk_categories[0] if risk_categories else None,
+        direction="restrictive",
+        triage_status=triage_status,
         geography_json={"primary": geo_primary, "scope": "federal"},
         content_hash=content_hash,
         metadata_json={
@@ -1434,6 +1480,12 @@ def _insert_risk_event(
             # from event_date (which may be effective_on for final rules).
             "publication_date": doc.published_at.date().isoformat()
             if doc.published_at else None,
+            # 2026-07-31 triage-plan Phase 1 markers:
+            "category_mapping": "query_config",
+            "is_procedural_step": procedural,
+            "triage_route": (
+                "auto_display_only_procedural" if procedural else None
+            ),
         },
     )
     session.add(ev)
@@ -1977,6 +2029,55 @@ def ingest_federal_register(
                             )
                             seen_mids.add(material.id)
 
+                    # ── Bundle 2 (2026-06-07): Refine basket-fanout attributions ───
+                    # Basket fanout (Layer 3 in _extract_from_title) attributes
+                    # 5 materials at uniform 0.40 relevance for titles matching
+                    # "lithium-ion batteries" and similar patterns.  Now that
+                    # Haiku has read the document via extract_fr_attribution, we
+                    # can confirm or attenuate each basket member based on
+                    # whether the document substantively discusses it.
+                    #
+                    # Three-way refinement when Haiku gave a high-confidence
+                    # scope accept (scope_conf >= 0.5):
+                    #   Haiku confirmed (in materials list, conf >= 0.5) →
+                    #     relevance bumped to max(0.40, 0.60) — confirmed
+                    #   Haiku not mentioning this basket member →
+                    #     relevance downweighted 0.40 → 0.20 (uncertain, NOT
+                    #     dropped — Haiku may have missed a real one).
+                    #   Haiku low-confidence or absent → no refinement (keep
+                    #     0.40 baseline; review queue catches it elsewhere).
+                    if (
+                        haiku_payload is not None
+                        and is_in_scope is True
+                        and scope_conf >= 0.5
+                    ):
+                        haiku_mat_ids: set[int] = set()
+                        for m in haiku_payload.get("materials", []) or []:
+                            mname = (m.get("name") or "").strip()
+                            mconf = float(m.get("confidence") or 0.0)
+                            if not mname or mconf < 0.5:
+                                continue
+                            mat = material_resolver.resolve_by_canonical_name(mname)
+                            if mat is not None:
+                                haiku_mat_ids.add(mat.id)
+                        refined: list = []
+                        for mid, rel, reason, hs_id in detected_materials:
+                            if reason.startswith("title_basket"):
+                                if mid in haiku_mat_ids:
+                                    # Confirmed by Haiku — bump relevance.
+                                    new_rel = max(rel, 0.60)
+                                    new_reason = f"basket_haiku_confirmed:{reason[len('title_basket:'):][:24]}"
+                                    refined.append((mid, new_rel, new_reason[:64], hs_id))
+                                else:
+                                    # Not confirmed — downweight rather than drop
+                                    # (Haiku may have missed a real basket member).
+                                    new_rel = rel * 0.5
+                                    new_reason = f"basket_haiku_unconfirmed:{reason[len('title_basket:'):][:22]}"
+                                    refined.append((mid, new_rel, new_reason[:64], hs_id))
+                            else:
+                                refined.append((mid, rel, reason, hs_id))
+                        detected_materials = refined
+
                     # Merge Haiku-extracted countries into detected_geos.
                     # Existing geo_cache matches keep their context;
                     # Haiku-only countries map to a context derived from
@@ -2151,8 +2252,25 @@ def ingest_federal_register(
                     # Per-run resolver instance was created at startup so the alias
                     # cache stays warm across all events in this ingest run.
                     doc_type_lc = (parsed.doc_type or "").strip().lower()
+                    # Build 3 (2026-07-27): relevance gate on the SUGGESTION
+                    # path. A high-authority doc only stages a suggested
+                    # regulation when the event carries at least one
+                    # DIRECT material attribution (relevance >= 0.90 —
+                    # canonical-name/keyword or title-basket match; the
+                    # 0.40 category-inference layer does not qualify).
+                    # Events are still created and linked regardless —
+                    # this only keeps partner-review queue noise out
+                    # (drone export rules, IC licensing, etc. staged 10
+                    # junk suggestions pre-filter). Agency allowlisting
+                    # already happens upstream via the structured queries.
+                    _direct_material_hit = any(
+                        rel >= 0.90 for _mid, rel, _rsn, _hs in detected_materials
+                    )
                     if doc_number:
-                        if doc_type_lc in _STAGE_REGULATION_DOC_TYPES:
+                        if (
+                            doc_type_lc in _STAGE_REGULATION_DOC_TYPES
+                            and _direct_material_hit
+                        ):
                             reg_result = reg_alias_resolver.resolve_or_stage(
                                 source_system="federal_register",
                                 source_key=doc_number,

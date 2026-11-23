@@ -1843,6 +1843,7 @@ def seed_material_exposures(session: Session) -> dict[str, int]:
                     data_confidence=entry.get("data_confidence"),
                     rationale=entry.get("rationale"),
                     as_of_date=_AS_OF,
+                    score_derivation="curated_seed",  # migration 053 provenance
                 )
             )
             log.info(
@@ -1861,7 +1862,14 @@ def seed_material_exposures(session: Session) -> dict[str, int]:
                 "data_confidence": entry.get("data_confidence"),
                 "rationale": entry.get("rationale"),
                 "as_of_date": _AS_OF,
+                "score_derivation": "curated_seed",  # migration 053 provenance
             }
+            if existing.rationale and "[workbook]" in (existing.rationale or ""):
+                # The workbook loader appended filing evidence to this row's
+                # rationale (seed_company_workbook.py) — don't clobber it,
+                # and keep the fresher workbook as_of_date.
+                mutable.pop("rationale")
+                mutable.pop("as_of_date")
             for field, value in mutable.items():
                 if getattr(existing, field) != value:
                     setattr(existing, field, value)

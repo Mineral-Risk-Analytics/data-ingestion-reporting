@@ -1,0 +1,22 @@
+Global Trade Alert	scoring	gta_id=157799	id=21105	2026-09-20	United States of America: U.S. Administration imposes tariffs on countries following Section 301 inv
+Global Trade Alert	scoring	gta_id=146798	id=20544	2026-09-20	United States of America: USTR imposes 25% tariff on Brazilian goods following Section 301 investiga
+Global Trade Alert	scoring	gta_id=157798	id=21104	2026-08-31	United States of America: U.S. Administration imposes tariffs on countries following Section 301 inv
+Global Trade Alert	scoring	gta_id=157992	id=21111	2026-09-20	Netherlands: Ban on import and trade of goods from illegal Israeli settlements
+Global Trade Alert	rejected	gta_id=144976	id=20477	2026-08-14	EU: Consolidated countermeasures package against US tariffs, including import and export restriction
+Global Trade Alert	scoring	gta_id=157844	id=21109	2026-08-31	EU: 21st sanctions package against Russia for its invasion of Ukraine (July 2026)
+Global Trade Alert	scoring	gta_id=157804	id=21106	2026-09-20	China: Government adds 14 European Union entities to the Export Control List (July 2026)
+Federal Register API	scoring	gta_id=None	id=21120	2026-08-14	Notice of Initiation of Changed Circumstances Reviews, and Consideration of Revocation of the Antidu
+Federal Register API	scoring	gta_id=None	id=21119	2026-08-14	Large Diameter Graphite Electrodes From India: Preliminary Affirmative Countervailing Duty Determina
+Federal Register API	scoring	gta_id=None	id=21122	2026-08-31	Certain Anode Materials for Use in Battery Cells and Batteries; Notice of Institution of Investigati
+Federal Register API	scoring	gta_id=None	id=21199	2026-08-31	Further Strengthening Actions Taken To Adjust Imports of Aluminum Into the United States
+Global Trade Alert	display_only	gta_id=147861	id=20622	2026-08-02	EU: Consolidated countermeasures package against US tariffs, including import and export restriction
+Federal Register API	scoring	gta_id=None	id=21118	2026-08-14	Large Diameter Graphite Electrodes From the People's Republic of China: Preliminary Affirmative Coun
+Global Trade Alert	scoring	gta_id=153555	id=20930	2026-08-14	Canada: Provisional anti-subsidy duty on imports of unarmoured building cables from China
+Global Trade Alert	scoring	gta_id=153554	id=20929	2026-08-31	Canada: Provisional antidumping duty on imports of unarmoured building cables from China
+Global Trade Alert	display_only	gta_id=144977	id=20478	2026-08-04	EU: Consolidated countermeasures package against US tariffs, including import and export restriction
+Federal Register API	scoring	gta_id=None	id=21210	2026-08-11	Notice Regarding the Uyghur Forced Labor Prevention Act Entity List
+Global Trade Alert	scoring	gta_id=153823	id=20940	2026-08-14	United States of America: Provisional anti-subsidy duty on imports of large diameter graphite electr
+Global Trade Alert	scoring	gta_id=157667	id=21089	2026-08-31	United States of America: Restrictions on public procurement waivers for sensitive defense materials
+Global Trade Alert	scoring	gta_id=157856	id=21110	2026-09-20	Canada: Canada Growth Fund invests CAD 75 million in Idealist Capital Fund II LP
+Federal Register API	rejected	gta_id=None	id=21208	2026-09-20	Modifying the Grand Staircase-Escalante National Monument
+Federal Register API	scoring	gta_id=None	id=21125	2026-09-20	Crystalline Silicon Photovoltaic Cells, Whether or Not Assembled Into Modules, From the People's Rep

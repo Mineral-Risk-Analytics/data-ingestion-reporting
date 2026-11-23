@@ -834,12 +834,19 @@ _COUNTRIES: list[dict] = [
     # ── Bloc identifiers (not ISO 3166 countries) ────────────────────────────
     {
         "iso2": "EU", "name": "European Union", "iso3": None, "region": "Europe",
-        "comtrade_code": None,
+        "comtrade_code": 97,
         "common_names": ["European Union", "EU"],
         "detection_patterns": None,
         "is_sanctions_risk": False,
         "is_major_producer": False, "is_major_consumer": True,
-        "notes": "Bloc identifier used in regulation_geography_scope and risk_event_geography.",
+        "notes": (
+            "Bloc identifier used in regulation_geography_scope and "
+            "risk_event_geography. Comtrade reporterCode 97 returns "
+            "extra-EU trade only (intra-EU flows are NOT included); the "
+            "individual member-state reporters (DE, FR, BE, etc.) carry "
+            "their full trade including intra-EU. Use EU=97 for bloc-level "
+            "scoring views; use member states for individual-country views."
+        ),
     },
 
     # ── Added 2026-05-09: countries appearing in MCS 2026 World Production
@@ -1438,6 +1445,23 @@ _COUNTRIES: list[dict] = [
         "is_sanctions_risk": True,
         "is_major_producer": False, "is_major_consumer": False,
         "notes": "Iron ore, bauxite (limited operations under sanctions).",
+    },
+    {
+        # Added 2026-09-24 (XJ/JE geography-code audit): Jersey is a real
+        # ISO 3166-1 code with its own customs territory that appeared in a
+        # GTA measure but had no reference row, so its geography link
+        # joined to nothing. Also relevant as an incorporation domicile in
+        # the companies data (e.g. Glencore) — see future_features.md §2 on
+        # why incorporation is NOT control.
+        "iso2": "JE", "name": "Jersey", "iso3": "JEY", "region": "Europe",
+        "comtrade_code": 832,
+        "common_names": ["Jersey", "Bailiwick of Jersey"],
+        "detection_patterns": [
+            {"pattern": "jersey", "context": "primary"},
+        ],
+        "is_sanctions_risk": False,
+        "is_major_producer": False, "is_major_consumer": False,
+        "notes": "Crown dependency; appears as implementing jurisdiction in trade measures and as an incorporation domicile.",
     },
 ]
 

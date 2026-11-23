@@ -31,6 +31,7 @@ import app.models  # noqa: F401
 from app.db.base import Base
 from app.models.company import Company, CompanyScore
 from app.services.scoring.evidence_query import EventWithRelevance
+from app.services.scoring.supplier_risk import SCORING_VERSION
 from app.services.scoring.orchestrator import rescore_company
 
 
@@ -130,7 +131,7 @@ def test_rescore_writes_score_row(sqlite_session: Session, fixture_company: Comp
 
     assert score_row.id is not None, "flush() should populate the PK"
     assert score_row.company_id == fixture_company.id
-    assert score_row.scoring_version == "3.0"
+    assert score_row.scoring_version == SCORING_VERSION
 
     # All five component scores must be present and on [0, 100]
     for col in (
